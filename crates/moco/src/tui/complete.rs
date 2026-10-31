@@ -58,7 +58,8 @@ impl Completer {
     }
 
     fn slash(&self, q: &str) -> Vec<Item> {
-        let mut all: Vec<(String, String)> = vec![("help".into(), "show the keys".into()), ("exit".into(), "quit".into())];
+        let mut all: Vec<(String, String)> = vec![("help".into(), "show the keys".into()), ("exit".into(), "quit".into()), ("resume".into(), "continue a session by id".into())];
+        all.extend(super::builtin::NAMES.iter().map(|(n, d)| (n.to_string(), d.to_string())));
         all.extend(self.commands.iter().cloned());
         if let Some(m) = &self.mcp {
             all.extend(m.prompts().into_iter().map(|p| (p.command, format!("{} [mcp]", p.description))));
@@ -172,9 +173,10 @@ mod tests {
     #[test]
     fn slash_commands_match_by_prefix_before_substring() {
         let c = c();
-        assert_eq!(labels(&c.items("/")), vec!["/exit", "/help", "/init", "/review"]);
-        assert_eq!(labels(&c.items("/re")), vec!["/review"]);
-        assert_eq!(labels(&c.items("/it")), vec!["/exit", "/init"]); // substring
+        assert_eq!(labels(&c.items("/"))[..3], ["/agent", "/archive", "/commands"]);
+        assert_eq!(labels(&c.items("/i"))[0], "/init"); // prefix before substring
+        assert_eq!(labels(&c.items("/re"))[..4], ["/redo", "/rename", "/resume", "/review"]);
+        assert!(labels(&c.items("/it")).starts_with(&["/exit", "/init"])); // substring
         assert!(c.items("/zzz").is_empty());
     }
 

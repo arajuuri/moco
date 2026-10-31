@@ -115,6 +115,25 @@ if scenario == "chat":
     send(b"\r")  # sends "look at @a.txt": the mention was completed, so the file gets attached
     wait_for(r"attached.*a\.txt")
     wait_for(r"Thefilesays:ONE-LINE-OF-TEXT(.|\n)*Thefilesays:ONE-LINE-OF-TEXT|in,\d+out(.|\n)*in,\d+out")
+    send(b"/model\r")
+    wait_for(r"model\(1\)")  # the picker lists the one connected model
+    wait_for(r"fake/m")
+    send(b"\r")
+    wait_for(r"model:fake/m")
+    send(b"\x10")  # Ctrl-P: command palette
+    wait_for(r"commands\(\d+\)")
+    send(b"und")  # filter
+    wait_for(r"/undo")
+    send(b"\x1b")
+    pump(0.4)  # a lone Esc must not run into the next key (ESC + / would be Alt-/)
+    send(b"/sessions\r")
+    wait_for(r"sessions\(1\)")
+    send(b"\r")  # resume the one session listed
+    wait_for(r"session\w{8}:Fakeprotocoltest")
+    send(b"/new\r")
+    wait_for(r"session\w{8}:\(untitled\)")
+    send(b"/undo\r")
+    wait_for(r"nothingtoundo")
     send(b"one\x1b\rtwo")  # Alt-Enter adds a line instead of sending
     pump(0.3)
     send(b"\x1b[A\x15\x0b")  # Up to the first line, Ctrl-U and Ctrl-K clear it

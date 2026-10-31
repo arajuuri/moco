@@ -1,6 +1,7 @@
 //! Full-screen terminal UI (ratatui + crossterm). One UI thread owns the terminal and an event
 //! channel; the engine runs on a worker thread and talks to the UI through `TuiUi`.
 mod app;
+mod builtin;
 mod complete;
 mod term;
 
@@ -10,6 +11,7 @@ use app::{Action, App, AppEvent, Ev};
 use crossterm::event::{self, Event};
 use moco_core::engine::{Engine, PermissionPrompt, Reply, Ui, UiEvent};
 use moco_core::tools::Question;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -47,9 +49,16 @@ pub struct Host<'a> {
     pub submit: &'a dyn Fn(&str) -> Result<Vec<String>, String>,
     /// Turn `/name args` into a prompt (custom commands, MCP prompts). `Err` carries a message for the user.
     pub command: &'a dyn Fn(&str) -> Result<Resolved, String>,
-    pub completer: Completer,
+    pub completer: Option<Completer>,
     /// Prompt history, one JSON string per line.
     pub history_path: std::path::PathBuf,
+    /// Working directory of the session (sessions of other directories cannot be resumed here).
+    pub cwd: String,
+    /// (id, description) of the skills found.
+    pub skills: Vec<(String, String)>,
+    /// (name, description) of the custom commands found, subagent ones included.
+    pub custom_commands: Vec<(String, String)>,
+    pub manager: Option<Arc<moco_core::mcp::Manager>>,
 }
 
 /// A slash command resolved to a prompt. `agent` and `model` apply to this one prompt only.
@@ -117,13 +126,15 @@ impl Ui for TuiUi {
         answer.recv().unwrap_or(Reply::Reject(None))
     }
 
-    fn ask_questions(&self, _questions: &[Question]) -> Option<Vec<Vec<String>>> {
-        self.send(AppEvent::Engine { depth: 0, agent: String::new(), ev: Ev::Notice("the assistant asked a question; forms are not available in the full-screen UI yet (use --plain)".into()) });
-        None
+    fn ask_questions(&self, questions: &[Question]) -> Option<Vec<Vec<String>>> {
+        let (reply, answer) = channel();
+        self.send(AppEvent::Questions { questions: questions.to_vec(), reply });
+        // Answered by the UI thread; dropped (None) when dismissed or the run is torn down.
+        answer.recv().ok().flatten()
     }
 }
 
-pub fn run(host: Host) -> std::io::Result<()> {
+pub fn run(mut host: Host) -> std::io::Result<()> {
     install_term_handlers();
     let (mut terminal, _guard) = term::enter()?;
     let (tx, rx) = channel::<AppEvent>();
@@ -136,14 +147,38 @@ pub fn run(host: Host) -> std::io::Result<()> {
         let _ = notify_tx.lock().unwrap().send(AppEvent::Background(line.to_string()));
     }));
 
+    let mut sid = host.session_id.clone();
     let mut app = App::new(&host.model, &host.agent);
     app.title = host.title.clone();
     app.history = load_history(&host.history_path);
-    let completer = host.completer;
-    app.completer = Some(Box::new(move |t| completer.items(t)));
+    if let Some(completer) = host.completer.take() {
+        app.completer = Some(Box::new(move |t| completer.items(t)));
+    }
     // Agent and model that a slash command overrode for one prompt, restored when its run ends.
     let restore: Mutex<Option<(String, Option<String>)>> = Mutex::new(None);
-    app.push_info(host.header.clone());
+    let engine = host.engine;
+
+    // Show the stored conversation of the session we start in (--continue, --session).
+    let load_rows = |app: &mut App, sid: &str| {
+        let (messages, revert, totals) = {
+            let st = engine.store.lock().unwrap();
+            (st.messages(sid).unwrap_or_default(), st.revert(sid).ok().flatten(), st.usage_totals(sid).map(|t| t.0).unwrap_or(0.0))
+        };
+        let hidden = revert.as_ref().and_then(|r| r["messageId"].as_str().map(String::from));
+        app.rows = builtin::history_rows(&messages, hidden.as_deref());
+        app.session_cost = totals;
+        app.scroll = 0;
+    };
+    // Model, agent and title as stored for the session.
+    let refresh_status = |app: &mut App, sid: &str| {
+        if let Some(s) = engine.store.lock().unwrap().session(sid).ok().flatten() {
+            app.model = engine.model_ref_for(&s);
+            app.agent = s.agent.clone();
+            app.title = s.title.clone();
+        }
+    };
+    load_rows(&mut app, &sid);
+    app.rows.insert(0, app::Row::Info(host.header.clone()));
 
     std::thread::scope(|scope| -> std::io::Result<()> {
         // Terminal events. Polls with a timeout so it can stop when the UI loop ends.
@@ -170,22 +205,34 @@ pub fn run(host: Host) -> std::io::Result<()> {
             }
         });
 
-        let start_run = |app: &mut App, resume: bool| {
+        let start_run = |app: &mut App, sid: &str, resume: bool| {
             app.running = true;
             cancel.store(false, Ordering::Relaxed);
             let done_tx = tx.clone();
-            let (engine, ui, cancel, sid) = (host.engine, &ui, &cancel, host.session_id.as_str());
+            let (ui, cancel, sid) = (&ui, &cancel, sid.to_string());
             scope.spawn(move || {
-                let outcome = engine.run(sid, ui, cancel, resume).map_err(|e| e.to_string());
+                let outcome = engine.run(&sid, ui, cancel, resume).map_err(|e| e.to_string());
                 let _ = done_tx.send(AppEvent::RunDone(outcome));
             });
         };
 
+        // Queue a prompt for the session and start the run, showing attachment notes.
+        let send_prompt = |app: &mut App, sid: &str, text: &str| match (host.submit)(text) {
+            Ok(notes) => {
+                for n in notes {
+                    app.push_info(n);
+                }
+                start_run(app, sid, false);
+            }
+            Err(e) => app.rows.push(app::Row::Error(e)),
+        };
+
         if host.recovered {
             app.push_info("resuming interrupted run");
-            start_run(&mut app, true);
+            start_run(&mut app, &sid, true);
         }
 
+        let mut actions: VecDeque<Action> = VecDeque::new();
         let mut quit = false;
         while !quit {
             if SIGNALLED.load(Ordering::Relaxed) {
@@ -203,80 +250,143 @@ pub fn run(host: Host) -> std::io::Result<()> {
             while let Some(ev) = next.take() {
                 if matches!(ev, AppEvent::RunDone(_)) {
                     if let Some((agent, model)) = restore.lock().unwrap().take() {
-                        let st = host.engine.store.lock().unwrap();
-                        st.set_agent(&host.session_id, &agent).ok();
-                        st.set_model(&host.session_id, model.as_deref()).ok();
+                        let st = engine.store.lock().unwrap();
+                        st.set_agent(&sid, &agent).ok();
+                        st.set_model(&sid, model.as_deref()).ok();
                     }
                 }
-                match app.update(ev) {
-                    Action::None => {}
-                    Action::Quit => quit = true,
-                    Action::Interrupt => cancel.store(true, Ordering::Relaxed),
-                    Action::Poke => {
-                        let pending = host.engine.store.lock().unwrap().pending_inbox(&host.session_id).unwrap_or(0);
-                        if pending > 0 {
-                            start_run(&mut app, false);
-                        }
-                    }
-                    Action::Submit { text, shown } => {
-                        append_history(&host.history_path, &shown);
-                        if matches!(text.as_str(), "/exit" | "/quit") {
-                            quit = true;
-                        } else if text == "/help" {
-                            app.push_info("Enter sends, Alt-Enter or Ctrl-J adds a line, Up/Down move or browse history, Tab completes / and @, Esc or Ctrl-C interrupts, PageUp/PageDown scroll, Ctrl-End follows the output, Ctrl-D quits. !command runs a shell command. Other built-in slash commands are not available in the full-screen UI yet: run `moco` (without --tui) for them.");
-                        } else if let Some(cmd) = text.strip_prefix('!') {
-                            let cmd = cmd.trim().to_string();
-                            app.push_user(shown.clone());
-                            if cmd.is_empty() {
-                                app.push_info("usage: !<shell command>");
-                            } else {
-                                app.running = true;
-                                cancel.store(false, Ordering::Relaxed);
-                                let done_tx = tx.clone();
-                                let (engine, cancel, sid) = (host.engine, &cancel, host.session_id.as_str());
-                                scope.spawn(move || {
-                                    let r = engine.run_user_command(sid, &cmd, cancel);
-                                    let _ = done_tx.send(AppEvent::ShellDone(r));
-                                });
+                actions.push_back(app.update(ev));
+                while let Some(action) = actions.pop_front() {
+                    match action {
+                        Action::None => {}
+                        Action::Quit => quit = true,
+                        Action::Interrupt => cancel.store(true, Ordering::Relaxed),
+                        Action::Poke => {
+                            let pending = engine.store.lock().unwrap().pending_inbox(&sid).unwrap_or(0);
+                            if pending > 0 {
+                                start_run(&mut app, &sid, false);
                             }
-                        } else if text.starts_with('/') {
-                            app.push_user(shown.clone());
-                            match (host.command)(&text) {
-                                Ok(r) => {
-                                    if r.agent.is_some() || r.model.is_some() {
-                                        let st = host.engine.store.lock().unwrap();
-                                        if let Some(cur) = st.session(&host.session_id).ok().flatten() {
-                                            *restore.lock().unwrap() = Some((cur.agent.clone(), cur.model.clone()));
-                                        }
-                                        if let Some(a) = r.agent.as_ref().filter(|a| host.engine.agents().iter().any(|x| x.id == **a)) {
-                                            st.set_agent(&host.session_id, a).ok();
-                                        }
-                                        if let Some(m) = &r.model {
-                                            st.set_model(&host.session_id, Some(m)).ok();
-                                        }
+                        }
+                        Action::Palette => app.open_picker(app::Picker::new(app::PickKind::Command, "commands", builtin::palette_items(&host), "")),
+                        Action::Picked { kind, value } => match kind {
+                            app::PickKind::Model => {
+                                engine.store.lock().unwrap().set_model(&sid, Some(&value)).ok();
+                                refresh_status(&mut app, &sid);
+                                app.push_info(format!("model: {value}"));
+                            }
+                            app::PickKind::Agent => {
+                                engine.store.lock().unwrap().set_agent(&sid, &value).ok();
+                                refresh_status(&mut app, &sid);
+                                app.push_info(format!("agent: {value}"));
+                            }
+                            app::PickKind::Session => {
+                                let found = engine.store.lock().unwrap().session(&value).ok().flatten();
+                                if let Some(s) = found {
+                                    if app.running {
+                                        app.rows.push(app::Row::Error("wait for the running turn to finish (or press Esc) before switching sessions".into()));
+                                    } else if let builtin::Effect::Switch(s) = builtin::resume(&host, &mut app, s) {
+                                        sid = s.id.clone();
+                                        load_rows(&mut app, &sid);
+                                        refresh_status(&mut app, &sid);
+                                        app.push_info(format!("session {}: {}", crate::short(&sid), s.title.unwrap_or_else(|| "(untitled)".into())));
                                     }
-                                    match (host.submit)(&r.text) {
-                                        Ok(notes) => {
-                                            for n in notes {
-                                                app.push_info(n);
+                                }
+                            }
+                            app::PickKind::Command => {
+                                if let Some(cmd) = value.strip_prefix("run:") {
+                                    actions.push_back(Action::Submit { text: cmd.to_string(), shown: cmd.to_string() });
+                                } else if let Some(cmd) = value.strip_prefix("ins:") {
+                                    app.input = cmd.to_string();
+                                    app.cursor = cmd.chars().count();
+                                    app.refresh_popup();
+                                }
+                            }
+                        },
+                        Action::Submit { text, shown } => {
+                            append_history(&host.history_path, &shown);
+                            let (name, args) = text.strip_prefix('/').map(|r| r.split_once(char::is_whitespace).unwrap_or((r, ""))).unwrap_or(("", ""));
+                            if matches!(text.as_str(), "/exit" | "/quit") {
+                                quit = true;
+                            } else if text == "/help" {
+                                app.push_info("Enter sends, Alt-Enter or Ctrl-J adds a line, Up/Down move or browse history, Tab completes / and @, Ctrl-P opens the command palette, Esc or Ctrl-C interrupts, PageUp/PageDown scroll, Ctrl-End follows the output, Ctrl-D quits. !command runs a shell command. Commands: /model /agent /sessions /resume /new /rename /fork /archive /undo /redo /diff /compact /jobs /skills /commands /mcp /exit.");
+                            } else if let Some(cmd) = text.strip_prefix('!') {
+                                let cmd = cmd.trim().to_string();
+                                app.push_user(shown.clone());
+                                if cmd.is_empty() {
+                                    app.push_info("usage: !<shell command>");
+                                } else {
+                                    app.running = true;
+                                    cancel.store(false, Ordering::Relaxed);
+                                    let done_tx = tx.clone();
+                                    let (cancel, sid) = (&cancel, sid.clone());
+                                    scope.spawn(move || {
+                                        let r = engine.run_user_command(&sid, &cmd, cancel);
+                                        let _ = done_tx.send(AppEvent::ShellDone(r));
+                                    });
+                                }
+                            } else if text.starts_with('/') {
+                                app.push_user(shown.clone());
+                                let is_builtin = builtin::NAMES.iter().any(|(n, _)| *n == name) || matches!(name, "resume" | "unarchive");
+                                if is_builtin {
+                                    if app.running && !matches!(name, "jobs" | "skills" | "commands" | "mcp" | "diff") {
+                                        app.rows.push(app::Row::Error("a turn is running: wait for it (or press Esc) first".into()));
+                                    } else {
+                                        let agent = app.agent.clone();
+                                        match builtin::run(&host, &mut app, &sid, &agent, name, args) {
+                                            Some(builtin::Effect::Switch(s)) => {
+                                                sid = s.id.clone();
+                                                load_rows(&mut app, &sid);
+                                                refresh_status(&mut app, &sid);
+                                                app.push_info(format!("session {}: {}", crate::short(&sid), s.title.unwrap_or_else(|| "(untitled)".into())));
                                             }
-                                            start_run(&mut app, false);
+                                            Some(builtin::Effect::Reload) => {
+                                                let keep: Vec<app::Row> = std::mem::take(&mut app.rows).into_iter().rev().take_while(|r| !matches!(r, app::Row::User(_))).collect();
+                                                load_rows(&mut app, &sid);
+                                                app.rows.extend(keep.into_iter().rev());
+                                            }
+                                            Some(builtin::Effect::Compact) => {
+                                                app.running = true;
+                                                cancel.store(false, Ordering::Relaxed);
+                                                let (ui, cancel, done_tx, sid) = (&ui, &cancel, tx.clone(), sid.clone());
+                                                scope.spawn(move || {
+                                                    use moco_core::engine::CompactResult::*;
+                                                    let r = match engine.compact(&sid, ui, cancel) {
+                                                        Ok(Compacted { .. }) => Ok("compacted".to_string()),
+                                                        Ok(NothingToCompact) => Ok("nothing to compact yet (recent messages are kept as they are)".into()),
+                                                        Ok(Interrupted) => Ok("interrupted".into()),
+                                                        Ok(Failed(e)) => Err(format!("compaction failed: {e}")),
+                                                        Err(e) => Err(format!("store error: {e}")),
+                                                    };
+                                                    let _ = done_tx.send(AppEvent::OpDone(r));
+                                                });
+                                            }
+                                            _ => {}
+                                        }
+                                        refresh_status(&mut app, &sid);
+                                    }
+                                } else {
+                                    match (host.command)(&text) {
+                                        Ok(r) => {
+                                            if r.agent.is_some() || r.model.is_some() {
+                                                let st = engine.store.lock().unwrap();
+                                                if let Some(cur) = st.session(&sid).ok().flatten() {
+                                                    *restore.lock().unwrap() = Some((cur.agent.clone(), cur.model.clone()));
+                                                }
+                                                if let Some(a) = r.agent.as_ref().filter(|a| engine.agents().iter().any(|x| x.id == **a)) {
+                                                    st.set_agent(&sid, a).ok();
+                                                }
+                                                if let Some(m) = &r.model {
+                                                    st.set_model(&sid, Some(m)).ok();
+                                                }
+                                            }
+                                            send_prompt(&mut app, &sid, &r.text);
                                         }
                                         Err(e) => app.rows.push(app::Row::Error(e)),
                                     }
                                 }
-                                Err(e) => app.rows.push(app::Row::Error(e)),
-                            }
-                        } else {
-                            app.push_user(shown.clone());
-                            match (host.submit)(&text) {
-                                Ok(notes) => {
-                                    for n in notes {
-                                        app.push_info(n);
-                                    }
-                                    start_run(&mut app, false);
-                                }
-                                Err(e) => app.rows.push(app::Row::Error(e)),
+                            } else {
+                                app.push_user(shown.clone());
+                                send_prompt(&mut app, &sid, &text);
                             }
                         }
                     }
@@ -292,9 +402,10 @@ pub fn run(host: Host) -> std::io::Result<()> {
         cancel.store(true, Ordering::Relaxed);
         stop.store(true, Ordering::Relaxed);
         app.dialogs.clear(); // dropping the senders rejects whatever the run was waiting on
+        app.forms.clear();
         while app.running {
             match rx.recv_timeout(Duration::from_secs(1)) {
-                Ok(AppEvent::RunDone(_)) | Err(RecvTimeoutError::Disconnected) => break,
+                Ok(AppEvent::RunDone(_)) | Ok(AppEvent::ShellDone(_)) | Ok(AppEvent::OpDone(_)) | Err(RecvTimeoutError::Disconnected) => break,
                 Ok(AppEvent::Ask { reply, .. }) => {
                     let _ = reply.send(Reply::Reject(None));
                 }

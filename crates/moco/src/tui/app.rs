@@ -4,7 +4,7 @@ use crate::human;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use moco_core::engine::Reply;
 use moco_core::provider::Usage;
-use moco_core::tools::Todo;
+use moco_core::tools::{Question, Todo};
 use ratatui::{prelude::*, widgets::*};
 use std::collections::VecDeque;
 use std::sync::mpsc::Sender;
@@ -60,6 +60,74 @@ pub enum AppEvent {
     RunDone(Result<moco_core::engine::RunOutcome, String>),
     /// A `!command` the user ran finished.
     ShellDone(Result<String, String>),
+    /// The `question` tool wants answers; `None` back means dismissed.
+    Questions { questions: Vec<Question>, reply: Sender<Option<Vec<Vec<String>>>> },
+    /// A background operation (compaction, ...) finished with a message for the transcript.
+    OpDone(Result<String, String>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickKind {
+    Model,
+    Session,
+    Agent,
+    Command,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PickItem {
+    pub label: String,
+    pub detail: String,
+    pub value: String,
+}
+
+/// A filterable list the user picks one entry from.
+pub struct Picker {
+    pub kind: PickKind,
+    pub title: String,
+    pub items: Vec<PickItem>,
+    pub filter: String,
+    pub sel: usize,
+}
+
+impl Picker {
+    pub fn new(kind: PickKind, title: &str, items: Vec<PickItem>, filter: &str) -> Picker {
+        Picker { kind, title: title.to_string(), items, filter: filter.to_string(), sel: 0 }
+    }
+
+    /// Indices of the items matching every word of the filter.
+    pub fn visible(&self) -> Vec<usize> {
+        let words: Vec<String> = self.filter.to_lowercase().split_whitespace().map(String::from).collect();
+        (0..self.items.len())
+            .filter(|&i| {
+                let hay = format!("{} {}", self.items[i].label, self.items[i].detail).to_lowercase();
+                words.iter().all(|w| hay.contains(w))
+            })
+            .collect()
+    }
+}
+
+/// The `question` tool's form: one question at a time.
+pub struct Form {
+    pub questions: Vec<Question>,
+    pub qi: usize,
+    pub cur: usize,
+    pub checked: Vec<bool>,
+    /// Some while typing a free-text answer.
+    pub typing: Option<String>,
+    pub answers: Vec<Vec<String>>,
+    pub reply: Sender<Option<Vec<Vec<String>>>>,
+}
+
+impl Form {
+    fn new(questions: Vec<Question>, reply: Sender<Option<Vec<Vec<String>>>>) -> Form {
+        let n = questions.first().map_or(0, |q| q.options.len());
+        Form { questions, qi: 0, cur: 0, checked: vec![false; n], typing: None, answers: vec![], reply }
+    }
+
+    fn q(&self) -> &Question {
+        &self.questions[self.qi]
+    }
 }
 
 /// One completion candidate.
@@ -92,6 +160,10 @@ pub enum Action {
     Submit { text: String, shown: String },
     /// Enter on an empty composer: let the assistant react to queued background results.
     Poke,
+    /// Ctrl-P: show the command palette.
+    Palette,
+    /// An entry was chosen in a picker.
+    Picked { kind: PickKind, value: String },
     Interrupt,
     Quit,
 }
@@ -110,6 +182,8 @@ pub enum Row {
     Todos(Vec<Todo>),
     Info(String),
     Shell(String),
+    /// A unified diff, colored by line.
+    Diff(String),
     Error(String),
     Usage(String),
 }
@@ -140,6 +214,8 @@ pub struct App {
     /// Lines scrolled up from the bottom; 0 follows the newest output.
     pub scroll: usize,
     pub dialogs: VecDeque<Permission>,
+    pub forms: VecDeque<Form>,
+    pub picker: Option<Picker>,
     pub model: String,
     pub agent: String,
     pub title: Option<String>,
@@ -173,6 +249,8 @@ impl App {
             running: false,
             scroll: 0,
             dialogs: VecDeque::new(),
+            forms: VecDeque::new(),
+            picker: None,
             model: model.to_string(),
             agent: agent.to_string(),
             title: None,
@@ -224,6 +302,21 @@ impl App {
                 self.scroll = 0;
             }
             AppEvent::Background(line) => self.push_info(format!("[{line}]")),
+            AppEvent::Questions { questions, reply } => {
+                if questions.is_empty() {
+                    let _ = reply.send(Some(vec![]));
+                } else {
+                    self.forms.push_back(Form::new(questions, reply));
+                    self.scroll = 0;
+                }
+            }
+            AppEvent::OpDone(r) => {
+                self.running = false;
+                match r {
+                    Ok(m) => self.push_info(m),
+                    Err(e) => self.rows.push(Row::Error(e)),
+                }
+            }
             AppEvent::ShellDone(r) => {
                 self.running = false;
                 match r {
@@ -235,6 +328,7 @@ impl App {
                 use moco_core::engine::RunOutcome::*;
                 self.running = false;
                 self.dialogs.clear(); // a dialog whose run is gone cannot be answered
+                self.forms.clear();
                 match outcome {
                     Ok(Idle) | Ok(Failed(_)) => {} // failures were reported as notices
                     Ok(Interrupted) => self.push_info("interrupted"),
@@ -534,7 +628,7 @@ impl App {
 
     fn key(&mut self, k: KeyEvent) -> Action {
         let action = self.key_inner(k);
-        if self.dialogs.is_empty() {
+        if !self.modal() {
             self.refresh_popup();
         }
         action
@@ -547,6 +641,12 @@ impl App {
         self.hint = None;
         if !self.dialogs.is_empty() {
             return self.dialog_key(k);
+        }
+        if !self.forms.is_empty() {
+            return self.form_key(k);
+        }
+        if self.picker.is_some() {
+            return self.picker_key(k);
         }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let alt = k.modifiers.contains(KeyModifiers::ALT);
@@ -583,6 +683,7 @@ impl App {
                 }
                 self.scroll = 0;
             }
+            KeyCode::Char('p') if ctrl => return Action::Palette,
             KeyCode::Char('j') if ctrl => self.insert("\n"),
             KeyCode::Enter if alt => self.insert("\n"),
             KeyCode::Tab => self.accept_completion(),
@@ -648,6 +749,132 @@ impl App {
             _ => {}
         }
         Action::None
+    }
+
+    /// Is a dialog, form or picker taking the keys?
+    pub fn modal(&self) -> bool {
+        !self.dialogs.is_empty() || !self.forms.is_empty() || self.picker.is_some()
+    }
+
+    pub fn open_picker(&mut self, p: Picker) {
+        self.popup = None;
+        self.picker = Some(p);
+    }
+
+    fn picker_key(&mut self, k: KeyEvent) -> Action {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(p) = self.picker.as_mut() else { return Action::None };
+        let n = p.visible().len();
+        match k.code {
+            KeyCode::Esc => self.picker = None,
+            KeyCode::Char('c') | KeyCode::Char('p') if ctrl => self.picker = None,
+            KeyCode::Up => p.sel = if n == 0 { 0 } else { (p.sel + n - 1) % n },
+            KeyCode::Down => p.sel = if n == 0 { 0 } else { (p.sel + 1) % n },
+            KeyCode::PageUp => p.sel = p.sel.saturating_sub(8),
+            KeyCode::PageDown => p.sel = (p.sel + 8).min(n.saturating_sub(1)),
+            KeyCode::Backspace => {
+                p.filter.pop();
+                p.sel = 0;
+            }
+            KeyCode::Char('u') if ctrl => {
+                p.filter.clear();
+                p.sel = 0;
+            }
+            KeyCode::Char(c) if !ctrl => {
+                p.filter.push(c);
+                p.sel = 0;
+            }
+            KeyCode::Enter => {
+                let vis = p.visible();
+                if let Some(&i) = vis.get(p.sel) {
+                    let (kind, value) = (p.kind, p.items[i].value.clone());
+                    self.picker = None;
+                    return Action::Picked { kind, value };
+                }
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    fn form_key(&mut self, k: KeyEvent) -> Action {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && matches!(k.code, KeyCode::Char('c')) {
+            self.forms.pop_front(); // dropping the sender dismisses the form
+            return Action::Interrupt;
+        }
+        let Some(f) = self.forms.front_mut() else { return Action::None };
+        let n_opts = f.q().options.len();
+        let multiple = f.q().multiple;
+        if f.typing.is_some() {
+            match k.code {
+                KeyCode::Esc => f.typing = None,
+                KeyCode::Backspace => {
+                    f.typing.as_mut().map(|t| t.pop());
+                }
+                KeyCode::Char(c) if !ctrl => f.typing.as_mut().map(|t| t.push(c)).unwrap_or(()),
+                KeyCode::Enter => {
+                    let text = f.typing.clone().unwrap_or_default();
+                    if !text.trim().is_empty() {
+                        let mut picked: Vec<String> = if multiple { (0..n_opts).filter(|&i| f.checked[i]).map(|i| f.q().options[i].label.clone()).collect() } else { vec![] };
+                        picked.push(text.trim().to_string());
+                        self.confirm(picked);
+                    }
+                }
+                _ => {}
+            }
+            return Action::None;
+        }
+        match k.code {
+            KeyCode::Esc => {
+                self.forms.pop_front();
+            }
+            KeyCode::Up => f.cur = (f.cur + n_opts) % (n_opts + 1),
+            KeyCode::Down => f.cur = (f.cur + 1) % (n_opts + 1),
+            KeyCode::Char(' ') if multiple && f.cur < n_opts => f.checked[f.cur] = !f.checked[f.cur],
+            KeyCode::Char(d @ '1'..='9') if (d as usize - '1' as usize) < n_opts => {
+                let i = d as usize - '1' as usize;
+                if multiple {
+                    f.checked[i] = !f.checked[i];
+                    f.cur = i;
+                } else {
+                    let label = f.q().options[i].label.clone();
+                    self.confirm(vec![label]);
+                }
+            }
+            KeyCode::Enter => {
+                if f.cur == n_opts {
+                    f.typing = Some(String::new());
+                } else if multiple {
+                    let mut picked: Vec<String> = (0..n_opts).filter(|&i| f.checked[i]).map(|i| f.q().options[i].label.clone()).collect();
+                    if picked.is_empty() {
+                        picked.push(f.q().options[f.cur].label.clone());
+                    }
+                    self.confirm(picked);
+                } else {
+                    let label = f.q().options[f.cur].label.clone();
+                    self.confirm(vec![label]);
+                }
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    /// Record the answer to the current question; send everything after the last one.
+    fn confirm(&mut self, picked: Vec<String>) {
+        let Some(f) = self.forms.front_mut() else { return };
+        f.answers.push(picked);
+        f.qi += 1;
+        if f.qi >= f.questions.len() {
+            if let Some(f) = self.forms.pop_front() {
+                let _ = f.reply.send(Some(f.answers));
+            }
+        } else {
+            f.cur = 0;
+            f.typing = None;
+            f.checked = vec![false; f.questions[f.qi].options.len()];
+        }
     }
 
     fn dialog_key(&mut self, k: KeyEvent) -> Action {
@@ -743,6 +970,16 @@ impl App {
                         }
                     }
                 }
+                Row::Diff(patch) => {
+                    for raw in patch.lines() {
+                        let style = match raw.chars().next() {
+                            Some('+') if !raw.starts_with("+++") => Style::new().fg(Color::Green),
+                            Some('-') if !raw.starts_with("---") => t.error,
+                            _ => t.dim,
+                        };
+                        out.extend(wrap(raw, width).into_iter().map(|l| Line::styled(l, style)));
+                    }
+                }
                 Row::Shell(s) => out.extend(wrap(s.trim_end(), width).into_iter().map(|l| Line::styled(l, t.text))),
                 Row::Info(s) => out.extend(wrap(s, width).into_iter().map(|l| Line::styled(l, t.dim))),
                 Row::Error(s) => out.extend(wrap(s, width).into_iter().map(|l| Line::styled(l, t.error))),
@@ -750,6 +987,58 @@ impl App {
             }
         }
         out
+    }
+
+    /// The dialog, form or picker that replaces the composer: (title, lines, cursor inside it).
+    fn modal_lines(&self, width: usize, max_h: usize) -> Option<(String, Vec<Line<'static>>, Option<(u16, u16)>)> {
+        let t = &self.theme;
+        if let Some(d) = self.dialogs.front() {
+            return Some((" permission ".into(), dialog_lines(d, width), None));
+        }
+        if let Some(f) = self.forms.front() {
+            let q = f.q();
+            let mut v = vec![];
+            let head = if q.header.is_empty() { q.question.clone() } else { format!("[{}] {}", q.header, q.question) };
+            for l in wrap(&head, width.saturating_sub(2)) {
+                v.push(Line::styled(l, Style::new().add_modifier(Modifier::BOLD)));
+            }
+            for (i, o) in q.options.iter().enumerate() {
+                let mark = if q.multiple { if f.checked[i] { "[x] " } else { "[ ] " } } else { "" };
+                let text = clip_width(&format!("{} {}. {mark}{}{}", if f.cur == i { ">" } else { " " }, i + 1, o.label, if o.description.is_empty() { String::new() } else { format!(" - {}", o.description) }), width.saturating_sub(2));
+                v.push(if f.cur == i { Line::styled(text, t.bar) } else { Line::raw(text) });
+            }
+            let own = format!("{} Type your own answer", if f.cur == q.options.len() { ">" } else { " " });
+            v.push(if f.cur == q.options.len() { Line::styled(own, t.bar) } else { Line::raw(own) });
+            let mut cursor = None;
+            match &f.typing {
+                Some(text) => {
+                    let line = format!("answer: {text}");
+                    cursor = Some((display_width(&line) as u16, v.len() as u16));
+                    v.push(Line::raw(line));
+                }
+                None => v.push(Line::styled(if q.multiple { "Space toggles, Enter confirms, 1-9 toggles, Esc dismisses" } else { "Enter or 1-9 selects, Esc dismisses" }, t.dim)),
+            }
+            let title = format!(" question {}/{} ", f.qi + 1, f.questions.len());
+            return Some((title, v, cursor));
+        }
+        if let Some(p) = &self.picker {
+            let vis = p.visible();
+            let rows = max_h.saturating_sub(2).clamp(1, 12);
+            let first = (p.sel + 1).saturating_sub(rows);
+            let mut v = vec![Line::raw(format!("filter: {}", p.filter))];
+            let cursor = Some((display_width(&format!("filter: {}", p.filter)) as u16, 0));
+            if vis.is_empty() {
+                v.push(Line::styled("no match", t.dim));
+            }
+            for (n, &i) in vis.iter().enumerate().skip(first).take(rows) {
+                let it = &p.items[i];
+                let text = clip_width(&format!(" {}  {}", it.label, it.detail), width.saturating_sub(2));
+                v.push(if n == p.sel { Line::styled(text, t.bar) } else { Line::raw(text) });
+            }
+            let title = format!(" {} ({}) - Enter picks, Esc closes ", p.title, vis.len());
+            return Some((title, v, cursor));
+        }
+        None
     }
 
     fn status_text(&self, width: usize) -> String {
@@ -876,12 +1165,13 @@ fn dialog_lines(d: &Permission, width: usize) -> Vec<Line<'static>> {
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let area = f.area();
-    let dialog = app.dialogs.front().map(|d| dialog_lines(d, area.width as usize));
+    let max_modal = (area.height as usize).saturating_sub(5).max(3);
+    let modal = app.modal_lines(area.width as usize, max_modal);
     let comp_w = (area.width as usize).saturating_sub(2).max(1);
     app.comp_w = comp_w;
     let comp_lines = app.layout(comp_w);
     let visible = comp_lines.len().min(MAX_COMPOSER_LINES);
-    let bottom_h = dialog.as_ref().map_or(visible as u16 + 2, |l| l.len() as u16 + 2).min(area.height.saturating_sub(2).max(1));
+    let bottom_h = modal.as_ref().map_or(visible as u16 + 2, |m| m.1.len() as u16 + 2).min(area.height.saturating_sub(2).max(1));
     let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(bottom_h), Constraint::Length(1)]).split(area);
     let (main, bottom, status) = (parts[0], parts[1], parts[2]);
 
@@ -893,8 +1183,13 @@ pub fn render(f: &mut Frame, app: &mut App) {
     let start = end.saturating_sub(h);
     f.render_widget(Paragraph::new(lines[start..end].to_vec()), main);
 
-    if let Some(l) = dialog {
-        f.render_widget(Paragraph::new(l).block(Block::bordered().border_style(app.theme.accent)), bottom);
+    if let Some((title, lines, cursor)) = modal {
+        let block = Block::bordered().title(title).border_style(app.theme.accent);
+        let inner = block.inner(bottom);
+        f.render_widget(Paragraph::new(lines).block(block), bottom);
+        if let Some((col, row)) = cursor {
+            f.set_cursor_position((inner.x + col.min(inner.width.saturating_sub(1)), inner.y + row));
+        }
     } else {
         let title = if app.running { " moco (running) " } else { " moco " };
         let block = Block::bordered().title(title).border_style(app.theme.accent);
@@ -1251,6 +1546,94 @@ mod tests {
         }
         let s = screen(&mut a, 30, 20);
         assert_eq!(s.iter().filter(|l| l.starts_with('│')).count(), 8, "{s:?}");
+    }
+
+    fn q(question: &str, opts: &[&str], multiple: bool) -> Question {
+        Question {
+            question: question.into(),
+            header: "H".into(),
+            options: opts.iter().map(|o| moco_core::tools::QuestionOption { label: o.to_string(), description: String::new() }).collect(),
+            multiple,
+        }
+    }
+
+    #[test]
+    fn question_form_collects_single_multiple_and_typed_answers() {
+        let mut a = App::new("m", "build");
+        a.running = true;
+        let (tx, rx) = channel();
+        a.update(AppEvent::Questions { questions: vec![q("Which?", &["red", "green"], false), q("Pick some", &["a", "b", "c"], true), q("Name?", &["x"], false)], reply: tx });
+        let joined = screen(&mut a, 60, 16).join("\n");
+        assert!(joined.contains("question 1/3") && joined.contains("[H] Which?") && joined.contains("1. red") && joined.contains("Type your own answer"), "{joined}");
+        press(&mut a, KeyCode::Down);
+        press(&mut a, KeyCode::Enter); // single: Enter picks the highlighted option
+        type_str(&mut a, "x"); // letters mean nothing in option mode
+        press(&mut a, KeyCode::Char(' ')); // multiple: toggle a (cursor on a), move, toggle c
+        press(&mut a, KeyCode::Down);
+        press(&mut a, KeyCode::Down);
+        press(&mut a, KeyCode::Char(' '));
+        assert!(screen(&mut a, 60, 16).join("\n").contains("3. [x] c"));
+        press(&mut a, KeyCode::Enter);
+        // Third question: "type your own" is the last row.
+        press(&mut a, KeyCode::Down);
+        press(&mut a, KeyCode::Enter);
+        type_str(&mut a, "Ada");
+        press(&mut a, KeyCode::Backspace);
+        type_str(&mut a, "a");
+        assert!(rx.try_recv().is_err()); // nothing is sent before the last answer
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(rx.try_recv().unwrap(), Some(vec![vec!["green".to_string()], vec!["a".into(), "c".into()], vec!["Ada".into()]]));
+        assert!(a.forms.is_empty());
+        // Digits answer a single-choice question at once; Esc dismisses (the sender is dropped: None for the engine).
+        let (tx, rx) = channel();
+        a.update(AppEvent::Questions { questions: vec![q("Which?", &["red", "green"], false)], reply: tx });
+        type_str(&mut a, "2");
+        assert_eq!(rx.try_recv().unwrap(), Some(vec![vec!["green".to_string()]]));
+        let (tx, rx) = channel();
+        a.update(AppEvent::Questions { questions: vec![q("Which?", &["red"], false)], reply: tx });
+        press(&mut a, KeyCode::Esc);
+        assert!(rx.recv().is_err());
+    }
+
+    fn items(names: &[&str]) -> Vec<PickItem> {
+        names.iter().map(|n| PickItem { label: n.to_string(), detail: format!("about {n}"), value: format!("v-{n}") }).collect()
+    }
+
+    #[test]
+    fn picker_filters_selects_and_closes() {
+        let mut a = App::new("m", "build");
+        a.open_picker(Picker::new(PickKind::Model, "model", items(&["anthropic/sonnet", "openai/gpt", "anthropic/haiku"]), ""));
+        let joined = screen(&mut a, 70, 14).join("\n");
+        assert!(joined.contains("model (3)") && joined.contains("anthropic/sonnet") && joined.contains("about openai/gpt"), "{joined}");
+        type_str(&mut a, "anth hai"); // every word must match, in label or detail
+        assert_eq!(a.picker.as_ref().unwrap().visible(), vec![2]);
+        assert_eq!(press(&mut a, KeyCode::Enter), Action::Picked { kind: PickKind::Model, value: "v-anthropic/haiku".into() });
+        assert!(a.picker.is_none());
+        // Typing never reaches the composer while a picker is open; Esc closes without a choice; no match picks nothing.
+        a.open_picker(Picker::new(PickKind::Session, "sessions", items(&["one", "two"]), ""));
+        type_str(&mut a, "zzz");
+        assert_eq!(press(&mut a, KeyCode::Enter), Action::None);
+        assert!(a.picker.is_some() && a.input.is_empty());
+        press(&mut a, KeyCode::Esc);
+        assert!(a.picker.is_none());
+        // Selection wraps around and the list scrolls to keep it visible.
+        let many: Vec<String> = (0..30).map(|i| format!("item{i:02}")).collect();
+        a.open_picker(Picker::new(PickKind::Command, "commands", items(&many.iter().map(String::as_str).collect::<Vec<_>>()), ""));
+        press(&mut a, KeyCode::Up);
+        assert_eq!(a.picker.as_ref().unwrap().sel, 29);
+        assert!(screen(&mut a, 60, 20).join("\n").contains("item29"));
+        assert_eq!(press(&mut a, KeyCode::Enter), Action::Picked { kind: PickKind::Command, value: "v-item29".into() });
+        // Ctrl-P opens the palette from the composer.
+        assert_eq!(a.update(key(KeyCode::Char('p'), KeyModifiers::CONTROL)), Action::Palette);
+    }
+
+    #[test]
+    fn diff_rows_are_colored_by_line() {
+        let mut a = App::new("m", "build");
+        a.rows.push(Row::Diff("--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new".into()));
+        let lines = a.lines(40);
+        let color = |i: usize| lines[i].style.fg;
+        assert_eq!((color(3), color(4), color(0)), (Some(Color::Red), Some(Color::Green), None));
     }
 
     #[test]

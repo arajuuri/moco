@@ -739,7 +739,7 @@ fn main() {
         let title = engine.store.lock().unwrap().session(&sid).ok().flatten();
         let model_now = title.as_ref().map(|s| engine.model_ref_for(s)).unwrap_or_default();
         let header = format!("moco {} | {} | agent {agent_id} | {n_sources} config file(s) | /help for commands", env!("CARGO_PKG_VERSION"), model_now);
-        let host = tui::Host { engine: &engine, session_id: sid.clone(), model: model_now, agent: agent_id.clone(), title: title.and_then(|s| s.title), header, recovered: recovered.contains(&sid), submit: &submit, command: &command, completer, history_path: app_dir.join("data/tui-history") };
+        let host = tui::Host { engine: &engine, session_id: sid.clone(), model: model_now, agent: agent_id.clone(), title: title.and_then(|s| s.title), header, recovered: recovered.contains(&sid), submit: &submit, command: &command, completer: Some(completer), history_path: app_dir.join("data/tui-history"), cwd: cwd_str.clone(), skills: found_skills.iter().map(|k| (k.id.clone(), k.description.clone())).collect(), custom_commands: found_commands.iter().map(|c| (c.name.clone(), c.description.clone())).collect(), manager: manager.clone() };
         let result = tui::run(host);
         engine.kill_all_jobs();
         if let Some(m) = &manager {
