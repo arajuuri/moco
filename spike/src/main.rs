@@ -111,11 +111,9 @@ fn shell() {
 
 fn secrets() {
     println!("-- secrets");
-    const SVC: &str = "moco-spike-test";
-    const ACCT: &str = "probe";
     let secret = b"sk-test-0123456789";
 
-    // A. File with 0600 perms (what a file-based auth store would do).
+    // File with 0600 perms (what a file-based auth store would do).
     {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let path = std::env::temp_dir().join("moco-spike-auth.json");
@@ -128,36 +126,6 @@ fn secrets() {
         let _ = std::fs::remove_file(&path);
     }
 
-    // B. Keychain via Security.framework (security-framework crate).
-    #[cfg(target_os = "macos")]
-    {
-        use security_framework::passwords as pw;
-        let t = Instant::now();
-        let set = pw::set_generic_password(SVC, ACCT, secret);
-        report("keychain set (framework)", set.is_ok(), format!("{set:?} in {:?}", t.elapsed()));
-        if set.is_ok() {
-            let got = pw::get_generic_password(SVC, ACCT);
-            report("keychain get (framework)", got.as_deref().ok() == Some(&secret[..]), format!("{:?}", got.as_ref().map(|v| v.len())));
-            let upd = pw::set_generic_password(SVC, ACCT, b"sk-updated");
-            let got2 = pw::get_generic_password(SVC, ACCT).ok();
-            report("keychain update", upd.is_ok() && got2.as_deref() == Some(&b"sk-updated"[..]), format!("{upd:?}"));
-            let del = pw::delete_generic_password(SVC, ACCT);
-            report("keychain delete", del.is_ok(), format!("{del:?}"));
-        }
-    }
-
-    // C. Keychain via /usr/bin/security CLI (fallback; exposes secret in argv for `add`).
-    let run = |args: &[&str]| Command::new("/usr/bin/security").args(args).output().map(|o| (o.status.success(), String::from_utf8_lossy(&o.stderr).trim().to_string())).unwrap_or((false, "spawn failed".into()));
-    let (ok, err) = run(&["add-generic-password", "-s", SVC, "-a", ACCT, "-w", "cli-secret", "-U"]);
-    report("keychain add (security CLI)", ok, err);
-    if ok {
-        let (ok, err) = run(&["find-generic-password", "-s", SVC, "-a", ACCT, "-w"]);
-        report("keychain find (security CLI)", ok, err);
-        let _ = run(&["delete-generic-password", "-s", SVC, "-a", ACCT]);
-    }
-    let (_, d) = run(&["default-keychain"]);
-    println!("INFO default keychain: {d}");
-    println!("INFO session: SSH_CONNECTION set = {}", std::env::var("SSH_CONNECTION").is_ok());
 }
 
 fn main() {

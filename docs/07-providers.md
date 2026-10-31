@@ -41,7 +41,7 @@ Order (`model-resolver.ts`): session-selected model -> agent `model` -> config `
 
 ## Credentials
 
-Sources of keys, in order: stored credential (UI "connect"), environment variable named by the catalog entry, config `providers.<id>`. Stored in **Keychain** in the rewrite. OAuth flows exist upstream for some providers (ChatGPT, GitHub Copilot, GitLab); skip initially, use API keys. For MCP OAuth see `08`.
+Sources of keys, in order: stored credential (UI "connect"), environment variable named by the catalog entry, config `providers.<id>`. Stored in `auth.json` (mode `0600`, see `02`) in the rewrite, not the Keychain. OAuth flows exist upstream for some providers (ChatGPT, GitHub Copilot, GitLab); skip initially, use API keys. For MCP OAuth see `08`.
 
 ## Cost and usage
 

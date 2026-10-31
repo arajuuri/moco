@@ -69,4 +69,4 @@ Filesystem layout (upstream uses XDG; on macOS pick `~/Library/Application Suppo
 - `config/` global `opencode.json(c)`, global `AGENTS.md`
 - `cache/` downloaded model catalog, installed binaries
 
-Credentials: upstream keeps API keys in its DB. On macOS use the **Keychain** (generic password items) instead.
+Credentials: upstream keeps API keys in its DB. moco keeps them in a separate `auth.json` in the app data directory, created with mode `0600`, not in SQLite. No Keychain: the app must work headless (SSH, no GUI session), and the Phase 0 spike showed the login keychain is unusable there (`-25308 User interaction is not allowed`).

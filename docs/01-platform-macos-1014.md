@@ -26,7 +26,7 @@ real Mojave machine or VM before committing to a toolchain. The facts from the r
 
 | Option | Pros | Cons |
 |---|---|---|
-| **A. Swift + AppKit** (recommended for a GUI app) | Native look, Keychain, drag-drop, no runtime to ship. Deployment target 10.14.4 works with Xcode 11-15 | No async/await or Combine; callback-style code. Terminal view: use SwiftTerm if its deployment target allows (check), else write a minimal VT100 view |
+| **A. Swift + AppKit** (recommended for a GUI app) | Native look, drag-drop, no runtime to ship. Deployment target 10.14.4 works with Xcode 11-15 | No async/await or Combine; callback-style code. Terminal view: use SwiftTerm if its deployment target allows (check), else write a minimal VT100 view |
 | **B. Rust core + thin AppKit shell or TUI (ratatui)** | One portable engine, tokio streaming, rustls, `rusqlite` bundled. Rust's x86_64-apple-darwin target historically floors at macOS 10.12 | Larger FFI surface if you want a Cocoa UI; verify current floor of the Rust version you use |
 | **C. Go** | Simple static binary | Go 1.21+ requires macOS 10.15 or newer; only Go 1.20 and older reach 10.14. Not recommended |
 | **D. Python/Node runtime bundled** | Fast to write | Needs an interpreter built for 10.14 (Node 16 or Python 3.8-3.9). Old, unpatched, large. Not recommended |

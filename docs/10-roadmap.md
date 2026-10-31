@@ -5,7 +5,7 @@ Each phase ends with a demonstrable check. Test each on a real 10.14 machine or 
 ## Phase 0: platform spike (1-3 days)
 - Pick toolchain (`01`). Build "hello" with `MACOSX_DEPLOYMENT_TARGET=10.14`; confirm with `otool -l` and by running on Mojave.
 - Prove: HTTPS streaming (SSE) to `api.anthropic.com` and an OpenAI-compatible endpoint from Mojave; SQLite; spawning a shell; reading the system trust store.
-- Decide Keychain vs file for secrets.
+- Secrets: decided, file (`auth.json`, mode 0600), no Keychain; it must work without a GUI session.
 - **Gate**: if TLS/cert validation fails on 10.14, bundle a TLS stack and CA bundle now.
 
 ## Phase 1: minimal agent
