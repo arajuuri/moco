@@ -1,5 +1,6 @@
 //! moco: line-based terminal chat.
 use moco_core::catalog::{Catalog, ProviderInfo};
+use moco_core::mcp::{self, trust, Manager, ServerSpec};
 use moco_core::tools::SubagentRequest;
 use moco_core::{commands, compaction, mentions, skills};
 use moco_core::engine::{CompactResult, DiffResult, Engine, UndoReport, UndoResult, EngineConfig, PermissionPrompt, Reply, RunOutcome, Ui, UiEvent};
@@ -313,6 +314,46 @@ fn pick_session(store: &Store, token: &str, last: &[SessionSummary]) -> Result<S
     }
 }
 
+/// The MCP servers to start. Servers from the user's own config start as they are; servers a *project's* config
+/// defines run a command from the repository, so they need approval first (asked once, remembered per project and
+/// exact definition). Without a terminal there is nobody to ask: they stay off unless `MOCO_TRUST_PROJECT_MCP=1`.
+fn mcp_specs(cfg: &config::Config, origins: &std::collections::BTreeMap<String, std::path::PathBuf>, app_dir: &std::path::Path, cwd: &std::path::Path) -> (Vec<ServerSpec>, Vec<String>) {
+    let (mut specs, mut warnings) = (vec![], vec![]);
+    let interactive = std::io::stdin().is_terminal();
+    let trust_all = std::env::var("MOCO_TRUST_PROJECT_MCP").is_ok_and(|v| v == "1");
+    for (name, scfg) in &cfg.mcp.servers {
+        let origin = origins.get(name);
+        let mut allowed = scfg.disabled || origin.is_none_or(|o| trust::origin_is_trusted(o, app_dir)) || trust_all;
+        if !allowed {
+            let fp = trust::fingerprint(cwd, name, scfg);
+            if trust::is_trusted(app_dir, &fp) {
+                allowed = true;
+            } else if interactive {
+                let what = if scfg.is_remote() { scfg.url.clone().unwrap_or_default() } else { scfg.command.join(" ") };
+                println!("The project config {} wants to start the MCP server '{name}':\n  {what}\nIt would run on your machine with your permissions.", origin.map(|o| tilde(&o.display().to_string())).unwrap_or_default());
+                print!("Start it? [y] this time  [a] always for this project  [N] no: ");
+                let _ = std::io::stdout().flush();
+                let mut ans = String::new();
+                let _ = std::io::stdin().lock().read_line(&mut ans);
+                match ans.trim().to_lowercase().as_str() {
+                    "y" | "yes" => allowed = true,
+                    "a" | "always" => {
+                        allowed = true;
+                        let _ = trust::approve(app_dir, &fp);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if allowed {
+            specs.push(ServerSpec { name: name.clone(), config: scfg.clone(), cwd: cwd.to_path_buf() });
+        } else {
+            warnings.push(format!("MCP server '{name}' from {} was not started: project-defined servers need your approval (run moco in a terminal, or set MOCO_TRUST_PROJECT_MCP=1)", origin.map(|o| tilde(&o.display().to_string())).unwrap_or_default()));
+        }
+    }
+    (specs, warnings)
+}
+
 fn print_files(r: &UndoReport) {
     let mut lines: Vec<String> = r.restored.iter().map(|p| format!("  restored {p}")).chain(r.deleted.iter().map(|p| format!("  removed {p}"))).collect();
     let extra = lines.len().saturating_sub(15);
@@ -566,6 +607,26 @@ fn main() {
     let found_commands = commands::discover(&app_dir, &cwd, &cfg.commands);
     engine_cfg.skills = found_skills.clone();
     engine_cfg.small_model = cfg.small_model.clone();
+    let (mcp_specs, mcp_warnings) = mcp_specs(&cfg, &loaded.mcp_origins, &app_dir, &cwd);
+    for w in &mcp_warnings {
+        eprintln!("warning: {w}");
+    }
+    let manager: Option<std::sync::Arc<Manager>> = (!mcp_specs.is_empty()).then(|| Manager::start(mcp_specs, &cfg.mcp.timeout));
+    if let Some(m) = &manager {
+        // Tools are fixed once a conversation starts, so wait for the servers instead of letting them appear mid-way.
+        let wait = std::time::Duration::from_millis(cfg.mcp.timeout.startup.unwrap_or(30_000) + 2_000);
+        if !m.wait_ready(std::time::Duration::from_millis(1_500)) {
+            eprintln!("{DIM}starting MCP servers...{RESET}");
+            m.wait_ready(wait);
+        }
+        for info in m.status() {
+            if !matches!(info.status, mcp::Status::Connected | mcp::Status::Disabled) {
+                let tail = m.stderr_tail(&info.name);
+                eprintln!("warning: MCP server '{}' {}{}", info.name, mcp::manager::describe(&info), if tail.is_empty() { String::new() } else { format!(" (stderr: {tail})") });
+            }
+        }
+    }
+    engine_cfg.mcp = manager.clone();
     let n_sources = loaded.sources.len();
     let engine = Engine::with_providers(store, providers, engine_cfg);
     // Drop snapshot data that no session active in the last 30 days refers to.
@@ -595,7 +656,7 @@ fn main() {
     let send = |sid: &str, text: &str| -> bool {
         let subagents = engine.subagent_names();
         let caps = caps_of(sid);
-        let (m, notes) = mentions::expand(text, &mentions::Ctx { cwd: &cwd, skills: &found_skills, subagents: &subagents, app_dir: &app_dir, caps });
+        let (m, notes) = mentions::expand(text, &mentions::Ctx { cwd: &cwd, skills: &found_skills, subagents: &subagents, app_dir: &app_dir, caps, mcp: manager.as_deref() });
         for n in notes {
             println!("{DIM}{n}{RESET}");
         }
@@ -610,6 +671,9 @@ fn main() {
         // `-p "/review the last commit"` works like typing the command.
         let text = match p.strip_prefix('/').and_then(|r| {
             let (name, args) = r.split_once(char::is_whitespace).unwrap_or((r, ""));
+            if let Some(m) = manager.as_ref().filter(|m| m.prompts().iter().any(|p| p.command == name)) {
+                return Some(m.get_prompt(name, args).unwrap_or_else(|e| die(&e)));
+            }
             found_commands.iter().find(|c| c.name == name && !c.subagent).map(|c| commands::expand(c, args))
         }) {
             Some(t) => t,
@@ -619,6 +683,9 @@ fn main() {
             die("could not queue the prompt");
         }
         let ok = matches!(run(&session.id, false), Some(RunOutcome::Idle));
+        if let Some(m) = &manager {
+            m.shutdown(); // process::exit skips destructors, and the servers must not be left running
+        }
         std::process::exit(if ok { 0 } else { 1 });
     }
 
@@ -643,13 +710,37 @@ fn main() {
                     println!("{DIM}  {:<20} {}{RESET}", k.id, clip(&k.description, 90));
                 }
             }
+            l if l == "/mcp" || l.starts_with("/mcp ") => {
+                let Some(m) = &manager else {
+                    println!("{DIM}no MCP servers configured (add `mcp.servers` to moco.jsonc){RESET}");
+                    continue;
+                };
+                let arg = l.trim_start_matches("/mcp").trim();
+                if let Some(name) = arg.strip_prefix("reconnect") {
+                    let name = name.trim();
+                    if !m.reconnect(name) {
+                        println!("no enabled MCP server '{name}'");
+                    } else {
+                        m.wait_ready(std::time::Duration::from_secs(35));
+                    }
+                }
+                for i in m.status() {
+                    println!("{DIM}  {:<14} {}   [{}]{RESET}", i.name, mcp::manager::describe(&i), clip(&i.command, 50));
+                }
+                println!("{DIM}  tools from MCP servers are named <server>_<tool>; /mcp reconnect <name> restarts one{RESET}");
+            }
             "/commands" => {
+                if let Some(m) = &manager {
+                    for p in m.prompts() {
+                        println!("{DIM}  /{:<18} {}  [mcp]{RESET}", p.command, clip(&p.description, 70));
+                    }
+                }
                 for c in &found_commands {
                     println!("{DIM}  /{:<18} {}{}{RESET}", c.name, clip(&c.description, 80), if c.source == "built-in" { String::new() } else { format!("  [{}]", if c.source == "config" { "config".to_string() } else { tilde(&c.source) }) });
                 }
             }
             "/help" => println!(
-                "/model [FILTER|PROVIDER/MODEL]  show, search or switch the model\n/agent <id>                     switch agent\n/compact                        summarize older messages to free up context\n/sessions [all|archived]       list sessions (/resume <n|id> to continue one)\n/rename <title>                 name this session\n/fork [N]                       copy this conversation into a new session\n/archive [n|id]                 hide a session from the list (/unarchive to restore)\n/undo, /redo                    undo the last turn's file changes and messages, or bring them back\n/diff                           changes in the working tree since this session started\n/new                            start a new session\n/skills, /commands              list skills and custom slash commands (@name mentions a skill, agent or file)\n/exit                           quit (Ctrl-C interrupts a running turn)"
+                "/model [FILTER|PROVIDER/MODEL]  show, search or switch the model\n/agent <id>                     switch agent\n/compact                        summarize older messages to free up context\n/sessions [all|archived]       list sessions (/resume <n|id> to continue one)\n/rename <title>                 name this session\n/fork [N]                       copy this conversation into a new session\n/archive [n|id]                 hide a session from the list (/unarchive to restore)\n/undo, /redo                    undo the last turn's file changes and messages, or bring them back\n/diff                           changes in the working tree since this session started\n/new                            start a new session\n/skills, /commands, /mcp       list skills, custom slash commands (also MCP prompts) and MCP servers (@name mentions a skill, agent or file)\n/exit                           quit (Ctrl-C interrupts a running turn)"
             ),
             l if l == "/sessions" || l.starts_with("/sessions ") => {
                 let which = l.trim_start_matches("/sessions").trim();
@@ -811,6 +902,17 @@ fn main() {
             }
             l if l.starts_with('/') => {
                 let (name, args) = l[1..].split_once(char::is_whitespace).unwrap_or((&l[1..], ""));
+                if let Some(m) = manager.as_ref().filter(|m| m.prompts().iter().any(|p| p.command == name)) {
+                    match m.get_prompt(name, args) {
+                        Ok(text) => {
+                            if send(&session.id, &text) {
+                                run(&session.id, false);
+                            }
+                        }
+                        Err(e) => println!("{e}"),
+                    }
+                    continue;
+                }
                 let Some(cmd) = found_commands.iter().find(|c| c.name == name) else {
                     println!("unknown command /{name} (try /help, /commands)");
                     continue;
@@ -822,7 +924,7 @@ fn main() {
                     let Some(parent) = parent else { continue };
                     let subagents = engine.subagent_names();
                     let caps = caps_of(&session.id);
-                    let (m, notes) = mentions::expand(&prompt, &mentions::Ctx { cwd: &cwd, skills: &found_skills, subagents: &subagents, app_dir: &app_dir, caps });
+                    let (m, notes) = mentions::expand(&prompt, &mentions::Ctx { cwd: &cwd, skills: &found_skills, subagents: &subagents, app_dir: &app_dir, caps, mcp: manager.as_deref() });
                     for n in notes {
                         println!("{DIM}{n}{RESET}");
                     }
@@ -877,5 +979,8 @@ fn main() {
                 }
             }
         }
+    }
+    if let Some(m) = &manager {
+        m.shutdown();
     }
 }

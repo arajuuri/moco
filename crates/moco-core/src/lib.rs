@@ -11,6 +11,7 @@ pub mod engine;
 pub mod id;
 pub mod instructions;
 pub mod markdown;
+pub mod mcp;
 pub mod media;
 pub mod mentions;
 pub mod permission;

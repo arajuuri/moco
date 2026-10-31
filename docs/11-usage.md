@@ -41,7 +41,8 @@ Check a Mojave build with `otool -l moco | grep minos` (must say 10.14). On Linu
 | `/diff` | Changes in the working tree since the session started |
 | `/sessions [all\|archived]`, `/resume <n\|id>` | List and continue sessions (numbers refer to the last list) |
 | `/rename <title>`, `/fork [N]`, `/archive [n\|id]`, `/unarchive <n\|id>` | Manage sessions; `/fork N` branches off before your Nth most recent prompt |
-| `/skills`, `/commands` | List the skills and custom slash commands that were found |
+| `/skills`, `/commands` | List the skills and custom slash commands that were found (MCP prompts included) |
+| `/mcp`, `/mcp reconnect <name>` | Show the MCP servers and their state, or restart one |
 | `/<name> [args]` | Run a custom command (built in: `/init`, `/review`) |
 | `/new`, `/help`, `/exit` | |
 
@@ -56,9 +57,22 @@ Check a Mojave build with `otool -l moco | grep minos` (must say 10.14). On Linu
 - **Mentions**: `@src/main.rs` attaches that file, `@docs/` a directory listing, `@release` a skill, `@explore` asks the model to delegate to that subagent. What was attached is shown as a dim note.
 - **Images and PDFs**: `@screenshot.png` or `@spec.pdf` (or dragging the file into the terminal, which pastes its path) sends the file to the model; the model can also open them itself with `read`. Images up to 5 MiB and 8000 px per side, PDFs up to 10 MiB, and only for models that accept them (`moco models` shows the catalog; a text-only model gets a note instead).
 
+## MCP servers
+
+MCP servers add tools (and prompts and resources) from other programs. Declare them in the config:
+
+```jsonc
+{ "mcp": { "servers": {
+    "files": { "command": ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/Users/me/Documents"] },
+    "db":    { "command": ["/usr/local/bin/my-db-server"], "environment": { "DB_URL": "{env:DB_URL}" } } } } }
+```
+- Their tools are named `<server>_<tool>` and are checked like any other tool: add a rule such as `{ "action": "files_*", "resource": "*", "effect": "ask" }` to be asked first. Prompts are slash commands `/<server>:<prompt> args`; resources can be mentioned with `@server:name`.
+- **Servers declared in a project's own config file ask for your approval** before starting (a terminal is required; "always" is remembered for that project and that exact definition). Servers in your user config (`~/Library/Application Support/moco/config/`) start without asking.
+- `/mcp` shows what is running; a server that fails to start prints its reason and stderr at startup. Remote (HTTP) servers are not supported yet.
+
 ## Tools the model has
 
-`read`, `write`, `edit`, `patch`, `glob`, `grep`, `shell`, `webfetch`, `todowrite`, `question`, `subagent` (agents `general` and `explore`), and `skill` when skills exist. Paths outside the project ask for an `external_directory` permission first. Long output is cut to 2000 lines or 50 KiB and the full text is saved under `data/tool-output/`.
+`read`, `write`, `edit`, `patch`, `glob`, `grep`, `shell`, `webfetch`, `todowrite`, `question`, `subagent` (agents `general` and `explore`), `skill` when skills exist, and `<server>_<tool>` for each tool of a configured MCP server. Paths outside the project ask for an `external_directory` permission first. Long output is cut to 2000 lines or 50 KiB and the full text is saved under `data/tool-output/`.
 
 ## Configuration
 

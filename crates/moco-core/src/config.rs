@@ -61,6 +61,49 @@ pub struct CompactionConfig {
     pub keep: Option<u64>,
 }
 
+/// `mcp.servers.<name>`: a Model Context Protocol server. `local` servers are child processes speaking over stdio.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct McpServerConfig {
+    /// `"local"` (default when `command` is set) or `"remote"`.
+    #[serde(rename = "type")]
+    pub kind: Option<String>,
+    /// Program and arguments.
+    pub command: Vec<String>,
+    pub cwd: Option<String>,
+    pub environment: BTreeMap<String, String>,
+    pub disabled: bool,
+    /// Per-call timeout for this server, in milliseconds.
+    pub timeout: Option<u64>,
+    pub url: Option<String>,
+    pub headers: BTreeMap<String, String>,
+    pub oauth: Option<Value>,
+}
+
+impl McpServerConfig {
+    pub fn is_remote(&self) -> bool {
+        self.kind.as_deref() == Some("remote") || (self.kind.is_none() && self.command.is_empty() && self.url.is_some())
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct McpTimeouts {
+    /// Starting the server and the initialize handshake (ms, default 30 000).
+    pub startup: Option<u64>,
+    /// `tools/list`, `prompts/list`, `resources/list` (ms, default 30 000).
+    pub catalog: Option<u64>,
+    /// A tool or prompt call (ms, default 300 000).
+    pub execution: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct McpConfig {
+    pub timeout: McpTimeouts,
+    pub servers: BTreeMap<String, McpServerConfig>,
+}
+
 /// `commands.<name>`: a prompt template reachable as `/name`.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
@@ -76,6 +119,7 @@ pub struct CommandConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    pub mcp: McpConfig,
     /// Extra skill locations: a directory of skills, or a single skill directory.
     pub skills: Vec<String>,
     pub commands: BTreeMap<String, CommandConfig>,
@@ -100,6 +144,8 @@ pub struct Loaded {
     pub config: Config,
     pub sources: Vec<PathBuf>,
     pub warnings: Vec<String>,
+    /// For each `mcp.servers` entry, the config file that defined it last (so project-supplied servers can be vetted).
+    pub mcp_origins: BTreeMap<String, PathBuf>,
 }
 
 /// Remove `//` and `/* */` comments and trailing commas, leaving strings untouched.
@@ -261,6 +307,9 @@ pub fn load(app_dir: &Path, cwd: &Path) -> Loaded {
             .and_then(|raw| serde_json::from_str::<Value>(&strip_jsonc(&raw)).map_err(|e| e.to_string()));
         match parsed {
             Ok(v) if v.is_object() => {
+                for name in v["mcp"]["servers"].as_object().into_iter().flat_map(|o| o.keys()) {
+                    out.mcp_origins.insert(name.clone(), path.clone());
+                }
                 merged = merge(merged, v, "");
                 out.sources.push(path);
             }

@@ -24,6 +24,28 @@ pub struct Ctx<'a> {
     pub app_dir: &'a Path,
     /// What the current model accepts.
     pub caps: MediaCaps,
+    /// MCP servers, for `@server:resource` mentions.
+    pub mcp: Option<&'a crate::mcp::Manager>,
+}
+
+/// First `MAX_LINES` lines / `MAX_TEXT_BYTES` bytes of `full` (CRLF normalized): `(kept, truncated, line count, lines kept)`.
+fn limit_text(full: &str) -> (String, bool, usize, usize) {
+    let full = full.replace("\r\n", "\n");
+    let pieces = full.split('\n').count(); // a trailing newline yields an empty last piece that is not a line
+    let total = pieces - usize::from(full.ends_with('\n'));
+    let (mut kept, mut used, mut n) = (String::new(), 0usize, 0usize);
+    for line in full.split('\n') {
+        if n >= MAX_LINES || used + line.len() + 1 > MAX_TEXT_BYTES {
+            break;
+        }
+        if n > 0 {
+            kept.push('\n');
+        }
+        kept.push_str(line);
+        used += line.len() + 1;
+        n += 1;
+    }
+    (kept, n < pieces, total, n)
 }
 
 /// Distinct `@tokens` of a prompt, trailing punctuation removed, `\ ` unescaped, in order of appearance.
@@ -123,22 +145,7 @@ pub fn expand(text: &str, ctx: &Ctx) -> (Value, Vec<String>) {
                 notes.push(format!("skipped {name}: not a text file"));
                 continue;
             }
-            let full = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
-            let pieces = full.split('\n').count(); // a trailing newline yields an empty last piece that is not a line
-            let total = pieces - usize::from(full.ends_with('\n'));
-            let (mut kept, mut used, mut n) = (String::new(), 0usize, 0usize);
-            for line in full.split('\n') {
-                if n >= MAX_LINES || used + line.len() + 1 > MAX_TEXT_BYTES {
-                    break;
-                }
-                if n > 0 {
-                    kept.push('\n');
-                }
-                kept.push_str(line);
-                used += line.len() + 1;
-                n += 1;
-            }
-            let truncated = n < pieces;
+            let (kept, truncated, total, n) = limit_text(&String::from_utf8_lossy(&bytes));
             notes.push(format!("attached {name} ({total} lines{})", if truncated { format!(", first {n} shown") } else { String::new() }));
             files.push(json!({"path": name, "kind": "file", "content": kept, "truncated": truncated, "lines": total}));
         } else if let Some(s) = ctx.skills.iter().find(|s| s.id == tok) {
@@ -147,6 +154,20 @@ pub fn expand(text: &str, ctx: &Ctx) -> (Value, Vec<String>) {
         } else if ctx.subagents.iter().any(|a| *a == tok) {
             notes.push(format!("@{tok}: the model will be asked to delegate to it"));
             agents.push(json!(tok));
+        } else if let Some(r) = ctx.mcp.and_then(|m| m.find_resource(&tok).map(|r| (m, r))) {
+            let (m, r) = r;
+            let label = format!("mcp://{}/{}", r.server, r.name);
+            if files.iter().any(|f| f["path"] == label.as_str()) {
+                continue; // the same resource named twice (by name and by URI) is attached once
+            }
+            match m.read_resource(&r.server, &r.uri) {
+                Ok(text) => {
+                    let (kept, truncated, total, n) = limit_text(&text);
+                    notes.push(format!("attached MCP resource {}:{} ({total} lines{})", r.server, r.name, if truncated { format!(", first {n} shown") } else { String::new() }));
+                    files.push(json!({"path": label, "kind": "file", "content": kept, "truncated": truncated, "lines": total}));
+                }
+                Err(e) => notes.push(format!("skipped MCP resource {}:{}: {e}", r.server, r.name)),
+            }
         }
     }
     if files.is_empty() && skill_items.is_empty() && agents.is_empty() {
@@ -219,7 +240,7 @@ mod tests {
             self.root.join("work")
         }
         fn ctx<'a>(&'a self, work: &'a Path, subagents: &'a [String], caps: MediaCaps) -> Ctx<'a> {
-            Ctx { cwd: work, skills: &self.skills, subagents, app_dir: &self.root, caps }
+            Ctx { cwd: work, skills: &self.skills, subagents, app_dir: &self.root, caps, mcp: None }
         }
     }
     impl Drop for Fx {
@@ -313,6 +334,31 @@ mod tests {
         assert!(notes.iter().any(|n| n.contains("first 2000 shown")) && notes.iter().any(|n| n.contains("skipped huge.txt: larger than 2 MiB")), "{notes:?}");
         assert!(notes.iter().any(|n| n.contains("skipped giant.bin: larger than 10 MiB")), "{notes:?}");
         assert_eq!(m["files"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn mcp_resources_can_be_mentioned() {
+        if std::process::Command::new("python3").arg("--version").output().map(|o| !o.status.success()).unwrap_or(true) {
+            return eprintln!("skipped: python3 not available");
+        }
+        let fx = setup();
+        let work = fx.work();
+        let spec = crate::mcp::ServerSpec {
+            name: "fake".into(),
+            config: crate::config::McpServerConfig { command: vec!["python3".into(), concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_mcp.py").into()], ..Default::default() },
+            cwd: work.clone(),
+        };
+        let m = crate::mcp::Manager::start(vec![spec], &Default::default());
+        assert!(m.wait_ready(std::time::Duration::from_secs(20)));
+        let ctx = Ctx { mcp: Some(&m), ..fx.ctx(&work, &[], MediaCaps::default()) };
+        let (v, notes) = expand("what is in @fake:notes and again @file:///notes.txt, ignoring @fake:missing", &ctx);
+        let files = v["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1, "one resource, named twice, is attached once: {files:?}");
+        assert_eq!((files[0]["path"].as_str(), files[0]["content"].as_str()), (Some("mcp://fake/notes"), Some("remember the milk")));
+        assert_eq!(notes, ["attached MCP resource fake:notes (1 lines)"], "unknown names are left as plain text");
+        let blocks = render_blocks(&v, &|_| None);
+        assert!(matches!(&blocks[0], Block::Text(t) if t == "<file path=\"mcp://fake/notes\">\nremember the milk\n</file>"));
+        m.shutdown();
     }
 
     #[test]

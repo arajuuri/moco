@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -108,6 +108,8 @@ pub struct EngineConfig {
     pub small_model: Option<String>,
     /// Discovered skills (see `skills::discover`).
     pub skills: Vec<skills::Skill>,
+    /// MCP servers whose tools join the built-in ones. Their tool list is read again for every request.
+    pub mcp: Option<Arc<crate::mcp::Manager>>,
     /// Waits for retry backoff; must return early when `cancel` is set.
     pub sleep: Box<dyn Fn(Duration, &AtomicBool) + Send + Sync>,
     pub jitter: Box<dyn Fn() -> f64 + Send + Sync>,
@@ -127,6 +129,7 @@ impl EngineConfig {
             snapshot_max_files: 50_000,
             small_model: None,
             skills: vec![],
+            mcp: None,
             sleep: Box::new(|d, cancel| {
                 let end = std::time::Instant::now() + d;
                 while std::time::Instant::now() < end && !cancel.load(Ordering::Relaxed) {
@@ -144,7 +147,8 @@ pub struct Engine {
     /// Used when a model's provider has no client of its own (tests, single-provider setups).
     fallback: Option<Box<dyn Provider>>,
     cfg: EngineConfig,
-    tools: Vec<Box<dyn Tool>>,
+    /// Built-in tools; MCP tools are added per request (`current_tools`).
+    tools: Vec<Arc<dyn Tool>>,
     /// Sessions whose automatic compaction failed during this process; they are not retried every step.
     auto_failed: Mutex<HashSet<String>>,
     /// One user prompt at a time across the whole process (parent and subagent sessions).
@@ -199,6 +203,8 @@ struct Prepared<'a> {
     /// History after the latest compaction.
     eff: Vec<crate::store::Message>,
     limit: Option<u64>,
+    /// The tool list the request was built from (tool calls are looked up here).
+    tools: Vec<Arc<dyn Tool>>,
 }
 
 fn subagent_list(cfg: &EngineConfig) -> Vec<(String, String)> {
@@ -238,12 +244,12 @@ struct AttemptResult {
 impl Engine {
     /// Single provider answering every model ref.
     pub fn new(store: Store, provider: Box<dyn Provider>, cfg: EngineConfig) -> Self {
-        Engine { store: Mutex::new(store), providers: HashMap::new(), fallback: Some(provider), tools: tools::all(subagent_list(&cfg), cfg.skills.clone()), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()), title_tried: Mutex::new(HashSet::new()) }
+        Engine { store: Mutex::new(store), providers: HashMap::new(), fallback: Some(provider), tools: tools::all(subagent_list(&cfg), cfg.skills.clone()).into_iter().map(Arc::from).collect(), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()), title_tried: Mutex::new(HashSet::new()) }
     }
 
     /// One client per provider id; a model ref's provider part picks the client.
     pub fn with_providers(store: Store, providers: HashMap<String, Box<dyn Provider>>, cfg: EngineConfig) -> Self {
-        Engine { store: Mutex::new(store), providers, fallback: None, tools: tools::all(subagent_list(&cfg), cfg.skills.clone()), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()), title_tried: Mutex::new(HashSet::new()) }
+        Engine { store: Mutex::new(store), providers, fallback: None, tools: tools::all(subagent_list(&cfg), cfg.skills.clone()).into_iter().map(Arc::from).collect(), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()), title_tried: Mutex::new(HashSet::new()) }
     }
 
     pub fn catalog(&self) -> &catalog::Catalog {
@@ -305,6 +311,19 @@ impl Engine {
 
     pub fn app_dir(&self) -> &std::path::Path {
         &self.cfg.app_dir
+    }
+
+    /// Built-in tools plus what the MCP servers offer right now ("each request captures the tool list at request time").
+    fn current_tools(&self) -> Vec<Arc<dyn Tool>> {
+        let mut all = self.tools.clone();
+        if let Some(m) = &self.cfg.mcp {
+            all.extend(m.tools());
+        }
+        all
+    }
+
+    pub fn mcp(&self) -> Option<&Arc<crate::mcp::Manager>> {
+        self.cfg.mcp.as_ref()
     }
 
     /// Stored messages as provider messages, with attachments loaded from the blob store.
@@ -395,7 +414,8 @@ impl Engine {
         let agent = agent::find(&self.cfg.agents, &session.agent)
             .or_else(|| self.cfg.agents.first().cloned())
             .expect("at least one agent is configured");
-        let advertised: Vec<&dyn Tool> = self.tools.iter().map(|t| t.as_ref()).filter(|t| agent::advertised(&agent, *t)).collect();
+        let all_tools = self.current_tools();
+        let advertised: Vec<&dyn Tool> = all_tools.iter().map(|t| t.as_ref()).filter(|t| agent::advertised(&agent, *t)).collect();
 
         let eff = compaction::effective(&history);
         let mut messages = self.chat(&eff);
@@ -440,7 +460,7 @@ impl Engine {
             tools_disabled: max_steps_hit,
         };
         let limit = self.cfg.catalog.model(&provider_id, &model_id).map(|m| m.limit.context).filter(|l| *l > 0);
-        Ok(Ok(Prepared { session, agent, req, provider, provider_id, model_id, eff, limit }))
+        Ok(Ok(Prepared { session, agent, req, provider, provider_id, model_id, eff, limit, tools: all_tools }))
     }
 
     fn run_step_inner(&self, sid: &str, step: u32, ui: &dyn Ui, cancel: &AtomicBool, overflowed: bool) -> Result<StepOutcome, StoreError> {
@@ -470,7 +490,7 @@ impl Engine {
                 }
             }
         }
-        let Prepared { session, agent, req, provider, provider_id, model_id, .. } = p;
+        let Prepared { session, agent, req, provider, provider_id, model_id, tools: step_tools, .. } = p;
         let (provider_id, model_id) = (provider_id.as_str(), model_id.as_str());
         let caps = self.media_caps(provider_id, model_id);
 
@@ -492,7 +512,7 @@ impl Engine {
 
         let mut retries = 0u32;
         let result = loop {
-            let r = self.attempt(provider, &session, &req, &permitter, ui, cancel, &msg_id, caps);
+            let r = self.attempt(provider, &session, &req, &permitter, ui, cancel, &msg_id, caps, &step_tools);
             match &r.stream {
                 Err(e) if !r.dispatched && !cancel.load(Ordering::Relaxed) => {
                     // Safe to retry: no tool has run, and the partial output is discarded.
@@ -968,7 +988,7 @@ impl Engine {
 
     /// One streaming request. Tools start executing as soon as their call is complete.
     #[allow(clippy::too_many_arguments)]
-    fn attempt(&self, provider: &dyn Provider, session: &Session, req: &Request, permitter: &EnginePermitter, ui: &dyn Ui, cancel: &AtomicBool, msg_id: &str, caps: MediaCaps) -> AttemptResult {
+    fn attempt(&self, provider: &dyn Provider, session: &Session, req: &Request, permitter: &EnginePermitter, ui: &dyn Ui, cancel: &AtomicBool, msg_id: &str, caps: MediaCaps, step_tools: &[Arc<dyn Tool>]) -> AttemptResult {
         let cwd = PathBuf::from(&session.directory);
         let root = project_root_of(&cwd);
         let spill = self.spill_dir();
@@ -999,7 +1019,7 @@ impl Engine {
                     parts.push(chat::tool_part(&id, &name, &input));
                     let idx = parts.len() - 1;
                     let _ = self.store().set_message_parts(msg_id, &parts);
-                    let tool = self.tools.iter().find(|t| t.name() == name).map(|t| t.as_ref());
+                    let tool = step_tools.iter().find(|t| t.name() == name).map(|t| t.as_ref());
                     let (cwd, root, spill) = (cwd.clone(), root.clone(), spill.clone());
                     handles.push((
                         idx,
@@ -2228,7 +2248,7 @@ mod tests {
         let f = fixture(vec![text("seen"), text("again")]);
         f.file("notes.txt", "remember the milk\n");
         let skills_none: Vec<skills::Skill> = vec![];
-        let ctx = crate::mentions::Ctx { cwd: &f.dir.join("work"), skills: &skills_none, subagents: &["explore".to_string()], app_dir: f.engine.app_dir(), caps: MediaCaps::default() };
+        let ctx = crate::mentions::Ctx { cwd: &f.dir.join("work"), skills: &skills_none, subagents: &["explore".to_string()], app_dir: f.engine.app_dir(), caps: MediaCaps::default(), mcp: None };
         let (m, notes) = crate::mentions::expand("what does @notes.txt say? ask @explore too", &ctx);
         assert_eq!(notes.len(), 2);
         f.engine.submit_with(&f.session.id, "what does @notes.txt say? ask @explore too", Some(m), Mode::Steer).unwrap();
@@ -2290,7 +2310,7 @@ mod tests {
         let f = fixture(vec![text("it is a diagram")]);
         std::fs::write(f.dir.join("work/diagram.png"), tiny_png()).unwrap();
         let work = f.dir.join("work");
-        let ctx = crate::mentions::Ctx { cwd: &work, skills: &[], subagents: &[], app_dir: f.engine.app_dir(), caps: MediaCaps::default() };
+        let ctx = crate::mentions::Ctx { cwd: &work, skills: &[], subagents: &[], app_dir: f.engine.app_dir(), caps: MediaCaps::default(), mcp: None };
         let (m, notes) = crate::mentions::expand("explain @diagram.png", &ctx);
         assert!(notes[0].starts_with("attached image diagram.png"));
         f.engine.submit_with(&f.session.id, "explain @diagram.png", Some(m), Mode::Steer).unwrap();
@@ -2329,5 +2349,95 @@ mod tests {
         let reqs = f.fake.requests.lock().unwrap();
         assert!(!has_image(&reqs[1]));
         assert!(matches!(&reqs[1].messages.last().unwrap().content[0], Block::ToolResult { is_error: true, content, .. } if content.contains("does not accept image input")));
+    }
+
+    fn fake_mcp(dir: &std::path::Path) -> Option<Arc<crate::mcp::Manager>> {
+        std::process::Command::new("python3").arg("--version").output().ok().filter(|o| o.status.success())?;
+        let spec = crate::mcp::ServerSpec {
+            name: "fake".into(),
+            config: config::McpServerConfig { command: vec!["python3".into(), concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_mcp.py").into()], ..Default::default() },
+            cwd: dir.to_path_buf(),
+        };
+        let m = crate::mcp::Manager::start(vec![spec], &config::McpTimeouts::default());
+        assert!(m.wait_ready(Duration::from_secs(20)));
+        Some(m)
+    }
+
+    #[test]
+    fn mcp_tools_join_the_builtin_ones_per_request() {
+        let dir = std::env::temp_dir().join(crate::id::new_id("moco-eng-mcp"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let Some(mcp) = fake_mcp(&dir) else { return eprintln!("skipped: python3 not available") };
+        let f = fixture_cfg(
+            vec![
+                tool_call("t1", "fake_echo", json!({"text":"from the model"})),
+                tool_call("t2", "fake_add_tool", json!({})),
+                text("now there is one more tool"),
+                tool_call("t3", "fake_added", json!({})),
+                text("used it"),
+            ],
+            |c| c.mcp = Some(mcp.clone()),
+        );
+        f.say("use the mcp tools");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        let reqs = f.fake.requests.lock().unwrap();
+        let names = |r: &Request| r.tools.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
+        assert!(names(&reqs[0]).contains(&"fake_echo".to_string()) && names(&reqs[0]).contains(&"read".to_string()) && names(&reqs[0]).contains(&"mcp-resource".to_string()));
+        let echo = reqs[0].tools.iter().find(|t| t.name == "fake_echo").unwrap();
+        assert_eq!((echo.description.as_str(), echo.schema["required"].clone()), ("Echo the text back", json!(["text"])));
+        assert_eq!(result_text(&reqs[1]), "echo: from the model");
+        assert!(!names(&reqs[0]).contains(&"fake_added".to_string()));
+        // The server announced a new tool during step 2; the very next request already lists it.
+        let wait_end = std::time::Instant::now() + Duration::from_secs(5);
+        while !mcp.tools().iter().any(|t| t.name() == "fake_added") && std::time::Instant::now() < wait_end {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(reqs);
+        f.fake.extend(vec![text("x")]);
+        f.say("again");
+        f.run(&TestUi::default());
+        let reqs = f.fake.requests.lock().unwrap();
+        assert!(reqs.last().unwrap().tools.iter().any(|t| t.name == "fake_added"));
+        mcp.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rules_apply_to_mcp_tools_by_name() {
+        let dir = std::env::temp_dir().join(crate::id::new_id("moco-eng-mcp2"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let Some(mcp) = fake_mcp(&dir) else { return eprintln!("skipped: python3 not available") };
+        let cfg: config::Config = serde_json::from_value(json!({"permissions":[{"action":"fake_*","resource":"*","effect":"ask"}]})).unwrap();
+        let f = fixture_cfg(vec![tool_call("t1", "fake_echo", json!({"text":"x"})), text("asked first"), sub("t2", "explore", "look"), tool_call("c1", "fake_echo", json!({"text":"from explore"})), text("explore done"), text("finished")], |c| {
+            c.mcp = Some(mcp.clone());
+            c.agents = config::resolve_agents(&cfg);
+        });
+        f.say("go");
+        let ui = TestUi::replying(vec![Reply::Once]);
+        assert_eq!(f.run(&ui), RunOutcome::Idle);
+        assert_eq!(ui.asked.lock().unwrap().as_slice(), ["fake_echo *"], "a wildcard rule on the tool name made it ask");
+        // Your rules come last, so they also override a built-in agent's blanket deny: explore may now use these tools, with asking.
+        f.say("now delegate");
+        let ui = TestUi::replying(vec![Reply::Once]);
+        assert_eq!(f.run(&ui), RunOutcome::Idle);
+        assert_eq!(ui.asked.lock().unwrap().as_slice(), ["fake_echo *"]);
+        mcp.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn read_only_agents_do_not_get_mcp_tools_unless_you_say_so() {
+        let dir = std::env::temp_dir().join(crate::id::new_id("moco-eng-mcp3"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let Some(mcp) = fake_mcp(&dir) else { return eprintln!("skipped: python3 not available") };
+        let f = fixture_cfg(vec![sub("t1", "explore", "look"), text("explore done"), text("finished")], |c| c.mcp = Some(mcp.clone()));
+        f.say("delegate");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        let reqs = f.fake.requests.lock().unwrap();
+        assert!(reqs[0].tools.iter().any(|t| t.name == "fake_echo"));
+        let explore_req = reqs.iter().find(|r| r.system.contains("file search specialist")).expect("explore ran");
+        assert!(!explore_req.tools.iter().any(|t| t.name.starts_with("fake_") || t.name == "mcp-resource"), "explore denies everything it does not list");
+        mcp.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

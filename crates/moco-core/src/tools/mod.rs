@@ -76,6 +76,17 @@ impl ToolOutput {
         }
     }
 
+    /// Add another file for the model to see (see `with_media`).
+    pub fn add_media(&mut self, media_type: &str, name: &str, bytes: &[u8]) {
+        use base64::Engine as _;
+        let entry = json!({"mediaType": media_type, "name": name, "base64": base64::engine::general_purpose::STANDARD.encode(bytes)});
+        if let Some(list) = self.metadata.get_mut("_media").and_then(Value::as_array_mut) {
+            list.push(entry);
+        } else {
+            self.metadata["_media"] = json!([entry]);
+        }
+    }
+
     /// Remove and return the attachments carried by `with_media`.
     pub fn take_media(&mut self) -> Vec<Attachment> {
         use base64::Engine as _;
@@ -245,7 +256,7 @@ pub fn normalize(p: &Path) -> PathBuf {
 }
 
 pub trait Tool: Send + Sync {
-    fn name(&self) -> &'static str;
+    fn name(&self) -> &str;
     fn description(&self) -> String;
     fn schema(&self) -> Value;
     fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError>;
