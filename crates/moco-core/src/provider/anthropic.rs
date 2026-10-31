@@ -7,6 +7,8 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 pub struct Anthropic {
+    /// Mark the prompt prefix for Anthropic's prompt cache (`cache_control`). On by default.
+    pub prompt_cache: bool,
     pub api_key: String,
     /// Without trailing `/v1` (default `https://api.anthropic.com`).
     pub base_url: String,
@@ -16,6 +18,7 @@ pub struct Anthropic {
 impl Anthropic {
     pub fn new(api_key: String, base_url: Option<String>) -> Self {
         Anthropic {
+            prompt_cache: true,
             api_key,
             base_url: base_url.unwrap_or_else(|| "https://api.anthropic.com".into()).trim_end_matches('/').to_string(),
             agent: ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(20)).timeout_read(Duration::from_secs(120)).build(),
@@ -23,7 +26,17 @@ impl Anthropic {
     }
 }
 
-pub fn build_body(req: &Request) -> Value {
+const EPHEMERAL: &str = "ephemeral";
+
+fn mark(block: &mut Value) {
+    block["cache_control"] = json!({"type": EPHEMERAL});
+}
+
+/// Request body. With `cache` on, up to four cache breakpoints are set: the last tool (covers all tool
+/// definitions), the system prompt, the last block of the final message, and the last block of the message that
+/// ended the previous request of an agent loop (so the previous step's cache entry is hit exactly, even if a
+/// step added more content blocks than the cache lookback covers).
+pub fn build_body(req: &Request, cache: bool) -> Value {
     let messages: Vec<Value> = req
         .messages
         .iter()
@@ -42,12 +55,29 @@ pub fn build_body(req: &Request) -> Value {
             json!({"role": if m.role == Role::User {"user"} else {"assistant"}, "content": content})
         })
         .collect();
+    let mut messages = messages;
+    if cache {
+        let n = messages.len();
+        for idx in [n.checked_sub(1), n.checked_sub(3)].into_iter().flatten() {
+            if let Some(last) = messages[idx]["content"].as_array_mut().and_then(|c| c.last_mut()) {
+                mark(last);
+            }
+        }
+    }
     let mut body = json!({"model":req.model,"max_tokens":req.max_tokens,"stream":true,"messages":messages});
     if !req.system.is_empty() {
-        body["system"] = json!(req.system);
+        body["system"] = if cache {
+            json!([{"type":"text","text":req.system,"cache_control":{"type":EPHEMERAL}}])
+        } else {
+            json!(req.system)
+        };
     }
     if !req.tools.is_empty() {
-        body["tools"] = req.tools.iter().map(|t| json!({"name":t.name,"description":t.description,"input_schema":t.schema})).collect();
+        let mut tools: Vec<Value> = req.tools.iter().map(|t| json!({"name":t.name,"description":t.description,"input_schema":t.schema})).collect();
+        if let (true, Some(last)) = (cache, tools.last_mut()) {
+            mark(last);
+        }
+        body["tools"] = json!(tools);
         if req.tools_disabled {
             body["tool_choice"] = json!({"type":"none"});
         }
@@ -183,7 +213,7 @@ impl Provider for Anthropic {
             .set("x-api-key", &self.api_key)
             .set("anthropic-version", "2023-06-01")
             .set("content-type", "application/json")
-            .send_string(&build_body(req).to_string());
+            .send_string(&build_body(req, self.prompt_cache).to_string());
         let resp = match resp {
             Ok(r) => r,
             Err(ureq::Error::Status(code, r)) => {
@@ -313,6 +343,78 @@ mod tests {
         assert!(matches!(classify_http(400, &body("invalid_request_error", "messages: bad"), None), ProviderError::InvalidRequest(_)));
     }
 
+    fn marked(v: &Value) -> bool {
+        v.get("cache_control") == Some(&json!({"type":"ephemeral"}))
+    }
+
+    fn agent_loop_request(extra_turns: usize) -> Request {
+        let mut messages = vec![ChatMessage { role: Role::User, content: vec![Block::Text("task".into())] }];
+        for i in 0..extra_turns {
+            messages.push(ChatMessage { role: Role::Assistant, content: vec![Block::Text(format!("a{i}")), Block::ToolUse { id: format!("t{i}"), name: "read".into(), input: json!({}) }] });
+            messages.push(ChatMessage { role: Role::User, content: vec![Block::ToolResult { id: format!("t{i}"), content: "r".into(), is_error: false }] });
+        }
+        Request {
+            model: "m".into(),
+            system: "sys".into(),
+            messages,
+            tools: vec![
+                ToolDef { name: "read".into(), description: "d".into(), schema: json!({}) },
+                ToolDef { name: "shell".into(), description: "d".into(), schema: json!({}) },
+            ],
+            max_tokens: 10,
+            tools_disabled: false,
+        }
+    }
+
+    #[test]
+    fn cache_breakpoints_are_placed_and_capped_at_four() {
+        let b = build_body(&agent_loop_request(2), true);
+        // messages: user, assistant, user(results), assistant, user(results)
+        let m = b["messages"].as_array().unwrap();
+        let marked_msgs: Vec<usize> = (0..m.len()).filter(|i| m[*i]["content"].as_array().unwrap().iter().any(marked)).collect();
+        assert_eq!(marked_msgs, [2, 4], "the final message and the one that ended the previous request");
+        assert!(marked(&m[4]["content"][0]) && marked(&b["system"][0]) && marked(&b["tools"][1]) && !marked(&b["tools"][0]));
+        assert_eq!(b["system"][0]["text"], "sys");
+        assert_eq!(b.to_string().matches("cache_control").count(), 4, "Anthropic allows at most four");
+        // Short conversations: just the last message; no system or tools means fewer markers.
+        let b = build_body(&agent_loop_request(0), true);
+        assert_eq!(b.to_string().matches("cache_control").count(), 3);
+        let mut r = agent_loop_request(1);
+        r.system.clear();
+        r.tools.clear();
+        let b = build_body(&r, true);
+        assert!(b.get("system").is_none() && b.get("tools").is_none());
+        assert_eq!(b.to_string().matches("cache_control").count(), 2, "three messages: the final one, and the task message where the first step's request ended");
+        r.messages.truncate(2);
+        assert_eq!(build_body(&r, true).to_string().matches("cache_control").count(), 1, "two messages: only the final one");
+    }
+
+    #[test]
+    fn consecutive_agent_loop_requests_share_their_marked_prefix() {
+        // What the cache sees: everything up to a marker must be byte-identical between steps.
+        let strip = |mut v: Value| {
+            fn walk(v: &mut Value) {
+                match v {
+                    Value::Object(o) => {
+                        o.remove("cache_control");
+                        o.values_mut().for_each(walk);
+                    }
+                    Value::Array(a) => a.iter_mut().for_each(walk),
+                    _ => {}
+                }
+            }
+            walk(&mut v);
+            v
+        };
+        let (a, b) = (build_body(&agent_loop_request(1), true), build_body(&agent_loop_request(2), true));
+        assert_eq!(strip(a["tools"].clone()), strip(b["tools"].clone()));
+        assert_eq!(strip(a["system"].clone()), strip(b["system"].clone()));
+        let (ma, mb) = (a["messages"].as_array().unwrap(), b["messages"].as_array().unwrap());
+        assert_eq!(strip(json!(ma)), strip(json!(&mb[..ma.len()])), "the new request extends the old one");
+        // The old request's final message is marked in the new request too: the previous cache entry is hit exactly.
+        assert!(marked(&mb[ma.len() - 1]["content"][0]));
+    }
+
     #[test]
     fn request_body_shape() {
         let req = Request {
@@ -327,9 +429,10 @@ mod tests {
             max_tokens: 100,
             tools_disabled: true,
         };
-        let b = build_body(&req);
+        let b = build_body(&req, false);
         assert_eq!(b["stream"], true);
         assert_eq!(b["system"], "sys");
+        assert!(!b.to_string().contains("cache_control"), "no markers when caching is off");
         assert_eq!(b["tool_choice"], json!({"type":"none"}));
         assert_eq!(b["tools"][0]["input_schema"], json!({"type":"object"}));
         assert_eq!(b["messages"][1]["content"][0]["type"], "tool_use");

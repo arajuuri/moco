@@ -28,7 +28,9 @@ pub fn build(catalog: &Catalog, app_dir: &Path) -> HashMap<String, Box<dyn Provi
                 // ANTHROPIC_BASE_URL is honored for proxies and test servers.
                 let base = (id == "anthropic").then(|| std::env::var("ANTHROPIC_BASE_URL").ok()).flatten().or_else(|| p.base_url());
                 let base = base.map(|b| b.trim_end_matches("/v1").to_string());
-                Box::new(Anthropic::new(key.unwrap_or_default(), base))
+                let mut client = Anthropic::new(key.unwrap_or_default(), base);
+                client.prompt_cache = p.prompt_cache.unwrap_or(true);
+                Box::new(client)
             }
             Some(Protocol::OpenAiChat) => Box::new(OpenAiChat::new(key, p.base_url().unwrap_or_default(), p.headers.clone())),
             None => continue,

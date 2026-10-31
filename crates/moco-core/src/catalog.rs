@@ -73,6 +73,9 @@ pub struct ProviderInfo {
     pub keyless_ok: bool,
     #[serde(skip)]
     pub protocol_override: Option<Protocol>,
+    /// Anthropic prompt caching (`cache_control` markers); `None` means on.
+    #[serde(skip)]
+    pub prompt_cache: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,6 +246,9 @@ impl Catalog {
                 _ => {}
             }
             p.headers.extend(pc.headers.clone());
+            if pc.prompt_cache.is_some() {
+                p.prompt_cache = pc.prompt_cache;
+            }
             for (mid, mc) in &pc.models {
                 let m = p.models.entry(mid.clone()).or_insert_with(|| Model { id: mid.clone(), name: mid.clone(), ..Default::default() });
                 if let Some(n) = &mc.name {

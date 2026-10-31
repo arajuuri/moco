@@ -47,6 +47,8 @@ pub struct ProviderConfig {
     pub headers: BTreeMap<String, String>,
     pub models: BTreeMap<String, ModelConfig>,
     pub disabled: bool,
+    /// Set `false` to stop sending `cache_control` markers (Anthropic protocol only; default on).
+    pub prompt_cache: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

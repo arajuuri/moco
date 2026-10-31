@@ -75,7 +75,8 @@ impl Terminal {
             Some(l) if l > 0 => format!("context {}% of {}", (r.context * 100 / l).min(100), human(l)),
             _ => format!("context {}", human(r.context)),
         };
-        println!("{DIM}{} in, {} out, {} cached | {cost} | {ctx}{RESET}", human(r.usage.input), human(r.usage.output), human(r.usage.cache_read));
+        let wrote = if r.usage.cache_write > 0 { format!(", {} cache written", human(r.usage.cache_write)) } else { String::new() };
+        println!("{DIM}{} in, {} out, {} cached{wrote} | {cost} | {ctx}{RESET}", human(r.usage.input), human(r.usage.output), human(r.usage.cache_read));
     }
 }
 
@@ -127,6 +128,7 @@ impl Terminal {
                 r.usage.input += usage.input;
                 r.usage.output += usage.output;
                 r.usage.cache_read += usage.cache_read;
+                r.usage.cache_write += usage.cache_write;
                 r.cost += cost.unwrap_or(0.0);
                 r.priced |= cost.is_some();
                 r.steps += 1;

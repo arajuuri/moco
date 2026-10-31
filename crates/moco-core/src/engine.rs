@@ -303,15 +303,13 @@ impl Engine {
         let eff = compaction::effective(&history);
         let mut messages = chat::to_chat(&eff);
         let mut reminders = vec![];
-        if agent.id == "plan" {
-            reminders.push(agent::PLAN_REMINDER.to_string());
-        }
         let max_steps_hit = agent.steps.is_some_and(|n| step >= n);
         if max_steps_hit {
             reminders.push(agent::MAX_STEPS.to_string());
         }
         for r in reminders {
-            // Appended at request time (never stored), so it cannot be lost to compaction or revert.
+            // Appended at request time (never stored). Only used on the last allowed step, so it never
+            // changes the prefix of earlier requests.
             append_user_text(&mut messages, r);
         }
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
@@ -324,13 +322,20 @@ impl Engine {
                 return Ok(Err(StepOutcome::Stop(RunOutcome::Failed(msg))));
             }
         };
+        let mut system = agent::system_prompt(
+            &agent,
+            &advertised,
+            &agent::EnvInfo { cwd: &session.directory, platform: std::env::consts::OS, date: &agent::date_from_unix(now), instructions: &ins },
+        );
+        if agent.id == "plan" {
+            // In the system prompt (not appended to the last message) so every request keeps the same prefix.
+            system.push_str("\n");
+            system.push_str(agent::PLAN_REMINDER);
+            system.push('\n');
+        }
         let req = Request {
             model: model_id.clone(),
-            system: agent::system_prompt(
-                &agent,
-                &advertised,
-                &agent::EnvInfo { cwd: &session.directory, platform: std::env::consts::OS, date: &agent::date_from_unix(now), instructions: &ins },
-            ),
+            system,
             messages,
             tools: advertised.iter().map(|t| ToolDef { name: t.name().into(), description: t.description(), schema: t.schema() }).collect(),
             max_tokens: self.cfg.max_tokens,
@@ -1016,7 +1021,8 @@ mod tests {
         assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
         let reqs = f.fake.requests.lock().unwrap();
         assert!(!reqs[0].tools.iter().any(|t| t.name == "write" || t.name == "edit"));
-        assert!(last_user_blocks(&reqs[0]).iter().any(|b| matches!(b, Block::Text(t) if t.contains("Plan mode"))));
+        assert!(reqs[0].system.contains("You are in Plan mode") && reqs[1].system.contains("You are in Plan mode"));
+        assert!(!all_text(&reqs[0]).contains("Plan mode"), "the reminder lives in the system prompt, not the messages");
         assert!(matches!(&last_user_blocks(&reqs[1])[0], Block::ToolResult { content, is_error: true, .. } if content.starts_with("Permission denied: edit")));
         assert!(!f.dir.join("work/x").exists());
         // The reminder is request-time only, never stored.
@@ -1550,5 +1556,31 @@ mod tests {
         f.say("ask");
         assert_eq!(f.run(&TestUi::default()), RunOutcome::Declined);
         assert_eq!(f.fake.calls(), 1);
+    }
+
+    #[test]
+    fn every_request_of_a_turn_extends_the_previous_one() {
+        // Prompt caching needs a stable prefix: system, tools and earlier messages must not change between steps,
+        // for the plan agent too (whose reminder used to move with the last message).
+        for agent in ["build", "plan"] {
+            let f = fixture(vec![
+                tool_call("t1", "read", json!({"path":"a.txt"})),
+                tool_call("t2", "glob", json!({"pattern":"*.txt"})),
+                tool_call("t3", "grep", json!({"pattern":"x"})),
+                text("done"),
+            ]);
+            f.engine.store().set_agent(&f.session.id, agent).unwrap();
+            f.file("a.txt", "x\n");
+            f.say("look around");
+            assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+            let reqs = f.fake.requests.lock().unwrap();
+            assert_eq!(reqs.len(), 4);
+            for w in reqs.windows(2) {
+                assert_eq!(w[0].system, w[1].system, "{agent}: system prompt");
+                assert_eq!(w[0].tools, w[1].tools, "{agent}: tools");
+                assert_eq!(&w[1].messages[..w[0].messages.len()], &w[0].messages[..], "{agent}: earlier messages");
+                assert!(w[1].messages.len() > w[0].messages.len());
+            }
+        }
     }
 }
