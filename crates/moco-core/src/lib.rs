@@ -8,6 +8,7 @@ pub mod chat;
 pub mod compaction;
 pub mod config;
 pub mod engine;
+pub mod format;
 pub mod id;
 pub mod instructions;
 pub mod markdown;

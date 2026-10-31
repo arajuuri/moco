@@ -70,8 +70,19 @@ MCP servers add tools (and prompts and resources) from other programs. Declare t
     "db":    { "command": ["/usr/local/bin/my-db-server"], "environment": { "DB_URL": "{env:DB_URL}" } } } } }
 ```
 - Their tools are named `<server>_<tool>` and are checked like any other tool: add a rule such as `{ "action": "files_*", "resource": "*", "effect": "ask" }` to be asked first. Prompts are slash commands `/<server>:<prompt> args`; resources can be mentioned with `@server:name`.
-- **Servers declared in a project's own config file ask for your approval** before starting (a terminal is required; "always" is remembered for that project and that exact definition). Servers in your user config (`~/Library/Application Support/moco/config/`) start without asking.
+- **Servers declared in a project's own config file ask for your approval** before starting (a terminal is required; "always" is remembered for that project and that exact definition; `MOCO_TRUST_PROJECT_CONFIG=1` approves them without asking). Servers in your user config (`~/Library/Application Support/moco/config/`) start without asking.
 - `/mcp` shows what is running; a server that fails to start prints its reason and stderr at startup. Remote (HTTP) servers are not supported yet.
+
+## Formatters
+
+moco can run a formatter on every file the model writes, edits or patches. Nothing runs unless you configure it:
+
+```jsonc
+{ "formatter": {
+    "rustfmt":  { "command": ["rustfmt", "--edition", "2021", "$FILE"], "extensions": [".rs"] },
+    "prettier": { "command": ["npx", "prettier", "--write", "$FILE"], "extensions": [".js", ".ts", ".json"] } } }
+```
+If the formatter changes the file, the model is told to re-read it before editing further; if the formatter fails, the model is told why and the file stays as written. As with MCP servers, a formatter defined in a *project's* config asks for your approval first. `"formatter": false` turns formatting off.
 
 ## Background work
 

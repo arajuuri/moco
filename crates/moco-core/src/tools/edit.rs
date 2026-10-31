@@ -44,8 +44,9 @@ include enough surrounding context to make it unique. Do not include the `N: ` l
         }
         out.extend_from_slice(updated.as_bytes());
         std::fs::write(&path, out).map_err(|e| ToolError::fail(e.to_string()))?;
+        let note = ctx.format_file(&path).map(|n| format!("\n{n}")).unwrap_or_default();
         Ok(ToolOutput {
-            text: format!("Edit applied: {n} replacement{} in {}", if n == 1 { "" } else { "s" }, ctx.display(&path)),
+            text: format!("Edit applied: {n} replacement{} in {}{note}", if n == 1 { "" } else { "s" }, ctx.display(&path)),
             metadata: json!({"path": path.to_string_lossy(), "replacements": n}),
         })
     }
@@ -186,6 +187,16 @@ mod tests {
         // Change line endings: old/new differ only in \r.
         Edit.run(&json!({"path":"w.txt","oldString":"a\r\nb","newString":"a\nb"}), &env.ctx()).unwrap();
         assert_eq!(std::fs::read(&p).unwrap(), b"a\nb\r\n");
+    }
+
+    #[test]
+    fn edit_reformats_and_says_so() {
+        let mut env = Env::new();
+        env.formatters = crate::format::tests::upcase_formatters();
+        let p = env.file("a.txt", b"hello world");
+        let o = Edit.run(&json!({"path":"a.txt","oldString":"world","newString":"there"}), &env.ctx()).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "HELLO THERE");
+        assert!(o.text.starts_with("Edit applied: 1 replacement in a.txt\nFormatted with upcase:"), "{}", o.text);
     }
 
     #[test]

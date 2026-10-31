@@ -133,4 +133,5 @@ Code: `tools/shell.rs` (process runner), `tools/jobs.rs`, `engine/jobs.rs`.
 - **`!command`** in the chat runs a command immediately in the session's directory (no model, no permission prompt, 2 minute limit) and records "The user ran this command themselves: ..." in the conversation so the model knows.
 - **Requires a shared engine**: background jobs use threads that outlive the call that started them, so the engine must be created with `Engine::share()` (the chat does); on an unshared engine the request fails with a clear message.
 - **Not implemented**: moving a *running* foreground command to the background (`ctrl+b`), jobs that survive a restart of moco (their processes are stopped on exit; a crash can leave them running), waking an idle session automatically (see `03`).
+- **Formatter hooks** (Phase 3): `write`, `edit` and `patch` run the configured formatter on the files they wrote and append a note to their output when it changed or failed; see `08` implementation notes.
 

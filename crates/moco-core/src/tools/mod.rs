@@ -206,6 +206,7 @@ pub trait Host: Sync {
 }
 
 pub struct ToolCtx<'a> {
+    pub formatters: &'a crate::format::Formatters,
     pub media: MediaCaps,
     pub session_id: &'a str,
     pub host: &'a dyn Host,
@@ -254,6 +255,15 @@ impl ToolCtx<'_> {
             vec![format!("{}/*", dir.display())],
             vec![format!("{}/*", root.display())],
         )
+    }
+
+    /// Run the configured formatter on a file a tool just wrote. Only files inside the project are touched.
+    /// Returns a sentence for the tool's output when the formatter changed the file or failed.
+    pub fn format_file(&self, path: &Path) -> Option<String> {
+        if self.formatters.is_empty() || !self.is_internal(path) || path.starts_with(&self.spill_dir) {
+            return None;
+        }
+        crate::format::note(&self.formatters.run(path, &self.cwd))
     }
 
     pub fn cancelled(&self) -> bool {
@@ -397,18 +407,19 @@ pub(crate) mod testutil {
         pub perm: TestPermitter,
         pub cancel: AtomicBool,
         pub host: TestHost,
+        pub formatters: crate::format::Formatters,
     }
     impl Env {
         pub fn new() -> Self {
             let dir = std::env::temp_dir().join(crate::id::new_id("moco-tool"));
             std::fs::create_dir_all(dir.join("work")).unwrap();
-            Env { dir, perm: TestPermitter::allow(), cancel: AtomicBool::new(false), host: TestHost::default() }
+            Env { dir, perm: TestPermitter::allow(), cancel: AtomicBool::new(false), host: TestHost::default(), formatters: Default::default() }
         }
         pub fn work(&self) -> PathBuf {
             self.dir.join("work")
         }
         pub fn ctx(&self) -> ToolCtx<'_> {
-            ToolCtx { media: MediaCaps::default(), session_id: "ses_test", host: &self.host, cwd: self.work(), project_root: self.work(), spill_dir: self.dir.join("spill"), permitter: &self.perm, cancel: &self.cancel }
+            ToolCtx { formatters: &self.formatters, media: MediaCaps::default(), session_id: "ses_test", host: &self.host, cwd: self.work(), project_root: self.work(), spill_dir: self.dir.join("spill"), permitter: &self.perm, cancel: &self.cancel }
         }
         pub fn file(&self, rel: &str, content: &[u8]) -> PathBuf {
             let p = self.work().join(rel);

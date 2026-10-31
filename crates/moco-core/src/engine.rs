@@ -112,6 +112,8 @@ pub struct EngineConfig {
     pub skills: Vec<skills::Skill>,
     /// MCP servers whose tools join the built-in ones. Their tool list is read again for every request.
     pub mcp: Option<Arc<crate::mcp::Manager>>,
+    /// Run on files the model writes, edits or patches (see `format.rs`).
+    pub formatters: crate::format::Formatters,
     /// Waits for retry backoff; must return early when `cancel` is set.
     pub sleep: Box<dyn Fn(Duration, &AtomicBool) + Send + Sync>,
     pub jitter: Box<dyn Fn() -> f64 + Send + Sync>,
@@ -132,6 +134,7 @@ impl EngineConfig {
             small_model: None,
             skills: vec![],
             mcp: None,
+            formatters: Default::default(),
             sleep: Box::new(|d, cancel| {
                 let end = std::time::Instant::now() + d;
                 while std::time::Instant::now() < end && !cancel.load(Ordering::Relaxed) {
@@ -1043,7 +1046,7 @@ impl Engine {
                             None => Err(ToolError::fail(format!("Unknown tool: {name}"))),
                             Some(t) => {
                                 let host = EngineHost { engine: self, session, ui, cancel };
-                                t.run(&input, &ToolCtx { media: caps, session_id: &session.id, host: &host, cwd, project_root: root, spill_dir: spill, permitter, cancel })
+                                t.run(&input, &ToolCtx { formatters: &self.cfg.formatters, media: caps, session_id: &session.id, host: &host, cwd, project_root: root, spill_dir: spill, permitter, cancel })
                             }
                         }),
                     ));

@@ -296,7 +296,17 @@ impl Tool for Patch {
                 }
             }
         }
-        Ok(ToolOutput { text: format!("Success. Updated the following files:\n{}", summary.join("\n")), metadata: json!({"files": summary}) })
+        // Format what was written (not what was deleted); say so for each file the formatter changed or choked on.
+        let mut notes = vec![];
+        for p in &order {
+            if staged[p].is_some() {
+                if let Some(n) = ctx.format_file(p) {
+                    notes.push(format!("{}: {n}", ctx.display(p)));
+                }
+            }
+        }
+        let tail = if notes.is_empty() { String::new() } else { format!("\n\n{}", notes.join("\n")) };
+        Ok(ToolOutput { text: format!("Success. Updated the following files:\n{}{tail}", summary.join("\n")), metadata: json!({"files": summary}) })
     }
 }
 
@@ -388,6 +398,20 @@ mod tests {
         let asked = env.perm.asked();
         assert_eq!(asked[0].action, "edit");
         assert_eq!(asked[0].resources, ["new/dir/n.txt", "gone.txt", "edit.txt", "old.txt", "moved.txt"]);
+    }
+
+    #[test]
+    fn patch_formats_written_files_but_not_deleted_ones() {
+        let mut env = Env::new();
+        env.formatters = crate::format::tests::upcase_formatters();
+        env.file("old.txt", b"bye\n");
+        env.file("edit.txt", b"keep\nchange\n");
+        let o = run(&env, &wrap("*** Add File: new.txt\n+fresh\n*** Delete File: old.txt\n*** Update File: edit.txt\n@@\n keep\n-change\n+changed\n*** Add File: plain.rs\n+fn x() {}")).unwrap();
+        let w = env.work();
+        assert_eq!((std::fs::read_to_string(w.join("new.txt")).unwrap().as_str(), std::fs::read_to_string(w.join("edit.txt")).unwrap().as_str()), ("FRESH\n", "KEEP\nCHANGED\n"));
+        assert_eq!(std::fs::read_to_string(w.join("plain.rs")).unwrap(), "fn x() {}\n");
+        assert!(!w.join("old.txt").exists());
+        assert!(o.text.contains("new.txt: Formatted with upcase") && o.text.contains("edit.txt: Formatted with upcase") && !o.text.contains("plain.rs: ") && !o.text.contains("old.txt: "), "{}", o.text);
     }
 
     #[test]

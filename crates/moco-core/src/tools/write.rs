@@ -30,8 +30,9 @@ For partial changes, use the edit tool instead.".into()
         }
         bytes.extend_from_slice(content.as_bytes());
         std::fs::write(&path, bytes).map_err(|e| ToolError::fail(format!("{}: {e}", path.display())))?;
+        let note = ctx.format_file(&path).map(|n| format!("\n{n}")).unwrap_or_default();
         Ok(ToolOutput {
-            text: format!("{} {}", if existed { "Overwrote" } else { "Created" }, ctx.display(&path)),
+            text: format!("{} {}{note}", if existed { "Overwrote" } else { "Created" }, ctx.display(&path)),
             metadata: json!({"path": path.to_string_lossy(), "existed": existed}),
         })
     }
@@ -55,6 +56,31 @@ mod tests {
         assert_eq!(std::fs::read(env.work().join("bom.txt")).unwrap(), b"\xef\xbb\xbfnew");
         let asked = env.perm.asked();
         assert_eq!((asked[0].action.as_str(), asked[0].resources.clone()), ("edit", vec!["a/b/c.txt".to_string()]));
+    }
+
+    #[test]
+    fn the_formatter_runs_on_what_was_written_and_the_model_is_told() {
+        let mut env = Env::new();
+        env.formatters = crate::format::tests::upcase_formatters();
+        let o = Write.run(&json!({"path":"notes.txt","content":"hello"}), &env.ctx()).unwrap();
+        assert_eq!(std::fs::read_to_string(env.work().join("notes.txt")).unwrap(), "HELLO");
+        assert!(o.text.starts_with("Created notes.txt\nFormatted with upcase:") && o.text.contains("read it again"), "{}", o.text);
+        // A file the formatter does not cover, and one already in shape, get no note.
+        assert_eq!(Write.run(&json!({"path":"code.rs","content":"fn x(){}"}), &env.ctx()).unwrap().text, "Created code.rs");
+        assert_eq!(Write.run(&json!({"path":"loud.txt","content":"ALREADY"}), &env.ctx()).unwrap().text, "Created loud.txt");
+        // Outside the project nothing is run, even for a covered extension.
+        let outside = env.dir.join("elsewhere.txt");
+        let o = Write.run(&json!({"path": outside.to_string_lossy(), "content":"quiet"}), &env.ctx()).unwrap();
+        assert_eq!((std::fs::read_to_string(&outside).unwrap().as_str(), o.text.contains("Formatted")), ("quiet", false));
+    }
+
+    #[test]
+    fn a_failing_formatter_does_not_fail_the_write() {
+        let mut env = Env::new();
+        env.formatters = crate::format::tests::failing_formatters();
+        let o = Write.run(&json!({"path":"a.txt","content":"as written"}), &env.ctx()).unwrap();
+        assert_eq!(std::fs::read_to_string(env.work().join("a.txt")).unwrap(), "as written");
+        assert!(o.text.contains("The formatter strict failed (exit code 1: parse error at 1:1); the file was left as written."), "{}", o.text);
     }
 
     #[test]
