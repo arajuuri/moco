@@ -1,10 +1,12 @@
 # Full-screen TUI: plan
 
-Status: slice 1 done (see Progress), the rest planned. Screen concepts come from `09-ui.md`; this file decides how moco builds them.
+Status: slices 1 and 2 done (see Progress), the rest planned. Screen concepts come from `09-ui.md`; this file decides how moco builds them.
 
 ## Progress
 
 - **Slice 1 (skeleton): done.** `moco --tui` (opt-in until the slash commands exist in the TUI; then it becomes the default with `--plain` as the escape). Code: `crates/moco/src/tui/{mod,app,term}.rs`. Transcript (user, streamed assistant text, tool rows with failures, todos, subagent tool rows indented, usage line per run), single-line composer with cursor editing and paste, permission dialog (y / a / n / f for feedback, queued), Esc or Ctrl-C interrupt, PageUp/PageDown/Ctrl-Home/Ctrl-End scrolling, status bar (model, agent, title, session cost, context %, spinner), terminal restore on exit, panic (main thread), SIGTERM and SIGHUP. Not in the TUI yet: slash commands (only `/help`, `/exit`), the `question` form (dismissed with a notice), sending while a run is active, mouse. Tests: 8 model/render tests with `TestBackend`, 2 pty tests (`tests/tui.rs` + `tests/tui_pty.py`: dialog, streaming, resize, Ctrl-D, and SIGTERM while a dialog is open; the second fails if the worker is not released), on Linux and Mojave. Live on Mojave with the real model: a prompt that creates a file ran and exited cleanly. Release binary 10.8 MB, `minos 10.14`.
+
+- **Slice 2 (composer): done.** Multiline composer (Alt-Enter or Ctrl-J adds a line; wrapped lines; grows to 8 rows then scrolls), cursor movement by character, word and line (Ctrl-A/E/U/K/W act on the current line), Up/Down move between visual lines (remembering the column) and then browse prompt history (kept in `data/tui-history`, last 500, drafts are restored), large pastes (6+ lines or 800+ characters) collapse to `[Pasted text #N: L lines]` and expand on send. Completion popup (Tab or Enter accepts, Up/Down select, Esc dismisses): `/` offers `/help`, `/exit`, custom commands and MCP prompts; `@` offers subagents, skills, MCP resources and project files (listed in the background honoring `.gitignore`, ranked by base name, then path, then subsequence; directories keep the popup open; spaces are escaped as `\ `). Custom slash commands and MCP prompts now run in the TUI (a command's `agent`/`model` apply to that one prompt); subagent-style commands are refused with a message; `!command` runs a shell command and shows its output. Not yet: the built-in session/model commands (`/model`, `/sessions`, `/undo`, ...) which arrive with the dialogs in slice 3. Live on Mojave: `/sho` + Tab, `@note` + Tab, Enter, answer, Up recalls the prompt.
 
 ## Where we stopped (before slice 1)
 

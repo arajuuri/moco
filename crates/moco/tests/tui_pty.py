@@ -102,7 +102,24 @@ if scenario == "chat":
     os.kill(pid, signal.SIGWINCH)
     pump(0.6)
     send(b"/nope\r")
-    wait_for(r"slashcommandsarenotavailable")
+    wait_for(r"unknowncommand/nope")
+    send(b"!echo hi-from-shell\r")
+    end = time.time() + 15
+    while squashed().count("hi-from-shell") < 2:  # the command row and its output
+        if time.time() > end:
+            fail("the !command output never showed")
+        pump(0.1)
+    send(b"look at @a.t")
+    wait_for(r"@a\.txt")  # the completion popup lists the file
+    send(b"\t")  # Tab completes it
+    send(b"\r")  # sends "look at @a.txt": the mention was completed, so the file gets attached
+    wait_for(r"attached.*a\.txt")
+    wait_for(r"Thefilesays:ONE-LINE-OF-TEXT(.|\n)*Thefilesays:ONE-LINE-OF-TEXT|in,\d+out(.|\n)*in,\d+out")
+    send(b"one\x1b\rtwo")  # Alt-Enter adds a line instead of sending
+    pump(0.3)
+    send(b"\x1b[A\x15\x0b")  # Up to the first line, Ctrl-U and Ctrl-K clear it
+    send(b"\x1b[B\x05\x15")  # back down, End, clear the second
+    pump(0.3)
     send(b"\x04")  # Ctrl-D on an empty composer
     check_restored(wait_exit())
 elif scenario == "sigterm":

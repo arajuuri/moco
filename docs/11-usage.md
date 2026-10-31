@@ -70,7 +70,7 @@ If one misbehaves, `/model` back to another provider and report the error text.
 
 ## Full-screen UI (preview)
 
-`moco --tui` runs the chat full screen (it needs a terminal; works over SSH). Enter sends, Esc or Ctrl-C interrupts a running turn (Ctrl-C on an empty prompt, or Ctrl-D, quits), PageUp/PageDown scroll, Ctrl-End jumps back to the newest output. A permission request replaces the prompt box: `y` once, `a` always, `n` reject, `f` reject with feedback. Slash commands other than `/help` and `/exit`, question forms and sending while a turn runs are not available yet; use the plain chat for those.
+`moco --tui` runs the chat full screen (it needs a terminal; works over SSH). Enter sends, Esc or Ctrl-C interrupts a running turn (Ctrl-C on an empty prompt, or Ctrl-D, quits), PageUp/PageDown scroll, Ctrl-End jumps back to the newest output. A permission request replaces the prompt box: `y` once, `a` always, `n` reject, `f` reject with feedback. Alt-Enter (or Ctrl-J) adds a line, Up/Down move through lines and then your prompt history, Tab completes `/commands` and `@files`, `@skills`, `@agents`; big pastes collapse to a placeholder; `!command` runs a shell command. Custom commands and MCP prompts work; the built-in commands (`/model`, `/sessions`, `/undo`, ...), question forms and sending while a turn runs are not available yet; use the plain chat for those.
 
 ## MCP servers
 

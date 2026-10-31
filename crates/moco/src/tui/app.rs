@@ -58,13 +58,38 @@ pub enum AppEvent {
     /// A line from the engine's notifier (background job finished, ...).
     Background(String),
     RunDone(Result<moco_core::engine::RunOutcome, String>),
+    /// A `!command` the user ran finished.
+    ShellDone(Result<String, String>),
 }
+
+/// One completion candidate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Item {
+    /// Replaces the typed token (a trailing space is added unless it ends in `/`).
+    pub insert: String,
+    pub label: String,
+    pub detail: String,
+}
+
+pub struct Popup {
+    pub items: Vec<Item>,
+    pub sel: usize,
+    /// Char range of the token being completed.
+    pub start: usize,
+    pub token: String,
+}
+
+const MAX_POPUP: usize = 8;
+const MAX_COMPOSER_LINES: usize = 8;
+const PASTE_LINES: usize = 6;
+const PASTE_CHARS: usize = 800;
 
 /// What the event loop must do after an update.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
     None,
-    Submit(String),
+    /// `text` has pasted blocks expanded; `shown` is what the transcript displays.
+    Submit { text: String, shown: String },
     /// Enter on an empty composer: let the assistant react to queued background results.
     Poke,
     Interrupt,
@@ -84,6 +109,7 @@ pub enum Row {
     Tool { depth: usize, agent: String, name: String, summary: String, state: ToolState },
     Todos(Vec<Todo>),
     Info(String),
+    Shell(String),
     Error(String),
     Usage(String),
 }
@@ -122,6 +148,17 @@ pub struct App {
     pub limit: Option<u64>,
     pub hint: Option<String>,
     pub tick: u64,
+    pub history: Vec<String>,
+    hist: Option<usize>,
+    draft: String,
+    pastes: Vec<(String, String)>,
+    pub popup: Option<Popup>,
+    dismissed: Option<String>,
+    pub completer: Option<Box<dyn Fn(&str) -> Vec<Item>>>,
+    /// Inner width of the composer, set by `render` (for Up/Down over wrapped lines).
+    comp_w: usize,
+    /// Column to aim for while moving up and down over lines of different lengths.
+    goal_col: Option<usize>,
     pub view_h: usize,
     pub theme: Theme,
     run: RunUsage,
@@ -144,6 +181,15 @@ impl App {
             limit: None,
             hint: None,
             tick: 0,
+            history: vec![],
+            hist: None,
+            draft: String::new(),
+            pastes: vec![],
+            popup: None,
+            dismissed: None,
+            completer: None,
+            comp_w: 80,
+            goal_col: None,
             view_h: 20,
             theme: Theme::default(),
             run: RunUsage::default(),
@@ -166,7 +212,8 @@ impl App {
                 if let Some(Permission { feedback: Some(f), .. }) = self.dialogs.front_mut() {
                     f.push_str(&s.replace(['\r', '\n'], " "));
                 } else {
-                    self.insert(&s.replace("\r\n", " ").replace(['\r', '\n'], " "));
+                    self.paste(&s);
+                    self.refresh_popup();
                 }
             }
             AppEvent::Resize => {}
@@ -177,6 +224,13 @@ impl App {
                 self.scroll = 0;
             }
             AppEvent::Background(line) => self.push_info(format!("[{line}]")),
+            AppEvent::ShellDone(r) => {
+                self.running = false;
+                match r {
+                    Ok(out) => self.rows.push(Row::Shell(out)),
+                    Err(e) => self.rows.push(Row::Error(e)),
+                }
+            }
             AppEvent::RunDone(outcome) => {
                 use moco_core::engine::RunOutcome::*;
                 self.running = false;
@@ -271,7 +325,7 @@ impl App {
     }
 
     fn insert(&mut self, s: &str) {
-        let s: String = s.chars().filter(|c| !c.is_control()).collect();
+        let s: String = s.chars().filter(|c| !c.is_control() || *c == '\n').collect();
         let at = self.byte_at(self.cursor);
         self.input.insert_str(at, &s);
         self.cursor += s.chars().count();
@@ -281,6 +335,17 @@ impl App {
         let (a, b) = (self.byte_at(from), self.byte_at(to));
         self.input.replace_range(a..b, "");
         self.cursor = from;
+    }
+
+    /// Start and end of the logical line (between line breaks) the cursor is in.
+    fn line_start(&self) -> usize {
+        let chars: Vec<char> = self.input.chars().collect();
+        (0..self.cursor).rev().find(|&i| chars[i] == '\n').map_or(0, |i| i + 1)
+    }
+
+    fn line_end(&self) -> usize {
+        let chars: Vec<char> = self.input.chars().collect();
+        (self.cursor..chars.len()).find(|&i| chars[i] == '\n').unwrap_or(chars.len())
     }
 
     fn word_start(&self) -> usize {
@@ -307,7 +372,175 @@ impl App {
         i
     }
 
+    /// Pasted text: short pastes go in as typed (newlines kept); big ones become a placeholder that
+    /// is expanded again on send, so the composer stays readable.
+    fn paste(&mut self, raw: &str) {
+        let t = raw.replace("\r\n", "\n").replace('\r', "\n").replace('\t', "    ");
+        let lines = t.lines().count();
+        if lines >= PASTE_LINES || t.chars().count() >= PASTE_CHARS {
+            let tag = format!("[Pasted text #{}: {} lines]", self.pastes.len() + 1, lines.max(1));
+            self.pastes.push((tag.clone(), t));
+            self.insert(&tag);
+        } else {
+            self.insert(&t);
+        }
+    }
+
+    /// Visual lines of the composer as char ranges: split at newlines, hard-wrapped at `width`.
+    pub fn layout(&self, width: usize) -> Vec<(usize, usize)> {
+        let width = width.max(1);
+        let mut out = vec![];
+        let (mut start, mut w, mut i) = (0, 0, 0);
+        for c in self.input.chars() {
+            if c == '\n' {
+                out.push((start, i));
+                start = i + 1;
+                w = 0;
+            } else {
+                let cw = c.width().unwrap_or(0);
+                if w + cw > width {
+                    out.push((start, i));
+                    start = i;
+                    w = 0;
+                }
+                w += cw;
+            }
+            i += 1;
+        }
+        out.push((start, i));
+        out
+    }
+
+    /// (visual line, column in display cells) of the cursor.
+    pub fn cursor_pos(&self, width: usize) -> (usize, usize) {
+        let lines = self.layout(width);
+        let chars: Vec<char> = self.input.chars().collect();
+        // At a wrap point the cursor belongs to the start of the next line.
+        let idx = lines.iter().rposition(|&(a, _)| a <= self.cursor).unwrap_or(0);
+        let (a, _) = lines[idx];
+        (idx, chars[a..self.cursor].iter().map(|c| c.width().unwrap_or(0)).sum())
+    }
+
+    fn move_vertical(&mut self, up: bool) -> bool {
+        let lines = self.layout(self.comp_w);
+        let (row, here) = self.cursor_pos(self.comp_w);
+        let col = *self.goal_col.get_or_insert(here);
+        let target = if up { row.checked_sub(1) } else { (row + 1 < lines.len()).then_some(row + 1) };
+        let Some(t) = target else { return false };
+        let (a, b) = lines[t];
+        let chars: Vec<char> = self.input.chars().collect();
+        let (mut x, mut w) = (a, 0);
+        while x < b && w + chars[x].width().unwrap_or(0) <= col {
+            w += chars[x].width().unwrap_or(0);
+            x += 1;
+        }
+        self.cursor = x;
+        true
+    }
+
+    fn history_step(&mut self, older: bool) {
+        if self.history.is_empty() {
+            return;
+        }
+        let next = match (self.hist, older) {
+            (None, true) => {
+                self.draft = self.input.clone();
+                Some(self.history.len() - 1)
+            }
+            (None, false) => return,
+            (Some(0), true) => Some(0),
+            (Some(i), true) => Some(i - 1),
+            (Some(i), false) if i + 1 < self.history.len() => Some(i + 1),
+            (Some(_), false) => None,
+        };
+        self.hist = next;
+        self.input = match next {
+            Some(i) => self.history[i].clone(),
+            None => std::mem::take(&mut self.draft),
+        };
+        self.cursor = self.len_chars();
+    }
+
+    fn token_before_cursor(&self) -> Option<(usize, String)> {
+        let chars: Vec<char> = self.input.chars().collect();
+        let mut start = self.cursor;
+        while start > 0 && !chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        let token: String = chars[start..self.cursor].iter().collect();
+        match token.chars().next()? {
+            '@' => Some((start, token)),
+            '/' if chars[..start].iter().all(|c| c.is_whitespace()) => Some((start, token)),
+            _ => None,
+        }
+    }
+
+    /// Recompute the completion popup for the token under the cursor.
+    pub fn refresh_popup(&mut self) {
+        let found = self.token_before_cursor();
+        let Some((start, token)) = found else {
+            self.popup = None;
+            self.dismissed = None;
+            return;
+        };
+        if self.dismissed.as_deref() == Some(token.as_str()) {
+            self.popup = None;
+            return;
+        }
+        self.dismissed = None;
+        let items = self.completer.as_ref().map(|c| c(&token)).unwrap_or_default();
+        if items.is_empty() {
+            self.popup = None;
+            return;
+        }
+        let sel = match &self.popup {
+            Some(p) if p.token == token => p.sel.min(items.len() - 1),
+            _ => 0,
+        };
+        self.popup = Some(Popup { items, sel, start, token });
+    }
+
+    fn accept_completion(&mut self) {
+        let Some(p) = self.popup.take() else { return };
+        let item = &p.items[p.sel];
+        let keep_open = item.insert.ends_with('/');
+        let mut text = item.insert.clone();
+        if !keep_open {
+            text.push(' ');
+        }
+        let (a, b) = (self.byte_at(p.start), self.byte_at(self.cursor));
+        self.input.replace_range(a..b, &text);
+        self.cursor = p.start + text.chars().count();
+        self.refresh_popup();
+    }
+
+    fn submit(&mut self) -> Action {
+        let shown = self.input.trim().to_string();
+        let mut text = shown.clone();
+        for (tag, content) in &self.pastes {
+            text = text.replace(tag, content.trim_end());
+        }
+        self.input.clear();
+        self.cursor = 0;
+        self.pastes.clear();
+        self.popup = None;
+        self.hist = None;
+        self.draft.clear();
+        if self.history.last() != Some(&shown) {
+            self.history.push(shown.clone());
+        }
+        Action::Submit { text, shown }
+    }
+
     fn key(&mut self, k: KeyEvent) -> Action {
+        let action = self.key_inner(k);
+        if self.dialogs.is_empty() {
+            self.refresh_popup();
+        }
+        action
+    }
+
+    fn key_inner(&mut self, k: KeyEvent) -> Action {
         if k.kind == KeyEventKind::Release {
             return Action::None;
         }
@@ -317,6 +550,9 @@ impl App {
         }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let alt = k.modifiers.contains(KeyModifiers::ALT);
+        if !matches!(k.code, KeyCode::Up | KeyCode::Down) {
+            self.goal_col = None;
+        }
         let page = self.view_h.saturating_sub(1).max(1);
         match k.code {
             KeyCode::Char('c') if ctrl => {
@@ -338,23 +574,43 @@ impl App {
                 }
             }
             KeyCode::Esc => {
+                if let Some(p) = self.popup.take() {
+                    self.dismissed = Some(p.token);
+                    return Action::None;
+                }
                 if self.running {
                     return Action::Interrupt;
                 }
                 self.scroll = 0;
             }
+            KeyCode::Char('j') if ctrl => self.insert("\n"),
+            KeyCode::Enter if alt => self.insert("\n"),
+            KeyCode::Tab => self.accept_completion(),
             KeyCode::Enter => {
-                let text = self.input.trim().to_string();
+                if let Some(p) = &self.popup {
+                    // Enter accepts the highlighted candidate, unless it is already what was typed.
+                    if p.items[p.sel].insert != p.token {
+                        self.accept_completion();
+                        return Action::None;
+                    }
+                }
                 if self.running {
                     self.hint = Some("a run is in progress: Esc interrupts it".into());
                     return Action::None;
                 }
-                if text.is_empty() {
+                if self.input.trim().is_empty() {
                     return Action::Poke;
                 }
-                self.input.clear();
-                self.cursor = 0;
-                return Action::Submit(text);
+                return self.submit();
+            }
+            KeyCode::Up | KeyCode::Down => {
+                let up = k.code == KeyCode::Up;
+                if let Some(p) = self.popup.as_mut() {
+                    let n = p.items.len();
+                    p.sel = if up { (p.sel + n - 1) % n } else { (p.sel + 1) % n };
+                } else if !self.move_vertical(up) {
+                    self.history_step(up);
+                }
             }
             KeyCode::PageUp => self.scroll = self.scroll.saturating_add(page),
             KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(page),
@@ -368,10 +624,14 @@ impl App {
             KeyCode::Right => self.cursor = (self.cursor + 1).min(self.len_chars()),
             KeyCode::Home => self.cursor = 0,
             KeyCode::End => self.cursor = self.len_chars(),
-            KeyCode::Char('a') if ctrl => self.cursor = 0,
-            KeyCode::Char('e') if ctrl => self.cursor = self.len_chars(),
-            KeyCode::Char('u') if ctrl => self.delete_range(0, self.cursor),
-            KeyCode::Char('k') if ctrl => self.delete_range(self.cursor, self.len_chars()),
+            KeyCode::Char('u') if ctrl => self.delete_range(self.line_start(), self.cursor),
+            KeyCode::Char('k') if ctrl => {
+                // To the end of the line; at the end of a line, the line break itself.
+                let end = self.line_end();
+                self.delete_range(self.cursor, if end == self.cursor { (end + 1).min(self.len_chars()) } else { end });
+            }
+            KeyCode::Char('a') if ctrl => self.cursor = self.line_start(),
+            KeyCode::Char('e') if ctrl => self.cursor = self.line_end(),
             KeyCode::Char('w') if ctrl => self.delete_range(self.word_start(), self.cursor),
             KeyCode::Backspace if alt => self.delete_range(self.word_start(), self.cursor),
             KeyCode::Backspace => {
@@ -483,6 +743,7 @@ impl App {
                         }
                     }
                 }
+                Row::Shell(s) => out.extend(wrap(s.trim_end(), width).into_iter().map(|l| Line::styled(l, t.text))),
                 Row::Info(s) => out.extend(wrap(s, width).into_iter().map(|l| Line::styled(l, t.dim))),
                 Row::Error(s) => out.extend(wrap(s, width).into_iter().map(|l| Line::styled(l, t.error))),
                 Row::Usage(s) => out.extend(wrap(s, width).into_iter().map(|l| Line::styled(l, t.dim))),
@@ -616,7 +877,11 @@ fn dialog_lines(d: &Permission, width: usize) -> Vec<Line<'static>> {
 pub fn render(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let dialog = app.dialogs.front().map(|d| dialog_lines(d, area.width as usize));
-    let bottom_h = dialog.as_ref().map_or(3, |l| l.len() as u16 + 2).min(area.height.saturating_sub(2).max(1));
+    let comp_w = (area.width as usize).saturating_sub(2).max(1);
+    app.comp_w = comp_w;
+    let comp_lines = app.layout(comp_w);
+    let visible = comp_lines.len().min(MAX_COMPOSER_LINES);
+    let bottom_h = dialog.as_ref().map_or(visible as u16 + 2, |l| l.len() as u16 + 2).min(area.height.saturating_sub(2).max(1));
     let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(bottom_h), Constraint::Length(1)]).split(area);
     let (main, bottom, status) = (parts[0], parts[1], parts[2]);
 
@@ -634,16 +899,35 @@ pub fn render(f: &mut Frame, app: &mut App) {
         let title = if app.running { " moco (running) " } else { " moco " };
         let block = Block::bordered().title(title).border_style(app.theme.accent);
         let inner = block.inner(bottom);
-        // Keep the cursor visible by dropping characters from the left.
         let chars: Vec<char> = app.input.chars().collect();
-        let mut from = 0;
-        let col = |from: usize| chars[from..app.cursor].iter().map(|c| c.width().unwrap_or(0)).sum::<usize>();
-        while from < app.cursor && col(from) >= inner.width as usize {
-            from += 1;
-        }
-        let shown: String = chars[from..].iter().collect();
-        f.render_widget(Paragraph::new(shown).block(block), bottom);
-        f.set_cursor_position((inner.x + col(from) as u16, inner.y));
+        let (row, col) = app.cursor_pos(comp_w);
+        // Show the window of lines that contains the cursor.
+        let shown = (inner.height as usize).max(1);
+        let top = (row + 1).saturating_sub(shown);
+        let rows: Vec<Line> = comp_lines.iter().skip(top).take(shown).map(|&(a, b)| Line::raw(chars[a..b].iter().collect::<String>())).collect();
+        f.render_widget(Paragraph::new(rows).block(block), bottom);
+        f.set_cursor_position((inner.x + (col as u16).min(inner.width.saturating_sub(1)), inner.y + (row - top) as u16));
+    }
+    if let Some(p) = &app.popup {
+        let n = p.items.len().min(MAX_POPUP) as u16;
+        let width = main.width.min(70);
+        let h = n.min(main.height);
+        let rect = Rect::new(main.x, main.y + main.height - h, width, h);
+        let first = (p.sel + 1).saturating_sub(MAX_POPUP);
+        let lines: Vec<Line> = p
+            .items
+            .iter()
+            .enumerate()
+            .skip(first)
+            .take(MAX_POPUP)
+            .map(|(i, it)| {
+                let text = clip_width(&format!(" {}  {}", it.label, it.detail), width as usize);
+                let pad = " ".repeat((width as usize).saturating_sub(display_width(&text)));
+                Line::styled(format!("{text}{pad}"), if i == p.sel { app.theme.bar } else { app.theme.dim.add_modifier(Modifier::REVERSED) })
+            })
+            .collect();
+        f.render_widget(Clear, rect);
+        f.render_widget(Paragraph::new(lines), rect);
     }
     f.render_widget(Paragraph::new(app.status_text(status.width as usize)).style(app.theme.bar), status);
 }
@@ -702,11 +986,23 @@ mod tests {
         assert_eq!(a.input, "one two ");
         a.update(key(KeyCode::Char('u'), KeyModifiers::CONTROL));
         assert_eq!(a.input, "");
+        type_str(&mut a, "ab");
+        a.update(key(KeyCode::Enter, KeyModifiers::ALT));
+        type_str(&mut a, "cd");
+        a.update(key(KeyCode::Char('a'), KeyModifiers::CONTROL)); // start of this line, not of the text
+        type_str(&mut a, ">");
+        a.update(key(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert_eq!(a.input, "ab\n>");
+        a.update(key(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        a.update(key(KeyCode::Char('k'), KeyModifiers::CONTROL)); // at a line end: joins nothing after, removes nothing
+        a.update(key(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(a.input, "ab");
+        a.update(key(KeyCode::Char('u'), KeyModifiers::CONTROL));
         a.update(AppEvent::Paste("multi\nline\r\npaste".into()));
-        assert_eq!(a.input, "multi line paste");
+        assert_eq!(a.input, "multi\nline\npaste"); // short pastes keep their lines
         type_str(&mut a, "é");
         a.update(key(KeyCode::Backspace, KeyModifiers::NONE));
-        assert_eq!(a.input, "multi line paste");
+        assert_eq!(a.input, "multi\nline\npaste");
     }
 
     #[test]
@@ -714,7 +1010,7 @@ mod tests {
         let mut a = App::new("m", "build");
         assert_eq!(press(&mut a, KeyCode::Enter), Action::Poke);
         type_str(&mut a, "  fix it  ");
-        assert_eq!(press(&mut a, KeyCode::Enter), Action::Submit("fix it".into()));
+        assert_eq!(press(&mut a, KeyCode::Enter), Action::Submit { text: "fix it".into(), shown: "fix it".into() });
         assert_eq!(a.input, "");
         a.running = true;
         type_str(&mut a, "more");
@@ -808,6 +1104,153 @@ mod tests {
         a.update(AppEvent::Ask { action: "shell".into(), resources: vec![], save: vec![], reply: tx });
         a.update(AppEvent::RunDone(Ok(RunOutcome::Idle)));
         assert!(a.dialogs.is_empty());
+    }
+
+    fn fake_completer(a: &mut App) {
+        a.completer = Some(Box::new(|t: &str| {
+            let all = ["/review", "/init", "@src/", "@src/main.rs", "@README.md"];
+            all.iter().filter(|c| c.starts_with(t)).map(|c| Item { insert: c.to_string(), label: c.to_string(), detail: String::new() }).collect()
+        }));
+    }
+
+    #[test]
+    fn alt_enter_adds_a_line_and_up_down_move_between_lines_then_history() {
+        let mut a = App::new("m", "build");
+        render_once(&mut a);
+        type_str(&mut a, "first");
+        a.update(key(KeyCode::Enter, KeyModifiers::ALT));
+        a.update(key(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        type_str(&mut a, "third");
+        assert_eq!(a.input, "first\n\nthird");
+        press(&mut a, KeyCode::Up);
+        press(&mut a, KeyCode::Up);
+        type_str(&mut a, "X"); // cursor moved to the first line, column 5
+        assert_eq!(a.input, "firstX\n\nthird");
+        assert_eq!(press(&mut a, KeyCode::Enter), Action::Submit { text: "firstX\n\nthird".into(), shown: "firstX\n\nthird".into() });
+        // History: Up from an empty composer recalls the last prompt; Down restores the draft.
+        type_str(&mut a, "draft");
+        press(&mut a, KeyCode::Up);
+        assert_eq!(a.input, "firstX\n\nthird");
+        type_str(&mut a, ""); // still on the history entry
+        press(&mut a, KeyCode::Down); // cursor is at the end (last line): leave history
+        assert_eq!(a.input, "draft");
+        press(&mut a, KeyCode::Down);
+        assert_eq!(a.input, "draft"); // nothing newer
+        // Several entries, oldest first when walking up; consecutive duplicates are not stored twice.
+        let mut a = App::new("m", "build");
+        render_once(&mut a);
+        for t in ["one", "two", "two", "three"] {
+            type_str(&mut a, t);
+            press(&mut a, KeyCode::Enter);
+        }
+        assert_eq!(a.history, vec!["one", "two", "three"]);
+        for want in ["three", "two", "one", "one"] {
+            press(&mut a, KeyCode::Up);
+            assert_eq!(a.input, want);
+        }
+    }
+
+    fn render_once(a: &mut App) {
+        screen(a, 40, 12);
+    }
+
+    #[test]
+    fn wrapped_lines_move_the_cursor_visually() {
+        let mut a = App::new("m", "build");
+        screen(&mut a, 12, 12); // composer inner width 10
+        type_str(&mut a, "abcdefghijklmno"); // wraps after 10 chars
+        assert_eq!(a.layout(10), vec![(0, 10), (10, 15)]);
+        assert_eq!(a.cursor_pos(10), (1, 5));
+        press(&mut a, KeyCode::Up);
+        assert_eq!(a.cursor, 5);
+        press(&mut a, KeyCode::Down);
+        assert_eq!(a.cursor, 15);
+        let s = screen(&mut a, 12, 12);
+        assert!(s.iter().any(|l| l.contains("abcdefghij")) && s.iter().any(|l| l.contains("klmno")), "{s:?}");
+    }
+
+    #[test]
+    fn big_pastes_collapse_to_a_placeholder_and_expand_on_send() {
+        let mut a = App::new("m", "build");
+        let big = (0..20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        type_str(&mut a, "look: ");
+        a.update(AppEvent::Paste(big.clone()));
+        assert_eq!(a.input, "look: [Pasted text #1: 20 lines]");
+        type_str(&mut a, " thanks");
+        match press(&mut a, KeyCode::Enter) {
+            Action::Submit { text, shown } => {
+                assert_eq!(text, format!("look: {big} thanks"));
+                assert_eq!(shown, "look: [Pasted text #1: 20 lines] thanks");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn completion_popup_filters_accepts_and_dismisses() {
+        let mut a = App::new("m", "build");
+        fake_completer(&mut a);
+        type_str(&mut a, "/");
+        assert_eq!(a.popup.as_ref().unwrap().items.len(), 2);
+        type_str(&mut a, "re");
+        assert_eq!(a.popup.as_ref().unwrap().items.len(), 1);
+        let joined = screen(&mut a, 40, 10).join("\n");
+        assert!(joined.contains("/review"), "{joined}");
+        assert_eq!(press(&mut a, KeyCode::Enter), Action::None); // accepts instead of sending
+        assert_eq!(a.input, "/review ");
+        assert!(a.popup.is_none());
+        type_str(&mut a, "now @");
+        assert_eq!(a.popup.as_ref().unwrap().items.len(), 3);
+        press(&mut a, KeyCode::Down);
+        press(&mut a, KeyCode::Down);
+        press(&mut a, KeyCode::Up); // selection moves: index 1
+        press(&mut a, KeyCode::Tab);
+        assert_eq!(a.input, "/review now @src/main.rs ");
+        // Directories keep the popup open for the next level; Esc dismisses until the token changes.
+        let mut a = App::new("m", "build");
+        fake_completer(&mut a);
+        type_str(&mut a, "@sr");
+        press(&mut a, KeyCode::Tab);
+        assert_eq!(a.input, "@src/"); // a directory keeps the token open for the next level
+        assert_eq!(a.popup.as_ref().unwrap().items.len(), 2);
+        let mut a = App::new("m", "build");
+        fake_completer(&mut a);
+        type_str(&mut a, "@zz");
+        assert!(a.popup.is_none()); // nothing matches
+        let mut a = App::new("m", "build");
+        fake_completer(&mut a);
+        type_str(&mut a, "@src");
+        assert!(a.popup.is_some());
+        press(&mut a, KeyCode::Esc);
+        assert!(a.popup.is_none());
+        type_str(&mut a, "/");
+        assert!(a.popup.is_some()); // a new token completes again
+        // Not a command or mention: no popup (a path in the middle of a sentence, an email address).
+        let mut a = App::new("m", "build");
+        fake_completer(&mut a);
+        type_str(&mut a, "see /re and a@re");
+        assert!(a.popup.is_none());
+        // An exact command sends instead of re-accepting.
+        let mut a = App::new("m", "build");
+        fake_completer(&mut a);
+        type_str(&mut a, "/init");
+        assert_eq!(press(&mut a, KeyCode::Enter), Action::Submit { text: "/init".into(), shown: "/init".into() });
+    }
+
+    #[test]
+    fn shell_output_and_the_composer_height() {
+        let mut a = App::new("m", "build");
+        a.running = true;
+        a.update(AppEvent::ShellDone(Ok("hello\nworld".into())));
+        assert!(!a.running);
+        let joined = screen(&mut a, 30, 12).join("\n");
+        assert!(joined.contains("hello\nworld"), "{joined}");
+        // The composer grows with its content up to a limit.
+        for _ in 0..20 {
+            a.update(key(KeyCode::Enter, KeyModifiers::ALT));
+        }
+        let s = screen(&mut a, 30, 20);
+        assert_eq!(s.iter().filter(|l| l.starts_with('│')).count(), 8, "{s:?}");
     }
 
     #[test]

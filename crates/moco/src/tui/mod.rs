@@ -1,7 +1,10 @@
 //! Full-screen terminal UI (ratatui + crossterm). One UI thread owns the terminal and an event
 //! channel; the engine runs on a worker thread and talks to the UI through `TuiUi`.
 mod app;
+mod complete;
 mod term;
+
+pub use complete::Completer;
 
 use app::{Action, App, AppEvent, Ev};
 use crossterm::event::{self, Event};
@@ -42,6 +45,34 @@ pub struct Host<'a> {
     pub recovered: bool,
     /// Expand mentions and queue the prompt; returns notes about attachments.
     pub submit: &'a dyn Fn(&str) -> Result<Vec<String>, String>,
+    /// Turn `/name args` into a prompt (custom commands, MCP prompts). `Err` carries a message for the user.
+    pub command: &'a dyn Fn(&str) -> Result<Resolved, String>,
+    pub completer: Completer,
+    /// Prompt history, one JSON string per line.
+    pub history_path: std::path::PathBuf,
+}
+
+/// A slash command resolved to a prompt. `agent` and `model` apply to this one prompt only.
+pub struct Resolved {
+    pub text: String,
+    pub agent: Option<String>,
+    pub model: Option<String>,
+}
+
+fn load_history(path: &std::path::Path) -> Vec<String> {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let all: Vec<String> = text.lines().filter_map(|l| serde_json::from_str::<String>(l).ok()).collect();
+    all[all.len().saturating_sub(500)..].to_vec()
+}
+
+fn append_history(path: &std::path::Path, entry: &str) {
+    use std::io::Write;
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{}", serde_json::Value::String(entry.to_string()));
+    }
 }
 
 /// `UiEvent`s and prompts become `AppEvent`s. Never touches the terminal.
@@ -107,6 +138,11 @@ pub fn run(host: Host) -> std::io::Result<()> {
 
     let mut app = App::new(&host.model, &host.agent);
     app.title = host.title.clone();
+    app.history = load_history(&host.history_path);
+    let completer = host.completer;
+    app.completer = Some(Box::new(move |t| completer.items(t)));
+    // Agent and model that a slash command overrode for one prompt, restored when its run ends.
+    let restore: Mutex<Option<(String, Option<String>)>> = Mutex::new(None);
     app.push_info(host.header.clone());
 
     std::thread::scope(|scope| -> std::io::Result<()> {
@@ -165,6 +201,13 @@ pub fn run(host: Host) -> std::io::Result<()> {
             let mut next = Some(first);
             let mut handled = 0;
             while let Some(ev) = next.take() {
+                if matches!(ev, AppEvent::RunDone(_)) {
+                    if let Some((agent, model)) = restore.lock().unwrap().take() {
+                        let st = host.engine.store.lock().unwrap();
+                        st.set_agent(&host.session_id, &agent).ok();
+                        st.set_model(&host.session_id, model.as_deref()).ok();
+                    }
+                }
                 match app.update(ev) {
                     Action::None => {}
                     Action::Quit => quit = true,
@@ -175,15 +218,57 @@ pub fn run(host: Host) -> std::io::Result<()> {
                             start_run(&mut app, false);
                         }
                     }
-                    Action::Submit(text) => {
+                    Action::Submit { text, shown } => {
+                        append_history(&host.history_path, &shown);
                         if matches!(text.as_str(), "/exit" | "/quit") {
                             quit = true;
                         } else if text == "/help" {
-                            app.push_info("Enter sends, Esc or Ctrl-C interrupts, PageUp/PageDown scroll, Ctrl-End follows the output, Ctrl-D quits. Slash commands are not available in the full-screen UI yet: run `moco` (without --tui) for them.");
+                            app.push_info("Enter sends, Alt-Enter or Ctrl-J adds a line, Up/Down move or browse history, Tab completes / and @, Esc or Ctrl-C interrupts, PageUp/PageDown scroll, Ctrl-End follows the output, Ctrl-D quits. !command runs a shell command. Other built-in slash commands are not available in the full-screen UI yet: run `moco` (without --tui) for them.");
+                        } else if let Some(cmd) = text.strip_prefix('!') {
+                            let cmd = cmd.trim().to_string();
+                            app.push_user(shown.clone());
+                            if cmd.is_empty() {
+                                app.push_info("usage: !<shell command>");
+                            } else {
+                                app.running = true;
+                                cancel.store(false, Ordering::Relaxed);
+                                let done_tx = tx.clone();
+                                let (engine, cancel, sid) = (host.engine, &cancel, host.session_id.as_str());
+                                scope.spawn(move || {
+                                    let r = engine.run_user_command(sid, &cmd, cancel);
+                                    let _ = done_tx.send(AppEvent::ShellDone(r));
+                                });
+                            }
                         } else if text.starts_with('/') {
-                            app.push_info("slash commands are not available in the full-screen UI yet; run `moco` without --tui for them");
+                            app.push_user(shown.clone());
+                            match (host.command)(&text) {
+                                Ok(r) => {
+                                    if r.agent.is_some() || r.model.is_some() {
+                                        let st = host.engine.store.lock().unwrap();
+                                        if let Some(cur) = st.session(&host.session_id).ok().flatten() {
+                                            *restore.lock().unwrap() = Some((cur.agent.clone(), cur.model.clone()));
+                                        }
+                                        if let Some(a) = r.agent.as_ref().filter(|a| host.engine.agents().iter().any(|x| x.id == **a)) {
+                                            st.set_agent(&host.session_id, a).ok();
+                                        }
+                                        if let Some(m) = &r.model {
+                                            st.set_model(&host.session_id, Some(m)).ok();
+                                        }
+                                    }
+                                    match (host.submit)(&r.text) {
+                                        Ok(notes) => {
+                                            for n in notes {
+                                                app.push_info(n);
+                                            }
+                                            start_run(&mut app, false);
+                                        }
+                                        Err(e) => app.rows.push(app::Row::Error(e)),
+                                    }
+                                }
+                                Err(e) => app.rows.push(app::Row::Error(e)),
+                            }
                         } else {
-                            app.push_user(text.clone());
+                            app.push_user(shown.clone());
                             match (host.submit)(&text) {
                                 Ok(notes) => {
                                     for n in notes {
@@ -218,4 +303,25 @@ pub fn run(host: Host) -> std::io::Result<()> {
         }
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_round_trips_multiline_entries_and_keeps_the_last_500() {
+        let dir = std::env::temp_dir().join(format!("moco-hist-{}", std::process::id()));
+        let path = dir.join("data/tui-history");
+        assert!(load_history(&path).is_empty());
+        append_history(&path, "one\ntwo \"quoted\"");
+        append_history(&path, "second");
+        assert_eq!(load_history(&path), vec!["one\ntwo \"quoted\"", "second"]);
+        for i in 0..600 {
+            append_history(&path, &format!("e{i}"));
+        }
+        let h = load_history(&path);
+        assert_eq!((h.len(), h[0].as_str(), h[499].as_str()), (500, "e100", "e599"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

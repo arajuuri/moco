@@ -718,10 +718,28 @@ fn main() {
             engine.submit_with(&sid, text, Some(m), Mode::Steer).map_err(|e| format!("could not queue the prompt: {e}"))?;
             Ok(notes)
         };
+        let command = |line: &str| -> Result<tui::Resolved, String> {
+            let (name, args) = line[1..].split_once(char::is_whitespace).unwrap_or((&line[1..], ""));
+            if let Some(m) = manager.as_ref().filter(|m| m.prompts().iter().any(|p| p.command == name)) {
+                return m.get_prompt(name, args).map(|text| tui::Resolved { text, agent: None, model: None });
+            }
+            let cmd = found_commands.iter().find(|c| c.name == name).ok_or_else(|| format!("unknown command /{name}: the full-screen UI has /help, /exit, custom commands and MCP prompts so far; run `moco` without --tui for the rest"))?;
+            if cmd.subagent {
+                return Err(format!("/{name} runs in a subagent, which the full-screen UI cannot show yet; run `moco` without --tui for it"));
+            }
+            Ok(tui::Resolved { text: commands::expand(cmd, args), agent: cmd.agent.clone(), model: cmd.model.clone() })
+        };
+        let completer = tui::Completer::new(
+            &cwd,
+            found_skills.iter().map(|k| (k.id.clone(), k.description.clone())).collect(),
+            engine.agents().iter().filter(|a| a.subagent()).map(|a| (a.id.clone(), a.description.clone())).collect(),
+            found_commands.iter().filter(|c| !c.subagent).map(|c| (c.name.clone(), c.description.clone())).collect(),
+            manager.clone(),
+        );
         let title = engine.store.lock().unwrap().session(&sid).ok().flatten();
         let model_now = title.as_ref().map(|s| engine.model_ref_for(s)).unwrap_or_default();
         let header = format!("moco {} | {} | agent {agent_id} | {n_sources} config file(s) | /help for commands", env!("CARGO_PKG_VERSION"), model_now);
-        let host = tui::Host { engine: &engine, session_id: sid.clone(), model: model_now, agent: agent_id.clone(), title: title.and_then(|s| s.title), header, recovered: recovered.contains(&sid), submit: &submit };
+        let host = tui::Host { engine: &engine, session_id: sid.clone(), model: model_now, agent: agent_id.clone(), title: title.and_then(|s| s.title), header, recovered: recovered.contains(&sid), submit: &submit, command: &command, completer, history_path: app_dir.join("data/tui-history") };
         let result = tui::run(host);
         engine.kill_all_jobs();
         if let Some(m) = &manager {
