@@ -19,7 +19,7 @@ Settings merge by key; arrays like `permissions` concatenate in priority order. 
 Implemented in `crates/moco-core/src/config.rs` and `instructions.rs`.
 - File names are `moco.json` / `moco.jsonc` (upstream's `opencode.json` is not read). Locations, lowest priority first: `<app dir>/config/`; then each ancestor of the working directory, outermost first, as `<dir>/moco.json[c]` and `<dir>/.moco/moco.json[c]`; then the file named by `$MOCO_CONFIG`. A file that fails to parse is skipped with a warning.
 - Merge: objects merge by key, `permissions` and `instructions` arrays concatenate (lowest priority first), anything else is replaced.
-- Keys read so far: `model` (`provider/model`), `default_agent`, `shell`, `permissions` (list of `{action, resource, effect}`), `agents.<id>` (`model`, `system`, `description`, `steps`, `permissions`, `disabled`; unknown ids define new agents), `instructions` (extra files). Other keys are ignored.
+- Keys read so far: `model` (`provider/model`), `default_agent`, `shell`, `permissions` (list of `{action, resource, effect}`), `agents.<id>` (`model`, `system`, `description`, `steps`, `permissions`, `disabled`; unknown ids define new agents), `instructions` (extra files), `providers` (see `07`), `compaction{auto, buffer, keep}` (see `03`). Other keys are ignored.
 - Rule order per agent: built-in defaults, then top-level `permissions`, then the agent's own `permissions`; last match wins. This is how to make `shell` or `edit` ask, which the default ruleset does not:
 ```jsonc
 { "permissions": [

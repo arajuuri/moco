@@ -1,6 +1,7 @@
 //! moco: line-based terminal chat.
 use moco_core::catalog::{Catalog, ProviderInfo};
-use moco_core::engine::{Engine, EngineConfig, PermissionPrompt, Reply, RunOutcome, Ui, UiEvent};
+use moco_core::compaction;
+use moco_core::engine::{CompactResult, Engine, EngineConfig, PermissionPrompt, Reply, RunOutcome, Ui, UiEvent};
 use moco_core::provider::registry;
 use moco_core::provider::Usage;
 use moco_core::store::{Mode, Store};
@@ -134,6 +135,10 @@ impl Ui for Terminal {
             UiEvent::Notice(n) => {
                 self.newline_if_needed();
                 eprintln!("{RED}{n}{RESET}");
+            }
+            UiEvent::Status(n) => {
+                self.newline_if_needed();
+                println!("{DIM}{n}{RESET}");
             }
         }
         let _ = std::io::stdout().flush();
@@ -349,6 +354,7 @@ fn main() {
     engine_cfg.agents = agents;
     engine_cfg.instructions = cfg.instructions.clone();
     engine_cfg.catalog = catalog;
+    engine_cfg.compaction = compaction::Settings::from_config(&cfg.compaction);
     let n_sources = loaded.sources.len();
     let engine = Engine::with_providers(store, providers, engine_cfg);
 
@@ -389,8 +395,18 @@ fn main() {
             "" => continue,
             "/exit" | "/quit" => break,
             "/help" => println!(
-                "/model [FILTER|PROVIDER/MODEL]  show, search or switch the model\n/agent <id>                     switch agent\n/new                            start a new session\n/exit                           quit (Ctrl-C interrupts a running turn)"
+                "/model [FILTER|PROVIDER/MODEL]  show, search or switch the model\n/agent <id>                     switch agent\n/compact                        summarize older messages to free up context\n/new                            start a new session\n/exit                           quit (Ctrl-C interrupts a running turn)"
             ),
+            "/compact" => {
+                CANCEL.store(false, Ordering::Relaxed);
+                match engine.compact(&session.id, &term, &CANCEL) {
+                    Ok(CompactResult::Compacted { .. }) => {}
+                    Ok(CompactResult::NothingToCompact) => println!("{DIM}nothing to compact yet (recent messages are kept as they are){RESET}"),
+                    Ok(CompactResult::Interrupted) => println!("{DIM}interrupted{RESET}"),
+                    Ok(CompactResult::Failed(e)) => eprintln!("{RED}compaction failed: {e}{RESET}"),
+                    Err(e) => eprintln!("{RED}store error: {e}{RESET}"),
+                }
+            }
             "/new" => match engine.store.lock().unwrap().create_session(&cwd_str, &agent_id) {
                 Ok(s) => {
                     session = s;

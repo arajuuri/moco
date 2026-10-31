@@ -49,7 +49,18 @@ pub struct ProviderConfig {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
+pub struct CompactionConfig {
+    pub auto: Option<bool>,
+    /// Free space to keep: a token count (`30000`) or a percentage of the context window (`"15%"`).
+    pub buffer: Option<serde_json::Value>,
+    /// Tokens of recent conversation kept verbatim.
+    pub keep: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
 pub struct Config {
+    pub compaction: CompactionConfig,
     pub providers: BTreeMap<String, ProviderConfig>,
     /// `provider/model`
     pub model: Option<String>,

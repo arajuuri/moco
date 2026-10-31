@@ -3,6 +3,7 @@ pub mod agent;
 pub mod auth;
 pub mod catalog;
 pub mod chat;
+pub mod compaction;
 pub mod config;
 pub mod engine;
 pub mod id;

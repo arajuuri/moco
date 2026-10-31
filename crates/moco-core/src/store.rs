@@ -211,6 +211,11 @@ impl Store {
         Ok(id)
     }
 
+    pub fn delete_message(&self, id: &str) -> Result<()> {
+        self.conn.execute("delete from message where id=?1", [id])?;
+        Ok(())
+    }
+
     /// Replace a message's content (assistant messages are updated as parts stream in).
     pub fn update_message(&self, id: &str, data: &Value) -> Result<()> {
         self.conn.execute("update message set data=?2 where id=?1", params![id, serde_json::to_string(data)?])?;

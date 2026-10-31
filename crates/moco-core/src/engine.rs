@@ -4,14 +4,14 @@
 //! (one LLM call, tools executing concurrently as their calls complete), continue while the step
 //! produced tool calls. History is reloaded from the store on every step.
 use crate::agent::{self, Agent};
-use crate::{catalog, config, instructions};
+use crate::{catalog, compaction, config, instructions};
 use crate::chat;
 use crate::permission::{self, Effect, Rule};
 use crate::provider::{retry, Block, ChatMessage, Event, FinishReason, Provider, ProviderError, Request, Role, ToolDef, Usage};
 use crate::store::{Mode, Session, Store, StoreError};
 use crate::tools::{self, project_root_of, PermReq, Permitter, Tool, ToolCtx, ToolError, ToolOutput};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -40,6 +40,8 @@ pub enum UiEvent<'a> {
     /// After each step: this step's tokens and cost, session total, and how full the context is.
     StepUsage { usage: Usage, cost: Option<f64>, session_cost: f64, context_tokens: u64, context_limit: Option<u64> },
     Notice(&'a str),
+    /// Progress that is not an error (compaction started or finished).
+    Status(&'a str),
 }
 
 /// Implemented by the front end. `ask` may be called from several tool threads; implementations
@@ -69,6 +71,7 @@ pub struct EngineConfig {
     /// Extra instruction files from config.
     pub instructions: Vec<String>,
     pub catalog: catalog::Catalog,
+    pub compaction: compaction::Settings,
     /// Waits for retry backoff; must return early when `cancel` is set.
     pub sleep: Box<dyn Fn(Duration, &AtomicBool) + Send + Sync>,
     pub jitter: Box<dyn Fn() -> f64 + Send + Sync>,
@@ -83,6 +86,7 @@ impl EngineConfig {
             agents: agent::builtin(),
             instructions: vec![],
             catalog: catalog::Catalog::embedded(),
+            compaction: compaction::Settings::default(),
             sleep: Box::new(|d, cancel| {
                 let end = std::time::Instant::now() + d;
                 while std::time::Instant::now() < end && !cancel.load(Ordering::Relaxed) {
@@ -101,6 +105,45 @@ pub struct Engine {
     fallback: Option<Box<dyn Provider>>,
     cfg: EngineConfig,
     tools: Vec<Box<dyn Tool>>,
+    /// Sessions whose automatic compaction failed during this process; they are not retried every step.
+    auto_failed: Mutex<HashSet<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CompactResult {
+    /// Token estimates before and after.
+    Compacted { before: u64, after: u64 },
+    NothingToCompact,
+    Failed(String),
+    Interrupted,
+}
+
+struct Prepared<'a> {
+    session: Session,
+    agent: Agent,
+    req: Request,
+    provider: &'a dyn Provider,
+    provider_id: String,
+    model_id: String,
+    /// History after the latest compaction.
+    eff: Vec<crate::store::Message>,
+    limit: Option<u64>,
+}
+
+/// Add text to the trailing user message, or start one (consecutive user content merges).
+fn append_user_text(messages: &mut Vec<ChatMessage>, text: String) {
+    match messages.last_mut().filter(|m| m.role == Role::User) {
+        Some(m) => m.content.push(Block::Text(text)),
+        None => messages.push(ChatMessage { role: Role::User, content: vec![Block::Text(text)] }),
+    }
+}
+
+fn add_usage(a: Usage, b: Usage) -> Usage {
+    Usage { input: a.input + b.input, output: a.output + b.output, cache_read: a.cache_read + b.cache_read, cache_write: a.cache_write + b.cache_write }
+}
+
+fn human_tokens(n: u64) -> String {
+    if n >= 10_000 { format!("{}k", n / 1000) } else { n.to_string() }
 }
 
 enum StepOutcome {
@@ -120,12 +163,12 @@ struct AttemptResult {
 impl Engine {
     /// Single provider answering every model ref.
     pub fn new(store: Store, provider: Box<dyn Provider>, cfg: EngineConfig) -> Self {
-        Engine { store: Mutex::new(store), providers: HashMap::new(), fallback: Some(provider), cfg, tools: tools::all() }
+        Engine { store: Mutex::new(store), providers: HashMap::new(), fallback: Some(provider), cfg, tools: tools::all(), auto_failed: Mutex::new(HashSet::new()) }
     }
 
     /// One client per provider id; a model ref's provider part picks the client.
     pub fn with_providers(store: Store, providers: HashMap<String, Box<dyn Provider>>, cfg: EngineConfig) -> Self {
-        Engine { store: Mutex::new(store), providers, fallback: None, cfg, tools: tools::all() }
+        Engine { store: Mutex::new(store), providers, fallback: None, cfg, tools: tools::all(), auto_failed: Mutex::new(HashSet::new()) }
     }
 
     pub fn catalog(&self) -> &catalog::Catalog {
@@ -166,6 +209,7 @@ impl Engine {
         if !resume && !self.store().claim(session_id)? {
             return Ok(RunOutcome::Busy);
         }
+        self.auto_failed.lock().unwrap().remove(session_id);
         let outcome = self.drain(session_id, ui, cancel, resume);
         self.store().release(session_id)?;
         outcome
@@ -194,6 +238,27 @@ impl Engine {
     }
 
     fn run_step(&self, sid: &str, step: u32, ui: &dyn Ui, cancel: &AtomicBool) -> Result<StepOutcome, StoreError> {
+        self.run_step_inner(sid, step, ui, cancel, false)
+    }
+
+    fn resolve_model(&self, session: &Session, agent: &Agent) -> Result<(&dyn Provider, String, String), String> {
+        let model_ref = session.model.clone().or(agent.model.clone()).unwrap_or_else(|| self.cfg.model.clone());
+        let (provider_id, model_id) = config::split_model(&model_ref);
+        match self.providers.get(provider_id).map(|p| p.as_ref()).or(self.fallback.as_deref()) {
+            Some(p) => Ok((p, provider_id.to_string(), model_id.to_string())),
+            None => {
+                let connected = self.connected_providers();
+                Err(format!(
+                    "provider '{provider_id}' is not connected (no API key). Connected: {}. Run `moco auth {provider_id}` or set {}.",
+                    if connected.is_empty() { "none".to_string() } else { connected.join(", ") },
+                    crate::auth::env_var_for(provider_id)
+                ))
+            }
+        }
+    }
+
+    /// Build the request for the next step from the stored history (after the latest compaction).
+    fn prepare(&self, sid: &str, step: u32, ui: &dyn Ui) -> Result<std::result::Result<Prepared<'_>, StepOutcome>, StoreError> {
         let (session, history) = {
             let st = self.store();
             (st.session(sid)?.expect("session exists"), st.messages(sid)?)
@@ -203,7 +268,8 @@ impl Engine {
             .expect("at least one agent is configured");
         let advertised: Vec<&dyn Tool> = self.tools.iter().map(|t| t.as_ref()).filter(|t| agent::advertised(&agent, *t)).collect();
 
-        let mut messages = chat::to_chat(&history);
+        let eff = compaction::effective(&history);
+        let mut messages = chat::to_chat(&eff);
         let mut reminders = vec![];
         if agent.id == "plan" {
             reminders.push(agent::PLAN_REMINDER.to_string());
@@ -214,28 +280,20 @@ impl Engine {
         }
         for r in reminders {
             // Appended at request time (never stored), so it cannot be lost to compaction or revert.
-            match messages.last_mut().filter(|m| m.role == Role::User) {
-                Some(m) => m.content.push(Block::Text(r)),
-                None => messages.push(ChatMessage { role: Role::User, content: vec![Block::Text(r)] }),
-            }
+            append_user_text(&mut messages, r);
         }
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         let lazy: Vec<PathBuf> = self.store().instruction_paths(sid)?.into_iter().map(PathBuf::from).collect();
         let ins = instructions::render(&instructions::load(&self.cfg.app_dir, std::path::Path::new(&session.directory), &self.cfg.instructions, &lazy));
-        let model_ref = session.model.clone().or(agent.model.clone()).unwrap_or_else(|| self.cfg.model.clone());
-        let (provider_id, model_id) = config::split_model(&model_ref);
-        let Some(provider) = self.providers.get(provider_id).map(|p| p.as_ref()).or(self.fallback.as_deref()) else {
-            let connected = self.connected_providers();
-            let msg = format!(
-                "provider '{provider_id}' is not connected (no API key). Connected: {}. Run `moco auth {provider_id}` or set {}.",
-                if connected.is_empty() { "none".to_string() } else { connected.join(", ") },
-                crate::auth::env_var_for(provider_id)
-            );
-            ui.event(&UiEvent::Notice(&msg));
-            return Ok(StepOutcome::Stop(RunOutcome::Failed(msg)));
+        let (provider, provider_id, model_id) = match self.resolve_model(&session, &agent) {
+            Ok(r) => r,
+            Err(msg) => {
+                ui.event(&UiEvent::Notice(&msg));
+                return Ok(Err(StepOutcome::Stop(RunOutcome::Failed(msg))));
+            }
         };
         let req = Request {
-            model: model_id.to_string(),
+            model: model_id.clone(),
             system: agent::system_prompt(
                 &agent,
                 &advertised,
@@ -246,6 +304,39 @@ impl Engine {
             max_tokens: self.cfg.max_tokens,
             tools_disabled: max_steps_hit,
         };
+        let limit = self.cfg.catalog.model(&provider_id, &model_id).map(|m| m.limit.context).filter(|l| *l > 0);
+        Ok(Ok(Prepared { session, agent, req, provider, provider_id, model_id, eff, limit }))
+    }
+
+    fn run_step_inner(&self, sid: &str, step: u32, ui: &dyn Ui, cancel: &AtomicBool, overflowed: bool) -> Result<StepOutcome, StoreError> {
+        let mut p = match self.prepare(sid, step, ui)? {
+            Ok(p) => p,
+            Err(outcome) => return Ok(outcome),
+        };
+
+        // Auto compaction: the prompt is close to the model's limit.
+        if let (true, Some(limit)) = (self.cfg.compaction.auto, p.limit) {
+            let size = compaction::context_size(&p.eff, compaction::estimate_request(&p.req));
+            if size > self.cfg.compaction.threshold(limit) && !self.auto_failed.lock().unwrap().contains(sid) {
+                match self.compact_inner(sid, "auto", ui, cancel)? {
+                    CompactResult::Compacted { .. } => {
+                        p = match self.prepare(sid, step, ui)? {
+                            Ok(p) => p,
+                            Err(outcome) => return Ok(outcome),
+                        }
+                    }
+                    CompactResult::Interrupted => return Ok(StepOutcome::Stop(RunOutcome::Interrupted)),
+                    CompactResult::Failed(e) => {
+                        // Don't retry a failing summarization on every step of this run.
+                        self.auto_failed.lock().unwrap().insert(sid.to_string());
+                        ui.event(&UiEvent::Notice(&format!("automatic compaction failed: {e}")));
+                    }
+                    CompactResult::NothingToCompact => {}
+                }
+            }
+        }
+        let Prepared { session, agent, req, provider, provider_id, model_id, .. } = p;
+        let (provider_id, model_id) = (provider_id.as_str(), model_id.as_str());
 
         let msg_id = self.store().add_message(sid, "assistant", &json!({ "parts": [] }))?;
         let declined = AtomicBool::new(false);
@@ -279,6 +370,25 @@ impl Engine {
                 _ => break r,
             }
         };
+
+        // The provider rejected the prompt as too long before producing anything: compact once and retry the step.
+        if let (Err(ProviderError::ContextOverflow(_)), false, false) = (&result.stream, result.dispatched, overflowed) {
+            if !cancel.load(Ordering::Relaxed) {
+                self.store().delete_message(&msg_id)?;
+                match self.compact_inner(sid, "overflow", ui, cancel)? {
+                    CompactResult::Compacted { .. } => return self.run_step_inner(sid, step, ui, cancel, true),
+                    CompactResult::Interrupted => return Ok(StepOutcome::Stop(RunOutcome::Interrupted)),
+                    other => {
+                        let why = match other {
+                            CompactResult::Failed(e) => e,
+                            _ => "there is nothing older to summarize".to_string(),
+                        };
+                        ui.event(&UiEvent::Notice(&format!("the prompt exceeds the model's context window and could not be compacted: {why}")));
+                        return Ok(StepOutcome::Stop(RunOutcome::Failed("context window exceeded".into())));
+                    }
+                }
+            }
+        }
 
         let tool_calls = result.parts.iter().filter(|p| p["type"] == "tool").count();
         let interrupted = cancel.load(Ordering::Relaxed) || matches!(result.stream, Err(ProviderError::Interrupted));
@@ -317,6 +427,133 @@ impl Engine {
         };
         self.store().update_message(&msg_id, &data)?;
         Ok(outcome)
+    }
+
+    /// Manual compaction (`/compact`). Holds the session claim while it runs.
+    pub fn compact(&self, sid: &str, ui: &dyn Ui, cancel: &AtomicBool) -> Result<CompactResult, StoreError> {
+        if !self.store().claim(sid)? {
+            return Ok(CompactResult::Failed("session is busy".into()));
+        }
+        let r = self.compact_inner(sid, "manual", ui, cancel);
+        self.store().release(sid)?;
+        r
+    }
+
+    /// Summarize everything before a cut point into a checkpoint message (see `compaction.rs`).
+    fn compact_inner(&self, sid: &str, trigger: &str, ui: &dyn Ui, cancel: &AtomicBool) -> Result<CompactResult, StoreError> {
+        let (session, history) = {
+            let st = self.store();
+            (st.session(sid)?.expect("session exists"), st.messages(sid)?)
+        };
+        let agent = agent::find(&self.cfg.agents, &session.agent).or_else(|| self.cfg.agents.first().cloned()).expect("an agent");
+        let (provider, provider_id, model_id) = match self.resolve_model(&session, &agent) {
+            Ok(r) => r,
+            Err(e) => return Ok(CompactResult::Failed(e)),
+        };
+        let eff = compaction::effective(&history);
+        let Some(k) = compaction::choose_cut(&eff, self.cfg.compaction.keep) else { return Ok(CompactResult::NothingToCompact) };
+        let keep_from = eff[k].id.clone();
+        let update = compaction::has_checkpoint(&eff);
+        let before: u64 = eff.iter().map(compaction::estimate).sum();
+        let limit = self.cfg.catalog.model(&provider_id, &model_id).map(|m| m.limit.context).filter(|l| *l > 0);
+        ui.event(&UiEvent::Status(&format!("compacting {k} message(s) ({trigger})...")));
+
+        let mut portion: Vec<crate::store::Message> = eff[..k].to_vec();
+        let first_droppable = usize::from(update);
+        // Stay inside the model's window while summarizing: drop the oldest material first.
+        if let Some(l) = limit {
+            while portion.len() > first_droppable + 1 && portion.iter().map(compaction::estimate).sum::<u64>() > l * 8 / 10 {
+                portion.remove(first_droppable);
+            }
+        }
+        let mut reply = String::new();
+        let mut usage_total = Usage::default();
+        let mut failure = None;
+        'attempts: for _ in 0..4 {
+            let mut messages = chat::to_chat(&portion);
+            append_user_text(&mut messages, compaction::prompt(update));
+            let req = Request { model: model_id.clone(), system: compaction::SYSTEM.into(), messages, tools: vec![], max_tokens: self.cfg.max_tokens, tools_disabled: false };
+            match self.summarize(provider, &req, ui, cancel) {
+                Ok((text, u)) => {
+                    usage_total = add_usage(usage_total, u);
+                    reply = text;
+                    if !compaction::follows_template(&reply) {
+                        // One nudge when the reply ignores the template.
+                        let mut again = req.clone();
+                        again.messages.push(ChatMessage { role: Role::Assistant, content: vec![Block::Text(reply.clone())] });
+                        again.messages.push(ChatMessage { role: Role::User, content: vec![Block::Text(compaction::NUDGE.into())] });
+                        match self.summarize(provider, &again, ui, cancel) {
+                            Ok((text2, u2)) => {
+                                usage_total = add_usage(usage_total, u2);
+                                if !text2.trim().is_empty() {
+                                    reply = text2;
+                                }
+                            }
+                            Err(ProviderError::Interrupted) => return Ok(CompactResult::Interrupted),
+                            Err(_) => {} // keep the first reply
+                        }
+                    }
+                    failure = None;
+                    break 'attempts;
+                }
+                Err(ProviderError::Interrupted) => return Ok(CompactResult::Interrupted),
+                Err(ProviderError::ContextOverflow(m)) if portion.len() > first_droppable + 1 => {
+                    // Still too big: drop the oldest quarter and try again.
+                    let n = (portion.len() - first_droppable).div_ceil(4).min(portion.len() - first_droppable - 1);
+                    portion.drain(first_droppable..first_droppable + n);
+                    failure = Some(m);
+                }
+                Err(e) => {
+                    failure = Some(e.message());
+                    break 'attempts;
+                }
+            }
+        }
+        if let Some(e) = failure {
+            return Ok(CompactResult::Failed(e));
+        }
+        let summary = reply.trim().to_string();
+        if summary.is_empty() {
+            return Ok(CompactResult::Failed("the model returned an empty summary".into()));
+        }
+        let after: u64 = compaction::estimate_text(&summary) + eff[k..].iter().map(compaction::estimate).sum::<u64>();
+        {
+            let st = self.store();
+            st.add_message(sid, "compaction", &json!({ "summary": summary, "keepFrom": keep_from, "trigger": trigger, "replaced": k }))?;
+            let cost = self.cfg.catalog.model(&provider_id, &model_id).and_then(|m| catalog::cost(m, &usage_total)).unwrap_or(0.0);
+            st.add_usage(sid, cost, &usage_total)?;
+        }
+        ui.event(&UiEvent::Status(&format!("compacted: about {} -> {} tokens", human_tokens(before), human_tokens(after))));
+        Ok(CompactResult::Compacted { before, after })
+    }
+
+    /// One non-streaming-looking call: collect the text of a tool-less response, with the usual retry policy.
+    fn summarize(&self, provider: &dyn Provider, req: &Request, ui: &dyn Ui, cancel: &AtomicBool) -> Result<(String, Usage), ProviderError> {
+        let mut attempt = 0u32;
+        loop {
+            let (mut text, mut usage) = (String::new(), Usage::default());
+            let res = provider.stream(req, cancel, &mut |ev| match ev {
+                Event::TextDelta(t) => text.push_str(&t),
+                Event::Finish { usage: u, .. } => usage = u,
+                _ => {}
+            });
+            match res {
+                Ok(()) => return Ok((text, usage)),
+                Err(e) => {
+                    attempt += 1;
+                    match retry::delay(attempt, &e, (self.cfg.jitter)()) {
+                        Some(wait) if !cancel.load(Ordering::Relaxed) => {
+                            ui.event(&UiEvent::Retry { attempt, wait, error: &e.message() });
+                            (self.cfg.sleep)(wait, cancel);
+                            if cancel.load(Ordering::Relaxed) {
+                                return Err(ProviderError::Interrupted);
+                            }
+                        }
+                        _ => return Err(e),
+                    }
+                }
+            }
+        }
     }
 
     /// One streaming request. Tools start executing as soon as their call is complete.
@@ -490,6 +727,7 @@ mod tests {
                 UiEvent::Retry { attempt, wait, .. } => format!("retry:{attempt}:{}", wait.as_secs()),
                 UiEvent::StepUsage { .. } => "usage".into(),
                 UiEvent::Notice(n) => format!("notice:{n}"),
+                UiEvent::Status(n) => format!("status:{n}"),
             };
             if let Some(h) = &*self.hook.lock().unwrap() {
                 h(&line);
@@ -517,6 +755,10 @@ mod tests {
     }
 
     fn fixture(script: Vec<Scripted>) -> Fixture {
+        fixture_cfg(script, |_| {})
+    }
+
+    fn fixture_cfg(script: Vec<Scripted>, tweak: impl FnOnce(&mut EngineConfig)) -> Fixture {
         let dir = std::env::temp_dir().join(crate::id::new_id("moco-eng"));
         std::fs::create_dir_all(dir.join("work")).unwrap();
         let fake = Arc::new(FakeProvider::new(script));
@@ -525,6 +767,7 @@ mod tests {
         let w = waits.clone();
         cfg.sleep = Box::new(move |d, _| w.lock().unwrap().push(d));
         cfg.jitter = Box::new(|| 0.0);
+        tweak(&mut cfg);
         let store = Store::open_memory().unwrap();
         let session = store.create_session(dir.join("work").to_str().unwrap(), "build").unwrap();
         let engine = Arc::new(Engine::new(store, Box::new(Shared(fake.clone())), cfg));
@@ -886,5 +1129,175 @@ mod tests {
         }
         assert_eq!(engine.store().messages(&ses.id).unwrap().len(), 1, "only the user message; no empty assistant message");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    const SUMMARY: &str = "## Objective\nSUMMARY-BODY\n## Work State\n### Completed\n- things\n## Next Move\n1. go on";
+
+    /// Catalog entry that gives `anthropic/claude-test` a small context window.
+    fn small_window(cfg: &mut EngineConfig, limit: u64, keep: u64) {
+        cfg.model = "anthropic/claude-test".into();
+        cfg.catalog.apply_config(&std::collections::BTreeMap::from([(
+            "anthropic".to_string(),
+            config::ProviderConfig {
+                models: std::collections::BTreeMap::from([(
+                    "claude-test".to_string(),
+                    config::ModelConfig { limit: Some(catalog::Limit { context: limit, output: 1000 }), ..Default::default() },
+                )]),
+                ..Default::default()
+            },
+        )]));
+        cfg.compaction = compaction::Settings { auto: true, buffer: compaction::Buffer::Tokens(500), keep };
+    }
+
+    /// `n` alternating user/assistant messages of about 1000 tokens each.
+    fn seed(f: &Fixture, n: usize) -> Vec<String> {
+        let st = f.engine.store();
+        (0..n)
+            .map(|i| {
+                let pad = format!("{} {}", if i % 2 == 0 { "OLD-USER" } else { "OLD-ASSISTANT" }, "x".repeat(3900));
+                if i % 2 == 0 {
+                    st.add_message(&f.session.id, "user", &json!({"text": pad})).unwrap()
+                } else {
+                    st.add_message(&f.session.id, "assistant", &json!({"parts":[{"type":"text","text":pad}]})).unwrap()
+                }
+            })
+            .collect()
+    }
+
+    fn all_text(req: &Request) -> String {
+        req.messages.iter().flat_map(|m| &m.content).filter_map(|b| if let Block::Text(t) = b { Some(t.as_str()) } else { None }).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn auto_compaction_summarizes_the_past_and_keeps_the_tail() {
+        let f = fixture_cfg(vec![text(SUMMARY), text("the answer")], |c| small_window(c, 3000, 1000));
+        seed(&f, 4);
+        f.say("next question");
+        let ui = TestUi::default();
+        assert_eq!(f.run(&ui), RunOutcome::Idle);
+        let reqs = f.fake.requests.lock().unwrap();
+        assert_eq!(reqs.len(), 2);
+        // 1: the summarization call: no tools, old history, the create prompt last.
+        assert!(reqs[0].tools.is_empty() && all_text(&reqs[0]).contains("OLD-USER") && all_text(&reqs[0]).contains("You MUST summarize"));
+        assert!(!all_text(&reqs[0]).contains("next question"), "the tail is not summarized");
+        // 2: the real step: checkpoint + tail only, same system prompt as always, tools back.
+        assert_eq!(reqs[1].tools.len(), 6);
+        let t = all_text(&reqs[1]);
+        assert!(t.contains(compaction::SUMMARY_PREFIX) && t.contains("SUMMARY-BODY") && t.contains("next question"), "{t}");
+        assert!(!t.contains("OLD-USER") && !t.contains("OLD-ASSISTANT"));
+        assert_eq!(reqs[1].messages.len(), 1, "checkpoint and the new prompt merge into one user message");
+        let stored = f.msgs();
+        let c = stored.iter().find(|m| m.kind == "compaction").expect("compaction message");
+        let next = stored.iter().find(|m| m.kind == "user" && m.data["text"] == "next question").unwrap();
+        assert_eq!((c.data["keepFrom"].as_str(), c.data["trigger"].as_str(), c.data["replaced"].as_u64()), (Some(next.id.as_str()), Some("auto"), Some(4)));
+        assert!(ui.log().iter().any(|l| l.starts_with("status:compacting 4 message(s) (auto)")) && ui.log().iter().any(|l| l.starts_with("status:compacted: about")));
+        // Nothing is deleted from the store; only the model's view changes.
+        assert_eq!(stored.iter().filter(|m| m.kind == "user" || m.kind == "assistant").count(), 6);
+    }
+
+    #[test]
+    fn a_reply_that_ignores_the_template_gets_one_nudge() {
+        let f = fixture_cfg(vec![text("Sure! Here is what we did."), text(SUMMARY), text("done")], |c| small_window(c, 3000, 1000));
+        seed(&f, 4);
+        f.say("go");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        let reqs = f.fake.requests.lock().unwrap();
+        assert_eq!(reqs.len(), 3);
+        let nudge = reqs[1].messages.last().unwrap();
+        assert!(matches!(&nudge.content[0], Block::Text(t) if t == compaction::NUDGE));
+        assert!(matches!(&reqs[1].messages[reqs[1].messages.len() - 2].content[0], Block::Text(t) if t == "Sure! Here is what we did."));
+        assert!(all_text(&reqs[2]).contains("SUMMARY-BODY"), "the conforming reply was kept");
+    }
+
+    #[test]
+    fn overflow_triggers_one_compaction_and_a_retry_but_not_a_loop() {
+        let overflow = || Scripted::Fail(vec![], ProviderError::ContextOverflow("prompt is too long".into()));
+        // Recovers: overflow -> summary -> answer.
+        let f = fixture_cfg(vec![overflow(), text(SUMMARY), text("ok now")], |c| c.compaction.keep = 1000);
+        seed(&f, 4);
+        f.say("go");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        assert_eq!(f.fake.calls(), 3);
+        let stored = f.msgs();
+        assert_eq!(stored.iter().find(|m| m.kind == "compaction").unwrap().data["trigger"], "overflow");
+        assert!(stored.iter().filter(|m| m.kind == "assistant").all(|m| !m.data["parts"].as_array().unwrap().is_empty()), "no empty assistant message left behind");
+        // Overflows again right after compacting: surfaced, not retried forever.
+        let f = fixture_cfg(vec![overflow(), text(SUMMARY), overflow()], |c| c.compaction.keep = 1000);
+        seed(&f, 4);
+        f.say("go");
+        assert!(matches!(f.run(&TestUi::default()), RunOutcome::Failed(_)));
+        assert_eq!(f.fake.calls(), 3);
+    }
+
+    #[test]
+    fn overflow_with_nothing_to_summarize_fails_clearly() {
+        let f = fixture_cfg(vec![Scripted::Fail(vec![], ProviderError::ContextOverflow("too long".into()))], |_| {});
+        f.say("hello");
+        let ui = TestUi::default();
+        assert_eq!(f.run(&ui), RunOutcome::Failed("context window exceeded".into()));
+        assert_eq!(f.fake.calls(), 1);
+        assert!(ui.log().iter().any(|l| l.contains("could not be compacted") && l.contains("nothing older")));
+    }
+
+    #[test]
+    fn a_second_compaction_updates_the_checkpoint() {
+        let f = fixture_cfg(vec![text(SUMMARY), text("## Objective\nSECOND-SUMMARY\n## Next Move\n1. x\n## Decisions\n(none)")], |c| small_window(c, 3000, 1000));
+        seed(&f, 4);
+        let ui = TestUi::default();
+        let cancel = AtomicBool::new(false);
+        assert!(matches!(f.engine.compact(&f.session.id, &ui, &cancel).unwrap(), CompactResult::Compacted { .. }));
+        seed(&f, 4);
+        assert!(matches!(f.engine.compact(&f.session.id, &ui, &cancel).unwrap(), CompactResult::Compacted { .. }));
+        let reqs = f.fake.requests.lock().unwrap();
+        let second = all_text(&reqs[1]);
+        assert!(second.contains("SUMMARY-BODY"), "previous checkpoint is the input");
+        assert!(second.contains("Update the existing checkpoint") && !second.contains("You MUST summarize"));
+        let eff = compaction::effective(&f.msgs());
+        assert!(eff[0].data["text"].as_str().unwrap().contains("SECOND-SUMMARY") && !eff[0].data["text"].as_str().unwrap().contains("SUMMARY-BODY"));
+    }
+
+    #[test]
+    fn manual_compaction_edge_cases() {
+        let f = fixture_cfg(vec![], |c| small_window(c, 3000, 1000));
+        let ui = TestUi::default();
+        let cancel = AtomicBool::new(false);
+        f.say("hi");
+        f.engine.store().deliver(&f.session.id, true).unwrap();
+        assert_eq!(f.engine.compact(&f.session.id, &ui, &cancel).unwrap(), CompactResult::NothingToCompact);
+        assert!(f.engine.store().claim(&f.session.id).unwrap());
+        assert_eq!(f.engine.compact(&f.session.id, &ui, &cancel).unwrap(), CompactResult::Failed("session is busy".into()));
+        assert_eq!(f.fake.calls(), 0);
+    }
+
+    #[test]
+    fn failed_auto_compaction_does_not_block_the_step_or_repeat() {
+        let f = fixture_cfg(
+            vec![Scripted::Fail(vec![], ProviderError::Auth("no access".into())), tool_call("t1", "shell", json!({"command":"true"})), text("finished")],
+            |c| small_window(c, 3000, 1000),
+        );
+        seed(&f, 4);
+        f.say("go");
+        let ui = TestUi::default();
+        assert_eq!(f.run(&ui), RunOutcome::Idle);
+        assert_eq!(f.fake.calls(), 3, "one failed summarization, then two normal steps; no second summarization attempt");
+        assert!(ui.log().iter().any(|l| l.starts_with("notice:automatic compaction failed")));
+        assert!(f.msgs().iter().all(|m| m.kind != "compaction"));
+    }
+
+    #[test]
+    fn auto_compaction_can_be_turned_off_and_needs_a_known_limit() {
+        let f = fixture_cfg(vec![text("plain")], |c| {
+            small_window(c, 3000, 1000);
+            c.compaction.auto = false;
+        });
+        seed(&f, 4);
+        f.say("go");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        assert_eq!(f.fake.calls(), 1);
+        let g = fixture(vec![text("plain")]); // test-model has no catalog entry: no limit, no auto compaction
+        seed(&g, 40);
+        g.say("go");
+        assert_eq!(g.run(&TestUi::default()), RunOutcome::Idle);
+        assert_eq!(g.fake.calls(), 1);
     }
 }
