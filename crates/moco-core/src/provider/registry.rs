@@ -1,5 +1,5 @@
 //! Builds a client for every catalog provider that has credentials.
-use super::{anthropic::Anthropic, openai_chat::OpenAiChat, Provider};
+use super::{anthropic::Anthropic, gemini::Gemini, openai_chat::OpenAiChat, openai_responses::OpenAiResponses, Provider};
 use crate::auth;
 use crate::catalog::{Catalog, Protocol, ProviderInfo};
 use std::collections::HashMap;
@@ -33,6 +33,8 @@ pub fn build(catalog: &Catalog, app_dir: &Path) -> HashMap<String, Box<dyn Provi
                 Box::new(client)
             }
             Some(Protocol::OpenAiChat) => Box::new(OpenAiChat::new(key, p.base_url().unwrap_or_default(), p.headers.clone())),
+            Some(Protocol::OpenAiResponses) => Box::new(OpenAiResponses::new(key, p.base_url().unwrap_or_default(), p.headers.clone())),
+            Some(Protocol::Gemini) => Box::new(Gemini::new(key, p.base_url().unwrap_or_default(), p.headers.clone())),
             None => continue,
         };
         out.insert(id.clone(), client);
@@ -63,6 +65,12 @@ mod tests {
             assert!(ids.contains(&expected.to_string()), "{expected} missing from {ids:?}");
         }
         assert!(!ids.contains(&"fireworks-ai".to_string()), "no key, not connected");
+        // Providers on the newer protocols are built like any other once they have a key.
+        std::fs::write(dir.join("auth.json"), r#"{"google":{"key":"g"},"openai":{"key":"o"}}"#).unwrap();
+        let mut cat2 = Catalog::embedded();
+        cat2.apply_config(&BTreeMap::from([("openai".to_string(), ProviderConfig { protocol: Some("openai-responses".into()), ..Default::default() })]));
+        let built2 = build(&cat2, &dir);
+        assert!(built2.contains_key("google") && built2.contains_key("openai"));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

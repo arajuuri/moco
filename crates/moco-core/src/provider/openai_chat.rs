@@ -42,7 +42,7 @@ pub fn build_body(req: &Request, max_completion_tokens: bool) -> Value {
                         Block::Document { media_type, data, name } => {
                             media.push(json!({"type":"file","file":{"filename":name,"file_data":format!("data:{media_type};base64,{data}")}}))
                         }
-                        Block::ToolUse { .. } => {}
+                        Block::ToolUse { .. } | Block::Native { .. } => {}
                     }
                 }
                 if !media.is_empty() {

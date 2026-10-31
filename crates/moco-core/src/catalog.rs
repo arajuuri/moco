@@ -90,11 +90,23 @@ pub struct ProviderInfo {
 pub enum Protocol {
     Anthropic,
     OpenAiChat,
+    /// OpenAI Responses API. Experimental (not verified against the live service); opt in with `protocol: "openai-responses"`.
+    OpenAiResponses,
+    /// Google Gemini API. Experimental (not verified against the live service).
+    Gemini,
+}
+
+impl Protocol {
+    /// Written from documentation and tested against local servers only.
+    pub fn experimental(self) -> bool {
+        matches!(self, Protocol::OpenAiResponses | Protocol::Gemini)
+    }
 }
 
 /// Base URLs for providers whose catalog entry has no `api` (the AI SDK packages know them).
 const DEFAULT_BASE: &[(&str, &str)] = &[
     ("openai", "https://api.openai.com/v1"),
+    ("google", "https://generativelanguage.googleapis.com/v1beta"),
     ("groq", "https://api.groq.com/openai/v1"),
     ("xai", "https://api.x.ai/v1"),
     ("mistral", "https://api.mistral.ai/v1"),
@@ -110,6 +122,7 @@ impl ProviderInfo {
         }
         match self.npm.as_deref()? {
             "@ai-sdk/anthropic" => Some(Protocol::Anthropic),
+            "@ai-sdk/google" => Some(Protocol::Gemini),
             "@ai-sdk/openai-compatible" | "@ai-sdk/openai" | "@openrouter/ai-sdk-provider" | "@ai-sdk/groq" | "@ai-sdk/xai" | "@ai-sdk/mistral"
             | "@ai-sdk/cerebras" | "@ai-sdk/togetherai" | "@ai-sdk/deepinfra" => Some(Protocol::OpenAiChat),
             _ => None,
@@ -250,6 +263,8 @@ impl Catalog {
             match pc.protocol.as_deref() {
                 Some("anthropic") => p.protocol_override = Some(Protocol::Anthropic),
                 Some("openai-chat") => p.protocol_override = Some(Protocol::OpenAiChat),
+                Some("openai-responses") => p.protocol_override = Some(Protocol::OpenAiResponses),
+                Some("gemini") => p.protocol_override = Some(Protocol::Gemini),
                 _ if is_new => p.protocol_override = Some(Protocol::OpenAiChat),
                 _ => {}
             }
@@ -311,6 +326,23 @@ mod tests {
         assert_eq!(c.providers["openai"].base_url().as_deref(), Some("https://api.openai.com/v1"));
         assert_eq!(c.providers["deepseek"].base_url().as_deref(), Some("https://api.deepseek.com"));
         assert_eq!(c.providers["fireworks-ai"].base_url().as_deref(), Some("https://api.fireworks.ai/inference/v1"), "trailing slash trimmed");
+    }
+
+    #[test]
+    fn protocol_selection_defaults_and_opt_ins() {
+        let mut c = Catalog::embedded();
+        assert_eq!(c.providers["openai"].protocol(), Some(Protocol::OpenAiChat), "OpenAI stays on Chat Completions unless you opt in");
+        let google = &c.providers["google"];
+        assert_eq!((google.protocol(), google.base_url().as_deref()), (Some(Protocol::Gemini), Some("https://generativelanguage.googleapis.com/v1beta")));
+        assert!(google.env.iter().any(|e| e == "GEMINI_API_KEY"));
+        assert!(Protocol::Gemini.experimental() && Protocol::OpenAiResponses.experimental() && !Protocol::OpenAiChat.experimental() && !Protocol::Anthropic.experimental());
+        let cfg = |proto: &str| BTreeMap::from([("openai".to_string(), crate::config::ProviderConfig { protocol: Some(proto.into()), ..Default::default() })]);
+        c.apply_config(&cfg("openai-responses"));
+        assert_eq!(c.providers["openai"].protocol(), Some(Protocol::OpenAiResponses));
+        c.apply_config(&cfg("gemini"));
+        assert_eq!(c.providers["openai"].protocol(), Some(Protocol::Gemini));
+        c.apply_config(&cfg("openai-chat"));
+        assert_eq!(c.providers["openai"].protocol(), Some(Protocol::OpenAiChat));
     }
 
     #[test]

@@ -1031,6 +1031,10 @@ impl Engine {
                 }
                 Event::ReasoningDelta(t) => ui.event(&UiEvent::ReasoningDelta(&t)),
                 Event::ToolInputStart { .. } => text_idx = None,
+                Event::Native { provider, data } => {
+                    text_idx = None;
+                    parts.push(json!({"type":"native","provider":provider,"data":data}));
+                }
                 Event::ToolCall { id, name, input } => {
                     text_idx = None;
                     dispatched = true;
@@ -2647,5 +2651,46 @@ mod tests {
         assert!(t.contains("The user ran this command themselves:\n$ ls; echo oops >&2; exit 2") && t.contains("a.txt"), "{t}");
         let (flag, _) = (AtomicBool::new(true), 0);
         assert_eq!(f.engine.run_user_command(&f.session.id, "sleep 5", &flag).unwrap_err(), "interrupted");
+    }
+
+    #[test]
+    fn provider_replay_data_survives_the_store_and_returns_with_the_next_request() {
+        use crate::provider::{gemini, openai_responses};
+        let reasoning = json!({"type":"reasoning","id":"rs_1","encrypted_content":"ENC","summary":[]});
+        let fc = json!({"type":"function_call","id":"fc_1","call_id":"call_1","name":"read","arguments":"{\"path\":\"a.txt\"}","status":"completed"});
+        let sig = json!({"call_id":"call_1","thoughtSignature":"SIG"});
+        let f = fixture(vec![
+            Scripted::Events(vec![
+                Event::Native { provider: openai_responses::PROVIDER.into(), data: reasoning.clone() },
+                Event::TextDelta("Reading it.".into()),
+                Event::Native { provider: openai_responses::PROVIDER.into(), data: fc.clone() },
+                Event::Native { provider: gemini::PROVIDER.into(), data: sig.clone() },
+                Event::ToolInputStart { id: "call_1".into(), name: "read".into() },
+                Event::ToolCall { id: "call_1".into(), name: "read".into(), input: json!({"path":"a.txt"}) },
+                Event::Finish { reason: FinishReason::ToolUse, usage: Usage::default() },
+            ]),
+            text("done"),
+        ]);
+        f.file("a.txt", "hello\n");
+        f.say("read it");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        // Stored in order, next to the visible parts.
+        let parts = f.msgs()[1].data["parts"].as_array().unwrap().clone();
+        let kinds: Vec<String> = parts.iter().map(|p| format!("{}:{}", p["type"].as_str().unwrap(), p["provider"].as_str().unwrap_or(p["name"].as_str().unwrap_or("-")))).collect();
+        assert_eq!(kinds, ["native:openai-responses", "text:-", "native:openai-responses", "native:gemini", "tool:read"]);
+        // The second request carries them back; each adapter replays only its own.
+        let reqs = f.fake.requests.lock().unwrap();
+        let body = openai_responses::build_body(&reqs[1]);
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[1], reasoning, "the reasoning item, verbatim and first");
+        assert_eq!(input[2], json!({"role":"assistant","content":[{"type":"output_text","text":"Reading it."}]}));
+        assert_eq!(input[3], fc, "the original function_call item, with its fc_ id");
+        assert_eq!(input[4]["type"], "function_call_output");
+        let g = gemini::build_body(&reqs[1]);
+        assert_eq!(g["contents"][1]["parts"][1]["thoughtSignature"], "SIG");
+        assert!(!g.to_string().contains("ENC"), "another provider's encrypted reasoning is never sent to Gemini");
+        let a = crate::provider::anthropic::build_body(&reqs[1], false).to_string();
+        assert!(!a.contains("ENC") && !a.contains("SIG") && !a.contains("native"), "nor to Anthropic");
+        assert!(!crate::provider::openai_chat::build_body(&reqs[1], false).to_string().contains("ENC"));
     }
 }

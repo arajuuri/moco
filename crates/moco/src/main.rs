@@ -454,7 +454,8 @@ fn provider_line(p: &ProviderInfo, app_dir: &std::path::Path) -> String {
     } else {
         format!("no key (set {} or run `moco auth {}`)", p.env.first().cloned().unwrap_or_else(|| auth::env_var_for(&p.id)), p.id)
     };
-    format!("{:<16} {:>4} models  {state}", p.id, p.models.len())
+    let experimental = if p.protocol().is_some_and(|x| x.experimental()) { "  [experimental protocol]" } else { "" };
+    format!("{:<16} {:>4} models  {state}{experimental}", p.id, p.models.len())
 }
 
 fn main() {

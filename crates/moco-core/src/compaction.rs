@@ -70,6 +70,7 @@ pub fn estimate_request(req: &crate::provider::Request) -> u64 {
         .flat_map(|m| &m.content)
         .map(|b| match b {
             Block::Text(t) => t.len(),
+            Block::Native { data, .. } => data.to_string().len(),
             Block::Image { .. } => 4 * crate::media::tokens("image/png", 0) as usize,
             Block::Document { media_type, data, .. } => 4 * crate::media::tokens(media_type, data.len() as u64 * 3 / 4) as usize,
             Block::ToolUse { name, input, .. } => name.len() + input.to_string().len(),

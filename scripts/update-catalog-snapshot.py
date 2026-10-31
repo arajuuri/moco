@@ -6,7 +6,7 @@ Usage: scripts/update-catalog-snapshot.py [path-to-api.json]   (downloads if no 
 """
 import json, sys, urllib.request
 
-KEEP = ["anthropic", "openai", "openrouter", "deepseek", "groq", "xai", "mistral", "togetherai", "cerebras", "fireworks-ai"]
+KEEP = ["anthropic", "openai", "google", "openrouter", "deepseek", "groq", "xai", "mistral", "togetherai", "cerebras", "fireworks-ai"]
 
 def load(path):
     if path:

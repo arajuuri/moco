@@ -63,6 +63,11 @@ pub fn to_chat_with(messages: &[Message], load: Loader) -> Vec<ChatMessage> {
                                 blocks.push(Block::Text(t.into()));
                             }
                         }
+                        Some("native") => {
+                            if let Some(provider) = p["provider"].as_str() {
+                                blocks.push(Block::Native { provider: provider.to_string(), data: p["data"].clone() });
+                            }
+                        }
                         Some("tool") => {
                             let id = p["id"].as_str().unwrap_or("").to_string();
                             blocks.push(Block::ToolUse { id: id.clone(), name: p["name"].as_str().unwrap_or("").into(), input: p["input"].clone() });
@@ -82,7 +87,8 @@ pub fn to_chat_with(messages: &[Message], load: Loader) -> Vec<ChatMessage> {
                         _ => {}
                     }
                 }
-                if blocks.is_empty() {
+                // An assistant message that is only replay data (no text, no tool call) says nothing to the model.
+                if !blocks.iter().any(|b| !matches!(b, Block::Native { .. })) {
                     continue;
                 }
                 out.push(ChatMessage { role: Role::Assistant, content: blocks });
@@ -161,6 +167,23 @@ mod tests {
         assert!(matches!(&results[2], Block::Image { media_type, data } if media_type == "image/png" && data == "AQID"), "images come after every result");
         assert!(matches!(&results[3], Block::Text(t) if t == "[attachment y.png is no longer available]"), "a missing blob degrades to a note, not an error");
         assert_eq!(to_chat(&m)[0].content.len(), 3, "without a loader the blocks are placeholders");
+    }
+
+    #[test]
+    fn native_parts_keep_their_order_and_do_not_make_a_message_on_their_own() {
+        let m = vec![
+            msg("user", json!({"text":"go"})),
+            msg("assistant", json!({"parts":[
+                {"type":"native","provider":"openai-responses","data":{"type":"reasoning","id":"rs_1","encrypted_content":"E"}},
+                {"type":"text","text":"thinking done"},
+                {"type":"native","provider":"gemini","data":{"call_id":"c1","thoughtSignature":"S"}},
+                {"type":"tool","id":"c1","name":"read","input":{},"state":{"status":"completed","output":"x"}}]})),
+            msg("assistant", json!({"parts":[{"type":"native","provider":"openai-responses","data":{"type":"reasoning","id":"rs_2"}}]})),
+        ];
+        let c = to_chat(&m);
+        assert_eq!(c.len(), 3, "user, assistant, tool results; the replay-only message is dropped");
+        let kinds: Vec<&str> = c[1].content.iter().map(|b| match b { Block::Native { provider, .. } => provider.as_str(), Block::Text(_) => "text", Block::ToolUse { .. } => "tool", _ => "?" }).collect();
+        assert_eq!(kinds, ["openai-responses", "text", "gemini", "tool"]);
     }
 
     #[test]

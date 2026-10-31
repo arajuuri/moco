@@ -53,6 +53,13 @@ Check a Mojave build with `otool -l moco | grep minos` (must say 10.14). On Linu
 
 **Permission prompts** show the action and what it touches: `y` allow once, `a` allow always (saved for this project with a pattern such as `git push *`), `n` reject and stop, or type feedback to reject and tell the model why. By default everything is allowed except reading `.env` files; make `shell` or `edit` ask with a rule (below). The `question` tool shows a numbered form; Enter dismisses it.
 
+## Other providers and protocols
+
+Anthropic and OpenAI-compatible Chat Completions servers are the well-trodden paths. Two more protocols are **experimental** (written from the documentation, not yet tried against the live services, labelled `[experimental protocol]` in `moco models`):
+- **Google Gemini**: `moco auth google` (or `GEMINI_API_KEY`), then `--model google/gemini-2.5-flash`.
+- **OpenAI Responses**: opt in with `{ "providers": { "openai": { "protocol": "openai-responses" } } }`. Reasoning models then keep their reasoning between turns.
+If one misbehaves, `/model` back to another provider and report the error text.
+
 ## Skills, commands and mentions
 
 - **Skills** are folders with a `SKILL.md` (frontmatter `name` and `description`, then instructions) in `.moco/skills/`, `.claude/skills/` or `.agents/skills/` of the project or any parent directory, or in `~/Library/Application Support/moco/config/skills/` and `~/.claude/skills/`. The model sees the list and loads a matching skill itself with the `skill` tool; you can also load one with `@skill-id`.

@@ -44,7 +44,7 @@ pub fn build_body(req: &Request, cache: bool) -> Value {
             let content: Vec<Value> = m
                 .content
                 .iter()
-                .map(|b| match b {
+                .filter_map(|b| Some(match b {
                     Block::Text(t) => json!({"type":"text","text":t}),
                     Block::Image { media_type, data } => json!({"type":"image","source":{"type":"base64","media_type":media_type,"data":data}}),
                     Block::Document { media_type, data, name } => {
@@ -54,7 +54,8 @@ pub fn build_body(req: &Request, cache: bool) -> Value {
                     Block::ToolResult { id, content, is_error } => {
                         json!({"type":"tool_result","tool_use_id":id,"content":content,"is_error":is_error})
                     }
-                })
+                    Block::Native { .. } => return None, // another provider's replay data
+                }))
                 .collect();
             json!({"role": if m.role == Role::User {"user"} else {"assistant"}, "content": content})
         })
