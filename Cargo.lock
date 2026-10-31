@@ -424,6 +424,7 @@ dependencies = [
 name = "moco-core"
 version = "0.0.0"
 dependencies = [
+ "base64",
  "fastrand",
  "globset",
  "ignore",

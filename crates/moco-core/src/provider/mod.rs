@@ -26,6 +26,10 @@ pub enum Role {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Block {
     Text(String),
+    /// Base64 image data.
+    Image { media_type: String, data: String },
+    /// A PDF (base64) with the name it was attached under.
+    Document { media_type: String, data: String, name: String },
     ToolUse { id: String, name: String, input: Value },
     ToolResult { id: String, content: String, is_error: bool },
 }

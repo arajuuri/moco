@@ -33,14 +33,27 @@ pub fn build_body(req: &Request, max_completion_tokens: bool) -> Value {
             Role::User => {
                 // Tool results must directly follow the assistant tool_calls message.
                 let mut text = vec![];
+                let mut media: Vec<Value> = vec![];
                 for b in &m.content {
                     match b {
                         Block::ToolResult { id, content, .. } => messages.push(json!({"role":"tool","tool_call_id":id,"content":content})),
                         Block::Text(t) => text.push(t.as_str()),
+                        Block::Image { media_type, data } => media.push(json!({"type":"image_url","image_url":{"url":format!("data:{media_type};base64,{data}")}})),
+                        Block::Document { media_type, data, name } => {
+                            media.push(json!({"type":"file","file":{"filename":name,"file_data":format!("data:{media_type};base64,{data}")}}))
+                        }
                         Block::ToolUse { .. } => {}
                     }
                 }
-                if !text.is_empty() {
+                if !media.is_empty() {
+                    // Parts form: the text first, then the images and files.
+                    let mut parts = vec![];
+                    if !text.is_empty() {
+                        parts.push(json!({"type":"text","text":text.join("\n\n")}));
+                    }
+                    parts.extend(media);
+                    messages.push(json!({"role":"user","content":parts}));
+                } else if !text.is_empty() {
                     messages.push(json!({"role":"user","content":text.join("\n\n")}));
                 }
             }
@@ -377,6 +390,36 @@ mod tests {
             max_tokens: 100,
             tools_disabled: false,
         }
+    }
+
+    #[test]
+    fn media_becomes_content_parts_after_the_text() {
+        let req = Request {
+            model: "m".into(),
+            system: "s".into(),
+            messages: vec![
+                ChatMessage { role: Role::User, content: vec![Block::Text("what is this".into()), Block::Image { media_type: "image/jpeg".into(), data: "QQ==".into() }] },
+                ChatMessage { role: Role::Assistant, content: vec![Block::ToolUse { id: "t".into(), name: "read".into(), input: json!({}) }] },
+                // A tool result plus the image it produced: the tool message first, then the image as a user turn.
+                ChatMessage {
+                    role: Role::User,
+                    content: vec![
+                        Block::ToolResult { id: "t".into(), content: "Image file x.png".into(), is_error: false },
+                        Block::Document { media_type: "application/pdf".into(), data: "UA==".into(), name: "a.pdf".into() },
+                    ],
+                },
+            ],
+            tools: vec![],
+            max_tokens: 5,
+            tools_disabled: false,
+        };
+        let b = build_body(&req, false);
+        let m = b["messages"].as_array().unwrap();
+        assert_eq!(m[1]["content"][0], json!({"type":"text","text":"what is this"}));
+        assert_eq!(m[1]["content"][1]["image_url"]["url"], "data:image/jpeg;base64,QQ==");
+        assert_eq!((m[3]["role"].as_str(), m[4]["role"].as_str()), (Some("tool"), Some("user")));
+        assert_eq!(m[4]["content"][0], json!({"type":"file","file":{"filename":"a.pdf","file_data":"data:application/pdf;base64,UA=="}}));
+        assert!(m[4]["content"].as_array().unwrap().len() == 1, "no empty text part");
     }
 
     #[test]

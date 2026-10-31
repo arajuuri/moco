@@ -70,6 +70,8 @@ pub fn estimate_request(req: &crate::provider::Request) -> u64 {
         .flat_map(|m| &m.content)
         .map(|b| match b {
             Block::Text(t) => t.len(),
+            Block::Image { .. } => 4 * crate::media::tokens("image/png", 0) as usize,
+            Block::Document { media_type, data, .. } => 4 * crate::media::tokens(media_type, data.len() as u64 * 3 / 4) as usize,
             Block::ToolUse { name, input, .. } => name.len() + input.to_string().len(),
             Block::ToolResult { content, .. } => content.len(),
         })
@@ -79,7 +81,19 @@ pub fn estimate_request(req: &crate::provider::Request) -> u64 {
 
 /// Rough token count (about 4 characters per token).
 pub fn estimate(m: &Message) -> u64 {
-    (m.data.to_string().len() as u64).div_ceil(4) + 4
+    (m.data.to_string().len() as u64).div_ceil(4) + 4 + media_tokens(&m.data)
+}
+
+/// Tokens for the attachments referenced anywhere in a message (the references themselves are tiny).
+fn media_tokens(v: &serde_json::Value) -> u64 {
+    match v {
+        serde_json::Value::Object(o) => {
+            let own = if o.contains_key("blob") { crate::media::tokens(o.get("mediaType").and_then(|m| m.as_str()).unwrap_or(""), o.get("size").and_then(|s| s.as_u64()).unwrap_or(0)) } else { 0 };
+            own + o.values().map(media_tokens).sum::<u64>()
+        }
+        serde_json::Value::Array(a) => a.iter().map(media_tokens).sum(),
+        _ => 0,
+    }
 }
 
 /// History as the model sees it: after the latest compaction, `[summary, messages from keepFrom on]`.
@@ -244,6 +258,15 @@ mod tests {
         assert_eq!(choose_cut(&e, 10), None, "only the checkpoint precedes the tail");
         e.push(big("m2", "user", 100));
         assert_eq!(choose_cut(&e, 10), Some(2), "m1 can now be folded into the checkpoint");
+    }
+
+    #[test]
+    fn attachments_count_by_size_not_by_their_reference_json() {
+        let with = msg("m1", "user", json!({"text":"x","mentions":{"files":[{"kind":"media","mediaType":"image/png","blob":"h","size":4_000_000,"name":"a.png"}]}}));
+        let without = msg("m2", "user", json!({"text":"x","mentions":{"files":[{"kind":"text","content":"y"}]}}));
+        assert!(estimate(&with) >= estimate(&without) + 1_400 && estimate(&with) < estimate(&without) + 1_700, "{} vs {}", estimate(&with), estimate(&without));
+        let pdf = msg("m3", "assistant", json!({"parts":[{"type":"tool","state":{"media":[{"mediaType":"application/pdf","blob":"h","size":1_200_000}]}}]}));
+        assert!(estimate(&pdf) >= 100_000, "a big PDF is expensive: {}", estimate(&pdf));
     }
 
     #[test]

@@ -5,12 +5,12 @@
 //! produced tool calls. History is reloaded from the store on every step.
 use crate::agent::{self, Agent};
 use crate::snapshot::{FileDiff, Snapshots};
-use crate::{catalog, compaction, config, instructions, skills, title};
+use crate::{blobs, catalog, compaction, config, instructions, skills, title};
 use crate::chat;
 use crate::permission::{self, Effect, Rule};
 use crate::provider::{retry, Block, ChatMessage, Event, FinishReason, Provider, ProviderError, Request, Role, ToolDef, Usage};
 use crate::store::{Mode, Session, Store, StoreError};
-use crate::tools::{self, project_root_of, Host, PermReq, Permitter, Question, SubagentRequest, SubagentResult, Todo, Tool, ToolCtx, ToolError, ToolOutput};
+use crate::tools::{self, project_root_of, Host, MediaCaps, PermReq, Permitter, Question, SubagentRequest, SubagentResult, Todo, Tool, ToolCtx, ToolError, ToolOutput};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -288,6 +288,30 @@ impl Engine {
         self.store().enqueue(session_id, None, mode, "user", &data)
     }
 
+    /// What the model accepts as input (from the catalog; unknown models are assumed to accept everything).
+    pub fn media_caps(&self, provider_id: &str, model_id: &str) -> MediaCaps {
+        match self.cfg.catalog.model(provider_id, model_id) {
+            Some(m) => MediaCaps { image: m.accepts("image"), pdf: m.accepts("pdf") },
+            None => MediaCaps::default(),
+        }
+    }
+
+    /// The session's current model split into `(provider, model)` and its media capabilities, for the UI.
+    pub fn current_media_caps(&self, session: &Session) -> MediaCaps {
+        let model_ref = self.model_ref_for(session);
+        let (p, m) = config::split_model(&model_ref);
+        self.media_caps(p, m)
+    }
+
+    pub fn app_dir(&self) -> &std::path::Path {
+        &self.cfg.app_dir
+    }
+
+    /// Stored messages as provider messages, with attachments loaded from the blob store.
+    fn chat(&self, messages: &[crate::store::Message]) -> Vec<ChatMessage> {
+        chat::to_chat_with(messages, &|hash| blobs::get(&self.cfg.app_dir, hash))
+    }
+
     pub fn skills(&self) -> &[skills::Skill] {
         &self.cfg.skills
     }
@@ -374,7 +398,7 @@ impl Engine {
         let advertised: Vec<&dyn Tool> = self.tools.iter().map(|t| t.as_ref()).filter(|t| agent::advertised(&agent, *t)).collect();
 
         let eff = compaction::effective(&history);
-        let mut messages = chat::to_chat(&eff);
+        let mut messages = self.chat(&eff);
         let mut reminders = vec![];
         let max_steps_hit = agent.steps.is_some_and(|n| step >= n);
         if max_steps_hit {
@@ -448,6 +472,7 @@ impl Engine {
         }
         let Prepared { session, agent, req, provider, provider_id, model_id, .. } = p;
         let (provider_id, model_id) = (provider_id.as_str(), model_id.as_str());
+        let caps = self.media_caps(provider_id, model_id);
 
         let snapshot = self.take_snapshot(&session, ui);
         let mut first = json!({ "parts": [] });
@@ -467,7 +492,7 @@ impl Engine {
 
         let mut retries = 0u32;
         let result = loop {
-            let r = self.attempt(provider, &session, &req, &permitter, ui, cancel, &msg_id);
+            let r = self.attempt(provider, &session, &req, &permitter, ui, cancel, &msg_id, caps);
             match &r.stream {
                 Err(e) if !r.dispatched && !cancel.load(Ordering::Relaxed) => {
                     // Safe to retry: no tool has run, and the partial output is discarded.
@@ -855,7 +880,7 @@ impl Engine {
         let mut usage_total = Usage::default();
         let mut failure = None;
         'attempts: for _ in 0..4 {
-            let mut messages = chat::to_chat(&portion);
+            let mut messages = self.chat(&portion);
             append_user_text(&mut messages, compaction::prompt(update));
             let req = Request { model: model_id.clone(), system: compaction::SYSTEM.into(), messages, tools: vec![], max_tokens: self.cfg.max_tokens, tools_disabled: false };
             match self.summarize(provider, &req, ui, cancel) {
@@ -942,7 +967,8 @@ impl Engine {
     }
 
     /// One streaming request. Tools start executing as soon as their call is complete.
-    fn attempt(&self, provider: &dyn Provider, session: &Session, req: &Request, permitter: &EnginePermitter, ui: &dyn Ui, cancel: &AtomicBool, msg_id: &str) -> AttemptResult {
+    #[allow(clippy::too_many_arguments)]
+    fn attempt(&self, provider: &dyn Provider, session: &Session, req: &Request, permitter: &EnginePermitter, ui: &dyn Ui, cancel: &AtomicBool, msg_id: &str, caps: MediaCaps) -> AttemptResult {
         let cwd = PathBuf::from(&session.directory);
         let root = project_root_of(&cwd);
         let spill = self.spill_dir();
@@ -981,7 +1007,7 @@ impl Engine {
                             None => Err(ToolError::fail(format!("Unknown tool: {name}"))),
                             Some(t) => {
                                 let host = EngineHost { engine: self, session, ui, cancel };
-                                t.run(&input, &ToolCtx { session_id: &session.id, host: &host, cwd, project_root: root, spill_dir: spill, permitter, cancel })
+                                t.run(&input, &ToolCtx { media: caps, session_id: &session.id, host: &host, cwd, project_root: root, spill_dir: spill, permitter, cancel })
                             }
                         }),
                     ));
@@ -1011,11 +1037,23 @@ impl Engine {
 
     fn finish_tool(&self, name: &str, outcome: Result<ToolOutput, ToolError>, spill: &std::path::Path, ui: &dyn Ui) -> Value {
         match outcome {
-            Ok(out) => {
+            Ok(mut out) => {
+                // Images and PDFs a tool returned go to the blob store; the message keeps a small reference.
+                let mut media = vec![];
+                for a in out.take_media() {
+                    match blobs::put(&self.cfg.app_dir, &a.bytes) {
+                        Ok(hash) => media.push(json!({"mediaType": a.media_type, "blob": hash, "size": a.bytes.len(), "name": a.name})),
+                        Err(e) => out.text.push_str(&format!("\n[could not store the attachment {}: {e}]", a.name)),
+                    }
+                }
                 let text = crate::truncate::truncate(&out.text, spill).map(|t| t.text).unwrap_or(out.text);
                 let text = if text.is_empty() { "(no output)".to_string() } else { text };
                 ui.event(&UiEvent::ToolFinished { name, ok: true, text: &text });
-                json!({"status":"completed","output":text,"metadata":out.metadata})
+                let mut state = json!({"status":"completed","output":text,"metadata":out.metadata});
+                if !media.is_empty() {
+                    state["media"] = json!(media);
+                }
+                state
             }
             Err(e) => {
                 let msg = if e == ToolError::Interrupted { chat::INTERRUPTED.to_string() } else { e.message() };
@@ -2190,7 +2228,7 @@ mod tests {
         let f = fixture(vec![text("seen"), text("again")]);
         f.file("notes.txt", "remember the milk\n");
         let skills_none: Vec<skills::Skill> = vec![];
-        let ctx = crate::mentions::Ctx { cwd: &f.dir.join("work"), skills: &skills_none, subagents: &["explore".to_string()] };
+        let ctx = crate::mentions::Ctx { cwd: &f.dir.join("work"), skills: &skills_none, subagents: &["explore".to_string()], app_dir: f.engine.app_dir(), caps: MediaCaps::default() };
         let (m, notes) = crate::mentions::expand("what does @notes.txt say? ask @explore too", &ctx);
         assert_eq!(notes.len(), 2);
         f.engine.submit_with(&f.session.id, "what does @notes.txt say? ask @explore too", Some(m), Mode::Steer).unwrap();
@@ -2218,5 +2256,78 @@ mod tests {
             .unwrap();
         assert_eq!(r.output, "review done");
         assert_eq!(f.engine.store().session(&r.session_id).unwrap().unwrap().parent_id.as_deref(), Some(f.session.id.as_str()));
+    }
+
+    fn tiny_png() -> Vec<u8> {
+        crate::media::tests::png(32, 16)
+    }
+    fn has_image(req: &Request) -> bool {
+        req.messages.iter().flat_map(|m| &m.content).any(|b| matches!(b, Block::Image { media_type, .. } if media_type == "image/png"))
+    }
+
+    #[test]
+    fn an_image_read_by_the_model_reaches_it_and_is_stored_as_a_blob() {
+        let f = fixture(vec![tool_call("t1", "read", json!({"path":"shot.png"})), text("a small png")]);
+        std::fs::write(f.dir.join("work/shot.png"), tiny_png()).unwrap();
+        f.say("what is in shot.png");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        let reqs = f.fake.requests.lock().unwrap();
+        assert!(has_image(&reqs[1]) && !has_image(&reqs[0]));
+        let last = reqs[1].messages.last().unwrap();
+        assert!(matches!(&last.content[0], Block::ToolResult { content, .. } if content.starts_with("image file shot.png (image/png, 32x16")));
+        assert!(matches!(&last.content[1], Block::Image { .. }), "the image follows the tool result in the same user message");
+        // The stored message holds a reference only.
+        let stored = f.msgs();
+        let state = &stored[1].data["parts"][0]["state"];
+        assert_eq!(state["media"][0]["mediaType"], "image/png");
+        let hash = state["media"][0]["blob"].as_str().unwrap();
+        assert_eq!(blobs::get(f.engine.app_dir(), hash).unwrap(), tiny_png());
+        assert!(!stored[1].data.to_string().contains("iVBOR") && !state["metadata"].to_string().contains("_media"));
+    }
+
+    #[test]
+    fn an_at_mentioned_image_is_sent_with_the_prompt() {
+        let f = fixture(vec![text("it is a diagram")]);
+        std::fs::write(f.dir.join("work/diagram.png"), tiny_png()).unwrap();
+        let work = f.dir.join("work");
+        let ctx = crate::mentions::Ctx { cwd: &work, skills: &[], subagents: &[], app_dir: f.engine.app_dir(), caps: MediaCaps::default() };
+        let (m, notes) = crate::mentions::expand("explain @diagram.png", &ctx);
+        assert!(notes[0].starts_with("attached image diagram.png"));
+        f.engine.submit_with(&f.session.id, "explain @diagram.png", Some(m), Mode::Steer).unwrap();
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        let reqs = f.fake.requests.lock().unwrap();
+        assert!(has_image(&reqs[0]));
+        assert_eq!(reqs[0].messages.len(), 1);
+        assert!(all_text(&reqs[0]).contains("<attachment path=\"diagram.png\" />"));
+    }
+
+    #[test]
+    fn a_missing_blob_degrades_gracefully_instead_of_failing_the_request() {
+        let f = fixture(vec![text("ok")]);
+        f.engine.store().add_message(&f.session.id, "user", &json!({"text":"old","mentions":{"files":[{"path":"gone.png","kind":"media","mediaType":"image/png","blob":"0000000000000000000000000000000000000000000000000000000000000000","size":10,"name":"gone.png"}]}})).unwrap();
+        f.say("continue");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        let reqs = f.fake.requests.lock().unwrap();
+        assert!(!has_image(&reqs[0]) && all_text(&reqs[0]).contains("[attachment gone.png is no longer available]"));
+    }
+
+    #[test]
+    fn models_without_image_input_are_refused_before_the_api_does_it_for_you() {
+        let probe = Engine::new(Store::open_memory().unwrap(), Box::new(FakeProvider::new(vec![])), EngineConfig::new("x", std::env::temp_dir()));
+        let (pid, mid) = probe
+            .catalog()
+            .providers
+            .iter()
+            .find_map(|(pid, p)| p.models.iter().find(|(_, m)| !m.modalities.input.is_empty() && !m.accepts("image")).map(|(mid, _)| (pid.clone(), mid.clone())))
+            .expect("the catalog has a text-only model");
+        assert!(!probe.media_caps(&pid, &mid).image);
+        assert_eq!(probe.media_caps("unknown", "unknown"), MediaCaps::default());
+        let f = fixture_cfg(vec![tool_call("t1", "read", json!({"path":"shot.png"})), text("cannot see it")], |c| c.model = format!("{pid}/{mid}"));
+        std::fs::write(f.dir.join("work/shot.png"), tiny_png()).unwrap();
+        f.say("look");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        let reqs = f.fake.requests.lock().unwrap();
+        assert!(!has_image(&reqs[1]));
+        assert!(matches!(&reqs[1].messages.last().unwrap().content[0], Block::ToolResult { is_error: true, content, .. } if content.contains("does not accept image input")));
     }
 }

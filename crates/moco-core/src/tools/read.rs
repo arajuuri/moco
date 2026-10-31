@@ -45,6 +45,19 @@ Prefer one larger read over many small slices, and use grep to find specific con
         }
 
         let bytes = std::fs::read(&path).map_err(|e| ToolError::fail(format!("{}: {e}", path.display())))?;
+        if let Some(s) = crate::media::sniff(&bytes) {
+            // Images and PDFs go to the model as media, judged by their bytes (the extension may lie).
+            let name = ctx.display(&path);
+            let accepted = if s.kind == crate::media::Kind::Image { ctx.media.image } else { ctx.media.pdf };
+            if !accepted {
+                return Err(ToolError::fail(format!("{name} is {} but the current model does not accept {} input. Use another model (see /model) or describe the file's content in another way.", s.kind.label(), s.kind.label())));
+            }
+            crate::media::check(&s, bytes.len()).map_err(|e| ToolError::fail(format!("{name}: {e}")))?;
+            let file = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| name.clone());
+            let mut out = ToolOutput::with_media(format!("{} file {name} ({}). Its content is attached below.", s.kind.label(), crate::media::describe(&s, bytes.len())), s.media_type, &file, &bytes);
+            out.metadata["path"] = json!(path.to_string_lossy());
+            return Ok(out);
+        }
         if bytes[..bytes.len().min(8192)].contains(&0) {
             return Err(ToolError::fail(format!("{} is a binary file; use shell to inspect it", path.display())));
         }
@@ -146,6 +159,47 @@ mod tests {
         assert_eq!(run(&env, json!({"path":"b.txt"})).unwrap().text, "1: hi\n2: yo");
         env.file("c.txt", "x".repeat(2500).as_bytes());
         assert!(run(&env, json!({"path":"c.txt"})).unwrap().text.ends_with("... (line truncated to 2000 chars)"));
+    }
+
+    fn png_bytes(w: u32, h: u32) -> Vec<u8> {
+        let mut b = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        b.extend_from_slice(&w.to_be_bytes());
+        b.extend_from_slice(&h.to_be_bytes());
+        b.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+        b
+    }
+
+    #[test]
+    fn images_and_pdfs_come_back_as_media() {
+        let env = Env::new();
+        env.file("shot.png", &png_bytes(800, 600));
+        env.file("noext", b"%PDF-1.7\nbody");
+        let mut o = run(&env, json!({"path":"shot.png"})).unwrap();
+        assert_eq!(o.text, "image file shot.png (image/png, 800x600, 1 KiB). Its content is attached below.");
+        let media = o.take_media();
+        assert_eq!((media.len(), media[0].media_type.as_str(), media[0].name.as_str(), media[0].bytes.len()), (1, "image/png", "shot.png", png_bytes(1, 1).len()));
+        assert!(o.metadata.get("_media").is_none() && o.metadata["path"].is_string(), "bytes removed from metadata, path kept");
+        let mut pdf = run(&env, json!({"path":"noext"})).unwrap();
+        assert!(pdf.text.starts_with("PDF file noext (application/pdf,"), "the extension does not matter: {}", pdf.text);
+        assert_eq!(pdf.take_media()[0].media_type, "application/pdf");
+        assert_eq!(env.perm.asked()[0].action, "read", "permission is still checked first");
+    }
+
+    #[test]
+    fn media_the_model_cannot_use_is_refused_clearly() {
+        let env = Env::new();
+        env.file("a.png", &png_bytes(10, 10));
+        env.file("b.png", &png_bytes(9000, 10));
+        env.file("c.pdf", b"%PDF-1.4");
+        let ctx = ToolCtx { media: MediaCaps { image: false, pdf: true }, ..env.ctx() };
+        let e = Read.run(&json!({"path":"a.png"}), &ctx).unwrap_err().message();
+        assert!(e.contains("does not accept image input") && e.contains("/model"), "{e}");
+        assert!(Read.run(&json!({"path":"c.pdf"}), &ctx).is_ok(), "PDFs are judged separately");
+        let e = run(&env, json!({"path":"b.png"})).unwrap_err().message();
+        assert!(e.contains("9000x10") && e.contains("sips"), "{e}");
+        // A file named .png that is not an image is just a binary file.
+        env.file("fake.png", b"not really\0 an image");
+        assert!(run(&env, json!({"path":"fake.png"})).unwrap_err().message().contains("binary"));
     }
 
     #[test]

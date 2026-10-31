@@ -591,9 +591,11 @@ fn main() {
     };
 
     // Expand @mentions of files, directories, skills and agents, tell the user what was attached, then queue the prompt.
+    let caps_of = |sid: &str| engine.store.lock().unwrap().session(sid).ok().flatten().map(|s| engine.current_media_caps(&s)).unwrap_or_default();
     let send = |sid: &str, text: &str| -> bool {
         let subagents = engine.subagent_names();
-        let (m, notes) = mentions::expand(text, &mentions::Ctx { cwd: &cwd, skills: &found_skills, subagents: &subagents });
+        let caps = caps_of(sid);
+        let (m, notes) = mentions::expand(text, &mentions::Ctx { cwd: &cwd, skills: &found_skills, subagents: &subagents, app_dir: &app_dir, caps });
         for n in notes {
             println!("{DIM}{n}{RESET}");
         }
@@ -819,7 +821,8 @@ fn main() {
                     let parent = engine.store.lock().unwrap().session(&session.id).ok().flatten();
                     let Some(parent) = parent else { continue };
                     let subagents = engine.subagent_names();
-                    let (m, notes) = mentions::expand(&prompt, &mentions::Ctx { cwd: &cwd, skills: &found_skills, subagents: &subagents });
+                    let caps = caps_of(&session.id);
+                    let (m, notes) = mentions::expand(&prompt, &mentions::Ctx { cwd: &cwd, skills: &found_skills, subagents: &subagents, app_dir: &app_dir, caps });
                     for n in notes {
                         println!("{DIM}{n}{RESET}");
                     }

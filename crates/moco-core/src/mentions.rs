@@ -1,8 +1,12 @@
-//! `@` mentions in a prompt (docs/09 "Composer"): `@path` attaches a file or directory listing, `@skill` loads a
-//! skill, `@agent` asks the model to delegate to that subagent. Everything is resolved when the prompt is
-//! submitted and stored with the message, so a conversation replays exactly as it was sent.
-//! An `@` only starts a mention at the beginning of a word, so `me@example.com` is left alone.
+//! `@` mentions in a prompt (docs/09 "Composer"): `@path` attaches a file, image, PDF or directory listing, `@skill`
+//! loads a skill, `@agent` asks the model to delegate to that subagent. Everything is resolved when the prompt is
+//! submitted and stored with the message (images and PDFs as blobs), so a conversation replays exactly as it was sent.
+//! An `@` only starts a mention at the beginning of a word, so `me@example.com` is left alone. A path may contain
+//! spaces if they are escaped with a backslash, which is how a terminal pastes a dragged-in file.
+use crate::provider::Block;
 use crate::skills::{self, Skill};
+use crate::tools::MediaCaps;
+use crate::{blobs, media};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -16,9 +20,13 @@ pub struct Ctx<'a> {
     pub skills: &'a [Skill],
     /// Agents the subagent tool can start.
     pub subagents: &'a [String],
+    /// Where attachments are stored (`blobs::put`).
+    pub app_dir: &'a Path,
+    /// What the current model accepts.
+    pub caps: MediaCaps,
 }
 
-/// Distinct `@tokens` of a prompt, trailing punctuation removed, in order of appearance.
+/// Distinct `@tokens` of a prompt, trailing punctuation removed, `\ ` unescaped, in order of appearance.
 pub fn tokens(text: &str) -> Vec<String> {
     let mut out: Vec<String> = vec![];
     let chars: Vec<(usize, char)> = text.char_indices().collect();
@@ -28,13 +36,14 @@ pub fn tokens(text: &str) -> Vec<String> {
         let starts_word = pos == 0 || chars[i - 1].1.is_whitespace() || matches!(chars[i - 1].1, '(' | '[' | '{' | ',' | '"' | '\'');
         if c == '@' && starts_word {
             let mut j = i + 1;
-            while j < chars.len() && !chars[j].1.is_whitespace() {
+            while j < chars.len() && (!chars[j].1.is_whitespace() || chars[j - 1].1 == '\\') {
                 j += 1;
             }
             let end = chars.get(j).map(|(p, _)| *p).unwrap_or(text.len());
-            let tok = text[pos + 1..end].trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '}', '\'', '"']);
-            if !tok.is_empty() && !tok.starts_with('@') && !out.iter().any(|t| t == tok) {
-                out.push(tok.to_string());
+            let raw = text[pos + 1..end].trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '}', '\'', '"']);
+            let tok = raw.replace("\\ ", " ");
+            if !tok.is_empty() && !tok.starts_with('@') && !out.contains(&tok) {
+                out.push(tok);
             }
             i = j;
         } else {
@@ -79,14 +88,37 @@ pub fn expand(text: &str, ctx: &Ctx) -> (Value, Vec<String>) {
                 continue;
             }
             let Ok(meta) = std::fs::metadata(&path) else { continue };
-            if meta.len() > MAX_FILE_BYTES {
-                notes.push(format!("skipped {name}: larger than {} MiB (ask the model to read it in parts)", MAX_FILE_BYTES / 1024 / 1024));
+            if meta.len() > media::MAX_PDF_BYTES as u64 {
+                notes.push(format!("skipped {name}: larger than {} MiB", media::MAX_PDF_BYTES / 1024 / 1024));
                 continue;
             }
             let Ok(bytes) = std::fs::read(&path) else {
                 notes.push(format!("skipped {name}: cannot be read"));
                 continue;
             };
+            if let Some(s) = media::sniff(&bytes) {
+                // Images and PDFs, judged by their bytes.
+                let accepted = if s.kind == media::Kind::Image { ctx.caps.image } else { ctx.caps.pdf };
+                if !accepted {
+                    notes.push(format!("skipped {name}: the current model does not accept {} input (see /model)", s.kind.label()));
+                    continue;
+                }
+                if let Err(e) = media::check(&s, bytes.len()) {
+                    notes.push(format!("skipped {name}: {e}"));
+                    continue;
+                }
+                let Ok(hash) = blobs::put(ctx.app_dir, &bytes) else {
+                    notes.push(format!("skipped {name}: could not store the attachment"));
+                    continue;
+                };
+                notes.push(format!("attached {} {name} ({})", s.kind.label(), media::describe(&s, bytes.len())));
+                files.push(json!({"path": name, "kind": "media", "mediaType": s.media_type, "blob": hash, "size": bytes.len(), "name": path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| name.clone())}));
+                continue;
+            }
+            if meta.len() > MAX_FILE_BYTES {
+                notes.push(format!("skipped {name}: larger than {} MiB (ask the model to read it in parts)", MAX_FILE_BYTES / 1024 / 1024));
+                continue;
+            }
             if bytes[..bytes.len().min(8192)].contains(&0) || std::str::from_utf8(&bytes).is_err() {
                 notes.push(format!("skipped {name}: not a text file"));
                 continue;
@@ -123,29 +155,49 @@ pub fn expand(text: &str, ctx: &Ctx) -> (Value, Vec<String>) {
     (json!({"files": files, "skills": skill_items, "agents": agents}), notes)
 }
 
-/// Text blocks for a stored `mentions` value, appended after the typed text when the message is sent to the model.
-pub fn render(mentions: &Value) -> Vec<String> {
+/// Content blocks for a stored `mentions` value, appended after the typed text when the message goes to the model.
+/// Attachments are loaded through `load`.
+pub fn render_blocks(mentions: &Value, load: crate::chat::Loader) -> Vec<Block> {
     let mut out = vec![];
     for f in mentions["files"].as_array().into_iter().flatten() {
-        let (path, content) = (f["path"].as_str().unwrap_or(""), f["content"].as_str().unwrap_or(""));
+        let path = f["path"].as_str().unwrap_or("");
+        if f["kind"] == "media" {
+            out.push(Block::Text(format!("<attachment path=\"{path}\" />")));
+            out.push(crate::chat::media_block(f, load));
+            continue;
+        }
+        let content = f["content"].as_str().unwrap_or("");
         let content = content.strip_suffix('\n').unwrap_or(content); // the closing tag goes on its own line
         let tag = if f["kind"] == "dir" { "directory" } else { "file" };
         let note = if f["truncated"] == true { "\n[truncated: use the read tool for the rest]" } else { "" };
-        out.push(format!("<{tag} path=\"{path}\">\n{content}{note}\n</{tag}>"));
+        out.push(Block::Text(format!("<{tag} path=\"{path}\">\n{content}{note}\n</{tag}>")));
     }
     for s in mentions["skills"].as_array().into_iter().flatten() {
-        out.push(s["content"].as_str().unwrap_or("").to_string());
+        out.push(Block::Text(s["content"].as_str().unwrap_or("").to_string()));
     }
     for a in mentions["agents"].as_array().into_iter().flatten() {
         let a = a.as_str().unwrap_or("");
-        out.push(format!("<system-reminder>\nThe user mentioned the \"{a}\" agent with @{a}. Delegate the relevant part of the request to it with the subagent tool (agent: \"{a}\").\n</system-reminder>"));
+        out.push(Block::Text(format!("<system-reminder>\nThe user mentioned the \"{a}\" agent with @{a}. Delegate the relevant part of the request to it with the subagent tool (agent: \"{a}\").\n</system-reminder>")));
     }
     out
+}
+
+/// Text-only form (for prompts that become a subagent's task): attachments that are images or PDFs are not forwarded.
+pub fn render(mentions: &Value) -> Vec<String> {
+    render_blocks(mentions, &|_| None)
+        .into_iter()
+        .filter_map(|b| match b {
+            Block::Text(t) if t.starts_with("[attachment ") && t.ends_with("is no longer available]") => None,
+            Block::Text(t) => Some(t),
+            _ => None,
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::media::tests::png;
 
     #[test]
     fn tokens_start_at_word_boundaries_and_drop_punctuation() {
@@ -154,9 +206,29 @@ mod tests {
         assert_eq!(tokens("@x @x @y"), ["x", "y"], "deduplicated");
         assert_eq!(tokens("@\u{e9}t\u{e9}.txt!"), ["\u{e9}t\u{e9}.txt"], "non-ASCII is fine");
         assert_eq!(tokens("@~/notes.md"), ["~/notes.md"]);
+        assert_eq!(tokens("see @/Users/me/Screen\\ Shot\\ 2024.png now"), ["/Users/me/Screen Shot 2024.png"], "dragged-in paths keep their escaped spaces");
+        assert_eq!(tokens("@a\\ b.txt, @c"), ["a b.txt", "c"]);
     }
 
-    fn setup() -> (PathBuf, Vec<Skill>) {
+    struct Fx {
+        root: PathBuf,
+        skills: Vec<Skill>,
+    }
+    impl Fx {
+        fn work(&self) -> PathBuf {
+            self.root.join("work")
+        }
+        fn ctx<'a>(&'a self, work: &'a Path, subagents: &'a [String], caps: MediaCaps) -> Ctx<'a> {
+            Ctx { cwd: work, skills: &self.skills, subagents, app_dir: &self.root, caps }
+        }
+    }
+    impl Drop for Fx {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn setup() -> Fx {
         let root = std::env::temp_dir().join(crate::id::new_id("moco-mention"));
         std::fs::create_dir_all(root.join("work/sub")).unwrap();
         std::fs::write(root.join("work/a.txt"), "one\ntwo\r\nthree\n").unwrap();
@@ -166,18 +238,18 @@ mod tests {
         std::fs::create_dir_all(root.join("skill/pdf")).unwrap();
         std::fs::write(root.join("skill/pdf/SKILL.md"), "---\ndescription: pdf things\n---\nPDF steps").unwrap();
         let skills = skills::discover(&root.join("app"), &root.join("work"), &[root.join("skill").to_string_lossy().into_owned()]);
-        (root, skills)
+        Fx { root, skills }
     }
 
     #[test]
     fn files_dirs_skills_agents_and_nonmentions() {
-        let (root, skills) = setup();
-        let work = root.join("work");
+        let fx = setup();
+        let work = fx.work();
         let subagents = vec!["explore".to_string()];
-        let ctx = Ctx { cwd: &work, skills: &skills, subagents: &subagents };
+        let ctx = fx.ctx(&work, &subagents, MediaCaps::default());
         let (m, notes) = expand("read @a.txt and @sub and @../outside.txt, use @pdf, ask @explore, ignore @nothing @bin.dat", &ctx);
         let files = m["files"].as_array().unwrap();
-        assert_eq!(files.iter().map(|f| f["path"].as_str().unwrap()).collect::<Vec<_>>(), ["a.txt", "sub", &root.join("outside.txt").display().to_string()]);
+        assert_eq!(files.iter().map(|f| f["path"].as_str().unwrap()).collect::<Vec<_>>(), ["a.txt", "sub", &fx.root.join("outside.txt").display().to_string()]);
         assert_eq!(files[0]["content"], "one\ntwo\nthree\n", "CRLF normalized");
         assert_eq!((files[1]["kind"].as_str(), files[1]["content"].as_str()), (Some("dir"), Some("b.rs")));
         assert_eq!(m["skills"][0]["id"], "pdf");
@@ -191,23 +263,56 @@ mod tests {
         std::fs::write(work.join("pdf"), "a file called pdf").unwrap();
         let (m, _) = expand("@pdf", &ctx);
         assert_eq!((m["files"][0]["content"].as_str(), m["skills"].as_array().unwrap().len()), (Some("a file called pdf"), 0));
-        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn images_and_pdfs_become_blobs_judged_by_bytes_and_by_what_the_model_accepts() {
+        let fx = setup();
+        let work = fx.work();
+        std::fs::write(work.join("Screen Shot.png"), png(640, 480)).unwrap();
+        std::fs::write(work.join("spec"), b"%PDF-1.7 body").unwrap(); // no extension
+        std::fs::write(work.join("huge.png"), png(9000, 10)).unwrap();
+        std::fs::write(work.join("fake.png"), "plain text pretending").unwrap();
+        let ctx = fx.ctx(&work, &[], MediaCaps::default());
+        let (m, notes) = expand("@Screen\\ Shot.png @spec @huge.png @fake.png", &ctx);
+        let files = m["files"].as_array().unwrap();
+        assert_eq!(files.len(), 3, "{notes:?}");
+        assert_eq!((files[0]["kind"].as_str(), files[0]["mediaType"].as_str(), files[0]["name"].as_str()), (Some("media"), Some("image/png"), Some("Screen Shot.png")));
+        assert_eq!(files[1]["mediaType"], "application/pdf");
+        assert_eq!(files[2]["kind"], "file", "a fake .png is just a text file");
+        assert!(notes.iter().any(|n| n == "attached image Screen Shot.png (image/png, 640x480, 1 KiB)") && notes.iter().any(|n| n.contains("skipped huge.png: the image is 9000x10")), "{notes:?}");
+        // The bytes are in the blob store, not in the message.
+        let hash = files[0]["blob"].as_str().unwrap();
+        assert_eq!(blobs::get(&fx.root, hash).unwrap(), png(640, 480));
+        assert!(!m.to_string().contains("iVBOR"), "no base64 in the stored message");
+        // Rendering loads them back.
+        let blocks = render_blocks(&m, &|h| blobs::get(&fx.root, h));
+        assert!(matches!(&blocks[0], Block::Text(t) if t == "<attachment path=\"Screen Shot.png\" />"));
+        assert!(matches!(&blocks[1], Block::Image { media_type, .. } if media_type == "image/png"));
+        assert!(matches!(&blocks[3], Block::Document { name, .. } if name == "spec"));
+        // A model that cannot see images gets a note instead of an attachment.
+        let (m, notes) = expand("@Screen\\ Shot.png @spec", &fx.ctx(&work, &[], MediaCaps { image: false, pdf: true }));
+        assert_eq!(m["files"].as_array().unwrap().len(), 1);
+        assert!(notes.iter().any(|n| n.contains("does not accept image input")), "{notes:?}");
+        // Text-only rendering (for subagent prompts) leaves media out.
+        assert!(render(&expand("@Screen\\ Shot.png @a.txt", &ctx).0).iter().all(|t| !t.contains("Screen Shot.png\" />") || t.starts_with("<attachment")));
     }
 
     #[test]
     fn big_and_long_files_are_limited() {
-        let (root, skills) = setup();
-        let work = root.join("work");
+        let fx = setup();
+        let work = fx.work();
         std::fs::write(work.join("long.txt"), (1..=3000).map(|i| i.to_string()).collect::<Vec<_>>().join("\n")).unwrap();
         std::fs::write(work.join("huge.txt"), "x".repeat(3 * 1024 * 1024)).unwrap();
-        let ctx = Ctx { cwd: &work, skills: &skills, subagents: &[] };
-        let (m, notes) = expand("@long.txt @huge.txt", &ctx);
+        std::fs::write(work.join("giant.bin"), vec![b'x'; 11 * 1024 * 1024]).unwrap();
+        let ctx = fx.ctx(&work, &[], MediaCaps::default());
+        let (m, notes) = expand("@long.txt @huge.txt @giant.bin", &ctx);
         let f = &m["files"][0];
         assert_eq!((f["truncated"].as_bool(), f["lines"].as_u64()), (Some(true), Some(3000)));
         assert!(f["content"].as_str().unwrap().ends_with("2000") && !f["content"].as_str().unwrap().contains("2001"));
         assert!(notes.iter().any(|n| n.contains("first 2000 shown")) && notes.iter().any(|n| n.contains("skipped huge.txt: larger than 2 MiB")), "{notes:?}");
+        assert!(notes.iter().any(|n| n.contains("skipped giant.bin: larger than 10 MiB")), "{notes:?}");
         assert_eq!(m["files"].as_array().unwrap().len(), 1);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

@@ -58,7 +58,7 @@ Status: complete. 197 unit tests pass on Linux and on the Mojave machine; the re
 - **Not done** (carried to later phases or dropped): skills, custom commands and `@` mentions, MCP, `websearch`, background shell and background subagents, OpenAI Responses and Gemini protocols, reasoning variants and per-model request overlays, the `summary` agent, a graphical or full-screen UI (the terminal chat is line based), notifications.
 
 ## Phase 3: extensibility
-- Skills, custom commands, `@` mentions [done, see `08` implementation notes] and attachments (images/PDF).
+- Skills, custom commands, `@` mentions [done, see `08` implementation notes] and attachments (images/PDF) [done, see `04` implementation notes].
 - MCP stdio, then Streamable HTTP + OAuth.
 - Background shell, formatter hooks, OpenAI Responses and Gemini protocols.
 - Notifications, themes, keybinding config.

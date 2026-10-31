@@ -29,6 +29,7 @@ def trim(data, keep):
                 "id": mid,
                 "name": m.get("name", mid),
                 "reasoning": bool(m.get("reasoning")),
+                "modalities": {"input": (m.get("modalities") or {}).get("input", [])},
                 "limit": {"context": (m.get("limit") or {}).get("context", 0), "output": (m.get("limit") or {}).get("output", 0)},
             }
             if "input" in c and "output" in c:

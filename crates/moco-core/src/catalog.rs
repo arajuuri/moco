@@ -42,9 +42,17 @@ pub struct Limit {
     pub output: u64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Modalities {
+    /// `text`, `image`, `pdf`, `audio`, `video`
+    pub input: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct Model {
+    pub modalities: Modalities,
     pub id: String,
     pub name: String,
     pub reasoning: bool,
@@ -198,7 +206,7 @@ impl Catalog {
                 .models
                 .iter()
                 .map(|(mid, m)| {
-                    let mut v = serde_json::json!({"id":m.id,"name":m.name,"reasoning":m.reasoning,"tool_call":m.tool_call,"limit":{"context":m.limit.context,"output":m.limit.output}});
+                    let mut v = serde_json::json!({"id":m.id,"name":m.name,"reasoning":m.reasoning,"tool_call":m.tool_call,"modalities":{"input":m.modalities.input},"limit":{"context":m.limit.context,"output":m.limit.output}});
                     if let Some(c) = &m.cost {
                         v["cost"] = serde_json::to_value(c).unwrap_or_default();
                     }
@@ -266,6 +274,14 @@ impl Catalog {
 }
 
 /// USD cost of one response: tokens times per-million-token prices. `None` when the model has no price.
+impl Model {
+    /// Does the model take this kind of input (`image`, `pdf`)? Unknown (no modality data in the catalog) counts as yes,
+    /// so a custom or local model is never blocked by missing metadata.
+    pub fn accepts(&self, kind: &str) -> bool {
+        self.modalities.input.is_empty() || self.modalities.input.iter().any(|m| m == kind)
+    }
+}
+
 pub fn cost(model: &Model, u: &Usage) -> Option<f64> {
     let c = model.cost.as_ref()?;
     // Larger prompts can fall in a higher price tier; the biggest threshold that is exceeded wins.
@@ -320,6 +336,20 @@ mod tests {
         let big = Usage { input: 60_000, cache_read: 50_000, cache_write: 10_000, output: 1_000_000 };
         let expect = (60_000.0 * 0.5 + 1_000_000.0 * 2.5 + 50_000.0 * 0.05 + 10_000.0 * 0.125) / 1e6;
         assert!((cost(&m, &big).unwrap() - expect).abs() < 1e-9, "{} vs {expect}", cost(&m, &big).unwrap());
+    }
+
+    #[test]
+    fn modalities_decide_what_a_model_accepts() {
+        let c = Catalog::embedded();
+        let sonnet = c.model("anthropic", "claude-sonnet-5-5").unwrap();
+        assert!(sonnet.accepts("image") && sonnet.accepts("pdf") && sonnet.accepts("text"));
+        let text_only = c.providers.values().flat_map(|p| p.models.values()).find(|m| !m.modalities.input.is_empty() && !m.accepts("image"));
+        assert!(text_only.is_some(), "the snapshot has text-only models");
+        assert!(Model::default().accepts("image"), "unknown modalities never block");
+        // Survives the cache round trip.
+        let json = c.to_json().to_string();
+        let again = Catalog::parse(&json).unwrap();
+        assert_eq!(again.model("anthropic", "claude-sonnet-5-5").unwrap().modalities, sonnet.modalities);
     }
 
     #[test]

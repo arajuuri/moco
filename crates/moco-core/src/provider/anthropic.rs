@@ -46,6 +46,10 @@ pub fn build_body(req: &Request, cache: bool) -> Value {
                 .iter()
                 .map(|b| match b {
                     Block::Text(t) => json!({"type":"text","text":t}),
+                    Block::Image { media_type, data } => json!({"type":"image","source":{"type":"base64","media_type":media_type,"data":data}}),
+                    Block::Document { media_type, data, name } => {
+                        json!({"type":"document","title":name,"source":{"type":"base64","media_type":media_type,"data":data}})
+                    }
                     Block::ToolUse { id, name, input } => json!({"type":"tool_use","id":id,"name":name,"input":input}),
                     Block::ToolResult { id, content, is_error } => {
                         json!({"type":"tool_result","tool_use_id":id,"content":content,"is_error":is_error})
@@ -413,6 +417,31 @@ mod tests {
         assert_eq!(strip(json!(ma)), strip(json!(&mb[..ma.len()])), "the new request extends the old one");
         // The old request's final message is marked in the new request too: the previous cache entry is hit exactly.
         assert!(marked(&mb[ma.len() - 1]["content"][0]));
+    }
+
+    #[test]
+    fn images_and_documents_use_base64_sources_and_can_carry_cache_markers() {
+        let req = Request {
+            model: "m".into(),
+            system: String::new(),
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: vec![
+                    Block::Text("look".into()),
+                    Block::Image { media_type: "image/png".into(), data: "AAAA".into() },
+                    Block::Document { media_type: "application/pdf".into(), data: "BBBB".into(), name: "spec.pdf".into() },
+                ],
+            }],
+            tools: vec![],
+            max_tokens: 10,
+            tools_disabled: false,
+        };
+        let b = build_body(&req, true);
+        let c = &b["messages"][0]["content"];
+        assert_eq!(c[1], json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}));
+        assert_eq!(c[2]["type"], "document");
+        assert_eq!((c[2]["title"].clone(), c[2]["source"]["media_type"].clone()), (json!("spec.pdf"), json!("application/pdf")));
+        assert!(marked(&c[2]) && !marked(&c[1]), "the breakpoint goes on the last block, here the document");
     }
 
     #[test]

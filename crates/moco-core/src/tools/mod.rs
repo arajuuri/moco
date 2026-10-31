@@ -52,9 +52,58 @@ pub struct ToolOutput {
     pub text: String,
     pub metadata: Value,
 }
+
+/// A file a tool wants the model to see (an image or PDF); the engine stores it as a blob.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Attachment {
+    pub media_type: String,
+    pub name: String,
+    pub bytes: Vec<u8>,
+}
+
 impl ToolOutput {
     pub fn text(t: impl Into<String>) -> Self {
         ToolOutput { text: t.into(), metadata: json!({}) }
+    }
+
+    /// Output text plus a file for the model to look at. The bytes travel in `metadata._media` (base64) until
+    /// the engine takes them with `take_media`.
+    pub fn with_media(text: impl Into<String>, media_type: &str, name: &str, bytes: &[u8]) -> Self {
+        use base64::Engine as _;
+        ToolOutput {
+            text: text.into(),
+            metadata: json!({"_media": [{"mediaType": media_type, "name": name, "base64": base64::engine::general_purpose::STANDARD.encode(bytes)}]}),
+        }
+    }
+
+    /// Remove and return the attachments carried by `with_media`.
+    pub fn take_media(&mut self) -> Vec<Attachment> {
+        use base64::Engine as _;
+        let Some(list) = self.metadata.as_object_mut().and_then(|m| m.remove("_media")) else { return vec![] };
+        list.as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| {
+                Some(Attachment {
+                    media_type: e["mediaType"].as_str()?.to_string(),
+                    name: e["name"].as_str().unwrap_or("attachment").to_string(),
+                    bytes: base64::engine::general_purpose::STANDARD.decode(e["base64"].as_str()?).ok()?,
+                })
+            })
+            .collect()
+    }
+}
+
+/// What the current model accepts as input besides text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MediaCaps {
+    pub image: bool,
+    pub pdf: bool,
+}
+
+impl Default for MediaCaps {
+    fn default() -> Self {
+        MediaCaps { image: true, pdf: true }
     }
 }
 
@@ -122,6 +171,7 @@ pub trait Host: Sync {
 }
 
 pub struct ToolCtx<'a> {
+    pub media: MediaCaps,
     pub session_id: &'a str,
     pub host: &'a dyn Host,
     pub cwd: PathBuf,
@@ -301,7 +351,7 @@ pub(crate) mod testutil {
             self.dir.join("work")
         }
         pub fn ctx(&self) -> ToolCtx<'_> {
-            ToolCtx { session_id: "ses_test", host: &self.host, cwd: self.work(), project_root: self.work(), spill_dir: self.dir.join("spill"), permitter: &self.perm, cancel: &self.cancel }
+            ToolCtx { media: MediaCaps::default(), session_id: "ses_test", host: &self.host, cwd: self.work(), project_root: self.work(), spill_dir: self.dir.join("spill"), permitter: &self.perm, cancel: &self.cancel }
         }
         pub fn file(&self, rel: &str, content: &[u8]) -> PathBuf {
             let p = self.work().join(rel);
