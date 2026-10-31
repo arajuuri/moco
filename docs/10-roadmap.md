@@ -39,7 +39,7 @@ Status: complete. 84 unit tests pass on Linux and on the Mojave machine; the rel
 ## Phase 2: daily-driver
 - Inbox with steer/queue, resume after crash (`02`).
 - Compaction auto/manual/overflow recovery (`03`).
-- AGENTS.md, config loading (JSONC, merge, variables), model picker, cost/usage display (`07`, `08`).
+- AGENTS.md, config loading (JSONC, merge, variables) [done, see `08` implementation notes], model picker, cost/usage display (`07`, `08`).
 - `patch`, `webfetch`, `todowrite`, `question`, subagent tool and `general`/`explore` agents.
 - Snapshots + revert/undo, session diff view.
 - Title generation, session list, fork, rename, archive.

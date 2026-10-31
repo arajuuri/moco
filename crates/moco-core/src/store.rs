@@ -14,9 +14,10 @@ pub enum StoreError {
 }
 pub type Result<T> = std::result::Result<T, StoreError>;
 
-const MIGRATIONS: &[(i64, &str)] = &[(
-    1,
-    "create table project(
+const MIGRATIONS: &[(i64, &str)] = &[
+    (
+        1,
+        "create table project(
         id text primary key, directory text not null unique, name text, time_created integer not null);
      create table session(
         id text primary key, project_id text not null references project(id), parent_id text,
@@ -39,7 +40,14 @@ const MIGRATIONS: &[(i64, &str)] = &[(
      create table todo(
         session_id text not null references session(id) on delete cascade, position integer not null,
         content text not null, status text not null, primary key(session_id, position));",
-)];
+    ),
+    (
+        2,
+        "create table instruction_state(
+            session_id text not null references session(id) on delete cascade, path text not null,
+            primary key(session_id, path));",
+    ),
+];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Session {
@@ -237,6 +245,18 @@ impl Store {
         }
         tx.commit()?;
         Ok(ids)
+    }
+
+    /// Remember an instruction file that `read` discovered, so later steps keep including it.
+    pub fn add_instruction(&self, session_id: &str, path: &str) -> Result<()> {
+        self.conn.execute("insert or ignore into instruction_state(session_id, path) values (?1,?2)", params![session_id, path])?;
+        Ok(())
+    }
+
+    pub fn instruction_paths(&self, session_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("select path from instruction_state where session_id=?1 order by rowid")?;
+        let rows = stmt.query_map([session_id], |r| r.get(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
     pub fn save_permission(&self, project_id: &str, action: &str, resource: &str) -> Result<()> {

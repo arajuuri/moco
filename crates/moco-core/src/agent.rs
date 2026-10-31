@@ -4,10 +4,12 @@ use crate::tools::Tool;
 
 #[derive(Debug, Clone)]
 pub struct Agent {
-    pub id: &'static str,
-    pub name: &'static str,
-    pub description: &'static str,
-    pub system: Option<&'static str>,
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub system: Option<String>,
+    /// `provider/model` override for this agent.
+    pub model: Option<String>,
     /// Max steps per run; `None` is unlimited.
     pub steps: Option<u32>,
     pub permissions: Vec<Rule>,
@@ -21,26 +23,28 @@ pub fn builtin() -> Vec<Agent> {
     plan.push(Rule::new("edit", "*", Effect::Deny));
     vec![
         Agent {
-            id: "build",
-            name: "Build",
-            description: "The default agent. Executes tools based on configured permissions.",
+            id: "build".into(),
+            name: "Build".into(),
+            description: "The default agent. Executes tools based on configured permissions.".into(),
             system: None,
+            model: None,
             steps: None,
             permissions: build,
         },
         Agent {
-            id: "plan",
-            name: "Plan",
-            description: "Read-only agent for exploring the codebase and planning work before implementation.",
+            id: "plan".into(),
+            name: "Plan".into(),
+            description: "Read-only agent for exploring the codebase and planning work before implementation.".into(),
             system: None,
+            model: None,
             steps: None,
             permissions: plan,
         },
     ]
 }
 
-pub fn find(id: &str) -> Option<Agent> {
-    builtin().into_iter().find(|a| a.id == id)
+pub fn find(agents: &[Agent], id: &str) -> Option<Agent> {
+    agents.iter().find(|a| a.id == id).cloned()
 }
 
 /// Tool name -> permission action it is checked under.
@@ -81,6 +85,8 @@ pub struct EnvInfo<'a> {
     pub cwd: &'a str,
     pub platform: &'a str,
     pub date: &'a str,
+    /// Rendered `AGENTS.md` content (see `instructions::render`), may be empty.
+    pub instructions: &'a str,
 }
 
 /// Base prompt adapted from upstream `runner/prompt/system.txt` (MIT, see LICENSE-opencode).
@@ -116,10 +122,14 @@ pub fn system_prompt(agent: &Agent, tools: &[&dyn Tool], env: &EnvInfo) -> Strin
 - Keep changes consistent with the structure, naming, style, and patterns of the surrounding code.\n\
 - Treat unfamiliar files or changes as potential user work and investigate before deleting or overwriting them.\n",
     );
-    if let Some(extra) = agent.system {
+    if let Some(extra) = &agent.system {
         s.push('\n');
         s.push_str(extra);
         s.push('\n');
+    }
+    if !env.instructions.trim().is_empty() {
+        s.push_str("\n# Project instructions\nThese come from the user's AGENTS.md files; follow them. Later entries are more specific and win over earlier ones.\n\n");
+        s.push_str(env.instructions);
     }
     s.push_str(&format!("\n# Environment\n- Working directory: {}\n- Platform: {}\n- Date: {}\n", env.cwd, env.platform, env.date));
     s
@@ -154,18 +164,22 @@ mod tests {
     fn plan_hides_write_tools_but_build_does_not() {
         let tools = crate::tools::all();
         let names = |a: &Agent| tools.iter().filter(|t| advertised(a, t.as_ref())).map(|t| t.name()).collect::<Vec<_>>();
-        assert_eq!(names(&find("build").unwrap()), ["read", "write", "edit", "glob", "grep", "shell"]);
-        assert_eq!(names(&find("plan").unwrap()), ["read", "glob", "grep", "shell"]);
+        assert_eq!(names(&find(&builtin(), "build").unwrap()), ["read", "write", "edit", "glob", "grep", "shell"]);
+        assert_eq!(names(&find(&builtin(), "plan").unwrap()), ["read", "glob", "grep", "shell"]);
     }
 
     #[test]
     fn prompt_guidance_follows_enabled_tools() {
         let tools = crate::tools::all();
         let refs: Vec<&dyn Tool> = tools.iter().map(|t| t.as_ref()).collect();
-        let env = EnvInfo { cwd: "/w", platform: "macos", date: "2026-10-31" };
-        let full = system_prompt(&find("build").unwrap(), &refs, &env);
+        let env = EnvInfo { cwd: "/w", platform: "macos", date: "2026-10-31", instructions: "" };
+        let full = system_prompt(&find(&builtin(), "build").unwrap(), &refs, &env);
         assert!(full.contains("Use the edit tool for targeted changes") && full.contains("Working directory: /w"));
-        let no_edit = system_prompt(&find("build").unwrap(), &refs[3..], &env);
+        let no_edit = system_prompt(&find(&builtin(), "build").unwrap(), &refs[3..], &env);
         assert!(!no_edit.contains("edit tool") && no_edit.contains("Prefer dedicated tools"));
+        assert!(!full.contains("Project instructions"));
+        let with = EnvInfo { instructions: "Instructions from: /w/AGENTS.md\nuse tabs\n", ..env };
+        let p = system_prompt(&find(&builtin(), "build").unwrap(), &refs, &with);
+        assert!(p.contains("# Project instructions") && p.contains("use tabs"));
     }
 }

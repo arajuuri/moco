@@ -1,0 +1,366 @@
+//! Config loading (docs/08-config-and-extensions.md): `moco.json[c]` (JSONC) files merged from
+//! lowest to highest priority, `{env:NAME}` / `{file:path}` substitution on the raw text.
+//!
+//! Locations, lowest first: `<app dir>/config/moco.json[c]`; then for every ancestor of the working
+//! directory, outermost first, `<dir>/moco.json[c]` and `<dir>/.moco/moco.json[c]`; then `$MOCO_CONFIG`.
+//! Objects merge by key; `permissions` and `instructions` arrays concatenate (lowest priority first),
+//! every other value is replaced.
+use crate::agent::{self, Agent};
+use crate::permission::Rule;
+use serde::Deserialize;
+use serde_json::Value;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct AgentConfig {
+    pub model: Option<String>,
+    pub system: Option<String>,
+    pub description: Option<String>,
+    pub steps: Option<u32>,
+    pub permissions: Vec<Rule>,
+    pub disabled: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct Config {
+    /// `provider/model`
+    pub model: Option<String>,
+    pub default_agent: Option<String>,
+    pub shell: Option<String>,
+    pub permissions: Vec<Rule>,
+    pub agents: BTreeMap<String, AgentConfig>,
+    /// Extra instruction files (paths, `~/` allowed; relative paths resolve against the working directory).
+    pub instructions: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct Loaded {
+    pub config: Config,
+    pub sources: Vec<PathBuf>,
+    pub warnings: Vec<String>,
+}
+
+/// Remove `//` and `/* */` comments and trailing commas, leaving strings untouched.
+pub fn strip_jsonc(src: &str) -> String {
+    let cs: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len());
+    let (mut i, mut in_str) = (0, false);
+    while i < cs.len() {
+        let c = cs[i];
+        if in_str {
+            out.push(c);
+            if c == '\\' && i + 1 < cs.len() {
+                out.push(cs[i + 1]);
+                i += 1;
+            } else if c == '"' {
+                in_str = false;
+            }
+        } else if c == '"' {
+            in_str = true;
+            out.push(c);
+        } else if c == '/' && cs.get(i + 1) == Some(&'/') {
+            while i < cs.len() && cs[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        } else if c == '/' && cs.get(i + 1) == Some(&'*') {
+            i += 2;
+            while i + 1 < cs.len() && !(cs[i] == '*' && cs[i + 1] == '/') {
+                i += 1;
+            }
+            i += 2;
+            continue;
+        } else if c == ',' {
+            // Trailing comma: next significant char closes the container.
+            let mut j = i + 1;
+            loop {
+                while j < cs.len() && cs[j].is_whitespace() {
+                    j += 1;
+                }
+                if cs.get(j) == Some(&'/') && cs.get(j + 1) == Some(&'/') {
+                    while j < cs.len() && cs[j] != '\n' {
+                        j += 1;
+                    }
+                } else if cs.get(j) == Some(&'/') && cs.get(j + 1) == Some(&'*') {
+                    j += 2;
+                    while j + 1 < cs.len() && !(cs[j] == '*' && cs[j + 1] == '/') {
+                        j += 1;
+                    }
+                    j += 2;
+                } else {
+                    break;
+                }
+            }
+            if !matches!(cs.get(j), Some('}') | Some(']')) {
+                out.push(c);
+            }
+        } else {
+            out.push(c);
+        }
+        i += 1;
+    }
+    out
+}
+
+fn expand_home(p: &str) -> PathBuf {
+    match p.strip_prefix("~/") {
+        Some(rest) => PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(rest),
+        None => PathBuf::from(p),
+    }
+}
+
+fn json_escape(s: &str) -> String {
+    let q = serde_json::to_string(s).unwrap_or_default();
+    q[1..q.len().saturating_sub(1)].to_string()
+}
+
+/// Replace `{env:NAME}` (empty if unset) and `{file:path}` (contents, relative to `base`) in raw text.
+/// Values are JSON-escaped so they are safe inside a string literal.
+pub fn substitute(raw: &str, base: &Path) -> Result<String, String> {
+    let mut out = String::new();
+    let mut rest = raw;
+    while let Some(start) = rest.find('{') {
+        out.push_str(&rest[..start]);
+        let tail = &rest[start..];
+        let end = tail.find('}');
+        match (end, tail.strip_prefix("{env:").or_else(|| tail.strip_prefix("{file:"))) {
+            (Some(end), Some(_)) => {
+                let token = &tail[1..end];
+                let (kind, arg) = token.split_once(':').unwrap();
+                let value = if kind == "env" {
+                    std::env::var(arg.trim()).unwrap_or_default()
+                } else {
+                    let p = expand_home(arg.trim());
+                    let p = if p.is_absolute() { p } else { base.join(p) };
+                    std::fs::read_to_string(&p).map_err(|e| format!("{{file:{}}}: {e}", p.display()))?.trim_end_matches(['\n', '\r']).to_string()
+                };
+                out.push_str(&json_escape(&value));
+                rest = &tail[end + 1..];
+            }
+            _ => {
+                out.push('{');
+                rest = &tail[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+const CONCAT_KEYS: &[&str] = &["permissions", "instructions"];
+
+pub fn merge(base: Value, over: Value, key: &str) -> Value {
+    match (base, over) {
+        (Value::Object(mut b), Value::Object(o)) => {
+            for (k, v) in o {
+                let merged = match b.remove(&k) {
+                    Some(existing) => merge(existing, v, &k),
+                    None => v,
+                };
+                b.insert(k, merged);
+            }
+            Value::Object(b)
+        }
+        (Value::Array(mut b), Value::Array(o)) if CONCAT_KEYS.contains(&key) => {
+            b.extend(o);
+            Value::Array(b)
+        }
+        (_, o) => o,
+    }
+}
+
+fn candidates(dir: &Path) -> Vec<PathBuf> {
+    ["moco.json", "moco.jsonc"].iter().map(|n| dir.join(n)).collect()
+}
+
+/// Config files that exist, lowest priority first.
+pub fn discover(app_dir: &Path, cwd: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![app_dir.join("config")];
+    let mut ancestors: Vec<&Path> = cwd.ancestors().collect();
+    ancestors.reverse();
+    for a in ancestors {
+        dirs.push(a.to_path_buf());
+        dirs.push(a.join(".moco"));
+    }
+    let mut files: Vec<PathBuf> = dirs.iter().flat_map(|d| candidates(d)).filter(|p| p.is_file()).collect();
+    if let Ok(p) = std::env::var("MOCO_CONFIG") {
+        files.push(PathBuf::from(p));
+    }
+    files
+}
+
+pub fn load(app_dir: &Path, cwd: &Path) -> Loaded {
+    let mut merged = Value::Object(Default::default());
+    let mut out = Loaded::default();
+    for path in discover(app_dir, cwd) {
+        let parsed = std::fs::read_to_string(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|raw| substitute(&raw, path.parent().unwrap_or(Path::new("."))))
+            .and_then(|raw| serde_json::from_str::<Value>(&strip_jsonc(&raw)).map_err(|e| e.to_string()));
+        match parsed {
+            Ok(v) if v.is_object() => {
+                merged = merge(merged, v, "");
+                out.sources.push(path);
+            }
+            Ok(_) => out.warnings.push(format!("{}: top level must be an object", path.display())),
+            Err(e) => out.warnings.push(format!("{}: {e}", path.display())),
+        }
+    }
+    match serde_json::from_value::<Config>(merged) {
+        Ok(c) => out.config = c,
+        Err(e) => out.warnings.push(format!("invalid config: {e}")),
+    }
+    out
+}
+
+/// Built-in agents with config overrides applied, plus agents defined only in config.
+/// Rule order: agent defaults, then top-level `permissions`, then the agent's own `permissions`.
+pub fn resolve_agents(cfg: &Config) -> Vec<Agent> {
+    let mut agents: Vec<Agent> = agent::builtin();
+    for (id, ac) in &cfg.agents {
+        if let Some(a) = agents.iter_mut().find(|a| &a.id == id) {
+            a.model = ac.model.clone().or(a.model.take());
+            a.system = ac.system.clone().or(a.system.take());
+            a.description = ac.description.clone().unwrap_or_else(|| a.description.clone());
+            a.steps = ac.steps.or(a.steps);
+        } else if !ac.disabled {
+            agents.push(Agent {
+                id: id.clone(),
+                name: id.clone(),
+                description: ac.description.clone().unwrap_or_default(),
+                system: ac.system.clone(),
+                steps: ac.steps,
+                model: ac.model.clone(),
+                permissions: crate::permission::default_rules(),
+            });
+        }
+    }
+    agents.retain(|a| !cfg.agents.get(&a.id).is_some_and(|c| c.disabled));
+    for a in &mut agents {
+        a.permissions.extend(cfg.permissions.iter().cloned());
+        if let Some(ac) = cfg.agents.get(&a.id) {
+            a.permissions.extend(ac.permissions.iter().cloned());
+        }
+    }
+    agents
+}
+
+/// `provider/model` -> (`provider`, `model`); a bare id defaults to the anthropic provider.
+pub fn split_model(s: &str) -> (&str, &str) {
+    s.split_once('/').unwrap_or(("anthropic", s))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::permission::Effect;
+    use serde_json::json;
+
+    fn tmp() -> PathBuf {
+        let d = std::env::temp_dir().join(crate::id::new_id("moco-cfg"));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn jsonc_comments_and_trailing_commas() {
+        let src = r#"{
+            // line comment
+            "a": "x // not a comment", /* block */
+            "b": [1, 2, /* tail */ ],
+            "c": {"d": "q\"uote",},
+        }"#;
+        let v: Value = serde_json::from_str(&strip_jsonc(src)).unwrap();
+        assert_eq!(v, json!({"a":"x // not a comment","b":[1,2],"c":{"d":"q\"uote"}}));
+    }
+
+    #[test]
+    fn variables_env_file_and_escaping() {
+        let dir = tmp();
+        std::fs::write(dir.join("prompt.txt"), "line1\n\"quoted\"\n").unwrap();
+        std::env::set_var("MOCO_TEST_VAR", "va\"lue");
+        let raw = r#"{"a":"{env:MOCO_TEST_VAR}","b":"{file:prompt.txt}","c":"{env:MOCO_UNSET_VAR_X}","d":"{not a var}"}"#;
+        let v: Value = serde_json::from_str(&substitute(raw, &dir).unwrap()).unwrap();
+        assert_eq!(v, json!({"a":"va\"lue","b":"line1\n\"quoted\"","c":"","d":"{not a var}"}));
+        assert!(substitute(r#"{"a":"{file:missing.txt}"}"#, &dir).unwrap_err().contains("missing.txt"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn merge_rules() {
+        let base = json!({"model":"a","permissions":[1],"agents":{"build":{"steps":5,"permissions":[1]}},"list":[1]});
+        let over = json!({"model":"b","permissions":[2],"agents":{"build":{"permissions":[2]}},"list":[2]});
+        assert_eq!(
+            merge(base, over, ""),
+            json!({"model":"b","permissions":[1,2],"agents":{"build":{"steps":5,"permissions":[1,2]}},"list":[2]})
+        );
+    }
+
+    #[test]
+    fn layered_files_inner_directory_wins() {
+        let root = tmp();
+        let app = root.join("app");
+        let proj = root.join("proj");
+        let inner = proj.join("sub");
+        std::fs::create_dir_all(app.join("config")).unwrap();
+        std::fs::create_dir_all(inner.join(".moco")).unwrap();
+        std::fs::write(app.join("config/moco.jsonc"), r#"{"model":"global/m","default_agent":"plan"}"#).unwrap();
+        std::fs::write(proj.join("moco.json"), r#"{"model":"proj/m","permissions":[{"action":"shell","resource":"*","effect":"ask"}]}"#).unwrap();
+        std::fs::write(inner.join(".moco/moco.jsonc"), r#"{"model":"inner/m", // c
+            "permissions":[{"action":"shell","resource":"ls *","effect":"allow"},]}"#).unwrap();
+        let l = load(&app, &inner);
+        assert!(l.warnings.is_empty(), "{:?}", l.warnings);
+        assert_eq!(l.config.model.as_deref(), Some("inner/m"));
+        assert_eq!(l.config.default_agent.as_deref(), Some("plan"));
+        assert_eq!(l.config.permissions.len(), 2);
+        assert_eq!(l.config.permissions[0].effect, Effect::Ask, "lower priority first");
+        assert_eq!(l.sources.len(), 3);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bad_files_become_warnings_not_failures() {
+        let root = tmp();
+        std::fs::write(root.join("moco.json"), "{ not json").unwrap();
+        std::fs::create_dir_all(root.join(".moco")).unwrap();
+        std::fs::write(root.join(".moco/moco.json"), r#"{"model":"ok/m"}"#).unwrap();
+        let l = load(&root.join("none"), &root);
+        assert_eq!(l.warnings.len(), 1);
+        assert!(l.warnings[0].contains("moco.json"));
+        assert_eq!(l.config.model.as_deref(), Some("ok/m"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agents_resolve_with_config_rules_in_order() {
+        let cfg: Config = serde_json::from_value(json!({
+            "permissions": [{"action":"shell","resource":"*","effect":"ask"}],
+            "default_agent": "docs",
+            "agents": {
+                "build": {"steps": 30, "permissions": [{"action":"shell","resource":"git *","effect":"allow"}]},
+                "plan": {"disabled": true},
+                "docs": {"description":"writes docs","system":"Be brief.","permissions":[{"action":"edit","resource":"*","effect":"ask"}]}
+            }}))
+        .unwrap();
+        let agents = resolve_agents(&cfg);
+        let ids: Vec<_> = agents.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, ["build", "docs"]);
+        let build = &agents[0];
+        assert_eq!(build.steps, Some(30));
+        use crate::permission::evaluate;
+        assert_eq!(evaluate("shell", "ls", &build.permissions), Effect::Ask, "global rule beats the default allow");
+        assert_eq!(evaluate("shell", "git status", &build.permissions), Effect::Allow, "agent rule beats the global one");
+        assert_eq!(agents[1].system.as_deref(), Some("Be brief."));
+        assert_eq!(evaluate("edit", "x", &agents[1].permissions), Effect::Ask);
+    }
+
+    #[test]
+    fn model_refs() {
+        assert_eq!(split_model("anthropic/claude-x"), ("anthropic", "claude-x"));
+        assert_eq!(split_model("claude-x"), ("anthropic", "claude-x"));
+        assert_eq!(split_model("openrouter/anthropic/claude-x"), ("openrouter", "anthropic/claude-x"));
+    }
+}

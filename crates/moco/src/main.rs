@@ -2,7 +2,7 @@
 use moco_core::engine::{Engine, EngineConfig, PermissionPrompt, Reply, RunOutcome, Ui, UiEvent};
 use moco_core::provider::anthropic::Anthropic;
 use moco_core::store::{Mode, Store};
-use moco_core::{agent, auth};
+use moco_core::{auth, config};
 use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -110,26 +110,23 @@ fn die(msg: &str) -> ! {
 
 fn main() {
     let (mut cont, mut prompt, mut dir) = (false, None, None);
-    let mut model = std::env::var("MOCO_MODEL").unwrap_or_else(|_| "claude-sonnet-5-5".into());
-    let mut agent_id = "build".to_string();
+    let mut model = std::env::var("MOCO_MODEL").ok();
+    let mut agent_id: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut value = |flag: &str| args.next().unwrap_or_else(|| die(&format!("{flag} needs a value")));
         match a.as_str() {
             "--continue" | "-c" => cont = true,
-            "--model" | "-m" => model = value("--model"),
-            "--agent" => agent_id = value("--agent"),
+            "--model" | "-m" => model = Some(value("--model")),
+            "--agent" => agent_id = Some(value("--agent")),
             "--dir" => dir = Some(value("--dir")),
             "--prompt" | "-p" => prompt = Some(value("--prompt")),
             "--help" | "-h" => {
-                println!("usage: moco [--continue] [--model ID] [--agent build|plan] [--dir PATH] [-p PROMPT]");
+                println!("usage: moco [--continue] [--model PROVIDER/MODEL] [--agent ID] [--dir PATH] [-p PROMPT]");
                 return;
             }
             other => die(&format!("unknown argument {other}")),
         }
-    }
-    if agent::find(&agent_id).is_none() {
-        die(&format!("unknown agent {agent_id}"));
     }
 
     let app_dir = auth::app_dir();
@@ -146,6 +143,21 @@ fn main() {
     let cwd_str = cwd.to_string_lossy().into_owned();
     std::env::set_current_dir(&cwd).ok();
 
+    let loaded = config::load(&app_dir, &cwd);
+    for w in &loaded.warnings {
+        eprintln!("warning: config: {w}");
+    }
+    let cfg = loaded.config;
+    if let (Some(sh), None) = (&cfg.shell, std::env::var_os("MOCO_SHELL")) {
+        std::env::set_var("MOCO_SHELL", sh);
+    }
+    let agents = config::resolve_agents(&cfg);
+    let mut agent_id = agent_id.or(cfg.default_agent.clone()).unwrap_or_else(|| "build".into());
+    if !agents.iter().any(|a| a.id == agent_id) {
+        die(&format!("unknown agent {agent_id}; available: {}", agents.iter().map(|a| a.id.as_str()).collect::<Vec<_>>().join(", ")));
+    }
+    let model = model.or(cfg.model.clone()).unwrap_or_else(|| "anthropic/claude-sonnet-5-5".into());
+
     let store = Store::open(&app_dir.join("data/moco.db")).unwrap_or_else(|e| die(&format!("database: {e}")));
     let recovered = store.recover_claims(3).unwrap_or_default();
     let mut session = match cont.then(|| store.latest_session(&cwd_str).ok().flatten()).flatten() {
@@ -155,7 +167,11 @@ fn main() {
     if cont {
         store.set_agent(&session.id, &agent_id).ok();
     }
-    let engine = Engine::new(store, Box::new(Anthropic::new(key, std::env::var("ANTHROPIC_BASE_URL").ok())), EngineConfig::new(&model, app_dir));
+    let mut engine_cfg = EngineConfig::new(&model, app_dir);
+    engine_cfg.agents = agents;
+    engine_cfg.instructions = cfg.instructions.clone();
+    let n_sources = loaded.sources.len();
+    let engine = Engine::new(store, Box::new(Anthropic::new(key, std::env::var("ANTHROPIC_BASE_URL").ok())), engine_cfg);
 
     install_sigint();
     let term = Terminal { mid_line: AtomicBool::new(false) };
@@ -184,7 +200,7 @@ fn main() {
         std::process::exit(if ok { 0 } else { 1 });
     }
 
-    println!("{DIM}moco {} | {} | agent {agent_id} | /help for commands{RESET}", env!("CARGO_PKG_VERSION"), model);
+    println!("{DIM}moco {} | {model} | agent {agent_id} | {n_sources} config file(s) | /help for commands{RESET}", env!("CARGO_PKG_VERSION"));
     while let Some(line) = term.read_line("> ") {
         CANCEL.store(false, Ordering::Relaxed);
         let line = line.trim();
@@ -199,14 +215,17 @@ fn main() {
                 }
                 Err(e) => eprintln!("{e}"),
             },
-            l if l.starts_with("/agent") => match agent::find(l.trim_start_matches("/agent").trim()) {
-                Some(a) => {
-                    agent_id = a.id.to_string();
-                    engine.store.lock().unwrap().set_agent(&session.id, a.id).ok();
-                    println!("{DIM}agent: {}{RESET}", a.name);
+            l if l.starts_with("/agent") => {
+                let want = l.trim_start_matches("/agent").trim();
+                match engine.agents().iter().find(|a| a.id == want) {
+                    Some(a) => {
+                        agent_id = a.id.clone();
+                        engine.store.lock().unwrap().set_agent(&session.id, &a.id).ok();
+                        println!("{DIM}agent: {}{RESET}", a.name);
+                    }
+                    None => println!("unknown agent; available: {}", engine.agents().iter().map(|a| a.id.as_str()).collect::<Vec<_>>().join(", ")),
                 }
-                None => println!("unknown agent; available: build, plan"),
-            },
+            }
             l if l.starts_with('/') => println!("unknown command (try /help)"),
             _ => {
                 if engine.submit(&session.id, line, Mode::Steer).is_ok() {

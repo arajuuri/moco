@@ -3,7 +3,8 @@
 //! `run` claims the session, then repeats: deliver inbox items allowed at this boundary, run one step
 //! (one LLM call, tools executing concurrently as their calls complete), continue while the step
 //! produced tool calls. History is reloaded from the store on every step.
-use crate::agent;
+use crate::agent::{self, Agent};
+use crate::{config, instructions};
 use crate::chat;
 use crate::permission::{self, Effect, Rule};
 use crate::provider::{retry, Block, ChatMessage, Event, FinishReason, Provider, ProviderError, Request, Role, ToolDef, Usage};
@@ -58,9 +59,13 @@ pub enum RunOutcome {
 }
 
 pub struct EngineConfig {
+    /// Default `provider/model` (an agent's own `model` overrides it).
     pub model: String,
     pub max_tokens: u32,
     pub app_dir: PathBuf,
+    pub agents: Vec<Agent>,
+    /// Extra instruction files from config.
+    pub instructions: Vec<String>,
     /// Waits for retry backoff; must return early when `cancel` is set.
     pub sleep: Box<dyn Fn(Duration, &AtomicBool) + Send + Sync>,
     pub jitter: Box<dyn Fn() -> f64 + Send + Sync>,
@@ -72,6 +77,8 @@ impl EngineConfig {
             model: model.into(),
             max_tokens: 16_000,
             app_dir,
+            agents: agent::builtin(),
+            instructions: vec![],
             sleep: Box::new(|d, cancel| {
                 let end = std::time::Instant::now() + d;
                 while std::time::Instant::now() < end && !cancel.load(Ordering::Relaxed) {
@@ -107,6 +114,10 @@ struct AttemptResult {
 impl Engine {
     pub fn new(store: Store, provider: Box<dyn Provider>, cfg: EngineConfig) -> Self {
         Engine { store: Mutex::new(store), provider, cfg, tools: tools::all() }
+    }
+
+    pub fn agents(&self) -> &[Agent] {
+        &self.cfg.agents
     }
 
     fn store(&self) -> std::sync::MutexGuard<'_, Store> {
@@ -159,7 +170,9 @@ impl Engine {
             let st = self.store();
             (st.session(sid)?.expect("session exists"), st.messages(sid)?)
         };
-        let agent = agent::find(&session.agent).unwrap_or_else(|| agent::find("build").unwrap());
+        let agent = agent::find(&self.cfg.agents, &session.agent)
+            .or_else(|| self.cfg.agents.first().cloned())
+            .expect("at least one agent is configured");
         let advertised: Vec<&dyn Tool> = self.tools.iter().map(|t| t.as_ref()).filter(|t| agent::advertised(&agent, *t)).collect();
 
         let mut messages = chat::to_chat(&history);
@@ -179,9 +192,16 @@ impl Engine {
             }
         }
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        let lazy: Vec<PathBuf> = self.store().instruction_paths(sid)?.into_iter().map(PathBuf::from).collect();
+        let ins = instructions::render(&instructions::load(&self.cfg.app_dir, std::path::Path::new(&session.directory), &self.cfg.instructions, &lazy));
+        let model_ref = agent.model.as_deref().unwrap_or(&self.cfg.model);
         let req = Request {
-            model: self.cfg.model.clone(),
-            system: agent::system_prompt(&agent, &advertised, &agent::EnvInfo { cwd: &session.directory, platform: std::env::consts::OS, date: &agent::date_from_unix(now) }),
+            model: config::split_model(model_ref).1.to_string(),
+            system: agent::system_prompt(
+                &agent,
+                &advertised,
+                &agent::EnvInfo { cwd: &session.directory, platform: std::env::consts::OS, date: &agent::date_from_unix(now), instructions: &ins },
+            ),
             messages,
             tools: advertised.iter().map(|t| ToolDef { name: t.name().into(), description: t.description().into(), schema: t.schema() }).collect(),
             max_tokens: self.cfg.max_tokens,
@@ -299,6 +319,15 @@ impl Engine {
                 let outcome = h.join().unwrap_or_else(|_| Err(ToolError::fail("tool panicked")));
                 declined |= outcome == Err(ToolError::Declined);
                 let name = parts[idx]["name"].as_str().unwrap_or("").to_string();
+                if let (true, Ok(out)) = (name == "read", &outcome) {
+                    // Reading a file pulls in AGENTS.md files between it and the working directory.
+                    if let Some(p) = out.metadata["path"].as_str() {
+                        let st = self.store();
+                        for ins in instructions::discover_between(std::path::Path::new(p), &cwd) {
+                            let _ = st.add_instruction(&session.id, &ins.to_string_lossy());
+                        }
+                    }
+                }
                 let state = self.finish_tool(&name, outcome, &spill, ui);
                 parts[idx]["state"] = state;
             }
@@ -709,5 +738,47 @@ mod tests {
         let f = fixture(vec![]);
         assert!(f.engine.store().claim(&f.session.id).unwrap());
         assert_eq!(f.run(&TestUi::default()), RunOutcome::Busy);
+    }
+
+    #[test]
+    fn instructions_reach_the_system_prompt_and_lazy_files_stick() {
+        let f = fixture(vec![tool_call("t1", "read", json!({"path":"pkg/a.txt"})), text("ok"), text("again")]);
+        f.file("AGENTS.md", "ROOT-RULE");
+        std::fs::create_dir_all(f.dir.join("work/pkg")).unwrap();
+        f.file("pkg/AGENTS.md", "PKG-RULE");
+        f.file("pkg/a.txt", "x");
+        f.say("read it");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        f.say("and again");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        let reqs = f.fake.requests.lock().unwrap();
+        assert!(reqs[0].system.contains("ROOT-RULE") && !reqs[0].system.contains("PKG-RULE"));
+        assert!(reqs[1].system.contains("PKG-RULE"), "discovered by the read, included from the next step on");
+        assert!(reqs[2].system.contains("PKG-RULE"), "and kept for later turns");
+        assert_eq!(f.engine.store().instruction_paths(&f.session.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn config_rules_make_shell_ask_and_agent_model_overrides() {
+        let dir = std::env::temp_dir().join(crate::id::new_id("moco-eng-cfg"));
+        std::fs::create_dir_all(dir.join("work")).unwrap();
+        let cfg_json: config::Config = serde_json::from_value(json!({
+            "permissions": [{"action":"shell","resource":"*","effect":"ask"}],
+            "agents": {"build": {"model": "anthropic/claude-other"}}
+        }))
+        .unwrap();
+        let fake = Arc::new(FakeProvider::new(vec![tool_call("t1", "shell", json!({"command":"touch ran"})), text("done")]));
+        let mut cfg = EngineConfig::new("anthropic/claude-default", dir.join("app"));
+        cfg.agents = config::resolve_agents(&cfg_json);
+        let store = Store::open_memory().unwrap();
+        let ses = store.create_session(dir.join("work").to_str().unwrap(), "build").unwrap();
+        let engine = Engine::new(store, Box::new(Shared(fake.clone())), cfg);
+        engine.submit(&ses.id, "go", Mode::Steer).unwrap();
+        let ui = TestUi::replying(vec![Reply::Reject(None)]);
+        assert_eq!(engine.run(&ses.id, &ui, &AtomicBool::new(false), false).unwrap(), RunOutcome::Declined);
+        assert_eq!(ui.asked.lock().unwrap().as_slice(), ["shell touch ran"]);
+        assert!(!dir.join("work/ran").exists());
+        assert_eq!(fake.requests.lock().unwrap()[0].model, "claude-other");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

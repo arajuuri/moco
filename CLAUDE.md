@@ -30,9 +30,10 @@ Mojave test machine: `ssh claude@semis-mac-pro.lan` (macOS 10.14.6, Xcode 11.3.1
 - `engine.rs`: step loop (claim, deliver inbox, run step, continue while tool calls). Tools run on scoped threads as soon as their call completes. Retries only when no tool ran in the attempt; the partial output is discarded.
 - `provider/`: neutral request/event types, `anthropic.rs` (SSE parser, error classification), `retry.rs`, `fake.rs` (scripted provider for tests).
 - `tools/`: read, write, edit, glob, grep, shell. Tools call `ToolCtx::permit`/`check_external`; the engine's `EnginePermitter` evaluates rules (`permission.rs`) and prompts through `Ui::ask`. `shellparse.rs` turns a command line into permission resources and "always" patterns.
+- `config.rs` / `instructions.rs`: JSONC config layering and `AGENTS.md` discovery (see `docs/08`); `agent.rs` holds built-in agents and the system prompt, `config::resolve_agents` applies overrides and config permission rules.
 - `store.rs`: SQLite (WAL, migrations in `MIGRATIONS`), inbox delivery semantics, saved permissions, execution claim and crash recovery. `chat.rs` rebuilds provider messages from stored history and repairs dangling tool calls.
 
-Known gaps versus the docs: no compaction, config files, AGENTS.md, snapshots/undo, background shell, image/PDF reads, or title generation (Phase 2+). The shell arity table in `shellparse.rs` is partial. The default ruleset allows everything except `.env` reads, as upstream does, and there is no config yet to change it.
+Known gaps versus the docs: no compaction, snapshots/undo, background shell, image/PDF reads, or title generation (Phase 2+). The shell arity table in `shellparse.rs` is partial. The default ruleset allows everything except `.env` reads, as upstream does; add `permissions` rules to a `moco.jsonc` to make `shell`/`edit` ask.
 
 ## Reading order
 

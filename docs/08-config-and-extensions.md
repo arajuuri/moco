@@ -14,6 +14,22 @@ Locations, roughly lowest to highest priority (the code documents `entries()` as
 Variable substitution is applied to the raw config text before parsing (`config/variable.ts`): `{env:NAME}` (empty string if unset; JSON-escaped if the raw value would break the JSON) and `{file:path}` (file contents; read `substituteFiles` for path resolution rules).
 Settings merge by key; arrays like `permissions` concatenate in priority order. Watch config files and reload live (`config.updated`).
 
+## moco implementation notes (Phase 2, config slice)
+
+Implemented in `crates/moco-core/src/config.rs` and `instructions.rs`.
+- File names are `moco.json` / `moco.jsonc` (upstream's `opencode.json` is not read). Locations, lowest priority first: `<app dir>/config/`; then each ancestor of the working directory, outermost first, as `<dir>/moco.json[c]` and `<dir>/.moco/moco.json[c]`; then the file named by `$MOCO_CONFIG`. A file that fails to parse is skipped with a warning.
+- Merge: objects merge by key, `permissions` and `instructions` arrays concatenate (lowest priority first), anything else is replaced.
+- Keys read so far: `model` (`provider/model`), `default_agent`, `shell`, `permissions` (list of `{action, resource, effect}`), `agents.<id>` (`model`, `system`, `description`, `steps`, `permissions`, `disabled`; unknown ids define new agents), `instructions` (extra files). Other keys are ignored.
+- Rule order per agent: built-in defaults, then top-level `permissions`, then the agent's own `permissions`; last match wins. This is how to make `shell` or `edit` ask, which the default ruleset does not:
+```jsonc
+{ "permissions": [
+    { "action": "shell", "resource": "*",    "effect": "ask" },
+    { "action": "shell", "resource": "ls *", "effect": "allow" }
+] }
+```
+- Instructions: `<app dir>/config/AGENTS.md`, then `AGENTS.md` in each directory from the project root (nearest `.git`) down to the working directory, falling back to `CLAUDE.md` in a directory that has no `AGENTS.md` (a moco extension). Files are re-read from disk on every step instead of being sent as deltas, which keeps them live but costs prompt-cache hits when they change. `read` adds `AGENTS.md` files in directories between the file and the working directory, remembered per session (`instruction_state` table).
+- Not done: remote config, managed/system config, live reload, `{file:}` path rules beyond "relative to the config file", URL instructions, `agents` markdown files, skills, custom commands, MCP.
+
 ## Top-level keys (`Config.Info`)
 
 `shell`, `model` (`provider/model`), `default_agent`, `update` (disable|notify|auto), `share`, `username`, `timezone`, `permissions` (rule list),
