@@ -28,6 +28,7 @@ By hand: `MACOSX_DEPLOYMENT_TARGET=10.14 CARGO_TARGET_DIR=<a directory outside t
 | `moco --session ID` / `-s` | Resume any session by a piece of its id (it runs in its own directory) |
 | `moco --model provider/model` / `-m` | Model for this session (also `MOCO_MODEL`) |
 | `moco --agent ID` | Agent for this session (`build` default, `plan` read-only); only primary agents can be chosen |
+| `moco --permission-mode manual\|auto` | Ask before acting (`manual`, the default) or allow what the default rules allow (`auto`); overrides `permission_mode` in config |
 | `moco --dir PATH` | Work in another directory |
 | `moco models [filter] [--refresh]` | Providers with connection state, or models with context size and price; `--refresh` downloads the full catalog |
 | `moco auth PROVIDER` | Store an API key |
@@ -55,7 +56,7 @@ By hand: `MACOSX_DEPLOYMENT_TARGET=10.14 CARGO_TARGET_DIR=<a directory outside t
 
 `Ctrl-C` interrupts a running turn (running commands are killed); `Ctrl-D` at the prompt quits.
 
-**Permission prompts** show the action and what it touches: `y` allow once, `a` allow always (saved for this project with a pattern such as `git push *`), `n` reject and stop, or type feedback to reject and tell the model why. By default everything is allowed except reading `.env` files; make `shell` or `edit` ask with a rule (below). The `question` tool shows a numbered form; Enter dismisses it.
+**Permission prompts** show the action and what it touches: `y` allow once, `a` allow always (saved for this project with a pattern such as `git push *`), `n` reject and stop, or type feedback to reject and tell the model why. In the default `manual` mode, anything that changes files, runs a command, or fetches from the web asks; reads and searches do not. In `auto` mode everything is allowed except reading `.env` files and web searches. Your own rules (below) apply in both modes. The `question` tool shows a numbered form; Enter dismisses it.
 
 ## Other providers and protocols
 
@@ -144,7 +145,7 @@ The model can run a long command in the background (`shell` with `background: tr
 
 ## Tools the model has
 
-`read`, `write`, `edit`, `patch`, `glob`, `grep`, `shell`, `jobs`, `webfetch`, `todowrite`, `question`, `subagent` (agents `general` and `explore`), `skill` when skills exist, and `<server>_<tool>` for each tool of a configured MCP server. Paths outside the project ask for an `external_directory` permission first. Long output is cut to 2000 lines or 50 KiB and the full text is saved under `data/tool-output/`.
+`read`, `write`, `edit`, `patch`, `glob`, `grep`, `shell`, `jobs`, `webfetch`, `todowrite`, `question`, `subagent` (agents `general` and `explore`), `skill` when skills exist, and `<server>_<tool>` for each tool of a configured MCP server. Paths outside the project ask for an `external_directory` permission in `manual` mode and are allowed in `auto` mode. Long output is cut to 2000 lines or 50 KiB and the full text is saved under `data/tool-output/`.
 
 ## Configuration
 
@@ -155,9 +156,9 @@ Files named `moco.json` or `moco.jsonc` (comments and trailing commas allowed), 
   "model": "anthropic/claude-sonnet-5-5",
   "small_model": "anthropic/claude-haiku-5-5",          // titles
   "default_agent": "build",
+  "permission_mode": "manual",                           // or "auto": see docs/05-permissions.md
   "shell": "/bin/zsh",
   "permissions": [                                       // last matching rule wins
-    { "action": "shell", "resource": "*",    "effect": "ask" },
     { "action": "shell", "resource": "ls *", "effect": "allow" },
     { "action": "edit",  "resource": "*.lock", "effect": "deny" }
   ],
@@ -171,7 +172,7 @@ Files named `moco.json` or `moco.jsonc` (comments and trailing commas allowed), 
   "commands": { "ship": { "description": "Tag and push", "template": "Tag the release and push it. $ARGUMENTS", "agent": "build" } }
 }
 ```
-Actions are `read`, `edit` (write, edit and patch), `glob`, `grep`, `shell`, `webfetch`, `question`, `subagent`, `external_directory`. Details: `08-config-and-extensions.md`, `07-providers.md`.
+Actions are `read`, `edit` (write, edit and patch), `glob`, `grep`, `shell`, `webfetch`, `question`, `subagent`, `external_directory`. Details: `05-permissions.md`, `08-config-and-extensions.md`, `07-providers.md`.
 
 **Project instructions**: `AGENTS.md` (or `CLAUDE.md` where there is no `AGENTS.md`) in the project root down to the working directory, `config/AGENTS.md` globally, plus `instructions` files. They are re-read every step.
 

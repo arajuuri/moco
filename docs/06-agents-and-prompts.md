@@ -20,7 +20,7 @@ Agent { id, name, model?: {providerID, modelID, variant?}, request {settings, he
 | `build` | Build | primary | no | "The default agent. Executes tools based on configured permissions." Adds `question: allow` |
 | `plan` | Plan | primary | no | "Read-only agent for exploring the codebase and planning work before implementation." Adds `question: allow`, `edit: deny`, `edit: <plan dir>/*: allow` |
 | `general` | General | subagent | no | "General-purpose agent for researching complex questions and executing multi-step tasks. Use this agent to execute multiple units of work in parallel." Adds `question: deny`, `subagent: deny` |
-| `explore` | Explore | subagent | no | file search specialist; permissions: `* deny`, then allow `shell, grep, glob, webfetch, websearch, read` (ask for `.env`, `.env.*`; allow `.env.example`), `subagent deny`, `external_directory allow`. System prompt below |
+| `explore` | Explore | subagent | no | file search specialist; permissions: `* deny`, then allow `grep, glob, webfetch, websearch, read` (ask for `.env`, `.env.*`; allow `.env.example`), deny `shell` (a command can write), `subagent deny`, `external_directory allow`. System prompt below |
 | `compaction` | Compaction | primary | yes | summarizer, prompt built by compaction code |
 | `title` | Title | primary | yes | `* deny`; system prompt below |
 | `summary` | Summary | primary | yes | `* deny`; system prompt below |
@@ -37,10 +37,11 @@ Guidelines:
 - Adapt your search approach based on the thoroughness level specified by the caller
 - Return file paths as absolute paths in your final response
 - You MUST NOT create, modify, delete, move, or copy files, including temporary files and reports
-- Shell commands MUST be read-only. NEVER run commands that write files or change system state
 
 Complete the user's search request efficiently and report your findings clearly.
 ```
+
+moco removes the upstream line "Shell commands MUST be read-only. NEVER run commands that write files or change system state", because moco denies `shell` to this agent (see the permissions table above). Upstream's prompt has the line; moco's does not.
 
 ### summary system prompt (verbatim)
 ```

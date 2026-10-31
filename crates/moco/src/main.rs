@@ -9,7 +9,7 @@ use moco_core::provider::registry;
 use moco_core::provider::Usage;
 use moco_core::tools::{Question, Todo};
 use moco_core::store::{Mode, Session, SessionSummary, Store};
-use moco_core::{auth, config};
+use moco_core::{auth, config, permission};
 use std::io::{BufRead, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -545,6 +545,7 @@ fn main() {
     let mut effort_arg: Option<String> = None;
     let mut model = std::env::var("MOCO_MODEL").ok();
     let mut agent_id: Option<String> = None;
+    let mut permission_mode_arg: Option<String> = None;
     let mut args = raw.drain(..);
     while let Some(a) = args.next() {
         let mut value = |flag: &str| args.next().unwrap_or_else(|| die(&format!("{flag} needs a value")));
@@ -552,6 +553,7 @@ fn main() {
             "--continue" | "-c" => cont = true,
             "--model" | "-m" => model = Some(value("--model")),
             "--agent" => agent_id = Some(value("--agent")),
+            "--permission-mode" => permission_mode_arg = Some(value("--permission-mode")),
             "--effort" => effort_arg = Some(value("--effort")),
             "--dir" => dir = Some(value("--dir")),
             "--session" | "-s" => session_arg = Some(value("--session")),
@@ -564,7 +566,7 @@ fn main() {
             }
             "--help" | "-h" => {
                 println!(
-                    "usage: moco [--continue | --session ID] [--model PROVIDER/MODEL] [--agent ID] [--effort LEVEL] [--dir PATH] [-p PROMPT] [--plain] [--version]\n       moco sessions [--all] [--archived] | rename ID TITLE | archive ID | unarchive ID\n       moco models [FILTER] [--refresh]\n       moco auth PROVIDER"
+                    "usage: moco [--continue | --session ID] [--model PROVIDER/MODEL] [--agent ID] [--permission-mode manual|auto] [--effort LEVEL] [--dir PATH] [-p PROMPT] [--plain] [--version]\n       moco sessions [--all] [--archived] | rename ID TITLE | archive ID | unarchive ID\n       moco models [FILTER] [--refresh]\n       moco auth PROVIDER"
                 );
                 return;
             }
@@ -593,7 +595,12 @@ fn main() {
     if let (Some(sh), None) = (&cfg.shell, std::env::var_os("MOCO_SHELL")) {
         std::env::set_var("MOCO_SHELL", sh);
     }
-    let agents = config::resolve_agents(&cfg);
+    // The flag wins over the config key; both default to manual.
+    let permission_mode = match &permission_mode_arg {
+        Some(s) => permission::PermissionMode::parse(s).unwrap_or_else(|| die(&format!("--permission-mode must be manual or auto, not {s}"))),
+        None => config::permission_mode(&cfg).unwrap_or_else(|e| die(&e)),
+    };
+    let agents = config::resolve_agents_in(&cfg, permission_mode);
     let agent_explicit = agent_id.is_some();
     let mut agent_id = agent_id.or(cfg.default_agent.clone()).unwrap_or_else(|| "build".into());
     if !agents.iter().any(|a| a.id == agent_id && a.selectable()) {

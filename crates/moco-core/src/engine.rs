@@ -1401,6 +1401,8 @@ mod tests {
         let w = waits.clone();
         cfg.sleep = Box::new(move |d, _| w.lock().unwrap().push(d));
         cfg.jitter = Box::new(|| 0.0);
+        // Engine mechanics are tested without permission prompts; prompting tests set their own rules in `tweak`.
+        cfg.agents = crate::agent::builtin_for(crate::permission::PermissionMode::Auto);
         tweak(&mut cfg);
         let store = Store::open_memory().unwrap();
         let session = store.create_session(dir.join("work").to_str().unwrap(), "build").unwrap();
@@ -2072,13 +2074,13 @@ mod tests {
     fn child_permission_prompts_go_through_the_parent_ui() {
         let cfg: config::Config = serde_json::from_value(json!({"permissions":[{"action":"shell","resource":"*","effect":"ask"}]})).unwrap();
         let script = || vec![sub("t1", "general", "run it"), tool_call("c1", "shell", json!({"command":"echo hi"})), text("ran"), text("done")];
-        let f = fixture_cfg(script(), |c| c.agents = config::resolve_agents(&cfg));
+        let f = fixture_cfg(script(), |c| c.agents = config::resolve_agents_in(&cfg, crate::permission::PermissionMode::Auto));
         f.say("go");
         let ui = TestUi::replying(vec![Reply::Once]);
         assert_eq!(f.run(&ui), RunOutcome::Idle);
         assert_eq!(ui.asked.lock().unwrap().as_slice(), ["shell echo hi"]);
         // Rejecting inside the child stops the whole run.
-        let f = fixture_cfg(script(), |c| c.agents = config::resolve_agents(&cfg));
+        let f = fixture_cfg(script(), |c| c.agents = config::resolve_agents_in(&cfg, crate::permission::PermissionMode::Auto));
         f.say("go");
         let ui = TestUi::replying(vec![Reply::Reject(None)]);
         assert_eq!(f.run(&ui), RunOutcome::Declined);
@@ -2092,7 +2094,7 @@ mod tests {
         assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
         let reqs = f.fake.requests.lock().unwrap();
         let names: Vec<&str> = reqs[1].tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, ["read", "glob", "grep", "shell", "webfetch"]);
+        assert_eq!(names, ["read", "glob", "grep", "webfetch"]);
         assert!(reqs[1].system.contains("file search specialist"));
         assert!(matches!(&reqs[2].messages.last().unwrap().content[0], Block::ToolResult { is_error: true, content, .. } if content.starts_with("Permission denied: edit")));
         assert!(!f.dir.join("work/x.txt").exists());
@@ -2103,7 +2105,7 @@ mod tests {
         let cfg: config::Config = serde_json::from_value(json!({"agents":{"deep":{"mode":"all","description":"recurses"}}})).unwrap();
         let mut script: Vec<Scripted> = (0..4).map(|i| sub(&format!("t{i}"), "deep", "go deeper")).collect();
         script.extend([text("c3"), text("c2"), text("c1"), text("p")]);
-        let f = fixture_cfg(script, |c| c.agents = config::resolve_agents(&cfg));
+        let f = fixture_cfg(script, |c| c.agents = config::resolve_agents_in(&cfg, crate::permission::PermissionMode::Auto));
         f.engine.store().set_agent(&f.session.id, "deep").unwrap();
         f.say("go");
         assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
@@ -2625,7 +2627,7 @@ mod tests {
         let cfg: config::Config = serde_json::from_value(json!({"permissions":[{"action":"fake_*","resource":"*","effect":"ask"}]})).unwrap();
         let f = fixture_cfg(vec![tool_call("t1", "fake_echo", json!({"text":"x"})), text("asked first"), sub("t2", "explore", "look"), tool_call("c1", "fake_echo", json!({"text":"from explore"})), text("explore done"), text("finished")], |c| {
             c.mcp = Some(mcp.clone());
-            c.agents = config::resolve_agents(&cfg);
+            c.agents = config::resolve_agents_in(&cfg, crate::permission::PermissionMode::Auto);
         });
         f.say("go");
         let ui = TestUi::replying(vec![Reply::Once]);
@@ -2752,7 +2754,7 @@ mod tests {
                 text("started it"),
                 text("the parent saw the report"),
             ],
-            |c| c.agents = config::resolve_agents(&cfg),
+            |c| c.agents = config::resolve_agents_in(&cfg, crate::permission::PermissionMode::Auto),
         );
         f.fake.script_route("BG-TASK-1", vec![tool_call("c1", "shell", json!({"command":"echo hi"})), text("finished, but could not run the command")]);
         f.say("delegate in the background");
@@ -2804,7 +2806,9 @@ mod tests {
         let fake = Arc::new(FakeProvider::new(vec![bg_shell("t1", "true"), text("ok")]));
         let store = Store::open_memory().unwrap();
         let ses = store.create_session(dir.join("work").to_str().unwrap(), "build").unwrap();
-        let engine = Engine::new(store, Box::new(Shared(fake.clone())), EngineConfig::new("m", dir.join("app"))); // no .share()
+        let mut cfg = EngineConfig::new("m", dir.join("app"));
+        cfg.agents = crate::agent::builtin_for(crate::permission::PermissionMode::Auto);
+        let engine = Engine::new(store, Box::new(Shared(fake.clone())), cfg); // no .share()
         engine.submit(&ses.id, "go", Mode::Steer).unwrap();
         engine.run(&ses.id, &TestUi::default(), &AtomicBool::new(false), false).unwrap();
         assert!(result_text(&fake.requests.lock().unwrap()[1]).contains("background jobs are not available"));

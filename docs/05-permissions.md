@@ -40,7 +40,18 @@ Outcomes: `allow` -> proceed. `deny` -> tool fails with `BlockedError` (message 
 - `reject` without message: fail with `DeclinedError` (stops the run of this tool batch). With message: `CorrectedError{feedback}`, model sees it as the tool error and continues. Rejection applies to **all** pending requests of that session.
 - On shutdown all pending requests are rejected.
 
-## Default ruleset for a new agent
+## Permission modes (moco)
+
+moco has two modes, chosen with `permission_mode` in config or `--permission-mode manual|auto` (the flag wins). The default is `manual`. The mode sets the starting rules of every agent (built-in and config-defined); your own `permissions` rules come after it and win.
+
+- **manual** (default): `*` asks. Allowed without a prompt: `read`, `glob`, `grep`, `question`, `todowrite`, `skill`. Reading `.env` files asks, `.env.example` is allowed, `websearch` asks, and so does `external_directory` (it falls under `*`).
+- **auto**: the upstream default ruleset below. Everything is allowed except `.env` reads and `websearch`.
+
+The `explore` subagent denies `shell` in both modes, because a shell command can write and the rules must enforce its read-only role.
+
+Not done: switching mode during a session (`/mode`), which needs the mode stored per session; and the automatic check that is meant to replace the prompt in auto mode.
+
+## Default ruleset (`auto`, and the upstream base)
 
 ```
 { "*", "*", allow }

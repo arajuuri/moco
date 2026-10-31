@@ -1,5 +1,5 @@
 //! Agents and the system prompt (docs/06-agents-and-prompts.md).
-use crate::permission::{Effect, Rule};
+use crate::permission::{Effect, PermissionMode, Rule};
 use crate::tools::Tool;
 
 #[derive(Debug, Clone)]
@@ -56,23 +56,29 @@ Guidelines:
 - Adapt your search approach based on the thoroughness level specified by the caller
 - Return file paths as absolute paths in your final response
 - You MUST NOT create, modify, delete, move, or copy files, including temporary files and reports
-- Shell commands MUST be read-only. NEVER run commands that write files or change system state
 
 Complete the user's search request efficiently and report your findings clearly.";
 
+/// The built-in agents with the default permission mode.
 pub fn builtin() -> Vec<Agent> {
-    let mut build = crate::permission::default_rules();
+    builtin_for(PermissionMode::default())
+}
+
+/// The built-in agents, each starting from the rules of `mode`.
+pub fn builtin_for(mode: PermissionMode) -> Vec<Agent> {
+    let mut build = crate::permission::mode_rules(mode);
     build.push(Rule::new("question", "*", Effect::Allow));
-    let mut plan = crate::permission::default_rules();
+    let mut plan = crate::permission::mode_rules(mode);
     plan.push(Rule::new("question", "*", Effect::Allow));
     plan.push(Rule::new("edit", "*", Effect::Deny));
-    let mut general = crate::permission::default_rules();
+    let mut general = crate::permission::mode_rules(mode);
     general.push(Rule::new("question", "*", Effect::Deny));
     general.push(Rule::new("subagent", "*", Effect::Deny));
-    let mut explore = crate::permission::default_rules();
+    let mut explore = crate::permission::mode_rules(mode);
     explore.extend([
         Rule::new("*", "*", Effect::Deny),
-        Rule::new("shell", "*", Effect::Allow),
+        // No shell: a command can write, and the rules (not the prompt) must keep this agent read-only.
+        Rule::new("shell", "*", Effect::Deny),
         Rule::new("grep", "*", Effect::Allow),
         Rule::new("glob", "*", Effect::Allow),
         Rule::new("webfetch", "*", Effect::Allow),
@@ -258,7 +264,7 @@ mod tests {
         use crate::permission::evaluate;
         assert_eq!(evaluate("write", "x", &ex.permissions), Effect::Deny);
         assert_eq!(evaluate("edit", "x", &ex.permissions), Effect::Deny);
-        assert_eq!(evaluate("shell", "ls", &ex.permissions), Effect::Allow);
+        assert_eq!(evaluate("shell", "ls", &ex.permissions), Effect::Deny, "a shell command can write");
         assert_eq!(evaluate("read", ".env", &ex.permissions), Effect::Ask);
         assert_eq!(evaluate("read", ".env.example", &ex.permissions), Effect::Allow);
         assert_eq!(evaluate("subagent", "general", &ex.permissions), Effect::Deny);
@@ -281,7 +287,7 @@ mod tests {
         assert_eq!(names(&find(&builtin(), "build").unwrap()), all);
         assert_eq!(names(&find(&builtin(), "plan").unwrap()), ["read", "glob", "grep", "shell", "jobs", "webfetch", "todowrite", "question", "subagent"]);
         assert_eq!(names(&find(&builtin(), "general").unwrap()), ["read", "write", "edit", "patch", "glob", "grep", "shell", "jobs", "webfetch", "todowrite"], "no question, no subagent");
-        assert_eq!(names(&find(&builtin(), "explore").unwrap()), ["read", "glob", "grep", "shell", "webfetch"], "read-only");
+        assert_eq!(names(&find(&builtin(), "explore").unwrap()), ["read", "glob", "grep", "webfetch"], "read-only, no shell");
     }
 
     #[test]

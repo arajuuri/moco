@@ -211,6 +211,8 @@ pub struct Config {
     /// Default reasoning effort (a variant name such as `high`); unset leaves the provider's default.
     pub effort: Option<String>,
     pub shell: Option<String>,
+    /// `"manual"` (default: ask before anything that changes state or leaves the project) or `"auto"`.
+    pub permission_mode: Option<String>,
     pub permissions: Vec<Rule>,
     pub agents: BTreeMap<String, AgentConfig>,
     /// Extra instruction files (paths, `~/` allowed; relative paths resolve against the working directory).
@@ -462,10 +464,23 @@ pub fn load(app_dir: &Path, cwd: &Path) -> Loaded {
     out
 }
 
-/// Built-in agents with config overrides applied, plus agents defined only in config.
-/// Rule order: agent defaults, then top-level `permissions`, then the agent's own `permissions`.
+/// The permission mode the config selects; unset means the default (manual).
+pub fn permission_mode(cfg: &Config) -> Result<crate::permission::PermissionMode, String> {
+    match &cfg.permission_mode {
+        None => Ok(Default::default()),
+        Some(s) => crate::permission::PermissionMode::parse(s).ok_or_else(|| format!("permission_mode must be \"manual\" or \"auto\", not \"{s}\"")),
+    }
+}
+
+/// Built-in agents with config overrides applied, plus agents defined only in config, in the default permission mode.
 pub fn resolve_agents(cfg: &Config) -> Vec<Agent> {
-    let mut agents: Vec<Agent> = agent::builtin();
+    resolve_agents_in(cfg, crate::permission::PermissionMode::default())
+}
+
+/// As `resolve_agents`, with the built-in agents starting from the rules of `mode`.
+/// Rule order: mode defaults, then top-level `permissions`, then the agent's own `permissions`.
+pub fn resolve_agents_in(cfg: &Config, mode: crate::permission::PermissionMode) -> Vec<Agent> {
+    let mut agents: Vec<Agent> = agent::builtin_for(mode);
     for (id, ac) in &cfg.agents {
         if let Some(a) = agents.iter_mut().find(|a| &a.id == id) {
             a.model = ac.model.clone().or(a.model.take());
@@ -484,7 +499,7 @@ pub fn resolve_agents(cfg: &Config) -> Vec<Agent> {
                 steps: ac.steps,
                 effort: ac.effort.clone(),
                 model: ac.model.clone(),
-                permissions: crate::permission::default_rules(),
+                permissions: crate::permission::mode_rules(mode),
             });
         }
     }
@@ -582,6 +597,22 @@ mod tests {
         assert!(l.warnings[0].contains("moco.json"));
         assert_eq!(l.config.model.as_deref(), Some("ok/m"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn permission_mode_comes_from_config_and_defaults_to_manual() {
+        use crate::permission::PermissionMode;
+        let none: Config = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(permission_mode(&none), Ok(PermissionMode::Manual));
+        let auto: Config = serde_json::from_value(json!({"permission_mode": "auto"})).unwrap();
+        assert_eq!(permission_mode(&auto), Ok(PermissionMode::Auto));
+        let bad: Config = serde_json::from_value(json!({"permission_mode": "yolo"})).unwrap();
+        assert!(permission_mode(&bad).unwrap_err().contains("yolo"));
+        // The mode decides the built-in rules: shell asks in manual and runs in auto.
+        let manual = resolve_agents_in(&none, PermissionMode::Manual);
+        let auto = resolve_agents_in(&auto, PermissionMode::Auto);
+        assert_eq!(crate::permission::evaluate("shell", "ls", &manual[0].permissions), Effect::Ask);
+        assert_eq!(crate::permission::evaluate("shell", "ls", &auto[0].permissions), Effect::Allow);
     }
 
     #[test]

@@ -33,7 +33,53 @@ pub fn evaluate(action: &str, resource: &str, rules: &[Rule]) -> Effect {
         .unwrap_or(Effect::Ask)
 }
 
-/// Default ruleset every new agent starts from.
+/// How much moco asks before it acts. `Manual` is the default; `Auto` allows what the default ruleset allows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PermissionMode {
+    #[default]
+    Manual,
+    Auto,
+}
+
+impl PermissionMode {
+    pub fn parse(s: &str) -> Option<PermissionMode> {
+        match s {
+            "manual" => Some(PermissionMode::Manual),
+            "auto" => Some(PermissionMode::Auto),
+            _ => None,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            PermissionMode::Manual => "manual",
+            PermissionMode::Auto => "auto",
+        }
+    }
+}
+
+/// The ruleset every agent starts from in a mode. Config rules come after it and win (last match wins).
+pub fn mode_rules(mode: PermissionMode) -> Vec<Rule> {
+    match mode {
+        PermissionMode::Auto => default_rules(),
+        // Ask for everything, then allow what only reads or plans: a prompt for every read would make the mode unusable.
+        PermissionMode::Manual => {
+            let mut rules = vec![Rule::new("*", "*", Effect::Ask)];
+            rules.extend([
+                Rule::new("read", "*", Effect::Allow),
+                Rule::new("glob", "*", Effect::Allow),
+                Rule::new("grep", "*", Effect::Allow),
+                Rule::new("question", "*", Effect::Allow),
+                Rule::new("todowrite", "*", Effect::Allow),
+                Rule::new("skill", "*", Effect::Allow),
+            ]);
+            rules.extend(default_rules().into_iter().filter(|r| r.action == "read" && r.resource.starts_with("*.env")));
+            rules.push(Rule::new("websearch", "*", Effect::Ask));
+            rules
+        }
+    }
+}
+
+/// Ruleset of `Auto` mode: allow everything, except `.env` reads and web searches, which ask.
 pub fn default_rules() -> Vec<Rule> {
     vec![
         Rule::new("*", "*", Effect::Allow),
@@ -86,6 +132,21 @@ mod tests {
         assert_eq!(evaluate("read", ".env.example", &d), Allow);
         assert_eq!(evaluate("shell", "rm -rf /", &d), Allow);
         assert_eq!(evaluate("websearch", "rust ureq timeout", &d), Ask, "queries leave the machine: ask first");
+    }
+
+    #[test]
+    fn manual_asks_for_changes_and_auto_allows_them() {
+        let manual = mode_rules(PermissionMode::Manual);
+        assert_eq!(evaluate("shell", "ls", &manual), Ask);
+        assert_eq!(evaluate("edit", "a.rs", &manual), Ask);
+        assert_eq!(evaluate("subagent", "general", &manual), Ask);
+        assert_eq!(evaluate("read", "src/main.rs", &manual), Allow);
+        assert_eq!(evaluate("grep", "*", &manual), Allow);
+        assert_eq!(evaluate("read", ".env", &manual), Ask);
+        let auto = mode_rules(PermissionMode::Auto);
+        assert_eq!(evaluate("shell", "ls", &auto), Allow);
+        assert_eq!(evaluate("edit", "a.rs", &auto), Allow);
+        assert_eq!(PermissionMode::default(), PermissionMode::Manual);
     }
 
     #[test]
