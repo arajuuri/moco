@@ -136,7 +136,7 @@ pub fn normalize(p: &Path) -> PathBuf {
     out
 }
 
-pub trait Tool: Sync {
+pub trait Tool: Send + Sync {
     fn name(&self) -> &'static str;
     fn description(&self) -> &'static str;
     fn schema(&self) -> Value;

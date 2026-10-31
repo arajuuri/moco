@@ -141,6 +141,24 @@ impl Store {
             .optional()?)
     }
 
+    pub fn set_agent(&self, session_id: &str, agent: &str) -> Result<()> {
+        self.conn.execute("update session set agent=?2, time_updated=?3 where id=?1", params![session_id, agent, now_ms()])?;
+        Ok(())
+    }
+
+    /// Most recently updated, non-archived top-level session for a directory.
+    pub fn latest_session(&self, directory: &str) -> Result<Option<Session>> {
+        Ok(self
+            .conn
+            .query_row(
+                "select id, project_id, directory, agent, title from session
+                 where directory=?1 and parent_id is null and time_archived is null order by id desc limit 1",
+                [directory],
+                |r| Ok(Session { id: r.get(0)?, project_id: r.get(1)?, directory: r.get(2)?, agent: r.get(3)?, title: r.get(4)? }),
+            )
+            .optional()?)
+    }
+
     pub fn set_title(&self, session_id: &str, title: &str) -> Result<()> {
         self.conn.execute("update session set title=?2, time_updated=?3 where id=?1", params![session_id, title, now_ms()])?;
         Ok(())
