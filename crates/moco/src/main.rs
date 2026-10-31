@@ -1,10 +1,13 @@
-//! moco: line-based terminal chat (Phase 1 UI).
+//! moco: line-based terminal chat.
+use moco_core::catalog::{Catalog, ProviderInfo};
 use moco_core::engine::{Engine, EngineConfig, PermissionPrompt, Reply, RunOutcome, Ui, UiEvent};
-use moco_core::provider::anthropic::Anthropic;
+use moco_core::provider::registry;
+use moco_core::provider::Usage;
 use moco_core::store::{Mode, Store};
 use moco_core::{auth, config};
-use std::io::{BufRead, Write};
+use std::io::{BufRead, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 static CANCEL: AtomicBool = AtomicBool::new(false);
 
@@ -27,8 +30,20 @@ const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
 const RED: &str = "\x1b[31m";
 
+#[derive(Default)]
+struct RunUsage {
+    usage: Usage,
+    cost: f64,
+    priced: bool,
+    session_cost: f64,
+    context: u64,
+    limit: Option<u64>,
+    steps: u32,
+}
+
 struct Terminal {
     mid_line: AtomicBool,
+    run: Mutex<RunUsage>,
 }
 
 impl Terminal {
@@ -46,6 +61,27 @@ impl Terminal {
         if self.mid_line.swap(false, Ordering::Relaxed) {
             println!();
         }
+    }
+    /// One dim line after a turn: tokens, cost, session cost, context fill.
+    fn print_usage(&self) {
+        let r = std::mem::take(&mut *self.run.lock().unwrap());
+        if r.steps == 0 {
+            return;
+        }
+        let cost = if r.priced { format!("${:.4} (session ${:.4})", r.cost, r.session_cost) } else { "cost n/a".to_string() };
+        let ctx = match r.limit {
+            Some(l) if l > 0 => format!("context {}% of {}", (r.context * 100 / l).min(100), human(l)),
+            _ => format!("context {}", human(r.context)),
+        };
+        println!("{DIM}{} in, {} out, {} cached | {cost} | {ctx}{RESET}", human(r.usage.input), human(r.usage.output), human(r.usage.cache_read));
+    }
+}
+
+fn human(n: u64) -> String {
+    match n {
+        0..=9_999 => n.to_string(),
+        10_000..=999_999 => format!("{:.1}k", n as f64 / 1000.0),
+        _ => format!("{:.1}M", n as f64 / 1_000_000.0),
     }
 }
 
@@ -67,7 +103,21 @@ impl Ui for Terminal {
                 print!("{t}");
                 self.mid_line.store(!t.ends_with('\n'), Ordering::Relaxed);
             }
-            UiEvent::ReasoningDelta(_) | UiEvent::Usage(_) => return,
+            UiEvent::ReasoningDelta(_) => return,
+            UiEvent::StepUsage { usage, cost, session_cost, context_tokens, context_limit } => {
+                let mut r = self.run.lock().unwrap();
+                r.usage.input += usage.input;
+                r.usage.output += usage.output;
+                r.usage.cache_read += usage.cache_read;
+                r.usage.cache_write += usage.cache_write;
+                r.priced |= cost.is_some();
+                r.cost += cost.unwrap_or(0.0);
+                r.session_cost = *session_cost;
+                r.context = *context_tokens;
+                r.limit = *context_limit;
+                r.steps += 1;
+                return;
+            }
             UiEvent::ToolStarted { name, input } => {
                 self.newline_if_needed();
                 println!("{DIM}> {name} {}{RESET}", summary(name, input));
@@ -108,11 +158,121 @@ fn die(msg: &str) -> ! {
     std::process::exit(2)
 }
 
+/// Read a secret from stdin; echo is turned off when stdin is a terminal.
+fn read_secret(prompt: &str) -> String {
+    eprint!("{prompt}");
+    let _ = std::io::stderr().flush();
+    let tty = std::io::stdin().is_terminal();
+    let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+    let echo_off = tty && unsafe { libc::tcgetattr(0, &mut saved) } == 0;
+    if echo_off {
+        let mut t = saved;
+        t.c_lflag &= !libc::ECHO;
+        unsafe { libc::tcsetattr(0, libc::TCSANOW, &t) };
+    }
+    let mut line = String::new();
+    let _ = std::io::stdin().lock().read_line(&mut line);
+    if echo_off {
+        unsafe { libc::tcsetattr(0, libc::TCSANOW, &saved) };
+        eprintln!();
+    }
+    line.trim().to_string()
+}
+
+fn price(m: &moco_core::catalog::Model) -> String {
+    match &m.cost {
+        Some(c) => format!("${}/{} per M", c.input, c.output),
+        None => "no price".into(),
+    }
+}
+
+fn list_models(catalog: &Catalog, app_dir: &std::path::Path, filter: &str, connected_only: bool, limit: usize) -> usize {
+    let filter = filter.to_lowercase();
+    let mut shown = 0;
+    for (pid, p) in &catalog.providers {
+        let connected = registry::is_connected(p, app_dir);
+        if (connected_only && !connected) || p.protocol().is_none() {
+            continue;
+        }
+        for m in p.models.values() {
+            let full = format!("{pid}/{}", m.id);
+            if !filter.is_empty() && !full.to_lowercase().contains(&filter) && !m.name.to_lowercase().contains(&filter) {
+                continue;
+            }
+            if shown >= limit {
+                return shown + 1; // signals "more"
+            }
+            println!("{}{full:<48} ctx {:<7} {}", if connected { "* " } else { "  " }, human(m.limit.context), price(m));
+            shown += 1;
+        }
+    }
+    shown
+}
+
+fn provider_line(p: &ProviderInfo, app_dir: &std::path::Path) -> String {
+    let state = if registry::is_connected(p, app_dir) {
+        "connected".to_string()
+    } else if p.protocol().is_none() {
+        "unsupported protocol".to_string()
+    } else {
+        format!("no key (set {} or run `moco auth {}`)", p.env.first().cloned().unwrap_or_else(|| auth::env_var_for(&p.id)), p.id)
+    };
+    format!("{:<16} {:>4} models  {state}", p.id, p.models.len())
+}
+
 fn main() {
+    // Let `moco models | head` end quietly instead of panicking on a closed pipe.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    let mut raw: Vec<String> = std::env::args().skip(1).collect();
+    let app_dir = auth::app_dir();
+
+    // Subcommands that need no session.
+    match raw.first().map(String::as_str) {
+        Some("auth") => {
+            let Some(provider) = raw.get(1) else { die("usage: moco auth <provider>   (reads the key from stdin)") };
+            let catalog = Catalog::load(&app_dir);
+            if !catalog.providers.contains_key(provider.as_str()) {
+                eprintln!("note: '{provider}' is not in the model catalog; storing the key anyway (define it under `providers` in moco.jsonc)");
+            }
+            let key = read_secret(&format!("API key for {provider}: "));
+            if key.is_empty() {
+                die("empty key, nothing stored");
+            }
+            match auth::store_key(provider, &key, &app_dir) {
+                Ok(p) => println!("stored in {} (mode 600)", p.display()),
+                Err(e) => die(&format!("could not store key: {e}")),
+            }
+            return;
+        }
+        Some("models") => {
+            let refresh = raw.iter().any(|a| a == "--refresh");
+            if refresh {
+                match Catalog::refresh(&app_dir, "https://models.dev/api.json") {
+                    Ok((p, m)) => println!("catalog updated: {p} providers, {m} models"),
+                    Err(e) => die(&e),
+                }
+            }
+            let filter = raw.iter().skip(1).find(|a| !a.starts_with("--")).cloned().unwrap_or_default();
+            let cwd = std::env::current_dir().unwrap_or_default();
+            let mut catalog = Catalog::load(&app_dir);
+            catalog.apply_config(&config::load(&app_dir, &cwd).config.providers);
+            if filter.is_empty() {
+                for p in catalog.providers.values().filter(|p| p.protocol().is_some()) {
+                    println!("{}", provider_line(p, &app_dir));
+                }
+                println!("\n`moco models <filter>` lists models; * marks connected providers.");
+            } else if list_models(&catalog, &app_dir, &filter, false, 60) > 60 {
+                println!("... more; narrow the filter");
+            }
+            return;
+        }
+        _ => {}
+    }
+
     let (mut cont, mut prompt, mut dir) = (false, None, None);
     let mut model = std::env::var("MOCO_MODEL").ok();
     let mut agent_id: Option<String> = None;
-    let mut args = std::env::args().skip(1);
+    let mut args = raw.drain(..);
     while let Some(a) = args.next() {
         let mut value = |flag: &str| args.next().unwrap_or_else(|| die(&format!("{flag} needs a value")));
         match a.as_str() {
@@ -122,20 +282,17 @@ fn main() {
             "--dir" => dir = Some(value("--dir")),
             "--prompt" | "-p" => prompt = Some(value("--prompt")),
             "--help" | "-h" => {
-                println!("usage: moco [--continue] [--model PROVIDER/MODEL] [--agent ID] [--dir PATH] [-p PROMPT]");
+                println!(
+                    "usage: moco [--continue] [--model PROVIDER/MODEL] [--agent ID] [--dir PATH] [-p PROMPT]\n       moco models [FILTER] [--refresh]\n       moco auth PROVIDER"
+                );
                 return;
             }
             other => die(&format!("unknown argument {other}")),
         }
     }
-
-    let app_dir = auth::app_dir();
     if let Some(w) = auth::permissions_warning(&app_dir) {
         eprintln!("warning: {w}");
     }
-    let Some(key) = auth::load_key("anthropic", &app_dir) else {
-        die(&format!("no API key. Set ANTHROPIC_API_KEY or put {{\"anthropic\": {{\"key\": \"...\"}}}} in {}/auth.json (mode 600)", app_dir.display()));
-    };
     let cwd = match dir {
         Some(d) => std::path::PathBuf::from(d).canonicalize().unwrap_or_else(|e| die(&format!("--dir: {e}"))),
         None => std::env::current_dir().unwrap_or_else(|e| die(&e.to_string())),
@@ -158,6 +315,20 @@ fn main() {
     }
     let model = model.or(cfg.model.clone()).unwrap_or_else(|| "anthropic/claude-sonnet-5-5".into());
 
+    let mut catalog = Catalog::load(&app_dir);
+    catalog.apply_config(&cfg.providers);
+    let providers = registry::build(&catalog, &app_dir);
+    let (want_provider, _) = config::split_model(&model);
+    if !providers.contains_key(want_provider) && !agents.iter().any(|a| a.model.is_some()) {
+        let mut have: Vec<&str> = providers.keys().map(String::as_str).collect();
+        have.sort();
+        die(&format!(
+            "provider '{want_provider}' is not connected. Set {} or run `moco auth {want_provider}`. Connected: {}. Use --model PROVIDER/MODEL to pick another (see `moco models`).",
+            auth::env_var_for(want_provider),
+            if have.is_empty() { "none".to_string() } else { have.join(", ") }
+        ));
+    }
+
     let store = Store::open(&app_dir.join("data/moco.db")).unwrap_or_else(|e| die(&format!("database: {e}")));
     let recovered = store.recover_claims(3).unwrap_or_default();
     let mut session = match cont.then(|| store.latest_session(&cwd_str).ok().flatten()).flatten() {
@@ -167,14 +338,22 @@ fn main() {
     if cont {
         store.set_agent(&session.id, &agent_id).ok();
     }
-    let mut engine_cfg = EngineConfig::new(&model, app_dir);
+    // An explicit --model / MOCO_MODEL applies to this session; otherwise a resumed session keeps its own.
+    let explicit_model = std::env::args().any(|a| a == "--model" || a == "-m") || std::env::var("MOCO_MODEL").is_ok();
+    if explicit_model {
+        store.set_model(&session.id, Some(&model)).ok();
+        session.model = Some(model.clone());
+    }
+
+    let mut engine_cfg = EngineConfig::new(&model, app_dir.clone());
     engine_cfg.agents = agents;
     engine_cfg.instructions = cfg.instructions.clone();
+    engine_cfg.catalog = catalog;
     let n_sources = loaded.sources.len();
-    let engine = Engine::new(store, Box::new(Anthropic::new(key, std::env::var("ANTHROPIC_BASE_URL").ok())), engine_cfg);
+    let engine = Engine::with_providers(store, providers, engine_cfg);
 
     install_sigint();
-    let term = Terminal { mid_line: AtomicBool::new(false) };
+    let term = Terminal { mid_line: AtomicBool::new(false), run: Mutex::new(RunUsage::default()) };
     let run = |sid: &str, resume: bool| {
         CANCEL.store(false, Ordering::Relaxed);
         let outcome = engine.run(sid, &term, &CANCEL, resume);
@@ -187,6 +366,7 @@ fn main() {
             Ok(RunOutcome::Busy) => eprintln!("session is busy"),
             Err(e) => eprintln!("{RED}store error: {e}{RESET}"),
         }
+        term.print_usage();
         outcome.ok()
     };
 
@@ -200,14 +380,17 @@ fn main() {
         std::process::exit(if ok { 0 } else { 1 });
     }
 
-    println!("{DIM}moco {} | {model} | agent {agent_id} | {n_sources} config file(s) | /help for commands{RESET}", env!("CARGO_PKG_VERSION"));
+    let current = |sid: &str| engine.store.lock().unwrap().session(sid).ok().flatten().map(|s| engine.model_ref_for(&s)).unwrap_or_default();
+    println!("{DIM}moco {} | {} | agent {agent_id} | {n_sources} config file(s) | /help for commands{RESET}", env!("CARGO_PKG_VERSION"), current(&session.id));
     while let Some(line) = term.read_line("> ") {
         CANCEL.store(false, Ordering::Relaxed);
         let line = line.trim();
         match line {
             "" => continue,
             "/exit" | "/quit" => break,
-            "/help" => println!("/agent <build|plan>  switch agent\n/new                 start a new session\n/exit                quit (Ctrl-C interrupts a running turn)"),
+            "/help" => println!(
+                "/model [FILTER|PROVIDER/MODEL]  show, search or switch the model\n/agent <id>                     switch agent\n/new                            start a new session\n/exit                           quit (Ctrl-C interrupts a running turn)"
+            ),
             "/new" => match engine.store.lock().unwrap().create_session(&cwd_str, &agent_id) {
                 Ok(s) => {
                     session = s;
@@ -215,6 +398,26 @@ fn main() {
                 }
                 Err(e) => eprintln!("{e}"),
             },
+            l if l.starts_with("/model") => {
+                let arg = l.trim_start_matches("/model").trim();
+                let connected = engine.connected_providers();
+                if arg.is_empty() {
+                    println!("{DIM}model: {}{RESET}\nconnected: {}\n/model <filter> searches; /model provider/model switches", current(&session.id), connected.join(", "));
+                } else if let Some((pid, mid)) = arg.split_once('/').filter(|(p, _)| connected.iter().any(|c| c == p)) {
+                    let known = engine.catalog().model(pid, mid).is_some();
+                    engine.store.lock().unwrap().set_model(&session.id, Some(arg)).ok();
+                    println!("{DIM}model: {arg}{}{RESET}", if known { "" } else { " (not in the catalog: no price or context limit)" });
+                } else if arg.contains('/') && !arg.contains(' ') && engine.catalog().providers.contains_key(arg.split('/').next().unwrap_or("")) {
+                    println!("provider '{}' is not connected; run `moco auth {}`", arg.split('/').next().unwrap_or(""), arg.split('/').next().unwrap_or(""));
+                } else {
+                    let n = list_models(engine.catalog(), &app_dir, arg, true, 25);
+                    if n == 0 {
+                        println!("no connected model matches '{arg}'");
+                    } else if n > 25 {
+                        println!("... more; narrow the filter");
+                    }
+                }
+            }
             l if l.starts_with("/agent") => {
                 let want = l.trim_start_matches("/agent").trim();
                 match engine.agents().iter().find(|a| a.id == want) {

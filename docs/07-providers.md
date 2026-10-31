@@ -49,3 +49,20 @@ After each step record usage, compute cost = sum(tokens x price / 1e6) with tier
 
 ## Warming (optional)
 Keep cache hot with periodic tiny requests (`config.warming`). Skip.
+
+## moco implementation notes (Phase 2, providers slice)
+
+Code: `catalog.rs`, `provider/{anthropic,openai_chat,registry}.rs`, `auth.rs`.
+- **Protocols implemented**: Anthropic Messages and OpenAI-compatible Chat Completions (`POST {base}/chat/completions`, `stream_options.include_usage`, tool calls assembled from deltas, `reasoning_content` shown but not stored, cached tokens read from `prompt_tokens_details`). OpenAI Responses and Gemini are not implemented; catalog providers that need them are listed as "unsupported protocol". Chat Completions is used for `api.openai.com` too, with `max_completion_tokens`.
+- **Catalog**: an embedded snapshot (`catalog_snapshot.json`, 10 providers, regenerate with `scripts/update-catalog-snapshot.py`), replaced by `<app dir>/cache/models.json` after `moco models --refresh` (full models.dev download filtered to usable providers and tool-calling models, about 7,000 models). Only the v1 `api.json` shape is parsed. Providers whose `npm` package is one of the AI SDK OpenAI-compatible families use Chat Completions; a small table supplies base URLs for those without an `api` field.
+- **Model refs** are `provider/model` (the first `/` splits, so `openrouter/anthropic/claude-x` works). Resolution: session choice (`/model`, `--model`, `MOCO_MODEL`), then the agent's `model`, then config `model`, then `anthropic/claude-sonnet-5-5`. There is no "last used / first connected" fallback; a missing provider fails with the env var and `moco auth` hint.
+- **Credentials**: an environment variable named by the catalog entry (or `<PROVIDER>_API_KEY`) wins over `auth.json`; `moco auth <provider>` reads the key from stdin (echo off on a terminal) and writes `auth.json` with mode 0600, keeping other entries.
+- **Config `providers.<id>`** adds or overrides a provider: `base_url`, `env`, `protocol` (`openai-chat` default for new ones, or `anthropic`), `headers`, `models.<id>` (`name`, `limit{context,output}`, `cost{input,output,cache_read,cache_write}`), `disabled`. Providers defined this way need no key (Ollama, LM Studio, vLLM):
+```jsonc
+{ "providers": { "ollama": { "base_url": "http://localhost:11434/v1",
+    "models": { "qwen3-coder": { "limit": { "context": 32768, "output": 8192 } } } } },
+  "model": "ollama/qwen3-coder" }
+```
+- **Cost**: tokens times catalog prices per million, including context tiers (a tier applies when input plus cached tokens exceed its size). Totals are stored on the session (`cost`, `tokens`); the terminal prints tokens, cost, session cost and context fill after each turn. Models without a price show "cost n/a".
+- **Not done**: variants (reasoning effort presets), per-model request overlays (`request.settings/headers/body`), OAuth flows, usage limits, warming.
+

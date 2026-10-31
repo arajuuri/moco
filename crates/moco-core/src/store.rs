@@ -56,6 +56,8 @@ pub struct Session {
     pub directory: String,
     pub agent: String,
     pub title: Option<String>,
+    /// `provider/model` chosen for this session, if any.
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -137,14 +139,14 @@ impl Store {
             "insert into session(id, project_id, directory, agent, time_created, time_updated) values (?1,?2,?3,?4,?5,?5)",
             params![id, project_id, directory, agent, t],
         )?;
-        Ok(Session { id, project_id, directory: directory.into(), agent: agent.into(), title: None })
+        Ok(Session { id, project_id, directory: directory.into(), agent: agent.into(), title: None, model: None })
     }
 
     pub fn session(&self, id: &str) -> Result<Option<Session>> {
         Ok(self
             .conn
-            .query_row("select id, project_id, directory, agent, title from session where id=?1", [id], |r| {
-                Ok(Session { id: r.get(0)?, project_id: r.get(1)?, directory: r.get(2)?, agent: r.get(3)?, title: r.get(4)? })
+            .query_row("select id, project_id, directory, agent, title, model from session where id=?1", [id], |r| {
+                Ok(Session { id: r.get(0)?, project_id: r.get(1)?, directory: r.get(2)?, agent: r.get(3)?, title: r.get(4)?, model: r.get(5)? })
             })
             .optional()?)
     }
@@ -154,15 +156,39 @@ impl Store {
         Ok(())
     }
 
+    pub fn set_model(&self, session_id: &str, model: Option<&str>) -> Result<()> {
+        self.conn.execute("update session set model=?2, time_updated=?3 where id=?1", params![session_id, model, now_ms()])?;
+        Ok(())
+    }
+
+    /// Add one step's usage to the session totals (`cost` in USD; `tokens` is a JSON object of running sums).
+    pub fn add_usage(&self, session_id: &str, cost: f64, usage: &crate::provider::Usage) -> Result<()> {
+        let prev: Option<String> = self.conn.query_row("select tokens from session where id=?1", [session_id], |r| r.get(0))?;
+        let mut t: Value = prev.and_then(|p| serde_json::from_str(&p).ok()).unwrap_or_else(|| serde_json::json!({}));
+        for (k, v) in [("input", usage.input), ("output", usage.output), ("cacheRead", usage.cache_read), ("cacheWrite", usage.cache_write)] {
+            t[k] = serde_json::json!(t[k].as_u64().unwrap_or(0) + v);
+        }
+        self.conn.execute("update session set cost=cost+?2, tokens=?3, time_updated=?4 where id=?1", params![session_id, cost, t.to_string(), now_ms()])?;
+        Ok(())
+    }
+
+    /// (cost in USD, token sums) for the session.
+    pub fn usage_totals(&self, session_id: &str) -> Result<(f64, crate::provider::Usage)> {
+        let (cost, tokens): (f64, Option<String>) = self.conn.query_row("select cost, tokens from session where id=?1", [session_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let t: Value = tokens.and_then(|p| serde_json::from_str(&p).ok()).unwrap_or(Value::Null);
+        let g = |k: &str| t[k].as_u64().unwrap_or(0);
+        Ok((cost, crate::provider::Usage { input: g("input"), output: g("output"), cache_read: g("cacheRead"), cache_write: g("cacheWrite") }))
+    }
+
     /// Most recently updated, non-archived top-level session for a directory.
     pub fn latest_session(&self, directory: &str) -> Result<Option<Session>> {
         Ok(self
             .conn
             .query_row(
-                "select id, project_id, directory, agent, title from session
+                "select id, project_id, directory, agent, title, model from session
                  where directory=?1 and parent_id is null and time_archived is null order by id desc limit 1",
                 [directory],
-                |r| Ok(Session { id: r.get(0)?, project_id: r.get(1)?, directory: r.get(2)?, agent: r.get(3)?, title: r.get(4)? }),
+                |r| Ok(Session { id: r.get(0)?, project_id: r.get(1)?, directory: r.get(2)?, agent: r.get(3)?, title: r.get(4)?, model: r.get(5)? }),
             )
             .optional()?)
     }
@@ -305,6 +331,23 @@ mod tests {
         let s = Store::open_memory().unwrap();
         let ses = s.create_session("/work/proj", "build").unwrap();
         (s, ses)
+    }
+
+    #[test]
+    fn model_and_usage_totals_accumulate() {
+        let (s, ses) = store();
+        assert_eq!(s.session(&ses.id).unwrap().unwrap().model, None);
+        s.set_model(&ses.id, Some("openai/gpt-x")).unwrap();
+        assert_eq!(s.session(&ses.id).unwrap().unwrap().model.as_deref(), Some("openai/gpt-x"));
+        assert_eq!(s.latest_session("/work/proj").unwrap().unwrap().model.as_deref(), Some("openai/gpt-x"));
+        let u = crate::provider::Usage { input: 10, output: 5, cache_read: 2, cache_write: 1 };
+        s.add_usage(&ses.id, 0.25, &u).unwrap();
+        s.add_usage(&ses.id, 0.5, &u).unwrap();
+        let (cost, t) = s.usage_totals(&ses.id).unwrap();
+        assert!((cost - 0.75).abs() < 1e-9);
+        assert_eq!(t, crate::provider::Usage { input: 20, output: 10, cache_read: 4, cache_write: 2 });
+        s.set_model(&ses.id, None).unwrap();
+        assert_eq!(s.session(&ses.id).unwrap().unwrap().model, None);
     }
 
     #[test]

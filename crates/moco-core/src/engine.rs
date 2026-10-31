@@ -4,13 +4,14 @@
 //! (one LLM call, tools executing concurrently as their calls complete), continue while the step
 //! produced tool calls. History is reloaded from the store on every step.
 use crate::agent::{self, Agent};
-use crate::{config, instructions};
+use crate::{catalog, config, instructions};
 use crate::chat;
 use crate::permission::{self, Effect, Rule};
 use crate::provider::{retry, Block, ChatMessage, Event, FinishReason, Provider, ProviderError, Request, Role, ToolDef, Usage};
 use crate::store::{Mode, Session, Store, StoreError};
 use crate::tools::{self, project_root_of, PermReq, Permitter, Tool, ToolCtx, ToolError, ToolOutput};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -36,7 +37,8 @@ pub enum UiEvent<'a> {
     ToolStarted { name: &'a str, input: &'a Value },
     ToolFinished { name: &'a str, ok: bool, text: &'a str },
     Retry { attempt: u32, wait: Duration, error: &'a str },
-    Usage(Usage),
+    /// After each step: this step's tokens and cost, session total, and how full the context is.
+    StepUsage { usage: Usage, cost: Option<f64>, session_cost: f64, context_tokens: u64, context_limit: Option<u64> },
     Notice(&'a str),
 }
 
@@ -66,6 +68,7 @@ pub struct EngineConfig {
     pub agents: Vec<Agent>,
     /// Extra instruction files from config.
     pub instructions: Vec<String>,
+    pub catalog: catalog::Catalog,
     /// Waits for retry backoff; must return early when `cancel` is set.
     pub sleep: Box<dyn Fn(Duration, &AtomicBool) + Send + Sync>,
     pub jitter: Box<dyn Fn() -> f64 + Send + Sync>,
@@ -79,6 +82,7 @@ impl EngineConfig {
             app_dir,
             agents: agent::builtin(),
             instructions: vec![],
+            catalog: catalog::Catalog::embedded(),
             sleep: Box::new(|d, cancel| {
                 let end = std::time::Instant::now() + d;
                 while std::time::Instant::now() < end && !cancel.load(Ordering::Relaxed) {
@@ -92,7 +96,9 @@ impl EngineConfig {
 
 pub struct Engine {
     pub store: Mutex<Store>,
-    provider: Box<dyn Provider>,
+    providers: HashMap<String, Box<dyn Provider>>,
+    /// Used when a model's provider has no client of its own (tests, single-provider setups).
+    fallback: Option<Box<dyn Provider>>,
     cfg: EngineConfig,
     tools: Vec<Box<dyn Tool>>,
 }
@@ -112,8 +118,30 @@ struct AttemptResult {
 }
 
 impl Engine {
+    /// Single provider answering every model ref.
     pub fn new(store: Store, provider: Box<dyn Provider>, cfg: EngineConfig) -> Self {
-        Engine { store: Mutex::new(store), provider, cfg, tools: tools::all() }
+        Engine { store: Mutex::new(store), providers: HashMap::new(), fallback: Some(provider), cfg, tools: tools::all() }
+    }
+
+    /// One client per provider id; a model ref's provider part picks the client.
+    pub fn with_providers(store: Store, providers: HashMap<String, Box<dyn Provider>>, cfg: EngineConfig) -> Self {
+        Engine { store: Mutex::new(store), providers, fallback: None, cfg, tools: tools::all() }
+    }
+
+    pub fn catalog(&self) -> &catalog::Catalog {
+        &self.cfg.catalog
+    }
+
+    pub fn connected_providers(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.providers.keys().cloned().collect();
+        v.sort();
+        v
+    }
+
+    /// Model used for a session: its own choice, else the agent's, else the configured default.
+    pub fn model_ref_for(&self, session: &Session) -> String {
+        let agent = agent::find(&self.cfg.agents, &session.agent);
+        session.model.clone().or(agent.and_then(|a| a.model)).unwrap_or_else(|| self.cfg.model.clone())
     }
 
     pub fn agents(&self) -> &[Agent] {
@@ -194,9 +222,20 @@ impl Engine {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         let lazy: Vec<PathBuf> = self.store().instruction_paths(sid)?.into_iter().map(PathBuf::from).collect();
         let ins = instructions::render(&instructions::load(&self.cfg.app_dir, std::path::Path::new(&session.directory), &self.cfg.instructions, &lazy));
-        let model_ref = agent.model.as_deref().unwrap_or(&self.cfg.model);
+        let model_ref = session.model.clone().or(agent.model.clone()).unwrap_or_else(|| self.cfg.model.clone());
+        let (provider_id, model_id) = config::split_model(&model_ref);
+        let Some(provider) = self.providers.get(provider_id).map(|p| p.as_ref()).or(self.fallback.as_deref()) else {
+            let connected = self.connected_providers();
+            let msg = format!(
+                "provider '{provider_id}' is not connected (no API key). Connected: {}. Run `moco auth {provider_id}` or set {}.",
+                if connected.is_empty() { "none".to_string() } else { connected.join(", ") },
+                crate::auth::env_var_for(provider_id)
+            );
+            ui.event(&UiEvent::Notice(&msg));
+            return Ok(StepOutcome::Stop(RunOutcome::Failed(msg)));
+        };
         let req = Request {
-            model: config::split_model(model_ref).1.to_string(),
+            model: model_id.to_string(),
             system: agent::system_prompt(
                 &agent,
                 &advertised,
@@ -221,7 +260,7 @@ impl Engine {
 
         let mut retries = 0u32;
         let result = loop {
-            let r = self.attempt(&session, &req, &permitter, ui, cancel, &msg_id);
+            let r = self.attempt(provider, &session, &req, &permitter, ui, cancel, &msg_id);
             match &r.stream {
                 Err(e) if !r.dispatched && !cancel.load(Ordering::Relaxed) => {
                     // Safe to retry: no tool has run, and the partial output is discarded.
@@ -247,7 +286,16 @@ impl Engine {
         if let Some((reason, usage)) = &result.finish {
             data["finish"] = json!(format!("{reason:?}"));
             data["usage"] = json!({"input": usage.input, "output": usage.output, "cacheRead": usage.cache_read, "cacheWrite": usage.cache_write});
-            ui.event(&UiEvent::Usage(*usage));
+            let model = self.cfg.catalog.model(provider_id, model_id);
+            let cost = model.and_then(|m| catalog::cost(m, usage));
+            let context_tokens = usage.input + usage.cache_read + usage.cache_write + usage.output;
+            let session_cost = {
+                let st = self.store();
+                let _ = st.add_usage(sid, cost.unwrap_or(0.0), usage);
+                st.usage_totals(sid).map(|t| t.0).unwrap_or(0.0)
+            };
+            data["cost"] = json!(cost);
+            ui.event(&UiEvent::StepUsage { usage: *usage, cost, session_cost, context_tokens, context_limit: model.map(|m| m.limit.context).filter(|l| *l > 0) });
         }
         let outcome = match &result.stream {
             _ if interrupted => {
@@ -272,7 +320,7 @@ impl Engine {
     }
 
     /// One streaming request. Tools start executing as soon as their call is complete.
-    fn attempt(&self, session: &Session, req: &Request, permitter: &EnginePermitter, ui: &dyn Ui, cancel: &AtomicBool, msg_id: &str) -> AttemptResult {
+    fn attempt(&self, provider: &dyn Provider, session: &Session, req: &Request, permitter: &EnginePermitter, ui: &dyn Ui, cancel: &AtomicBool, msg_id: &str) -> AttemptResult {
         let cwd = PathBuf::from(&session.directory);
         let root = project_root_of(&cwd);
         let spill = self.spill_dir();
@@ -284,7 +332,7 @@ impl Engine {
 
         let stream = std::thread::scope(|s| {
             let mut handles = vec![];
-            let res = self.provider.stream(req, cancel, &mut |ev| match ev {
+            let res = provider.stream(req, cancel, &mut |ev| match ev {
                 Event::TextDelta(t) => {
                     ui.event(&UiEvent::TextDelta(&t));
                     let i = *text_idx.get_or_insert_with(|| {
@@ -440,7 +488,7 @@ mod tests {
                 UiEvent::ToolStarted { name, .. } => format!("start:{name}"),
                 UiEvent::ToolFinished { name, ok, .. } => format!("done:{name}:{ok}"),
                 UiEvent::Retry { attempt, wait, .. } => format!("retry:{attempt}:{}", wait.as_secs()),
-                UiEvent::Usage(_) => "usage".into(),
+                UiEvent::StepUsage { .. } => "usage".into(),
                 UiEvent::Notice(n) => format!("notice:{n}"),
             };
             if let Some(h) = &*self.hook.lock().unwrap() {
@@ -779,6 +827,64 @@ mod tests {
         assert_eq!(ui.asked.lock().unwrap().as_slice(), ["shell touch ran"]);
         assert!(!dir.join("work/ran").exists());
         assert_eq!(fake.requests.lock().unwrap()[0].model, "claude-other");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn model_ref_routes_to_the_right_provider_and_reports_cost() {
+        let dir = std::env::temp_dir().join(crate::id::new_id("moco-eng-route"));
+        std::fs::create_dir_all(dir.join("work")).unwrap();
+        let a = Arc::new(FakeProvider::new(vec![text("from a")]));
+        let b = Arc::new(FakeProvider::new(vec![text("from b")]));
+        let providers: HashMap<String, Box<dyn Provider>> =
+            HashMap::from([("anthropic".to_string(), Box::new(Shared(a.clone())) as Box<dyn Provider>), ("deepseek".to_string(), Box::new(Shared(b.clone())))]);
+        let store = Store::open_memory().unwrap();
+        let ses = store.create_session(dir.join("work").to_str().unwrap(), "build").unwrap();
+        let engine = Engine::with_providers(store, providers, EngineConfig::new("anthropic/claude-sonnet-5-5", dir.join("app")));
+        let usage_events = Mutex::new(vec![]);
+        struct Capture<'a>(&'a Mutex<Vec<(Option<f64>, f64, u64, Option<u64>)>>);
+        impl Ui for Capture<'_> {
+            fn event(&self, e: &UiEvent) {
+                if let UiEvent::StepUsage { cost, session_cost, context_tokens, context_limit, .. } = e {
+                    self.0.lock().unwrap().push((*cost, *session_cost, *context_tokens, *context_limit));
+                }
+            }
+            fn ask(&self, _: &PermissionPrompt) -> Reply {
+                Reply::Reject(None)
+            }
+        }
+        let ui = Capture(&usage_events);
+        engine.submit(&ses.id, "one", Mode::Steer).unwrap();
+        engine.run(&ses.id, &ui, &AtomicBool::new(false), false).unwrap();
+        engine.store().set_model(&ses.id, Some("deepseek/deepseek-chat")).unwrap();
+        engine.submit(&ses.id, "two", Mode::Steer).unwrap();
+        engine.run(&ses.id, &ui, &AtomicBool::new(false), false).unwrap();
+        assert_eq!((a.calls(), b.calls()), (1, 1));
+        assert_eq!(b.requests.lock().unwrap()[0].model, "deepseek-chat");
+        let ev = usage_events.lock().unwrap().clone();
+        // 10 input + 5 output tokens at $2 / $10 per million.
+        assert!((ev[0].0.unwrap() - 0.00007).abs() < 1e-12, "{ev:?}");
+        assert_eq!((ev[0].2, ev[0].3), (15, Some(1_000_000)));
+        assert!(ev[1].1 >= ev[0].1, "session cost accumulates");
+        let (total, tokens) = engine.store().usage_totals(&ses.id).unwrap();
+        assert!(total >= ev[0].1 && tokens.input == 20 && tokens.output == 10, "{total} {tokens:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unconnected_provider_gives_an_actionable_error_before_any_request() {
+        let dir = std::env::temp_dir().join(crate::id::new_id("moco-eng-noprov"));
+        std::fs::create_dir_all(dir.join("work")).unwrap();
+        let store = Store::open_memory().unwrap();
+        let ses = store.create_session(dir.join("work").to_str().unwrap(), "build").unwrap();
+        let engine = Engine::with_providers(store, HashMap::new(), EngineConfig::new("openai/gpt-x", dir.join("app")));
+        engine.submit(&ses.id, "hi", Mode::Steer).unwrap();
+        let ui = TestUi::default();
+        match engine.run(&ses.id, &ui, &AtomicBool::new(false), false).unwrap() {
+            RunOutcome::Failed(m) => assert!(m.contains("'openai' is not connected") && m.contains("moco auth openai") && m.contains("OPENAI_API_KEY"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(engine.store().messages(&ses.id).unwrap().len(), 1, "only the user message; no empty assistant message");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

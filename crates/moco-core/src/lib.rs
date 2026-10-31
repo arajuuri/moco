@@ -1,6 +1,7 @@
 //! moco engine: UI-independent core (docs/00-overview.md).
 pub mod agent;
 pub mod auth;
+pub mod catalog;
 pub mod chat;
 pub mod config;
 pub mod engine;

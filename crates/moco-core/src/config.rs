@@ -25,7 +25,32 @@ pub struct AgentConfig {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
+pub struct ModelConfig {
+    pub name: Option<String>,
+    pub limit: Option<crate::catalog::Limit>,
+    pub cost: Option<crate::catalog::Cost>,
+}
+
+/// `providers.<id>`: adds a provider (any OpenAI-compatible server, e.g. Ollama or LM Studio) or
+/// overrides fields of a catalog provider.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ProviderConfig {
+    pub name: Option<String>,
+    pub base_url: Option<String>,
+    /// Environment variables to read the API key from.
+    pub env: Vec<String>,
+    /// `"openai-chat"` (default for new providers) or `"anthropic"`.
+    pub protocol: Option<String>,
+    pub headers: BTreeMap<String, String>,
+    pub models: BTreeMap<String, ModelConfig>,
+    pub disabled: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
 pub struct Config {
+    pub providers: BTreeMap<String, ProviderConfig>,
     /// `provider/model`
     pub model: Option<String>,
     pub default_agent: Option<String>,

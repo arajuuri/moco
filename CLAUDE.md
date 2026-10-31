@@ -17,7 +17,7 @@ cargo build --release            # produces target/release/moco
 moco -p "prompt"                 # one-shot; `moco` alone is the interactive chat; --continue resumes
 ```
 
-The API key comes from `ANTHROPIC_API_KEY` or `~/Library/Application Support/moco/auth.json` (`{"anthropic": {"key": "..."}}`, mode 600; `MOCO_HOME` overrides the directory).
+API keys come from the provider's env var (e.g. `ANTHROPIC_API_KEY`) or `~/Library/Application Support/moco/auth.json` (`{"anthropic": {"key": "..."}}`, mode 600; `MOCO_HOME` overrides the directory). `moco auth <provider>` writes it; `moco models [filter] [--refresh]` lists models and connection state. Always use a temporary `MOCO_HOME` when experimenting with auth or the catalog cache.
 
 **Always set `CARGO_TARGET_DIR` outside the repo.** `/home/ubuntu/Development` is an sshfs mount of the Mac Pro's disk, so the repo is shared between the Linux dev box and the Mojave test machine. Building into the shared `target/` fails intermittently over sshfs and mixes Linux and macOS artifacts. Use `CARGO_TARGET_DIR=/home/ubuntu/.cache/moco-target` on Linux and `CARGO_TARGET_DIR=$HOME/moco-target` on the Mac.
 
@@ -28,12 +28,12 @@ Mojave test machine: `ssh claude@semis-mac-pro.lan` (macOS 10.14.6, Xcode 11.3.1
 `crates/moco-core` is the UI-independent engine; `crates/moco` is the line-based terminal front end (`Ui` trait implementation); `spike/` is the standalone Phase 0 probe crate (excluded from the workspace).
 
 - `engine.rs`: step loop (claim, deliver inbox, run step, continue while tool calls). Tools run on scoped threads as soon as their call completes. Retries only when no tool ran in the attempt; the partial output is discarded.
-- `provider/`: neutral request/event types, `anthropic.rs` (SSE parser, error classification), `retry.rs`, `fake.rs` (scripted provider for tests).
+- `provider/`: neutral request/event types; one adapter per wire protocol (`anthropic.rs`, `openai_chat.rs`: SSE parser + error classification each); `registry.rs` builds a client per connected provider; `retry.rs`; `fake.rs` (scripted provider) and `testserver.rs` (local HTTP server) for tests. `catalog.rs` holds models.dev metadata, limits and cost math; the snapshot is regenerated with `scripts/update-catalog-snapshot.py`.
 - `tools/`: read, write, edit, glob, grep, shell. Tools call `ToolCtx::permit`/`check_external`; the engine's `EnginePermitter` evaluates rules (`permission.rs`) and prompts through `Ui::ask`. `shellparse.rs` turns a command line into permission resources and "always" patterns.
 - `config.rs` / `instructions.rs`: JSONC config layering and `AGENTS.md` discovery (see `docs/08`); `agent.rs` holds built-in agents and the system prompt, `config::resolve_agents` applies overrides and config permission rules.
 - `store.rs`: SQLite (WAL, migrations in `MIGRATIONS`), inbox delivery semantics, saved permissions, execution claim and crash recovery. `chat.rs` rebuilds provider messages from stored history and repairs dangling tool calls.
 
-Known gaps versus the docs: no compaction, snapshots/undo, background shell, image/PDF reads, or title generation (Phase 2+). The shell arity table in `shellparse.rs` is partial. The default ruleset allows everything except `.env` reads, as upstream does; add `permissions` rules to a `moco.jsonc` to make `shell`/`edit` ask.
+Known gaps versus the docs: no compaction, snapshots/undo, OpenAI Responses/Gemini protocols, background shell, image/PDF reads, or title generation (Phase 2+). The shell arity table in `shellparse.rs` is partial. The default ruleset allows everything except `.env` reads, as upstream does; add `permissions` rules to a `moco.jsonc` to make `shell`/`edit` ask.
 
 ## Reading order
 

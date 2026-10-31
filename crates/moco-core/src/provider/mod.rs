@@ -1,7 +1,11 @@
 //! Provider abstraction (docs/07-providers.md): neutral request/stream types; one adapter per wire protocol.
 pub mod anthropic;
 pub mod fake;
+pub mod openai_chat;
+pub mod registry;
 pub mod retry;
+#[cfg(test)]
+pub(crate) mod testserver;
 
 use serde_json::Value;
 use std::sync::atomic::AtomicBool;

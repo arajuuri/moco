@@ -39,11 +39,11 @@ Status: complete. 84 unit tests pass on Linux and on the Mojave machine; the rel
 ## Phase 2: daily-driver
 - Inbox with steer/queue, resume after crash (`02`).
 - Compaction auto/manual/overflow recovery (`03`).
-- AGENTS.md, config loading (JSONC, merge, variables) [done, see `08` implementation notes], model picker, cost/usage display (`07`, `08`).
+- AGENTS.md, config loading (JSONC, merge, variables) [done, see `08` implementation notes], model picker and cost/usage display [done, see `07` implementation notes] (`07`, `08`).
 - `patch`, `webfetch`, `todowrite`, `question`, subagent tool and `general`/`explore` agents.
 - Snapshots + revert/undo, session diff view.
 - Title generation, session list, fork, rename, archive.
-- Second provider protocol (OpenAI-compatible) so many hosted/local models work; models.dev catalog.
+- Second provider protocol (OpenAI-compatible) so many hosted/local models work; models.dev catalog. [done; verified against a local test server and the live Anthropic API, not yet against a live OpenAI-compatible provider]
 
 ## Phase 3: extensibility
 - Skills, custom commands, `@` mentions and attachments (images/PDF).
