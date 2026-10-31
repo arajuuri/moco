@@ -212,6 +212,8 @@ pub struct TuiConfig {
     pub away_after: Option<u64>,
     /// `true`, `false` or `"auto"` (default: shown when the terminal is wide enough).
     pub sidebar: Option<Value>,
+    /// Draw with plain ASCII instead of box-drawing and check-mark characters (also `MOCO_ASCII=1`).
+    pub ascii: Option<bool>,
 }
 
 #[derive(Debug, Default)]

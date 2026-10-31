@@ -1,7 +1,8 @@
 //! A small Markdown renderer for assistant text: headings, lists, quotes, fenced code, tables, inline
 //! code/bold/italic/links. Line breaks in the source are kept (chat replies rely on them). No dependencies;
 //! unknown or half-written syntax (the reply is still streaming) falls back to plain text.
-use super::app::Theme;
+use super::glyphs::Glyphs;
+use super::theme::Theme;
 use ratatui::prelude::*;
 use unicode_width::UnicodeWidthChar;
 
@@ -103,7 +104,7 @@ fn inline(s: &str, base: Style, t: &Theme) -> Vec<Cell> {
             let ticks = chars[i..].iter().take_while(|&&x| x == '`').count();
             let pat = vec!['`'; ticks];
             if let Some(end) = find(i + ticks, &pat) {
-                out.extend(chars[i + ticks..end].iter().map(|&x| (x, t.code)));
+                out.extend(chars[i + ticks..end].iter().map(|&x| (x, t.code.bg(t.panel.bg.unwrap_or(Color::Reset)))));
                 i = end + ticks;
                 continue;
             }
@@ -170,7 +171,7 @@ fn is_separator(line: &str) -> bool {
     !cells.is_empty() && cells.iter().all(|c| !c.is_empty() && c.chars().all(|x| matches!(x, '-' | ':' | ' ')) && c.contains('-'))
 }
 
-fn table(rows: &[String], width: usize, t: &Theme, out: &mut Vec<Line<'static>>) {
+fn table(rows: &[String], width: usize, t: &Theme, g: &Glyphs, out: &mut Vec<Line<'static>>) {
     let header = split_row(&rows[0]);
     let body: Vec<Vec<String>> = rows[2..].iter().map(|r| split_row(r)).collect();
     let n = header.len();
@@ -181,42 +182,43 @@ fn table(rows: &[String], width: usize, t: &Theme, out: &mut Vec<Line<'static>>)
             *w = (*w).max(r.get(c).map_or(0, |x| cells_width(&styled(x, t.text))));
         }
     }
-    let total: usize = cols.iter().sum::<usize>() + 3 * n + 1;
+    let total: usize = cols.iter().sum::<usize>() + 3 * (n - 1);
     if total > width {
         // Too wide to align: one line per row, cells separated by " | ".
         for (k, r) in std::iter::once(&header).chain(body.iter()).enumerate() {
             let mut cells = vec![];
             for (j, c) in r.iter().enumerate() {
                 if j > 0 {
-                    cells.extend(plain(" | ", t.dim));
+                    cells.extend(plain(" | ", t.border));
                 }
-                cells.extend(styled(c, if k == 0 { t.text.add_modifier(Modifier::BOLD) } else { t.text }));
+                cells.extend(styled(c, if k == 0 { t.heading.add_modifier(Modifier::BOLD) } else { t.text }));
             }
             emit(out, &[], &[], &cells, width);
         }
         return;
     }
     let row_line = |r: &[String], st: Style| {
-        let mut cells = plain("|", t.dim);
+        let mut cells: Vec<Cell> = vec![];
         for (c, w) in cols.iter().enumerate() {
+            if c > 0 {
+                cells.extend(plain(&format!(" {} ", g.vbar), t.border));
+            }
             let content = styled(r.get(c).map_or("", |x| x.as_str()), st);
             let pad = w - cells_width(&content);
-            cells.extend(plain(" ", t.text));
             cells.extend(content);
-            cells.extend(plain(&" ".repeat(pad + 1), t.text));
-            cells.extend(plain("|", t.dim));
+            cells.extend(plain(&" ".repeat(pad), t.text));
         }
         to_line(&[], &cells)
     };
-    out.push(row_line(&header, t.text.add_modifier(Modifier::BOLD)));
-    let rule: String = std::iter::once("|".to_string()).chain(cols.iter().map(|w| format!("{}|", "-".repeat(w + 2)))).collect();
-    out.push(Line::styled(rule, t.dim));
+    out.push(row_line(&header, t.heading.add_modifier(Modifier::BOLD)));
+    let rule: String = cols.iter().enumerate().map(|(c, w)| format!("{}{}", if c > 0 { format!("{}{}{}", g.rule, g.cross, g.rule) } else { String::new() }, g.rule.repeat(*w))).collect();
+    out.push(Line::styled(rule, t.border));
     for r in &body {
         out.push(row_line(r, t.text));
     }
 }
 
-pub fn render(text: &str, width: usize, t: &Theme) -> Vec<Line<'static>> {
+pub fn render(text: &str, width: usize, t: &Theme, g: &Glyphs) -> Vec<Line<'static>> {
     let text = clean(text);
     let lines: Vec<&str> = text.split('\n').collect();
     let width = width.max(8);
@@ -225,22 +227,32 @@ pub fn render(text: &str, width: usize, t: &Theme) -> Vec<Line<'static>> {
     while i < lines.len() {
         let line = lines[i];
         let trimmed = line.trim_start();
-        // fenced code
+        // fenced code: a card of its own, never reflowed, long lines cut
         if let Some(fence) = ["```", "~~~"].iter().find(|f| trimmed.starts_with(**f)) {
-            let lang = trimmed.trim_start_matches(fence.chars().next().unwrap()).trim();
-            if !lang.is_empty() {
-                out.push(Line::styled(format!("  {lang}"), t.dim));
-            }
+            let lang = trimmed.trim_start_matches(fence.chars().next().unwrap()).trim().to_string();
+            let panel = t.panel;
+            let code_st = t.code.bg(panel.bg.unwrap_or(Color::Reset));
+            let card = |cells: &[Cell], right: Option<&str>| -> Line<'static> {
+                let mut row: Vec<Cell> = plain(" ", panel);
+                row.extend(cells.iter().map(|&(c, st)| (c, st)));
+                if let Some(r) = right {
+                    let gap = width.saturating_sub(cells_width(&row) + r.chars().count() + 1);
+                    row.extend(plain(&" ".repeat(gap), panel));
+                    row.extend(plain(r, t.dim.bg(panel.bg.unwrap_or(Color::Reset))));
+                }
+                let pad = width.saturating_sub(cells_width(&row));
+                row.extend(plain(&" ".repeat(pad), panel));
+                to_line(&[], &row)
+            };
+            out.push(card(&[], if lang.is_empty() { None } else { Some(&lang) }));
             i += 1;
             while i < lines.len() && !lines[i].trim_start().starts_with(fence) {
-                // Code is never reflowed: long lines are cut into pieces.
-                let cells = plain(lines[i], t.code);
-                let prefix = plain("  ", t.code);
+                let cells = plain(lines[i], code_st);
                 let mut rest: &[Cell] = &cells;
                 loop {
                     let mut w = 0;
-                    let take = rest.iter().take_while(|(c, _)| { w += width_of(*c); w <= width - 2 }).count().max(1.min(rest.len()));
-                    out.push(to_line(&prefix, &rest[..take]));
+                    let take = rest.iter().take_while(|(c, _)| { w += width_of(*c); w <= width.saturating_sub(2) }).count().max(1.min(rest.len()));
+                    out.push(card(&rest[..take], None));
                     rest = &rest[take..];
                     if rest.is_empty() {
                         break;
@@ -248,6 +260,7 @@ pub fn render(text: &str, width: usize, t: &Theme) -> Vec<Line<'static>> {
                 }
                 i += 1;
             }
+            out.push(card(&[], None));
             i += 1; // the closing fence (or the end of a half-streamed block)
             continue;
         }
@@ -258,7 +271,7 @@ pub fn render(text: &str, width: usize, t: &Theme) -> Vec<Line<'static>> {
                 j += 1;
             }
             let rows: Vec<String> = lines[i..j].iter().map(|s| s.to_string()).collect();
-            table(&rows, width, t, &mut out);
+            table(&rows, width, t, g, &mut out);
             i = j;
             continue;
         }
@@ -268,19 +281,31 @@ pub fn render(text: &str, width: usize, t: &Theme) -> Vec<Line<'static>> {
             let level = 1 + h.chars().take_while(|&c| c == '#').count();
             let body = h.trim_start_matches('#');
             if level <= 6 && body.starts_with(' ') {
-                let st = if level <= 2 { t.heading.add_modifier(Modifier::BOLD).add_modifier(Modifier::UNDERLINED) } else { t.heading.add_modifier(Modifier::BOLD) };
-                emit(&mut out, &[], &[], &inline(body.trim(), st, t), width);
+                let st = match level {
+                    1 | 2 => t.heading.add_modifier(Modifier::BOLD),
+                    _ => t.text.add_modifier(Modifier::BOLD),
+                };
+                let cells = inline(body.trim(), st, t);
+                let underline = level == 1;
+                let start = out.len();
+                emit(&mut out, &[], &[], &cells, width);
+                if underline {
+                    let w = out[start..].iter().map(|l| l.spans.iter().map(|s| s.content.chars().map(width_of).sum::<usize>()).sum::<usize>()).max().unwrap_or(0);
+                    out.push(Line::styled(g.rule.repeat(w.min(width)), t.border));
+                }
             } else {
                 emit(&mut out, &[], &[], &inline(line, t.text, t), width);
             }
         } else if trimmed.len() >= 3 && trimmed.chars().all(|c| c == '-' || c == '*' || c == '_') && trimmed.chars().all(|c| c == trimmed.chars().next().unwrap()) {
-            out.push(Line::styled("-".repeat(width.min(40)), t.dim));
+            out.push(Line::styled(g.rule.repeat(width.min(40)), t.border));
         } else if let Some(q) = trimmed.strip_prefix('>') {
-            let bar = plain("| ", t.quote);
+            let bar = plain(&format!("{} ", g.quote_bar), t.border);
             emit(&mut out, &bar, &bar, &inline(q.trim_start(), t.quote, t), width);
         } else if let Some((indent, marker, rest)) = list_marker(line) {
             let pad = " ".repeat(indent.min(width / 2));
-            let first = plain(&format!("{pad}{marker}"), t.text);
+            let marker = if marker == "• " { format!("{} ", g.bullet) } else { marker };
+            let mut first = plain(&pad, t.text);
+            first.extend(plain(&marker, t.accent));
             let cont = plain(&" ".repeat(pad.len() + marker.chars().count()), t.text);
             emit(&mut out, &first, &cont, &inline(rest, t.text, t), width);
         } else {
@@ -315,62 +340,66 @@ mod tests {
     #[test]
     fn headings_lists_quotes_and_rules() {
         let t = theme();
-        let l = render("# Title\n\n- one\n- two with a long line that has to wrap around\n  - nested\n1. first\n2) second\n> quoted\n---\nplain", 24, &t);
+        let l = render("# Title\n\n- one\n- two with a long line that has to wrap around\n  - nested\n1. first\n2) second\n> quoted\n---\nplain", 24, &t, &super::super::glyphs::UNICODE);
         assert_eq!(
             text(&l),
-            vec!["Title", "", "• one", "• two with a long line", "  that has to wrap", "  around", "  • nested", "1. first", "2. second", "| quoted", "------------------------", "plain"]
+            vec!["Title", "─────", "", "• one", "• two with a long line", "  that has to wrap", "  around", "  • nested", "1. first", "2. second", "▎ quoted", "────────────────────────", "plain"]
         );
         assert!(styled(&l, "Title").unwrap().style.add_modifier.contains(Modifier::BOLD));
         // "#hashtag" and "####### seven" are not headings.
-        let l = render("#hashtag\n####### seven", 40, &t);
+        let l = render("#hashtag\n####### seven", 40, &t, &super::super::glyphs::UNICODE);
         assert_eq!(text(&l), vec!["#hashtag", "####### seven"]);
     }
 
     #[test]
     fn inline_styles_and_links() {
         let t = theme();
-        let l = render("use `cargo test` and **bold _inner_** or *it* plus [docs](https://x.y/z) and snake_case_name, 5 * 6 = 30", 100, &t);
+        let l = render("use `cargo test` and **bold _inner_** or *it* plus [docs](https://x.y/z) and snake_case_name, 5 * 6 = 30", 100, &t, &super::super::glyphs::UNICODE);
         assert_eq!(text(&l), vec!["use cargo test and bold inner or it plus docs (https://x.y/z) and snake_case_name, 5 * 6 = 30"]);
-        assert_eq!(styled(&l, "cargo test").unwrap().style, t.code);
+        assert_eq!(styled(&l, "cargo test").unwrap().style.fg, t.code.fg);
         let bold = styled(&l, "bold ").unwrap();
         assert!(bold.style.add_modifier.contains(Modifier::BOLD));
         assert!(styled(&l, "inner").unwrap().style.add_modifier.contains(Modifier::ITALIC | Modifier::BOLD));
         assert!(styled(&l, "it").is_some());
         assert_eq!(styled(&l, "docs").unwrap().style, t.link);
         // Unclosed markers stay literal (the reply may still be streaming).
-        assert_eq!(text(&render("half **bold and `code", 80, &t)), vec!["half **bold and `code"]);
+        assert_eq!(text(&render("half **bold and `code", 80, &t, &super::super::glyphs::UNICODE)), vec!["half **bold and `code"]);
     }
 
     #[test]
-    fn fenced_code_is_not_reflowed_and_survives_an_unclosed_fence() {
+    fn fenced_code_is_a_card_that_is_not_reflowed_and_survives_an_unclosed_fence() {
         let t = theme();
-        let l = render("text\n```rust\nlet a = 1;\nlet very_long_identifier_name = compute(1, 2, 3);\n```\nafter", 20, &t);
+        let l = render("text\n```rust\nlet a = 1;\nlet very_long_identifier_name = compute(1, 2, 3);\n```\nafter", 20, &t, &super::super::glyphs::UNICODE);
         let s = text(&l);
-        assert_eq!(s[..3], ["text", "  rust", "  let a = 1;"]);
+        assert_eq!(s[0], "text");
+        assert_eq!(s[1].trim(), "rust"); // the language, right-aligned on the card's first line
+        assert_eq!(s[2].trim(), "let a = 1;");
         assert_eq!(s.last().unwrap(), "after");
-        assert!(s.iter().all(|x| x.chars().count() <= 20), "{s:?}");
-        assert!(s.iter().any(|x| x == "  let very_long_iden"), "{s:?}");
-        assert_eq!(styled(&l, "let a").unwrap().style, t.code);
+        assert!(s[1..s.len() - 1].iter().all(|x| x.chars().count() == 20), "cards are as wide as the text area: {s:?}");
+        assert!(s.iter().any(|x| x.trim() == "let very_long_iden"), "long lines are cut, not wrapped at spaces: {s:?}");
+        let code = styled(&l, "let a").unwrap();
+        assert_eq!((code.style.fg, code.style.bg), (t.code.fg, t.panel.bg));
         // A fence that is still being streamed shows what has arrived.
-        assert_eq!(text(&render("```\nfn main() {", 40, &t)), vec!["  fn main() {"]);
+        let s = text(&render("```\nfn main() {", 40, &t, &super::super::glyphs::UNICODE));
+        assert!(s.iter().any(|x| x.trim() == "fn main() {"), "{s:?}");
     }
 
     #[test]
     fn tables_align_or_fall_back_when_too_wide() {
         let t = theme();
         let src = "| Name | Qty |\n|---|---:|\n| apple | 3 |\n| kiwi | 12 |";
-        assert_eq!(text(&render(src, 40, &t)), vec!["| Name  | Qty |", "|-------|-----|", "| apple | 3   |", "| kiwi  | 12  |"]);
-        assert_eq!(text(&render(src, 12, &t)), vec!["Name | Qty", "apple | 3", "kiwi | 12"]);
+        assert_eq!(text(&render(src, 40, &t, &super::super::glyphs::UNICODE)), vec!["Name  │ Qty", "──────┼────", "apple │ 3  ", "kiwi  │ 12 "]);
+        assert_eq!(text(&render(src, 10, &t, &super::super::glyphs::UNICODE)), vec!["Name | Qty", "apple | 3", "kiwi | 12"]);
         // A lone pipe line is just text.
-        assert_eq!(text(&render("a | b", 40, &t)), vec!["a | b"]);
+        assert_eq!(text(&render("a | b", 40, &t, &super::super::glyphs::UNICODE)), vec!["a | b"]);
     }
 
     #[test]
     fn wide_characters_wrap_by_display_width_and_controls_are_dropped() {
         let t = theme();
-        assert_eq!(text(&render("日本語のテキスト", 8, &t)), vec!["日本語の", "テキスト"]);
-        assert_eq!(text(&render("a\x1b[31mred\x07\tb", 40, &t)), vec!["a[31mred    b"]);
-        assert!(render("", 10, &t).is_empty());
-        assert_eq!(text(&render("para one\n\npara two\n\n\n", 40, &t)), vec!["para one", "", "para two"]);
+        assert_eq!(text(&render("日本語のテキスト", 8, &t, &super::super::glyphs::UNICODE)), vec!["日本語の", "テキスト"]);
+        assert_eq!(text(&render("a\x1b[31mred\x07\tb", 40, &t, &super::super::glyphs::UNICODE)), vec!["a[31mred    b"]);
+        assert!(render("", 10, &t, &super::super::glyphs::UNICODE).is_empty());
+        assert_eq!(text(&render("para one\n\npara two\n\n\n", 40, &t, &super::super::glyphs::UNICODE)), vec!["para one", "", "para two"]);
     }
 }

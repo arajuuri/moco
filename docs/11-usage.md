@@ -80,9 +80,10 @@ On a terminal `moco` runs the chat full screen (works over SSH). `moco --plain` 
     "keys": { "palette": "ctrl+k", "quit": ["ctrl+d", "ctrl+q"], "sidebar": "f3" },
     "leader": { "n": "/new", "g": "/diff" },   // Ctrl-X then a key
     "bell": true, "away_after": 8,          // bell + window title when a turn ends or input is needed while you are away
-    "sidebar": "auto" } }                   // true, false, or auto (from 110 columns)
+    "sidebar": "auto",                     // true, false, or auto (from 110 columns)
+    "ascii": false } }                     // true: draw with plain ASCII only (also MOCO_ASCII=1)
 ```
-Actions you can rebind: `interrupt` (Esc), `quit` (Ctrl-D), `palette` (Ctrl-P), `newline` (Alt-Enter, Ctrl-J), `queue` (Ctrl-Q), `detail` (Ctrl-O), `sidebar`, `page_up`, `page_down`, `top`, `bottom`, `leader` (Ctrl-X). Keys are written `ctrl+k`, `alt+enter`, `pageup`, `f2`, `x`; `null` unbinds. The leader menu (type Ctrl-X to see it) has n new, l sessions, m model, a agent, d diff, c compact, u undo, r redo, j jobs, t theme, h help, q exit, b sidebar, o detail. Themes: `/theme` picks one; a theme file is JSON in `~/Library/Application Support/moco/config/themes/NAME.json` (or `.moco/themes/` in a project), for example `{ "extends": "dark", "user": "#00afff bold", "bar": "white on 238" }` with the roles user, text, dim, error, accent, bar, code, heading, quote, link, added, removed. `#rrggbb` colors become the nearest of the 256 colors on terminals without truecolor, like Terminal.app.
+Actions you can rebind: `interrupt` (Esc), `quit` (Ctrl-D), `palette` (Ctrl-P), `newline` (Alt-Enter, Ctrl-J), `queue` (Ctrl-Q), `detail` (Ctrl-O), `sidebar`, `page_up`, `page_down`, `top`, `bottom`, `leader` (Ctrl-X). Keys are written `ctrl+k`, `alt+enter`, `pageup`, `f2`, `x`; `null` unbinds. The leader menu (type Ctrl-X to see it) has n new, l sessions, m model, a agent, d diff, c compact, u undo, r redo, j jobs, t theme, h help, q exit, b sidebar, o detail. Themes: `/theme` picks one; a theme file is JSON in `~/Library/Application Support/moco/config/themes/NAME.json` (or `.moco/themes/` in a project), for example `{ "extends": "dark", "user": "#00afff bold", "bar": "white on 238" }` with the roles user, text, dim, error, accent, bar, bar_hi, code, heading, quote, link, added, removed, panel, border, ok, warn. `#rrggbb` colors become the nearest of the 256 colors on terminals without truecolor, like Terminal.app.
 
 ## MCP servers
 

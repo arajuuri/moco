@@ -22,8 +22,21 @@ pub struct Theme {
     pub heading: Style,
     pub quote: Style,
     pub link: Style,
+    /// Added and removed diff lines (background included).
     pub added: Style,
     pub removed: Style,
+    /// Cards: user messages, code blocks, inline code, the completion list.
+    pub panel: Style,
+    /// Thin rules and box borders.
+    pub border: Style,
+    /// Good / careful: finished calls, healthy gauges, permission prompts.
+    pub ok: Style,
+    pub warn: Style,
+    /// The highlighted segment of the status bar.
+    pub bar_hi: Style,
+    /// Fill whole diff lines with their background (needs truecolor to look subtle); otherwise only
+    /// the `+`/`-` gutter gets the background and the rest of the line is just colored text.
+    pub diff_fill: bool,
 }
 
 pub const BUILTIN: &[&str] = &["dark", "light", "mono"];
@@ -41,13 +54,19 @@ impl Theme {
             dim: st().add_modifier(Modifier::DIM),
             error: st().fg(Color::Red),
             accent: st().fg(Color::Cyan),
-            bar: st().add_modifier(Modifier::REVERSED),
-            code: st().fg(Color::Yellow),
+            bar: st().fg(Color::Indexed(252)).bg(Color::Indexed(237)),
+            code: st().fg(Color::Indexed(180)),
             heading: st().fg(Color::Cyan),
             quote: st().add_modifier(Modifier::DIM),
             link: st().fg(Color::Blue).add_modifier(Modifier::UNDERLINED),
-            added: st().fg(Color::Green),
-            removed: st().fg(Color::Red),
+            added: st().fg(Color::Indexed(114)).bg(Color::Indexed(22)),
+            removed: st().fg(Color::Indexed(210)).bg(Color::Indexed(52)),
+            panel: st().bg(Color::Indexed(236)),
+            border: st().fg(Color::Indexed(240)),
+            ok: st().fg(Color::Green),
+            warn: st().fg(Color::Yellow),
+            bar_hi: st().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+            diff_fill: false,
         }
     }
 
@@ -59,13 +78,19 @@ impl Theme {
             dim: st().fg(Color::DarkGray),
             error: st().fg(Color::Red),
             accent: st().fg(Color::Blue),
-            bar: st().add_modifier(Modifier::REVERSED),
-            code: st().fg(Color::Magenta),
+            bar: st().fg(Color::Indexed(236)).bg(Color::Indexed(252)),
+            code: st().fg(Color::Indexed(125)),
             heading: st().fg(Color::Blue),
             quote: st().fg(Color::DarkGray),
             link: st().fg(Color::Blue).add_modifier(Modifier::UNDERLINED),
-            added: st().fg(Color::Green),
-            removed: st().fg(Color::Red),
+            added: st().fg(Color::Indexed(22)).bg(Color::Indexed(194)),
+            removed: st().fg(Color::Indexed(52)).bg(Color::Indexed(224)),
+            panel: st().bg(Color::Indexed(254)),
+            border: st().fg(Color::Indexed(245)),
+            ok: st().fg(Color::Indexed(28)),
+            warn: st().fg(Color::Indexed(130)),
+            bar_hi: st().fg(Color::White).bg(Color::Blue).add_modifier(Modifier::BOLD),
+            diff_fill: false,
         }
     }
 
@@ -84,16 +109,38 @@ impl Theme {
             link: st().add_modifier(Modifier::UNDERLINED),
             added: st().add_modifier(Modifier::BOLD),
             removed: st().add_modifier(Modifier::DIM),
+            panel: st(),
+            border: st().add_modifier(Modifier::DIM),
+            ok: st(),
+            warn: st().add_modifier(Modifier::BOLD),
+            bar_hi: st().add_modifier(Modifier::REVERSED | Modifier::BOLD),
+            diff_fill: false,
         }
     }
 
-    pub fn builtin(name: &str) -> Option<Theme> {
-        match name {
-            "dark" => Some(Theme::dark()),
-            "light" => Some(Theme::light()),
-            "mono" => Some(Theme::mono()),
-            _ => None,
+    /// The built-in theme `name`, tuned for the terminal's color depth.
+    pub fn builtin(name: &str, truecolor: bool) -> Option<Theme> {
+        let t = match name {
+            "dark" => Theme::dark(),
+            "light" => Theme::light(),
+            "mono" => return Some(Theme::mono()),
+            _ => return None,
+        };
+        Some(if truecolor { t.truecolor(name == "light") } else { t })
+    }
+
+    /// Subtle diff backgrounds that only truecolor can express; they fill whole lines.
+    pub fn truecolor(mut self, light: bool) -> Theme {
+        let rgb = |r, g, b| Color::Rgb(r, g, b);
+        if light {
+            self.added = st().fg(rgb(24, 84, 44)).bg(rgb(214, 242, 220));
+            self.removed = st().fg(rgb(124, 32, 36)).bg(rgb(252, 222, 222));
+        } else {
+            self.added = st().fg(rgb(168, 226, 182)).bg(rgb(20, 58, 34));
+            self.removed = st().fg(rgb(244, 172, 172)).bg(rgb(72, 28, 32));
         }
+        self.diff_fill = true;
+        self
     }
 
     fn role(&mut self, name: &str) -> Option<&mut Style> {
@@ -110,6 +157,11 @@ impl Theme {
             "link" => &mut self.link,
             "added" => &mut self.added,
             "removed" => &mut self.removed,
+            "panel" => &mut self.panel,
+            "border" => &mut self.border,
+            "ok" => &mut self.ok,
+            "warn" => &mut self.warn,
+            "bar_hi" => &mut self.bar_hi,
             _ => return None,
         })
     }
@@ -218,7 +270,7 @@ fn apply(base: &mut Theme, doc: &Value, truecolor: bool) -> Result<(), String> {
         if k == "extends" || k == "description" {
             continue;
         }
-        let slot = base.role(k).ok_or_else(|| format!("unknown role '{k}' (roles: user text dim error accent bar code heading quote link added removed)"))?;
+        let slot = base.role(k).ok_or_else(|| format!("unknown role '{k}' (roles: user text dim error accent bar bar_hi code heading quote link added removed panel border ok warn)"))?;
         *slot = parse_style(v.as_str().ok_or_else(|| format!("role '{k}' must be a string"))?, truecolor).map_err(|e| format!("role '{k}': {e}"))?;
     }
     Ok(())
@@ -255,11 +307,11 @@ pub fn load(name: &str, app_dir: &Path, cwd: &Path, truecolor: bool) -> Result<T
             let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
             let doc: Value = serde_json::from_str(&moco_core::config::strip_jsonc(&text)).map_err(|e| format!("{}: {e}", path.display()))?;
             let parent = doc["extends"].as_str().unwrap_or("dark");
-            let mut theme = Theme::builtin(parent).ok_or_else(|| format!("{}: extends unknown built-in theme '{parent}'", path.display()))?;
+            let mut theme = Theme::builtin(parent, truecolor).ok_or_else(|| format!("{}: extends unknown built-in theme '{parent}'", path.display()))?;
             apply(&mut theme, &doc, truecolor).map_err(|e| format!("{}: {e}", path.display()))?;
             Ok(theme)
         }
-        None => Theme::builtin(name).ok_or_else(|| format!("no theme '{name}' (built in: {}; or add {name}.json under {})", BUILTIN.join(", "), app_dir.join("config/themes").display())),
+        None => Theme::builtin(name, truecolor).ok_or_else(|| format!("no theme '{name}' (built in: {}; or add {name}.json under {})", BUILTIN.join(", "), app_dir.join("config/themes").display())),
     }
 }
 

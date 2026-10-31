@@ -92,17 +92,17 @@ def check_restored(status, code_ok=True):
         fail("the cursor was not shown again")
 
 
-wait_for(r"/helpforcommands")
+wait_for(r"moco0\.0\.0")
 if scenario == "config":
     send(b"\x1bOQ")  # F2 is the configured palette key
-    wait_for(r"commands\(\d+\)")
+    wait_for(r"commands·\d+")
     send(b"\x1b")
     pump(0.4)
     send(b"\x18")  # the leader key, then h: help, which names the configured key
     send(b"h")
     wait_for(r"F2opensthecommandpalette")
     send(b"Read a.txt and tell me what it says.\r")
-    wait_for(r"Permissionneeded:read")
+    wait_for(r"permissionneeded:read")
     # tui.away_after is 0: the user counts as away, so the request rings the bell and marks the window title.
     if "\x1b]0;moco: read needs permission\x07" not in raw.decode("utf-8", "replace"):
         fail("no window title mark for the permission request")
@@ -120,9 +120,9 @@ if scenario == "config":
     check_restored(wait_exit())
 elif scenario == "steer":
     send(b"SLOW read a.txt\r")
-    wait_for(r"\(running\)")  # the turn is going (the model is slow on purpose)
+    wait_for(r"running:")  # the turn is going (the model is slow on purpose)
     send(b"also steer this\r")
-    wait_for(r"nextstep>alsosteerthis")  # waiting in the strip above the composer
+    wait_for(r"nextstepalsosteerthis")  # waiting in the strip above the composer
     send(b"and queue this\x11")  # Ctrl-Q
     pump(0.3)
     # Both are delivered by the engine: the steer at a step boundary, the queued one when the turn ends.
@@ -160,10 +160,10 @@ elif scenario == "steer":
     check_restored(status)
 elif scenario == "chat":
     send(b"Read a.txt and tell me what it says.\r")
-    wait_for(r"Permissionneeded:read")
+    wait_for(r"permissionneeded:read")
     send(b"y")
     wait_for(r"Thefilesays:ONE-LINE-OF-TEXT")
-    wait_for(r"in,\d+out")
+    wait_for(r"in·\d+out")
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 20, 70, 0, 0))
     os.kill(pid, signal.SIGWINCH)
     pump(0.6)
@@ -182,18 +182,18 @@ elif scenario == "chat":
     wait_for(r"attached.*a\.txt")
     wait_for(r"Thefilesays:ONE-LINE-OF-TEXT(.|\n)*Thefilesays:ONE-LINE-OF-TEXT|in,\d+out(.|\n)*in,\d+out")
     send(b"/model\r")
-    wait_for(r"model\(1\)")  # the picker lists the one connected model
+    wait_for(r"model·1")  # the picker lists the one connected model
     wait_for(r"fake/m")
     send(b"\r")
     wait_for(r"model:fake/m")
     send(b"\x10")  # Ctrl-P: command palette
-    wait_for(r"commands\(\d+\)")
+    wait_for(r"commands·\d+")
     send(b"und")  # filter
     wait_for(r"/undo")
     send(b"\x1b")
     pump(0.4)  # a lone Esc must not run into the next key (ESC + / would be Alt-/)
     send(b"/sessions\r")
-    wait_for(r"sessions\(1\)")
+    wait_for(r"sessions·1")
     send(b"\r")  # resume the one session listed
     wait_for(r"session\w{8}:Fakeprotocoltest")
     send(b"/new\r")
@@ -209,7 +209,7 @@ elif scenario == "chat":
     check_restored(wait_exit())
 elif scenario == "sigterm":
     send(b"Read a.txt and tell me what it says.\r")
-    wait_for(r"Permissionneeded:read")  # the run is blocked on the dialog
+    wait_for(r"permissionneeded:read")  # the run is blocked on the dialog
     os.kill(pid, signal.SIGTERM)
     status = wait_exit()
     check_restored(status)

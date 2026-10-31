@@ -4,6 +4,9 @@ mod app;
 mod builtin;
 mod complete;
 mod diff;
+#[cfg(test)]
+mod gallery;
+mod glyphs;
 mod keys;
 mod md;
 mod term;
@@ -182,6 +185,7 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
     if let Some(n) = host.tui.away_after {
         app.away_after = Duration::from_secs(n);
     }
+    app.glyphs = glyphs::choose(host.tui.ascii.unwrap_or(false));
     let bell = host.tui.bell.unwrap_or(true);
     if let Some(completer) = host.completer.take() {
         app.completer = Some(Box::new(move |t| completer.items(t)));
@@ -210,7 +214,7 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
         }
     };
     load_rows(&mut app, &sid);
-    app.rows.insert(0, app::Row::Info(host.header.clone()));
+    app.rows.insert(0, app::Row::Banner { title: format!("moco {}", env!("CARGO_PKG_VERSION")), model: host.model.clone(), agent: host.agent.clone(), cwd: crate::tilde(&host.cwd) });
 
     std::thread::scope(|scope| -> std::io::Result<()> {
         // Terminal events. Polls with a timeout so it can stop when the UI loop ends.

@@ -8,6 +8,7 @@ use moco_core::tools::{Question, Todo};
 use ratatui::{prelude::*, widgets::*};
 use std::collections::VecDeque;
 use std::sync::mpsc::Sender;
+use super::glyphs::Glyphs;
 use super::keys::{KeyAction, Keymap};
 use super::md;
 use unicode_width::UnicodeWidthChar;
@@ -124,17 +125,25 @@ pub struct Viewer {
 
 impl Viewer {
     /// Wrapped, colored lines, and the line each file starts at.
-    fn lines(&self, width: usize, t: &Theme) -> (Vec<Line<'static>>, Vec<usize>) {
+    fn lines(&self, width: usize, t: &Theme, g: &Glyphs) -> (Vec<Line<'static>>, Vec<usize>) {
         let mut out = vec![];
         let mut starts = vec![];
+        let card = t.text.patch(t.panel).add_modifier(Modifier::BOLD);
         for f in &self.files {
             starts.push(out.len());
-            out.push(Line::styled(format!("=== {}  +{} -{}", f.path, f.adds, f.dels), t.accent.add_modifier(Modifier::BOLD)));
+            let spans = vec![
+                Span::styled(g.user_bar, t.accent.patch(t.panel)),
+                Span::styled(format!(" {}  ", f.path), card),
+                Span::styled(format!("+{}", f.adds), t.added.fg.map_or(card, |c| card.fg(c))),
+                Span::styled(" ", card),
+                Span::styled(format!("-{}", f.dels), t.removed.fg.map_or(card, |c| card.fg(c))),
+            ];
+            out.push(fill(spans, width, t.panel));
             if f.binary {
                 out.push(Line::styled("binary file changed", t.dim));
             }
             for raw in f.patch.lines() {
-                out.extend(diff_line(raw, width, t));
+                out.extend(diff_line(raw, width, t, g));
             }
             out.push(Line::default());
         }
@@ -223,6 +232,8 @@ pub enum Row {
     Tool { depth: usize, agent: String, name: String, summary: String, state: ToolState, detail: Option<String>, output: String },
     /// The model's reasoning, shown according to the detail level.
     Reasoning(String),
+    /// The welcome card at the top of a session.
+    Banner { title: String, model: String, agent: String, cwd: String },
     Todos(Vec<Todo>),
     Info(String),
     Shell(String),
@@ -274,6 +285,7 @@ pub struct App {
     /// Detail level: 0 compact, 1 normal, 2 full (Ctrl-O cycles).
     pub level: u8,
     pub keymap: Keymap,
+    pub glyphs: &'static Glyphs,
     leader_pending: bool,
     /// `None` shows the sidebar when the terminal is wide enough.
     pub sidebar: Option<bool>,
@@ -330,6 +342,7 @@ impl App {
             retry: None,
             level: 1,
             keymap: Keymap::default(),
+            glyphs: &super::glyphs::UNICODE,
             leader_pending: false,
             sidebar: None,
             side_visible: false,
@@ -454,13 +467,10 @@ impl App {
         if r.steps == 0 {
             return;
         }
-        let cost = if r.priced { format!("${:.4} (session ${:.4})", r.cost, self.session_cost) } else { "cost n/a".to_string() };
-        let ctx = match self.limit {
-            Some(l) if l > 0 => format!("context {}% of {}", (self.context * 100 / l).min(100), human(l)),
-            _ => format!("context {}", human(self.context)),
-        };
-        let wrote = if r.usage.cache_write > 0 { format!(", {} cache written", human(r.usage.cache_write)) } else { String::new() };
-        self.rows.push(Row::Usage(format!("{} in, {} out, {} cached{wrote} | {cost} | {ctx}", human(r.usage.input), human(r.usage.output), human(r.usage.cache_read))));
+        let sep = self.glyphs.sep;
+        let cost = if r.priced { format!("${:.4} {sep} session ${:.4}", r.cost, self.session_cost) } else { "cost n/a".to_string() };
+        let wrote = if r.usage.cache_write > 0 { format!(" {sep} {} cache written", human(r.usage.cache_write)) } else { String::new() };
+        self.rows.push(Row::Usage(format!("{} in {sep} {} out {sep} {} cached{wrote} {sep} {cost}", human(r.usage.input), human(r.usage.output), human(r.usage.cache_read))));
     }
 
     fn engine(&mut self, depth: usize, agent: String, ev: Ev) {
@@ -996,7 +1006,7 @@ impl App {
         let page = self.view_h.saturating_sub(1).max(1);
         let width = self.comp_w + 2;
         let Some(v) = self.viewer.as_mut() else { return Action::None };
-        let (lines, starts) = v.lines(width, &self.theme);
+        let (lines, starts) = v.lines(width, &self.theme, self.glyphs);
         let last = lines.len().saturating_sub(self.view_h);
         match k.code {
             KeyCode::Esc | KeyCode::Char('q') => self.viewer = None,
@@ -1242,30 +1252,61 @@ impl App {
 
     fn block_lines(&self, first: usize, end: usize, width: usize) -> Vec<Line<'static>> {
         let t = &self.theme;
+        let g = self.glyphs;
         let mut out: Vec<Line<'static>> = vec![];
         let row = &self.rows[first];
+        // Air between kinds of content: a blank line where the speaker or the kind of row changes.
+        let group = row_group(row);
+        let prev = first.checked_sub(1).map(|i| row_group(&self.rows[i]));
+        if first > 0 && (group == 0 || (matches!(group, 1..=3 | 5) && prev != Some(group))) {
+            out.push(Line::default());
+        }
+        const M: &str = "  ";
+        let dim = t.dim;
         match row {
             Row::User(s) => {
-                if first > 0 {
-                    out.push(Line::default());
+                // A card: accent bar on the left, panel background across.
+                let card = t.text.patch(t.panel);
+                let bar = t.user.patch(t.panel);
+                let mut card_line = |text: &str| {
+                    let spans = vec![Span::styled(g.user_bar, bar), Span::styled(" ", card), Span::styled(text.to_string(), card)];
+                    out.push(fill(spans, width, t.panel));
+                };
+                if width >= 50 {
+                    card_line("");
                 }
-                for (n, l) in wrap(s, width - 2).into_iter().enumerate() {
-                    out.push(Line::from(vec![Span::styled(if n == 0 { "> " } else { "  " }, t.user), Span::styled(l, t.text)]));
+                for l in wrap(s, width.saturating_sub(3).max(1)) {
+                    card_line(&l);
+                }
+                if width >= 50 {
+                    card_line("");
                 }
             }
-            Row::Assistant(s) => out.extend(md::render(s, width, t)),
+            Row::Assistant(s) => {
+                for l in md::render(s, width.saturating_sub(M.len()), t, g) {
+                    let mut spans = vec![Span::raw(M)];
+                    spans.extend(l.spans.into_iter());
+                    out.push(Line::from(spans).style(l.style));
+                }
+            }
             Row::Reasoning(s) => match self.level {
                 0 => {}
                 1 => {
                     let lines = s.lines().filter(|l| !l.trim().is_empty()).count();
                     let head = s.split_whitespace().collect::<Vec<_>>().join(" ");
-                    let text = format!("thinking ({lines} line{}): {}", if lines == 1 { "" } else { "s" }, head);
-                    out.push(Line::styled(clip_width(&text, width.saturating_sub(1)), t.dim.add_modifier(Modifier::ITALIC)));
+                    let label = format!("thinking{}{} ", if lines > 1 { format!(" ({lines} lines)") } else { String::new() }, "");
+                    let room = width.saturating_sub(M.len() + 2 + label.len() + 2);
+                    let head = if display_width(&head) > room { format!("{}{}", clip_width(&head, room.saturating_sub(1)), g.ellipsis) } else { head };
+                    out.push(Line::from(vec![Span::raw(M), Span::styled(format!("{} ", g.think), t.accent.add_modifier(Modifier::DIM)), Span::styled(label, dim.add_modifier(Modifier::ITALIC)), Span::styled(head, dim.add_modifier(Modifier::ITALIC))]));
                 }
-                _ => out.extend(wrap(s.trim(), width).into_iter().map(|l| Line::styled(l, t.dim.add_modifier(Modifier::ITALIC)))),
+                _ => {
+                    for l in wrap(s.trim(), width.saturating_sub(M.len() + 2)) {
+                        out.push(Line::from(vec![Span::raw(M), Span::styled(format!("{} ", g.vbar), t.border), Span::styled(l, dim.add_modifier(Modifier::ITALIC))]));
+                    }
+                }
             },
             Row::Tool { depth, agent, .. } if *depth > 0 && self.level < 2 => {
-                // A run of a subagent's calls becomes one line (Ctrl-O shows them all).
+                // A run of a subagent's calls becomes one line (the detail key shows them all).
                 let (mut n, mut failed, mut running) = (0, 0, false);
                 let (mut last_name, mut last_summary) = (&String::new(), &String::new());
                 for r in &self.rows[first..end] {
@@ -1277,71 +1318,185 @@ impl App {
                     }
                 }
                 let pad = "  ".repeat(*depth);
-                let text = format!("{pad}[{agent}] {n} tool call{}{}: {} > {last_name} {last_summary}", if n == 1 { "" } else { "s" }, if failed > 0 { format!(", {failed} failed") } else { String::new() }, if running { "now" } else { "last" });
-                out.extend(wrap(&text, width).into_iter().map(|l| Line::styled(l, if failed > 0 { t.error } else { t.dim })));
+                let mut text = format!("{agent} {} {n} tool call{}", g.sep, if n == 1 { "" } else { "s" });
+                if failed > 0 {
+                    text.push_str(&format!(" {} {failed} failed", g.sep));
+                }
+                text.push_str(&format!(" {} {}: {last_name} {last_summary}", g.sep, if running { "now" } else { "last" }));
+                let room = width.saturating_sub(M.len() + pad.len() + 2);
+                let text = clip_width(&text, room);
+                out.push(Line::from(vec![Span::raw(format!("{M}{pad}")), Span::styled(format!("{} ", if running { g.active } else { g.done }), if failed > 0 { t.error } else { t.accent }), Span::styled(text, if failed > 0 { t.error } else { dim })]));
             }
             Row::Tool { depth, agent, name, summary, state, detail, output } => {
                 let pad = "  ".repeat(*depth);
-                let who = if *depth > 0 { format!("[{agent}] ") } else { String::new() };
-                out.extend(wrap(&format!("{pad}{who}> {name} {summary}"), width).into_iter().map(|l| Line::styled(l, t.dim)));
+                let glyph = match state {
+                    ToolState::Running => Span::styled(if (self.tick / 3) % 2 == 0 { g.run } else { g.idle }, t.accent),
+                    ToolState::Done => Span::styled(g.ok, t.ok),
+                    ToolState::Failed(_) => Span::styled(g.fail, t.error),
+                };
+                let who = if *depth > 0 { format!("{agent} {} ", g.sep) } else { String::new() };
+                let head = format!("{who}{name:<6} ");
+                let room = width.saturating_sub(M.len() + pad.len() + 2 + display_width(&head));
+                let sum = if display_width(summary) > room { format!("{}{}", clip_width(summary, room.saturating_sub(1)), g.ellipsis) } else { summary.clone() };
+                out.push(Line::from(vec![Span::raw(format!("{M}{pad}")), glyph, Span::raw(" "), Span::styled(head, t.accent), Span::styled(sum, dim)]));
+                let indent = format!("{M}{pad}  ");
                 if let (Some(d), true) = (detail, self.level >= 1) {
                     let cap = if self.level >= 2 { usize::MAX } else { DETAIL_LINES };
                     let lines: Vec<&str> = d.lines().collect();
                     for raw in lines.iter().take(cap) {
-                        out.extend(diff_line(raw, width.saturating_sub(pad.len() + 2), t).into_iter().map(|mut l| {
-                            l.spans.insert(0, Span::raw(format!("{pad}  ")));
-                            l
-                        }));
+                        for mut l in diff_line(raw, width.saturating_sub(indent.len() + 1), t, g) {
+                            l.spans.insert(0, Span::raw(indent.clone()));
+                            out.push(l);
+                        }
                     }
                     if lines.len() > cap {
-                        out.push(Line::styled(format!("{pad}  ... {} more lines (Ctrl-O shows all)", lines.len() - cap), t.dim));
+                        out.push(Line::styled(format!("{indent}{} {} more lines (Ctrl-O shows all)", g.ellipsis, lines.len() - cap), dim));
                     }
                 }
                 if let ToolState::Failed(msg) = state {
-                    out.extend(wrap(&format!("{pad}  failed: {}", msg.lines().next().unwrap_or("")), width).into_iter().map(|l| Line::styled(l, t.error)));
+                    for l in wrap(msg.lines().next().unwrap_or(""), width.saturating_sub(indent.len() + 8)) {
+                        out.push(Line::styled(format!("{indent}failed: {l}"), t.error));
+                    }
                 } else if self.level >= 2 && !output.is_empty() && detail.is_none() {
-                    out.extend(output.lines().take(12).flat_map(|l| wrap(&format!("{pad}  {l}"), width)).map(|l| Line::styled(l, t.dim)));
+                    for l in output.lines().take(12).flat_map(|l| wrap(l, width.saturating_sub(indent.len() + 1))) {
+                        out.push(Line::styled(format!("{indent}{l}"), dim));
+                    }
                 }
             }
             Row::Todos(todos) => {
                 for td in todos {
-                    let mark = match td.status.as_str() {
-                        "completed" => "[x]",
-                        "in_progress" => "[~]",
-                        "cancelled" => "[-]",
-                        _ => "[ ]",
+                    let (glyph, gs, text_style) = match td.status.as_str() {
+                        "completed" => (g.ok, t.ok, dim),
+                        "in_progress" => (g.active, t.accent, t.text.add_modifier(Modifier::BOLD)),
+                        "cancelled" => (g.fail, dim, dim),
+                        _ => (g.idle, dim, t.text),
                     };
-                    out.extend(wrap(&format!("  {mark} {}", td.content), width).into_iter().map(|l| Line::styled(l, t.dim)));
+                    for (n, l) in wrap(&td.content, width.saturating_sub(M.len() + 2)).into_iter().enumerate() {
+                        out.push(Line::from(vec![Span::raw(M), Span::styled(if n == 0 { format!("{glyph} ") } else { "  ".to_string() }, gs), Span::styled(l, text_style)]));
+                    }
                 }
             }
-            Row::Shell(s) => out.extend(wrap(s.trim_end(), width).into_iter().map(|l| Line::styled(l, t.text))),
-            Row::Info(s) | Row::Usage(s) => out.extend(wrap(s, width).into_iter().map(|l| Line::styled(l, t.dim))),
-            Row::Error(s) => out.extend(wrap(s, width).into_iter().map(|l| Line::styled(l, t.error))),
+            Row::Banner { title, model, agent, cwd } => {
+                let inner = width.saturating_sub(6).clamp(20, 64);
+                let top = format!("╭{}╮", "─".repeat(inner + 2));
+                let bottom = format!("╰{}╯", "─".repeat(inner + 2));
+                let (top, bottom) = if !g.ascii { (top, bottom) } else { (format!("+{}+", "-".repeat(inner + 2)), format!("+{}+", "-".repeat(inner + 2))) };
+                let side = if g.ascii { "|" } else { "│" };
+                let row_of = |spans: Vec<Span<'static>>| {
+                    let used: usize = spans.iter().map(|s| display_width(&s.content)).sum();
+                    let mut v = vec![Span::raw(M), Span::styled(format!("{side} "), t.border)];
+                    v.extend(spans);
+                    v.push(Span::raw(" ".repeat(inner.saturating_sub(used))));
+                    v.push(Span::styled(format!(" {side}"), t.border));
+                    Line::from(v)
+                };
+                out.push(Line::from(vec![Span::raw(M), Span::styled(top, t.border)]));
+                out.push(row_of(vec![Span::styled(title.clone(), t.accent.add_modifier(Modifier::BOLD))]));
+                out.push(row_of(vec![Span::styled(clip_width(&format!("{model} {} agent {agent}", g.sep), inner), t.text)]));
+                out.push(row_of(vec![Span::styled(clip_width(cwd, inner), dim)]));
+                out.push(Line::from(vec![Span::raw(M), Span::styled(bottom, t.border)]));
+                out.push(Line::default());
+                out.push(Line::from(vec![
+                    Span::raw(M),
+                    Span::styled("/", t.accent),
+                    Span::styled(" commands  ", dim),
+                    Span::styled("@", t.accent),
+                    Span::styled(" files  ", dim),
+                    Span::styled(self.keymap.label(KeyAction::Palette), t.accent),
+                    Span::styled(" palette  ", dim),
+                    Span::styled(format!("{} h", self.keymap.label(KeyAction::Leader)), t.accent),
+                    Span::styled(" help", dim),
+                ]));
+            }
+            Row::Shell(s) => {
+                let card = t.text.patch(t.panel);
+                out.push(fill(vec![Span::styled(" ", card)], width, t.panel));
+                for l in wrap(s.trim_end(), width.saturating_sub(2).max(1)) {
+                    out.push(fill(vec![Span::styled(format!(" {l}"), card)], width, t.panel));
+                }
+                out.push(fill(vec![Span::styled(" ", card)], width, t.panel));
+            }
+            Row::Info(s) => out.extend(wrap(s, width.saturating_sub(M.len())).into_iter().map(|l| Line::styled(format!("{M}{l}"), dim))),
+            Row::Usage(s) => {
+                // A thin rule with the turn's numbers in it.
+                let text = format!(" {s} ");
+                let fillw = width.saturating_sub(M.len() + 2 + display_width(&text));
+                out.push(Line::from(vec![Span::raw(M), Span::styled(g.rule.repeat(2), t.border), Span::styled(clip_width(&text, width.saturating_sub(M.len() + 2)), dim), Span::styled(g.rule.repeat(fillw), t.border)]));
+            }
+            Row::Error(s) => {
+                for (n, l) in wrap(s, width.saturating_sub(M.len() + 2)).into_iter().enumerate() {
+                    out.push(Line::from(vec![Span::raw(M), Span::styled(if n == 0 { format!("{} ", g.fail) } else { "  ".to_string() }, t.error), Span::styled(l, t.error)]));
+                }
+            }
         }
         out
     }
 
-    /// The dialog, form or picker that replaces the composer: (title, lines, cursor inside it).
-    fn modal_lines(&self, width: usize, max_h: usize) -> Option<(String, Vec<Line<'static>>, Option<(u16, u16)>)> {
+    /// The dialog, form or picker that replaces the composer: (title, lines, cursor inside it, border style).
+    fn modal_lines(&self, width: usize, max_h: usize) -> Option<(Line<'static>, Vec<Line<'static>>, Option<(u16, u16)>, Style)> {
         let t = &self.theme;
+        let g = self.glyphs;
+        let inner_w = width.saturating_sub(4);
+        let key = |k: &str| Span::styled(format!("[{k}]"), t.accent.add_modifier(Modifier::BOLD));
         if let Some(d) = self.dialogs.front() {
-            return Some((" permission ".into(), dialog_lines(d, width, &self.theme), None));
+            let mut v = vec![];
+            let card = t.code.patch(t.panel);
+            for r in d.resources.iter().take(4) {
+                let prefix = if d.action == "shell" { "$ " } else { "" };
+                let text = format!(" {prefix}{}", clip_width(r.lines().next().unwrap_or(""), inner_w.saturating_sub(3)));
+                v.push(fill(vec![Span::styled(text, card)], inner_w, t.panel));
+            }
+            if d.resources.len() > 4 {
+                v.push(Line::styled(format!("{} {} more", g.ellipsis, d.resources.len() - 4), t.dim));
+            }
+            match &d.feedback {
+                Some(f) => {
+                    v.push(Line::from(vec![Span::styled("tell the assistant why (Enter sends, Esc goes back): ", t.dim), Span::raw(f.clone())]));
+                    let col = display_width("tell the assistant why (Enter sends, Esc goes back): ") + display_width(f);
+                    let row = v.len() as u16 - 1;
+                    let title = Line::from(vec![Span::styled(format!(" {} {} ", g.fail, d.action), t.warn.add_modifier(Modifier::BOLD))]);
+                    return Some((title, v, Some((col as u16, row)), t.warn));
+                }
+                None => {
+                    let mut first = vec![key("y"), Span::raw(" allow once   "), key("a"), Span::raw(" always")];
+                    if !d.save.is_empty() {
+                        first.push(Span::styled(format!(" ({})", clip_width(&d.save.join(", "), inner_w.saturating_sub(48).max(12))), t.dim));
+                    }
+                    let second = vec![key("n"), Span::raw(" reject   "), key("f"), Span::raw(" reject with feedback")];
+                    v.push(Line::default());
+                    let w = |s: &[Span]| s.iter().map(|x| display_width(&x.content)).sum::<usize>();
+                    if w(&first) + 3 + w(&second) <= inner_w {
+                        first.push(Span::raw("   "));
+                        first.extend(second);
+                        v.push(Line::from(first));
+                    } else {
+                        v.push(Line::from(first));
+                        v.push(Line::from(second));
+                    }
+                }
+            }
+            let title = Line::from(vec![Span::styled(format!(" {} permission needed: {} ", g.run, d.action), t.warn.add_modifier(Modifier::BOLD))]);
+            return Some((title, v, None, t.warn));
         }
         if let Some(f) = self.forms.front() {
             let q = f.q();
             let mut v = vec![];
-            let head = if q.header.is_empty() { q.question.clone() } else { format!("[{}] {}", q.header, q.question) };
-            for l in wrap(&head, width.saturating_sub(2)) {
-                v.push(Line::styled(l, Style::new().add_modifier(Modifier::BOLD)));
+            let head = if q.header.is_empty() { q.question.clone() } else { format!("{}: {}", q.header, q.question) };
+            for l in wrap(&head, inner_w) {
+                v.push(Line::styled(l, t.text.add_modifier(Modifier::BOLD)));
             }
+            v.push(Line::default());
             for (i, o) in q.options.iter().enumerate() {
                 let mark = if q.multiple { if f.checked[i] { "[x] " } else { "[ ] " } } else { "" };
-                let text = clip_width(&format!("{} {}. {mark}{}{}", if f.cur == i { ">" } else { " " }, i + 1, o.label, if o.description.is_empty() { String::new() } else { format!(" - {}", o.description) }), width.saturating_sub(2));
-                v.push(if f.cur == i { Line::styled(text, t.bar) } else { Line::raw(text) });
+                let cur = f.cur == i;
+                let text = clip_width(&format!(" {} {}. {mark}{}{}", if cur { g.select } else { " " }, i + 1, o.label, if o.description.is_empty() { String::new() } else { format!("  {}", o.description) }), inner_w);
+                v.push(if cur { fill(vec![Span::styled(text, t.bar_hi)], inner_w, t.bar_hi) } else { Line::styled(text, t.text) });
             }
-            let own = format!("{} Type your own answer", if f.cur == q.options.len() { ">" } else { " " });
-            v.push(if f.cur == q.options.len() { Line::styled(own, t.bar) } else { Line::raw(own) });
+            let own_cur = f.cur == q.options.len();
+            let own = clip_width(&format!(" {} {}. Type your own answer", if own_cur { g.select } else { " " }, q.options.len() + 1), inner_w);
+            v.push(if own_cur { fill(vec![Span::styled(own, t.bar_hi)], inner_w, t.bar_hi) } else { Line::styled(own, t.dim) });
             let mut cursor = None;
+            v.push(Line::default());
             match &f.typing {
                 Some(text) => {
                     let line = format!("answer: {text}");
@@ -1350,25 +1505,33 @@ impl App {
                 }
                 None => v.push(Line::styled(if q.multiple { "Space toggles, Enter confirms, 1-9 toggles, Esc dismisses" } else { "Enter or 1-9 selects, Esc dismisses" }, t.dim)),
             }
-            let title = format!(" question {}/{} ", f.qi + 1, f.questions.len());
-            return Some((title, v, cursor));
+            let title = Line::from(vec![Span::styled(format!(" question {}/{} ", f.qi + 1, f.questions.len()), t.accent.add_modifier(Modifier::BOLD))]);
+            return Some((title, v, cursor, t.accent));
         }
         if let Some(p) = &self.picker {
             let vis = p.visible();
-            let rows = max_h.saturating_sub(2).clamp(1, 12);
+            let rows = max_h.saturating_sub(4).clamp(1, 12);
             let first = (p.sel + 1).saturating_sub(rows);
-            let mut v = vec![Line::raw(format!("filter: {}", p.filter))];
-            let cursor = Some((display_width(&format!("filter: {}", p.filter)) as u16, 0));
+            let label_w = vis.iter().map(|&i| display_width(&p.items[i].label)).max().unwrap_or(0).min(inner_w / 2).min(44);
+            let mut v = vec![];
+            let prompt = format!("{} ", g.prompt);
+            let filter_line = if p.filter.is_empty() { Line::from(vec![Span::styled(prompt.clone(), t.accent), Span::styled("type to filter", t.dim)]) } else { Line::from(vec![Span::styled(prompt.clone(), t.accent), Span::raw(p.filter.clone())]) };
+            let cursor = Some(((display_width(&prompt) + display_width(&p.filter)) as u16, 0));
+            v.push(filter_line);
             if vis.is_empty() {
                 v.push(Line::styled("no match", t.dim));
             }
             for (n, &i) in vis.iter().enumerate().skip(first).take(rows) {
                 let it = &p.items[i];
-                let text = clip_width(&format!(" {}  {}", it.label, it.detail), width.saturating_sub(2));
-                v.push(if n == p.sel { Line::styled(text, t.bar) } else { Line::raw(text) });
+                let label = clip_width(&it.label, label_w);
+                let pad = " ".repeat(label_w.saturating_sub(display_width(&label)));
+                let sel = n == p.sel;
+                let line = format!(" {} {label}{pad}  {}", if sel { g.select } else { " " }, it.detail);
+                let line = clip_width(&line, inner_w);
+                v.push(if sel { fill(vec![Span::styled(line, t.bar_hi)], inner_w, t.bar_hi) } else { Line::from(vec![Span::styled(clip_width(&format!(" {} {label}{pad}", " "), inner_w), t.text), Span::styled(clip_width(&format!("  {}", it.detail), inner_w.saturating_sub(label_w + 4)), t.dim)]) });
             }
-            let title = format!(" {} ({}) - Enter picks, Esc closes ", p.title, vis.len());
-            return Some((title, v, cursor));
+            let title = Line::from(vec![Span::styled(format!(" {} {} ", p.title, g.sep), t.accent.add_modifier(Modifier::BOLD)), Span::styled(format!("{} ", vis.len()), t.dim)]);
+            return Some((title, v, cursor, t.accent));
         }
         None
     }
@@ -1376,39 +1539,45 @@ impl App {
     /// The right-hand panel: session, context, todos, MCP servers, jobs, waiting prompts.
     fn sidebar_lines(&self, width: usize) -> Vec<Line<'static>> {
         let t = &self.theme;
-        let bold = Style::new().add_modifier(Modifier::BOLD);
-        let head = |s: &str| Line::styled(format!("-- {s} {}", "-".repeat(width.saturating_sub(s.len() + 4))), t.dim);
+        let g = self.glyphs;
+        let w = width.saturating_sub(1);
+        let head = |s: &str| Line::from(vec![Span::styled(format!(" {} ", s.to_uppercase()), t.dim.add_modifier(Modifier::BOLD)), Span::styled(g.rule.repeat(w.saturating_sub(s.len() + 3)), t.border)]);
         let mut v: Vec<Line<'static>> = vec![];
-        for l in wrap(self.title.as_deref().unwrap_or("(untitled session)"), width.saturating_sub(1)).into_iter().take(2) {
-            v.push(Line::styled(format!(" {l}"), bold));
+        for l in wrap(self.title.as_deref().unwrap_or("(untitled session)"), w.saturating_sub(1)).into_iter().take(2) {
+            v.push(Line::styled(format!(" {l}"), t.text.add_modifier(Modifier::BOLD)));
         }
-        v.push(Line::styled(format!(" {}", clip_width(&self.model, width.saturating_sub(1))), t.dim));
+        v.push(Line::styled(format!(" {}", clip_width(&self.model, w.saturating_sub(1))), t.dim));
         v.push(Line::styled(format!(" agent {}", self.agent), t.dim));
-        let pct = match self.limit {
-            Some(l) if l > 0 => (self.context * 100 / l).min(100) as usize,
-            _ => 0,
-        };
+        v.push(Line::default());
         if self.context > 0 {
-            let bar_w = width.saturating_sub(12).clamp(4, 16);
-            let filled = pct * bar_w / 100;
-            v.push(Line::raw(format!(" ctx [{}{}] {}", "#".repeat(filled), "-".repeat(bar_w - filled), if self.limit.is_some() { format!("{pct}%") } else { human(self.context) })));
+            let pct = match self.limit {
+                Some(l) if l > 0 => (self.context * 100 / l).min(100) as usize,
+                _ => 0,
+            };
+            let mut spans = vec![Span::styled(" context ", t.dim)];
+            if self.limit.is_some() {
+                spans.extend(self.gauge(pct, w.saturating_sub(16).clamp(4, 14), Style::new()));
+                spans.push(Span::raw(format!(" {pct}%")));
+            } else {
+                spans.push(Span::raw(human(self.context)));
+            }
+            v.push(Line::from(spans));
         }
         if self.session_cost > 0.0 {
-            v.push(Line::styled(format!(" cost ${:.4}", self.session_cost), t.dim));
+            v.push(Line::from(vec![Span::styled(" cost    ", t.dim), Span::raw(format!("${:.4}", self.session_cost))]));
         }
         if !self.todos.is_empty() {
             v.push(Line::default());
-            v.push(head("todos"));
+            v.push(head("todo"));
             for td in &self.todos {
-                let mark = match td.status.as_str() {
-                    "completed" => "[x]",
-                    "in_progress" => "[~]",
-                    "cancelled" => "[-]",
-                    _ => "[ ]",
+                let (glyph, gs, ts) = match td.status.as_str() {
+                    "completed" => (g.ok, t.ok, t.dim),
+                    "in_progress" => (g.active, t.accent, t.text.add_modifier(Modifier::BOLD)),
+                    "cancelled" => (g.fail, t.dim, t.dim),
+                    _ => (g.idle, t.dim, t.text),
                 };
-                let style = if td.status == "completed" || td.status == "cancelled" { t.dim } else { t.text };
-                for (n, l) in wrap(&td.content, width.saturating_sub(6)).into_iter().take(2).enumerate() {
-                    v.push(Line::styled(format!(" {} {l}", if n == 0 { mark } else { "   " }), style));
+                for (n, l) in wrap(&td.content, w.saturating_sub(4)).into_iter().take(2).enumerate() {
+                    v.push(Line::from(vec![Span::styled(format!(" {} ", if n == 0 { glyph } else { " " }), gs), Span::styled(l, ts)]));
                 }
             }
         }
@@ -1416,79 +1585,161 @@ impl App {
             v.push(Line::default());
             v.push(head("mcp"));
             for (name, state) in &self.mcp {
-                v.push(Line::styled(clip_width(&format!(" {name}: {state}"), width), if state.starts_with("connected") { t.text } else { t.error }));
+                let ok = state.starts_with("connected");
+                v.push(Line::from(vec![Span::styled(format!(" {} ", if ok { g.done } else { g.idle }), if ok { t.ok } else { t.error }), Span::styled(clip_width(&format!("{name}: {state}"), w.saturating_sub(3)), if ok { t.text } else { t.error })]));
             }
         }
         if !self.job_list.is_empty() {
             v.push(Line::default());
             v.push(head("jobs"));
             for (id, what) in &self.job_list {
-                v.push(Line::styled(clip_width(&format!(" {id} {what}"), width), t.text));
+                v.push(Line::from(vec![Span::styled(format!(" {} ", g.run), t.accent), Span::raw(clip_width(&format!("{id} {what}"), w.saturating_sub(3)))]));
             }
         }
         if !self.queued.is_empty() {
             v.push(Line::default());
             v.push(head("waiting"));
             for q in self.queued.iter().take(4) {
-                v.push(Line::styled(clip_width(&format!(" {} {}", if q.steer { ">" } else { "~" }, q.text.lines().next().unwrap_or("")), width), t.dim));
+                v.push(Line::from(vec![Span::styled(format!(" {} ", g.next), t.accent), Span::styled(clip_width(q.text.lines().next().unwrap_or(""), w.saturating_sub(4)), t.dim)]));
             }
         }
         v
     }
 
-    fn status_text(&self, width: usize) -> String {
+    /// A bar of `width` cells filled to `pct` percent, colored by how full it is.
+    fn gauge(&self, pct: usize, width: usize, bg: Style) -> Vec<Span<'static>> {
+        let t = &self.theme;
+        let g = self.glyphs;
+        let filled = (pct * width).div_ceil(100).min(width);
+        let tone = if pct >= 85 { t.error } else if pct >= 60 { t.warn } else { t.ok };
+        vec![Span::styled(g.gauge_full.repeat(filled), tone.patch(bg)), Span::styled(g.gauge_empty.repeat(width - filled), t.border.patch(bg))]
+    }
+
+    /// The bar along the bottom: model, agent, title, context gauge, cost, jobs on the left, state on the right.
+    /// What does not fit is dropped, least important first.
+    fn status_line(&self, width: usize) -> Line<'static> {
+        let t = &self.theme;
+        let g = self.glyphs;
+        let bar = t.bar;
         let spin = ["|", "/", "-", "\\"][(self.tick % 4) as usize];
-        let mut parts = vec![self.model.clone(), format!("agent {}", self.agent)];
-        if let Some(t) = &self.title {
-            parts.push(t.clone());
-        }
-        if self.session_cost > 0.0 {
-            parts.push(format!("${:.4}", self.session_cost));
+        // (priority, spans): a higher number is dropped first.
+        let mut segs: Vec<(u8, Vec<Span<'static>>)> = vec![
+            (0, vec![Span::styled(format!(" {} ", self.model), t.bar_hi)]),
+            (0, vec![Span::styled(format!(" {} ", self.agent), bar.add_modifier(Modifier::BOLD))]),
+        ];
+        if let Some(title) = &self.title {
+            segs.push((4, vec![Span::styled(format!(" {} ", clip_width(title, 36)), bar.add_modifier(Modifier::DIM))]));
         }
         if self.context > 0 {
-            parts.push(match self.limit {
-                Some(l) if l > 0 => format!("ctx {}%", (self.context * 100 / l).min(100)),
-                _ => format!("ctx {}", human(self.context)),
-            });
+            let mut spans = vec![Span::styled(" ctx ", bar)];
+            match self.limit {
+                Some(l) if l > 0 => {
+                    let pct = (self.context * 100 / l).min(100) as usize;
+                    spans.extend(self.gauge(pct, 8, bar));
+                    spans.push(Span::styled(format!(" {pct}% "), bar));
+                }
+                _ => spans.push(Span::styled(format!("{} ", human(self.context)), bar)),
+            }
+            segs.push((2, spans));
+        }
+        if self.session_cost > 0.0 {
+            segs.push((3, vec![Span::styled(format!(" ${:.4} ", self.session_cost), bar)]));
         }
         if self.jobs > 0 {
-            parts.push(format!("{} job{} (/jobs)", self.jobs, if self.jobs == 1 { "" } else { "s" }));
+            segs.push((1, vec![Span::styled(format!(" {} {} job{} (/jobs) ", g.run, self.jobs, if self.jobs == 1 { "" } else { "s" }), t.accent.patch(bar))]));
         }
-        let mut s = format!(" {}", parts.join(" | "));
-        let right = if let Some(h) = &self.hint {
-            h.clone()
+        let (right, right_style) = if let Some(h) = &self.hint {
+            (h.clone(), bar)
         } else if let (true, Some((at, attempt, _))) = (self.running, &self.retry) {
             let left = at.saturating_duration_since(std::time::Instant::now()).as_secs() + 1;
-            format!("{spin} retrying in {left}s (attempt {attempt}), {} stops", self.keymap.label(KeyAction::Interrupt))
+            (format!("{spin} retrying in {left}s (attempt {attempt}), {} stops", self.keymap.label(KeyAction::Interrupt)), t.warn.patch(bar))
         } else if self.running {
-            format!("{spin} running: Enter steers, {} queues, {} stops", self.keymap.label(KeyAction::Queue), self.keymap.label(KeyAction::Interrupt))
+            let text = if width >= 96 { format!("{spin} running: Enter steers, {} queues, {} stops", self.keymap.label(KeyAction::Queue), self.keymap.label(KeyAction::Interrupt)) } else { format!("{spin} running, {} stops", self.keymap.label(KeyAction::Interrupt)) };
+            (text, t.accent.patch(bar))
         } else if self.scroll > 0 {
-            format!("scrolled ({} follows)", self.keymap.label(KeyAction::Bottom))
+            (format!("scrolled ({} follows)", self.keymap.label(KeyAction::Bottom)), t.warn.patch(bar))
+        } else if width >= 80 {
+            (format!("Enter sends, {} commands, {} quits", self.keymap.label(KeyAction::Palette), self.keymap.label(KeyAction::Quit)), bar.add_modifier(Modifier::DIM))
         } else {
-            format!("Enter sends, {} commands, {} quits", self.keymap.label(KeyAction::Palette), self.keymap.label(KeyAction::Quit))
+            (format!("{} commands", self.keymap.label(KeyAction::Palette)), bar.add_modifier(Modifier::DIM))
         };
-        let used = display_width(&s) + display_width(&right) + 2;
-        if used < width {
-            s.push_str(&" ".repeat(width - used + 1));
-            s.push_str(&right);
-        } else {
-            s = clip_width(&s, width.saturating_sub(display_width(&right) + 2));
-            s.push(' ');
-            s.push_str(&right);
+        let right_w = display_width(&right) + 2;
+        let total = |segs: &Vec<(u8, Vec<Span<'static>>)>| -> usize { segs.iter().flat_map(|(_, s)| s.iter()).map(|s| display_width(&s.content)).sum::<usize>() };
+        while total(&segs) + right_w > width {
+            match segs.iter().enumerate().filter(|(_, (p, _))| *p > 0).max_by_key(|(_, (p, _))| *p).map(|(i, _)| i) {
+                Some(i) => {
+                    segs.remove(i);
+                }
+                None => break,
+            }
         }
-        s
+        let mut spans: Vec<Span<'static>> = segs.into_iter().flat_map(|(_, s)| s).collect();
+        let used: usize = spans.iter().map(|s| display_width(&s.content)).sum();
+        let room = width.saturating_sub(used + 2);
+        let right = clip_width(&right, room);
+        spans.push(Span::styled(" ".repeat(room.saturating_sub(display_width(&right)) + 1), bar));
+        spans.push(Span::styled(right, right_style));
+        spans.push(Span::styled(" ", bar));
+        Line::from(spans).style(bar)
     }
 }
 
-/// One line of a unified diff, colored by its first character.
-fn diff_line(raw: &str, width: usize, t: &Theme) -> Vec<Line<'static>> {
-    let style = match raw.chars().next() {
-        Some('+') if !raw.starts_with("+++") => t.added,
-        Some('-') if !raw.starts_with("---") => t.removed,
-        Some('@') | Some('*') => t.accent,
+fn row_group(r: &Row) -> u8 {
+    match r {
+        Row::User(_) => 0,
+        Row::Assistant(_) => 1,
+        Row::Tool { .. } | Row::Reasoning(_) => 2,
+        Row::Usage(_) => 3,
+        Row::Todos(_) => 5,
+        _ => 4,
+    }
+}
+
+/// Pad a line with spaces in `style` out to `width` (so a background reaches the right edge).
+fn fill(mut spans: Vec<Span<'static>>, width: usize, style: Style) -> Line<'static> {
+    let used: usize = spans.iter().map(|s| display_width(&s.content)).sum();
+    if used < width {
+        spans.push(Span::styled(" ".repeat(width - used), style));
+    }
+    Line::from(spans)
+}
+
+/// One line of a unified diff. With truecolor the added and removed lines get a background that runs to the
+/// right edge; otherwise only the `+`/`-` gutter has one and the rest is colored text.
+fn diff_line(raw: &str, width: usize, t: &Theme, _g: &Glyphs) -> Vec<Line<'static>> {
+    let width = width.max(8);
+    let first = raw.chars().next();
+    let kind = match first {
+        Some('+') if !raw.starts_with("+++") => Some(t.added),
+        Some('-') if !raw.starts_with("---") => Some(t.removed),
+        _ => None,
+    };
+    if let Some(style) = kind {
+        let lines = wrap(raw, width);
+        return lines
+            .into_iter()
+            .enumerate()
+            .map(|(n, l)| {
+                if t.diff_fill {
+                    fill(vec![Span::styled(l, style)], width, style)
+                } else {
+                    // The gutter keeps the background; the text only the foreground.
+                    let text_style = Style { bg: None, ..style };
+                    if n == 0 {
+                        let rest: String = l.chars().skip(1).collect();
+                        Line::from(vec![Span::styled(first.unwrap_or(' ').to_string(), style.add_modifier(Modifier::BOLD)), Span::styled(rest, text_style)])
+                    } else {
+                        Line::styled(l, text_style)
+                    }
+                }
+            })
+            .collect();
+    }
+    let style = match first {
+        Some('@') | Some('*') => t.accent.add_modifier(Modifier::DIM),
         _ => t.dim,
     };
-    wrap(raw, width.max(8)).into_iter().map(|l| Line::styled(l, style)).collect()
+    wrap(raw, width).into_iter().map(|l| Line::styled(l, style)).collect()
 }
 
 pub fn display_width(s: &str) -> usize {
@@ -1557,48 +1808,47 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
     out
 }
 
-fn dialog_lines(d: &Permission, width: usize, t: &Theme) -> Vec<Line<'static>> {
-    let mut v = vec![Line::styled(format!("Permission needed: {}", d.action), Style::new().add_modifier(Modifier::BOLD))];
-    for r in d.resources.iter().take(4) {
-        v.push(Line::raw(format!("  {}", clip_width(r.lines().next().unwrap_or(""), width.saturating_sub(4)))));
-    }
-    if d.resources.len() > 4 {
-        v.push(Line::raw(format!("  ... {} more", d.resources.len() - 4)));
-    }
-    match &d.feedback {
-        Some(f) => v.push(Line::raw(format!("feedback (Enter sends, Esc back): {f}"))),
-        None => {
-            let always = if d.save.is_empty() { String::new() } else { format!(" ({})", clip_width(&d.save.join(", "), width.saturating_sub(40))) };
-            v.push(Line::styled(format!("[y] once  [a] always{always}  [n] reject  [f] reject with feedback"), t.accent));
-        }
-    }
-    v
-}
-
 fn render_viewer(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)]).split(area);
-    let theme_bar = app.theme.bar;
-    let dim = app.theme.dim;
+    let (bar, hi, accent, dim) = (app.theme.bar, app.theme.bar_hi, app.theme.accent.patch(app.theme.bar), app.theme.dim);
     let h = parts[1].height as usize;
     app.view_h = h;
     app.comp_w = (area.width as usize).saturating_sub(2);
+    let (theme, g) = (app.theme.clone(), app.glyphs);
     let Some(v) = app.viewer.as_mut() else { return };
-    let (lines, starts) = v.lines(area.width as usize, &app.theme);
+    let (lines, starts) = v.lines(area.width as usize, &theme, g);
     v.scroll = v.scroll.min(lines.len().saturating_sub(h));
     let (adds, dels): (usize, usize) = v.files.iter().fold((0, 0), |(a, d), f| (a + f.adds, d + f.dels));
     let at_end = v.scroll + h >= lines.len();
     let cur = if at_end { v.files.len() } else { starts.iter().rposition(|&s| s <= v.scroll).map_or(0, |i| i + 1) };
-    f.render_widget(Paragraph::new(format!(" changes since the session started: {} file(s) +{adds} -{dels}", v.files.len())).style(theme_bar), parts[0]);
+    let head = vec![
+        Span::styled(" changes ", hi),
+        Span::styled(format!(" {} file{}  ", v.files.len(), if v.files.len() == 1 { "" } else { "s" }), bar),
+        Span::styled(format!("+{adds}"), theme.added.fg.map_or(bar, |c| bar.fg(c))),
+        Span::styled(" ", bar),
+        Span::styled(format!("-{dels}"), theme.removed.fg.map_or(bar, |c| bar.fg(c))),
+        Span::styled(" since the session started", bar.add_modifier(Modifier::DIM)),
+    ];
+    f.render_widget(Paragraph::new(Line::from(head)).style(bar), parts[0]);
     f.render_widget(Paragraph::new(lines.iter().skip(v.scroll).take(h).cloned().collect::<Vec<_>>()), parts[1]);
     let at = if lines.len() <= h { "all".to_string() } else { format!("{}%", (v.scroll + h).min(lines.len()) * 100 / lines.len()) };
-    f.render_widget(Paragraph::new(format!(" j/k Space/b scroll  n/p file  g/G ends  q closes   file {cur}/{}  {at}", v.files.len())).style(dim), parts[2]);
+    let key = |k: &str, what: &str| vec![Span::styled(format!(" {k}"), accent), Span::styled(format!(" {what} "), bar.add_modifier(Modifier::DIM))];
+    let mut foot = vec![];
+    for (k, what) in [("j/k", "scroll"), ("Space", "page"), ("n/p", "file"), ("q", "close")] {
+        foot.extend(key(k, what));
+    }
+    foot.push(Span::styled(format!("  file {cur}/{}  {at}", v.files.len()), bar));
+    let _ = dim;
+    f.render_widget(Paragraph::new(Line::from(foot)).style(bar), parts[2]);
 }
 
 pub fn render(f: &mut Frame, app: &mut App) {
     if app.viewer.is_some() && app.dialogs.is_empty() && app.forms.is_empty() {
         return render_viewer(f, app);
     }
+    let t = app.theme.clone();
+    let g = app.glyphs;
     let full = f.area();
     // The sidebar needs room: at least 76 columns in all, and it is shown by default from 110.
     let fits = full.width >= 76;
@@ -1613,13 +1863,14 @@ pub fn render(f: &mut Frame, app: &mut App) {
         (body, None)
     };
     if let Some(side) = side {
-        let block = Block::new().borders(Borders::LEFT).border_style(app.theme.dim);
+        let block = Block::new().borders(Borders::LEFT).border_set(g.border).border_style(t.border);
         let inner = block.inner(side);
         f.render_widget(Paragraph::new(app.sidebar_lines(inner.width as usize)).block(block), side);
     }
     let max_modal = (area.height as usize).saturating_sub(5).max(3);
     let modal = app.modal_lines(area.width as usize, max_modal);
-    let comp_w = (area.width as usize).saturating_sub(2).max(1);
+    // Inside the box: two columns for the prompt marker.
+    let comp_w = (area.width as usize).saturating_sub(4).max(1);
     app.comp_w = comp_w;
     let comp_lines = app.layout(comp_w);
     let visible = comp_lines.len().min(MAX_COMPOSER_LINES);
@@ -1634,10 +1885,17 @@ pub fn render(f: &mut Frame, app: &mut App) {
             .queued
             .iter()
             .take(shown_q)
-            .map(|q| Line::styled(clip_width(&format!(" {} {}", if q.steer { "next step>" } else { "after turn>" }, q.text.lines().next().unwrap_or("")), area.width as usize), app.theme.dim))
+            .map(|q| {
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(format!("{} ", g.next), t.accent),
+                    Span::styled(if q.steer { "next step " } else { "after turn " }, t.dim),
+                    Span::styled(clip_width(q.text.lines().next().unwrap_or(""), (area.width as usize).saturating_sub(20)), t.text),
+                ])
+            })
             .collect();
         if app.queued.len() > 3 {
-            ql.push(Line::styled(format!(" +{} more (/queue)", app.queued.len() - 3), app.theme.dim));
+            ql.push(Line::styled(format!("    +{} more (/queue)", app.queued.len() - 3), t.dim));
         }
         ql.truncate(strip_h as usize);
         f.render_widget(Paragraph::new(ql), strip);
@@ -1653,32 +1911,51 @@ pub fn render(f: &mut Frame, app: &mut App) {
     let start = end.saturating_sub(h);
     f.render_widget(Paragraph::new(lines[start..end].to_vec()), main);
 
-    if let Some((title, lines, cursor)) = modal {
-        let block = Block::bordered().title(title).border_style(app.theme.accent);
+    if let Some((title, lines, cursor, border)) = modal {
+        let block = Block::bordered().border_set(g.border).title(title).border_style(border).padding(Padding::horizontal(1));
         let inner = block.inner(bottom);
         f.render_widget(Paragraph::new(lines).block(block), bottom);
         if let Some((col, row)) = cursor {
             f.set_cursor_position((inner.x + col.min(inner.width.saturating_sub(1)), inner.y + row));
         }
     } else {
-        let title = if app.running { " moco (running) " } else { " moco " };
-        let block = Block::bordered().title(title).border_style(app.theme.accent);
-        let inner = block.inner(bottom);
         let chars: Vec<char> = app.input.chars().collect();
+        let (title, border) = if app.running {
+            (Line::from(vec![Span::styled(format!(" {} working ", g.run), t.accent)]), t.border)
+        } else {
+            (Line::from(vec![Span::styled(" message ", t.accent.add_modifier(Modifier::BOLD))]), t.accent)
+        };
+        let mut block = Block::bordered().border_set(g.border).title(title).border_style(border);
+        if app.input.is_empty() && !app.running {
+            let hint = format!(" Enter send {} {} newline ", g.sep, app.keymap.label(KeyAction::Newline));
+            block = block.title_bottom(Line::from(Span::styled(hint, t.dim)).alignment(Alignment::Right));
+        }
+        let inner = block.inner(bottom);
         let (row, col) = app.cursor_pos(comp_w);
         // Show the window of lines that contains the cursor.
         let shown = (inner.height as usize).max(1);
         let top = (row + 1).saturating_sub(shown);
-        let rows: Vec<Line> = comp_lines.iter().skip(top).take(shown).map(|&(a, b)| Line::raw(chars[a..b].iter().collect::<String>())).collect();
+        let mut rows: Vec<Line> = vec![];
+        for (n, &(a, b)) in comp_lines.iter().enumerate().skip(top).take(shown) {
+            let marker = if n == 0 { Span::styled(format!("{} ", g.prompt), t.accent.add_modifier(Modifier::BOLD)) } else { Span::raw("  ") };
+            let text: String = chars[a..b].iter().collect();
+            if app.input.is_empty() && n == 0 && !app.running {
+                rows.push(Line::from(vec![marker, Span::styled("Ask anything. / for commands, @ to mention a file", t.dim)]));
+            } else {
+                rows.push(Line::from(vec![marker, Span::raw(text)]));
+            }
+        }
         f.render_widget(Paragraph::new(rows).block(block), bottom);
-        f.set_cursor_position((inner.x + (col as u16).min(inner.width.saturating_sub(1)), inner.y + (row - top) as u16));
+        f.set_cursor_position((inner.x + 2 + (col as u16).min(inner.width.saturating_sub(3)), inner.y + (row - top) as u16));
     }
     if let Some(p) = &app.popup {
         let n = p.items.len().min(MAX_POPUP) as u16;
-        let width = main.width.min(70);
-        let h = n.min(main.height);
-        let rect = Rect::new(main.x, main.y + main.height - h, width, h);
+        let width = main.width.min(74);
+        let h = (n + 2).min(main.height);
+        let rect = Rect::new(main.x + 1, main.y + main.height - h, width.saturating_sub(1), h);
         let first = (p.sel + 1).saturating_sub(MAX_POPUP);
+        let inner_w = rect.width.saturating_sub(2) as usize;
+        let label_w = p.items.iter().map(|i| display_width(&i.label)).max().unwrap_or(0).min(inner_w / 2);
         let lines: Vec<Line> = p
             .items
             .iter()
@@ -1686,15 +1963,21 @@ pub fn render(f: &mut Frame, app: &mut App) {
             .skip(first)
             .take(MAX_POPUP)
             .map(|(i, it)| {
-                let text = clip_width(&format!(" {}  {}", it.label, it.detail), width as usize);
-                let pad = " ".repeat((width as usize).saturating_sub(display_width(&text)));
-                Line::styled(format!("{text}{pad}"), if i == p.sel { app.theme.bar } else { app.theme.dim.add_modifier(Modifier::REVERSED) })
+                let label = clip_width(&it.label, label_w);
+                let pad = " ".repeat(label_w.saturating_sub(display_width(&label)));
+                if i == p.sel {
+                    let text = clip_width(&format!(" {label}{pad}  {}", it.detail), inner_w);
+                    fill(vec![Span::styled(text, t.bar_hi)], inner_w, t.bar_hi)
+                } else {
+                    let detail = clip_width(&it.detail, inner_w.saturating_sub(label_w + 3));
+                    fill(vec![Span::styled(format!(" {label}{pad}"), t.accent.patch(t.panel)), Span::styled(format!("  {detail}"), t.dim.patch(t.panel))], inner_w, t.panel)
+                }
             })
             .collect();
         f.render_widget(Clear, rect);
-        f.render_widget(Paragraph::new(lines), rect);
+        f.render_widget(Paragraph::new(lines).block(Block::bordered().border_set(g.border).border_style(t.border)), rect);
     }
-    f.render_widget(Paragraph::new(app.status_text(status.width as usize)).style(app.theme.bar), status);
+    f.render_widget(Paragraph::new(app.status_line(status.width as usize)).style(t.bar), status);
 }
 
 #[cfg(test)]
@@ -1804,30 +2087,30 @@ mod tests {
         assert_eq!(states, vec![ToolState::Running, ToolState::Failed("no such file\nmore".into())]); // the newest running call finishes first
         let s = screen(&mut a, 40, 12);
         let joined = s.join("\n");
-        assert!(joined.contains("> hi") && joined.contains("Hello") && joined.contains("> read a.rs") && joined.contains("failed: no such file"), "{joined}");
+        assert!(joined.contains("hi") && joined.contains("Hello") && joined.contains("read   a.rs") && joined.contains("failed: no such file"), "{joined}");
         // Subagent prose is hidden, its tools are indented.
         a.update(AppEvent::Engine { depth: 1, agent: "explore".into(), ev: Ev::Text("secret".into()) });
         a.update(AppEvent::Engine { depth: 1, agent: "explore".into(), ev: Ev::Tool { name: "grep".into(), summary: "x".into(), detail: None } });
-        let joined = screen(&mut a, 40, 14).join("\n");
-        assert!(!joined.contains("secret") && joined.contains("  [explore] 1 tool call: now > grep x"), "{joined}");
+        let joined = screen(&mut a, 60, 14).join("\n");
+        assert!(!joined.contains("secret") && joined.contains("explore · 1 tool call · now: grep x"), "{joined}");
     }
 
     #[test]
     fn scrolling_follows_the_tail_until_the_user_scrolls_up() {
         let mut a = App::new("m", "build");
         for i in 0..30 {
-            text(&mut a, Ev::Notice(format!("line {i}")));
+            a.push_info(format!("line {i}"));
         }
         let s = screen(&mut a, 30, 10); // 10 - 3 composer - 1 status = 6 transcript lines
-        assert_eq!(s[5], "line 29");
+        assert_eq!(s[5], "  line 29");
         press(&mut a, KeyCode::PageUp);
         let s = screen(&mut a, 30, 10);
-        assert_eq!(s[5], "line 24"); // one page (view - 1 = 5 lines) up
+        assert_eq!(s[5], "  line 24"); // one page (view - 1 = 5 lines) up
         assert!(s[9].contains("scrolled"));
         a.update(key(KeyCode::End, KeyModifiers::CONTROL));
-        assert_eq!(screen(&mut a, 30, 10)[5], "line 29");
+        assert_eq!(screen(&mut a, 30, 10)[5], "  line 29");
         a.update(key(KeyCode::Home, KeyModifiers::CONTROL));
-        assert_eq!(screen(&mut a, 30, 10)[0], "line 0"); // clamped to the top
+        assert_eq!(screen(&mut a, 30, 10)[0], "  line 0"); // clamped to the top
     }
 
     #[test]
@@ -1839,10 +2122,10 @@ mod tests {
         a.update(AppEvent::Ask { action: "shell".into(), resources: vec!["rm -rf x".into()], save: vec!["rm *".into()], reply: tx1 });
         a.update(AppEvent::Ask { action: "edit".into(), resources: vec!["a.rs".into()], save: vec![], reply: tx2 });
         let joined = screen(&mut a, 70, 12).join("\n");
-        assert!(joined.contains("Permission needed: shell") && joined.contains("rm -rf x") && joined.contains("[a] always (rm *)"), "{joined}");
+        assert!(joined.contains("permission needed: shell") && joined.contains("rm -rf x") && joined.contains("[a] always (rm *)"), "{joined}");
         type_str(&mut a, "a");
         assert_eq!(rx1.try_recv().unwrap(), Reply::Always);
-        assert!(screen(&mut a, 70, 12).join("\n").contains("Permission needed: edit")); // the next one is shown
+        assert!(screen(&mut a, 70, 12).join("\n").contains("permission needed: edit")); // the next one is shown
         press(&mut a, KeyCode::Char('f'));
         type_str(&mut a, "use sed");
         press(&mut a, KeyCode::Backspace);
@@ -1862,8 +2145,8 @@ mod tests {
         a.update(AppEvent::RunDone(Ok(RunOutcome::Interrupted)));
         assert!(!a.running);
         let joined = screen(&mut a, 90, 10).join("\n");
-        assert!(joined.contains("interrupted") && joined.contains("1200 in, 80 out, 4000 cached | $0.0123 (session $0.0500) | context 5% of 100.0k"), "{joined}");
-        assert!(joined.contains("$0.0500") && joined.contains("ctx 5%"), "{joined}");
+        assert!(joined.contains("interrupted") && joined.contains("1200 in · 80 out · 4000 cached · $0.0123 · session $0.0500"), "{joined}");
+        assert!(joined.contains("$0.0500") && joined.contains("ctx ") && joined.contains(" 5%"), "{joined}");
         // A pending dialog dies with its run.
         let (tx, _rx) = channel();
         a.update(AppEvent::Ask { action: "shell".into(), resources: vec![], save: vec![], reply: tx });
@@ -1922,7 +2205,7 @@ mod tests {
     #[test]
     fn wrapped_lines_move_the_cursor_visually() {
         let mut a = App::new("m", "build");
-        screen(&mut a, 12, 12); // composer inner width 10
+        screen(&mut a, 14, 12); // composer inner width 10 (border and prompt marker take four columns)
         type_str(&mut a, "abcdefghijklmno"); // wraps after 10 chars
         assert_eq!(a.layout(10), vec![(0, 10), (10, 15)]);
         assert_eq!(a.cursor_pos(10), (1, 5));
@@ -1930,7 +2213,7 @@ mod tests {
         assert_eq!(a.cursor, 5);
         press(&mut a, KeyCode::Down);
         assert_eq!(a.cursor, 15);
-        let s = screen(&mut a, 12, 12);
+        let s = screen(&mut a, 14, 12);
         assert!(s.iter().any(|l| l.contains("abcdefghij")) && s.iter().any(|l| l.contains("klmno")), "{s:?}");
     }
 
@@ -2009,7 +2292,7 @@ mod tests {
         a.update(AppEvent::ShellDone(Ok("hello\nworld".into())));
         assert!(!a.running);
         let joined = screen(&mut a, 30, 12).join("\n");
-        assert!(joined.contains("hello\nworld"), "{joined}");
+        assert!(joined.contains(" hello") && joined.contains(" world"), "{joined}");
         // The composer grows with its content up to a limit.
         for _ in 0..20 {
             a.update(key(KeyCode::Enter, KeyModifiers::ALT));
@@ -2034,7 +2317,7 @@ mod tests {
         let (tx, rx) = channel();
         a.update(AppEvent::Questions { questions: vec![q("Which?", &["red", "green"], false), q("Pick some", &["a", "b", "c"], true), q("Name?", &["x"], false)], reply: tx });
         let joined = screen(&mut a, 60, 16).join("\n");
-        assert!(joined.contains("question 1/3") && joined.contains("[H] Which?") && joined.contains("1. red") && joined.contains("Type your own answer"), "{joined}");
+        assert!(joined.contains("question 1/3") && joined.contains("H: Which?") && joined.contains("1. red") && joined.contains("Type your own answer"), "{joined}");
         press(&mut a, KeyCode::Down);
         press(&mut a, KeyCode::Enter); // single: Enter picks the highlighted option
         type_str(&mut a, "x"); // letters mean nothing in option mode
@@ -2074,7 +2357,7 @@ mod tests {
         let mut a = App::new("m", "build");
         a.open_picker(Picker::new(PickKind::Model, "model", items(&["anthropic/sonnet", "openai/gpt", "anthropic/haiku"]), ""));
         let joined = screen(&mut a, 70, 14).join("\n");
-        assert!(joined.contains("model (3)") && joined.contains("anthropic/sonnet") && joined.contains("about openai/gpt"), "{joined}");
+        assert!(joined.contains("model · 3") && joined.contains("anthropic/sonnet") && joined.contains("about openai/gpt"), "{joined}");
         type_str(&mut a, "anth hai"); // every word must match, in label or detail
         assert_eq!(a.picker.as_ref().unwrap().visible(), vec![2]);
         assert_eq!(press(&mut a, KeyCode::Enter), Action::Picked { kind: PickKind::Model, value: "v-anthropic/haiku".into() });
@@ -2123,10 +2406,13 @@ mod tests {
         tool_with_detail(&mut a, "edit", "@@ -1 +1 @@\n-old line\n+new line");
         tool_with_detail(&mut a, "write", &many);
         let s = screen(&mut a, 60, 50).join("\n");
-        assert!(s.contains("> edit x.rs") && s.contains("  -old line") && s.contains("  +new line") && s.contains("+added 23") && !s.contains("+added 24") && s.contains("... 16 more lines (Ctrl-O shows all)"), "{s}");
+        assert!(s.contains("edit   x.rs") && s.contains("-old line") && s.contains("+new line") && s.contains("+added 23") && !s.contains("+added 24") && s.contains("… 16 more lines (Ctrl-O shows all)"), "{s}");
         let lines = a.lines_window(60, usize::MAX).0;
-        let color = |needle: &str| lines.iter().find(|l| l.spans.iter().any(|s| s.content.contains(needle))).map(|l| l.style.fg);
-        assert_eq!((color("-old line"), color("+new line")), (Some(Some(Color::Red)), Some(Some(Color::Green))));
+        // Without truecolor the +/- gutter carries the background and the text only the color.
+        let find = |needle: &str| lines.iter().find(|l| l.spans.iter().any(|s| s.content.contains(needle))).unwrap().spans.clone();
+        let (old, new) = (find("old line"), find("new line"));
+        assert_eq!((old[1].content.as_ref(), old[1].style.bg, old[2].style.fg, old[2].style.bg), ("-", a.theme.removed.bg, a.theme.removed.fg, None));
+        assert_eq!((new[1].content.as_ref(), new[1].style.bg, new[2].style.fg), ("+", a.theme.added.bg, a.theme.added.fg));
         // Level 2 (Ctrl-O): everything, plus tool output where there is no diff.
         a.update(key(KeyCode::Char('o'), KeyModifiers::CONTROL));
         assert_eq!(a.level, 2);
@@ -2138,7 +2424,7 @@ mod tests {
         a.update(key(KeyCode::Char('o'), KeyModifiers::CONTROL));
         assert_eq!(a.level, 0);
         let s = screen(&mut a, 60, 50).join("\n");
-        assert!(s.contains("> edit x.rs") && !s.contains("-old line") && !s.contains("+added"), "level 0 shows only the call lines: {s}");
+        assert!(s.contains("edit   x.rs") && !s.contains("-old line") && !s.contains("+added"), "level 0 shows only the call lines: {s}");
     }
 
     #[test]
@@ -2149,10 +2435,10 @@ mod tests {
         text(&mut a, Ev::Text("Answer".into()));
         assert_eq!(a.rows.len(), 2); // reasoning chunks join into one row
         let s = screen(&mut a, 70, 10).join("\n");
-        assert!(s.contains("thinking (2 lines): Let me think about the *edge* case more") && s.contains("Answer"), "{s}");
+        assert!(s.contains("thinking (2 lines) Let me think about the *edge* case more") && s.contains("Answer"), "{s}");
         a.level = 2;
         let s = screen(&mut a, 40, 10).join("\n");
-        assert!(s.contains("Let me think\nabout the *edge* case more") && !s.contains("thinking ("), "{s}");
+        assert!(s.contains("Let me think") && s.contains("about the *edge* case more") && !s.contains("thinking ("), "{s}");
         a.level = 0;
         let s = screen(&mut a, 40, 10).join("\n");
         assert!(!s.contains("Let me think") && s.contains("Answer"), "{s}");
@@ -2172,18 +2458,18 @@ mod tests {
         let big: String = (0..60).map(|i| format!("+line {i}")).collect::<Vec<_>>().join("\n");
         a.viewer = Some(Viewer { files: vec![file("a.rs", &big), file("b.rs", "-gone\n+here")], scroll: 0 });
         let s = screen(&mut a, 60, 12);
-        assert!(s[0].contains("2 file(s) +61 -1") && s[1].contains("=== a.rs  +60 -0") && s[2].contains("+line 0") && s[11].contains("file 1/2"), "{s:?}");
+        assert!(s[0].contains("2 files") && s[0].contains("+61 -1") && s[1].contains("a.rs  +60 -0") && s[2].contains("+line 0") && s[11].contains("file 1/2"), "{s:?}");
         press(&mut a, KeyCode::Char('j'));
         assert!(screen(&mut a, 60, 12)[1].contains("+line 0"), "scrolled one line");
         press(&mut a, KeyCode::Char('n')); // next file
         let s = screen(&mut a, 60, 12);
-        assert!(s.iter().any(|l| l.contains("=== b.rs  +1 -1")) && s[11].contains("file 2/2"), "{s:?}"); // a short last file cannot reach the top
+        assert!(s.iter().any(|l| l.contains("b.rs  +1 -1")) && s[11].contains("file 2/2"), "{s:?}"); // a short last file cannot reach the top
         press(&mut a, KeyCode::Char('p'));
         assert!(screen(&mut a, 60, 12).iter().any(|l| l.contains("+line 5")), "p goes back to the first file's lines");
         press(&mut a, KeyCode::Char('G'));
         assert!(screen(&mut a, 60, 12).iter().any(|l| l.contains("+here")));
         press(&mut a, KeyCode::Char('g'));
-        assert!(screen(&mut a, 60, 12)[1].contains("=== a.rs"));
+        assert!(screen(&mut a, 60, 12)[1].contains("a.rs"));
         // Typing goes to the viewer, not the composer; q closes it.
         press(&mut a, KeyCode::Char('x'));
         assert!(a.input.is_empty());
@@ -2193,7 +2479,7 @@ mod tests {
         a.viewer = Some(Viewer { files: vec![file("a.rs", "+x")], scroll: 0 });
         let (tx, _rx) = channel();
         a.update(AppEvent::Ask { action: "shell".into(), resources: vec!["ls".into()], save: vec![], reply: tx });
-        assert!(screen(&mut a, 60, 12).join("\n").contains("Permission needed: shell"));
+        assert!(screen(&mut a, 60, 12).join("\n").contains("permission needed: shell"));
     }
 
     #[test]
@@ -2288,22 +2574,22 @@ mod tests {
         a.job_list = vec![("shl_1".into(), "shell 12s".into())];
         a.queued = vec![Queued { id: "i1".into(), steer: true, text: "also this".into() }];
         let wide = screen(&mut a, 120, 24).join("\n");
-        for want in ["Fix the parser", "ctx [####------------] 25%", "cost $0.0123", "-- todos --", "[~] write tests", "-- mcp --", "files: connected", "web: failed", "-- jobs --", "shl_1 shell 12s", "-- waiting --", "> also this"] {
+        for want in ["Fix the parser", "context ━━━━", "25%", "cost    $0.0123", "TODO", "◐ write tests", "MCP", "files: connected", "web: failed", "JOBS", "shl_1 shell 12s", "WAITING", "also this"] {
             assert!(wide.contains(want), "missing {want:?}:\n{wide}");
         }
-        assert!(!screen(&mut a, 100, 24).join("\n").contains("-- todos --"), "narrower than 110: hidden by default");
+        assert!(!screen(&mut a, 100, 24).join("\n").contains("TODO"), "narrower than 110: hidden by default");
         a.sidebar = Some(true);
-        assert!(screen(&mut a, 100, 24).join("\n").contains("-- todos --"), "forced on");
+        assert!(screen(&mut a, 100, 24).join("\n").contains("TODO"), "forced on");
         a.sidebar = Some(true);
-        assert!(!screen(&mut a, 70, 24).join("\n").contains("-- todos --"), "too narrow even when forced");
+        assert!(!screen(&mut a, 70, 24).join("\n").contains("TODO"), "too narrow even when forced");
         screen(&mut a, 120, 24); // the toggle flips what was last shown
         a.update(ctrl('x'));
         type_str(&mut a, "b"); // leader + b toggles
         assert_eq!(a.sidebar, Some(false));
-        assert!(!screen(&mut a, 120, 24).join("\n").contains("-- todos --"));
+        assert!(!screen(&mut a, 120, 24).join("\n").contains("TODO"));
         a.update(ctrl('x'));
         type_str(&mut a, "b");
-        assert!(screen(&mut a, 120, 24).join("\n").contains("-- todos --"));
+        assert!(screen(&mut a, 120, 24).join("\n").contains("TODO"));
     }
 
     #[test]
@@ -2339,7 +2625,7 @@ mod tests {
     fn themes_change_how_rows_are_styled() {
         let mut a = App::new("m", "build");
         a.push_user("hi");
-        let fg = |a: &App| a.lines_window(40, 10).0.iter().find(|l| l.spans.iter().any(|s| s.content.contains("> "))).map(|l| l.spans[0].style.fg);
+        let fg = |a: &App| a.lines_window(40, 10).0.iter().find(|l| l.spans.iter().any(|s| s.content.contains("hi"))).map(|l| l.spans[0].style.fg);
         assert_eq!(fg(&a), Some(Some(Color::Cyan)));
         a.theme = Theme::light();
         assert_eq!(fg(&a), Some(Some(Color::Blue)));
@@ -2348,11 +2634,33 @@ mod tests {
     }
 
     #[test]
+    fn ascii_mode_draws_with_ascii_only() {
+        let mut a = App::new("m", "build");
+        a.glyphs = &crate::tui::glyphs::ASCII;
+        a.rows.push(Row::Banner { title: "moco".into(), model: "m".into(), agent: "build".into(), cwd: "~/x".into() });
+        a.push_user("hello");
+        text(&mut a, Ev::Reasoning("hmm".into()));
+        text(&mut a, Ev::Text("# Title\n\n- item\n> quote\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```\ncode\n```".into()));
+        text(&mut a, Ev::Tool { name: "edit".into(), summary: "x".into(), detail: Some("@@ -1 +1 @@\n-a\n+b".into()) });
+        text(&mut a, Ev::ToolDone { name: "edit".into(), ok: true, msg: String::new(), output: String::new() });
+        text(&mut a, Ev::Todos(vec![Todo { content: "t".into(), status: "completed".into() }]));
+        text(&mut a, Ev::Usage { usage: Usage { input: 1, output: 1, cache_read: 0, cache_write: 0 }, cost: Some(0.1), session_cost: 0.1, context: 10, limit: Some(100) });
+        a.running = true;
+        a.queued.push(Queued { id: "q".into(), steer: true, text: "later".into() });
+        a.jobs = 1;
+        a.update(AppEvent::RunDone(Ok(RunOutcome::Idle)));
+        a.sidebar = Some(true);
+        let s = screen(&mut a, 120, 40).join("\n");
+        let odd: Vec<char> = s.chars().filter(|c| !c.is_ascii() && *c != '\n').collect();
+        assert!(odd.is_empty(), "non-ASCII characters in ASCII mode: {odd:?}\n{s}");
+    }
+
+    #[test]
     fn the_cursor_stays_visible_in_a_long_line() {
         let mut a = App::new("m", "build");
         type_str(&mut a, &"x".repeat(50));
         type_str(&mut a, "END");
         let s = screen(&mut a, 20, 8);
-        assert!(s[s.len() - 3].contains("xxxEND"), "{s:?}");
+        assert!(s[s.len() - 3].contains("xxEND"), "{s:?}"); // the composer wraps long lines now
     }
 }
