@@ -70,3 +70,11 @@ Filesystem layout (upstream uses XDG; on macOS pick `~/Library/Application Suppo
 - `cache/` downloaded model catalog, installed binaries
 
 Credentials: upstream keeps API keys in its DB. moco keeps them in a separate `auth.json` in the app data directory, created with mode `0600`, not in SQLite. No Keychain: the app must work headless (SSH, no GUI session), and the Phase 0 spike showed the login keychain is unusable there (`-25308 User interaction is not allowed`). Path: `~/Library/Application Support/moco/auth.json`. Shape (spike, provisional): `{"<provider-id>": {"key": "..."}}`; environment variables take precedence.
+
+## moco implementation notes (Phase 2, session management slice)
+
+- **Listing**: top-level sessions (subagent sessions are never listed or addressable), most recently active first; `time_updated` is bumped by every message, usage record and title change. `moco sessions [--all] [--archived]`, `/sessions [all|archived]`. A session is addressed by its list number (inside the chat) or by any prefix or suffix of its id (`moco --session`, `/resume`); an ambiguous piece is refused.
+- **Resume**: a session always runs in the directory it was created in (`--session` switches to it; `/resume` only accepts sessions of the current directory). A resumed session keeps its own agent and model unless `--agent` or `--model` is given. `--continue` picks the latest non-archived session of the directory.
+- **Rename / archive**: `/rename`, `moco sessions rename|archive|unarchive`; archiving the current session starts a fresh one. Archived sessions can still be resumed by id.
+- **Fork**: `/fork [N]` copies the conversation into a new top-level session (`fork_session_id`, `fork_boundary` record where it came from): all messages, or only those before the Nth most recent prompt. Message ids are regenerated (they stay ordered), compaction checkpoints are re-pointed to the copied messages, todos and the remembered `AGENTS.md` files are copied, step snapshot ids carry over so `/undo` works in the fork, and usage totals start at zero. A pending undo's hidden messages are not copied. The title becomes `<title> (fork)`.
+

@@ -42,8 +42,20 @@ Status: complete. 84 unit tests pass on Linux and on the Mojave machine; the rel
 - AGENTS.md, config loading (JSONC, merge, variables) [done, see `08` implementation notes], model picker and cost/usage display [done, see `07` implementation notes] (`07`, `08`).
 - `patch`, `webfetch`, `todowrite`, `question`, subagent tool and `general`/`explore` agents. [done; verified live on the Mojave machine, see `04` implementation notes]
 - Snapshots + revert/undo, session diff view. [done; verified live on the Mojave machine, see `03` implementation notes]
-- Title generation, session list, fork, rename, archive.
+- Title generation, session list, fork, rename, archive. [done; see `02` and `06` implementation notes]
 - Second provider protocol (OpenAI-compatible) so many hosted/local models work; models.dev catalog. [done; verified against a local test server and the live Anthropic API, not yet against a live OpenAI-compatible provider]
+
+### Phase 2 results (verified on macOS 10.14.6 with the live Anthropic API)
+Status: complete. 197 unit tests pass on Linux and on the Mojave machine; the release binary is `minos 10.14`. Every item below was exercised end to end on the Mac, not only in tests. Per-feature design notes and deviations are in the "implementation notes" sections of `02`, `03`, `04`, `06`, `07` and `08`.
+- **Config and instructions**: layered JSONC config (`moco.jsonc`), `{env:}`/`{file:}` substitution, `AGENTS.md` (and `CLAUDE.md`) discovery including files found while reading; permission rules from config made `shell` prompt in a live run.
+- **Providers**: Anthropic and OpenAI-compatible Chat Completions, models.dev catalog (embedded snapshot, `moco models --refresh` gives about 7,000 models), `/model`, `moco auth`, cost with context tiers. The OpenAI-compatible adapter is verified against a local test server only, not a live provider.
+- **Prompt caching**: Anthropic `cache_control` breakpoints; a follow-up turn within five minutes cost $0.0006 instead of about $0.015.
+- **Compaction**: automatic, on provider overflow and manual; a live run with a 5k-token window kept a codename across a compaction.
+- **Tools and agents**: `patch`, `webfetch` (with an HTML to Markdown converter), `todowrite`, `question`, `subagent` with `general` and `explore`.
+- **Snapshots**: per-step working-tree snapshots, `/undo`, `/redo`, `/diff`; an undo survives a restart.
+- **Sessions**: generated titles, list, resume by id piece, rename, fork, archive.
+- **Deviations worth knowing** (all documented where they arise): moco's own snapshot store instead of a private git dir; summarization, title and update prompts are my wording of the spec's contracts; the Plan reminder lives in the system prompt; steps run synchronously with a snapshot taken just before the request; subagents run in the foreground only; config files are `moco.json[c]`, not `opencode.json`.
+- **Not done** (carried to later phases or dropped): skills, custom commands and `@` mentions, MCP, `websearch`, background shell and background subagents, OpenAI Responses and Gemini protocols, reasoning variants and per-model request overlays, the `summary` agent, a graphical or full-screen UI (the terminal chat is line based), notifications.
 
 ## Phase 3: extensibility
 - Skills, custom commands, `@` mentions and attachments (images/PDF).

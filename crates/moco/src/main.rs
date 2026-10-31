@@ -5,7 +5,7 @@ use moco_core::engine::{CompactResult, DiffResult, Engine, UndoReport, UndoResul
 use moco_core::provider::registry;
 use moco_core::provider::Usage;
 use moco_core::tools::{Question, Todo};
-use moco_core::store::{Mode, Store};
+use moco_core::store::{Mode, Session, SessionSummary, Store};
 use moco_core::{auth, config};
 use std::io::{BufRead, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -196,7 +196,7 @@ impl Ui for Terminal {
                 print!("{t}");
                 self.mid_line.store(!t.ends_with('\n'), Ordering::Relaxed);
             }
-            UiEvent::ReasoningDelta(_) => return,
+            UiEvent::ReasoningDelta(_) | UiEvent::Titled(_) => return,
             UiEvent::StepUsage { usage, cost, session_cost, context_tokens, context_limit } => {
                 let mut r = self.run.lock().unwrap();
                 r.usage.input += usage.input;
@@ -247,6 +247,68 @@ impl Ui for Terminal {
             None | Some("") | Some("n") | Some("no") => Reply::Reject(None),
             Some(feedback) => Reply::Reject(Some(feedback.to_string())),
         }
+    }
+}
+
+fn short(id: &str) -> &str {
+    &id[id.len().saturating_sub(8)..]
+}
+
+fn ago(ms: i64) -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+    let s = ((now - ms) / 1000).max(0);
+    match s {
+        0..=59 => "just now".into(),
+        60..=3599 => format!("{}m ago", s / 60),
+        3600..=86_399 => format!("{}h ago", s / 3600),
+        _ => format!("{}d ago", s / 86_400),
+    }
+}
+
+fn tilde(dir: &str) -> String {
+    match std::env::var("HOME") {
+        Ok(h) if !h.is_empty() && dir.starts_with(&h) => format!("~{}", &dir[h.len()..]),
+        _ => dir.to_string(),
+    }
+}
+
+fn clip(s: &str, n: usize) -> String {
+    if s.chars().count() > n { format!("{}...", s.chars().take(n - 3).collect::<String>()) } else { s.to_string() }
+}
+
+/// Numbered session list; `show_dir` adds the working directory column.
+fn print_sessions(list: &[SessionSummary], show_dir: bool) {
+    if list.is_empty() {
+        println!("{DIM}no sessions{RESET}");
+        return;
+    }
+    for (i, s) in list.iter().enumerate() {
+        let title = s.title.as_deref().map(|t| clip(t, 44)).unwrap_or_else(|| "(untitled)".into());
+        let dir = if show_dir { format!("  {}", clip(&tilde(&s.directory), 30)) } else { String::new() };
+        let mut flags = String::new();
+        if s.forked_from.is_some() {
+            flags.push_str(" fork");
+        }
+        if s.archived {
+            flags.push_str(" archived");
+        }
+        println!("{:>3}  {}  {:<44}{dir}  {:>9}  {:>3} msg  ${:.2}  {}{flags}", i + 1, short(&s.id), title, ago(s.time_updated), s.messages, s.cost, s.agent);
+    }
+}
+
+/// A session from a list number or a piece of its id. Errors are user-facing messages.
+fn pick_session(store: &Store, token: &str, last: &[SessionSummary]) -> Result<Session, String> {
+    if let (Ok(n), true) = (token.parse::<usize>(), !last.is_empty()) {
+        return match last.get(n.wrapping_sub(1)) {
+            Some(s) => store.session(&s.id).ok().flatten().ok_or_else(|| "that session no longer exists".to_string()),
+            None => Err(format!("no session number {n} in the last list")),
+        };
+    }
+    let mut found = store.find_sessions(token).map_err(|e| e.to_string())?;
+    match found.len() {
+        0 => Err(format!("no session matches '{token}'")),
+        1 => Ok(found.remove(0)),
+        _ => Err(format!("'{token}' matches {} sessions; type more of the id", found.len())),
     }
 }
 
@@ -353,6 +415,37 @@ fn main() {
             }
             return;
         }
+        Some("sessions") => {
+            let store = Store::open(&app_dir.join("data/moco.db")).unwrap_or_else(|e| die(&format!("database: {e}")));
+            let rest: Vec<&str> = raw.iter().skip(1).map(String::as_str).collect();
+            let need = |what: &str| -> Session { pick_session(&store, rest.get(1).copied().unwrap_or(""), &[]).unwrap_or_else(|e| die(&format!("{what}: {e}"))) };
+            match rest.first().copied() {
+                Some("rename") => {
+                    let ses = need("rename");
+                    let title = rest[2..].join(" ");
+                    if title.trim().is_empty() {
+                        die("usage: moco sessions rename <id> <new title>");
+                    }
+                    store.set_title(&ses.id, title.trim()).unwrap_or_else(|e| die(&e.to_string()));
+                    println!("renamed {}", short(&ses.id));
+                }
+                Some(cmd @ ("archive" | "unarchive")) => {
+                    let ses = need(cmd);
+                    store.set_archived(&ses.id, cmd == "archive").unwrap_or_else(|e| die(&e.to_string()));
+                    println!("{cmd}d {}", short(&ses.id));
+                }
+                _ => {
+                    let all = rest.contains(&"--all");
+                    let cwd = std::env::current_dir().unwrap_or_default().to_string_lossy().into_owned();
+                    let list = store.list_sessions(if all { None } else { Some(&cwd) }, rest.contains(&"--archived"), 50).unwrap_or_default();
+                    print_sessions(&list, all);
+                    if !all && list.is_empty() {
+                        println!("{DIM}(only sessions started in {} are shown; use --all for every directory){RESET}", tilde(&cwd));
+                    }
+                }
+            }
+            return;
+        }
         Some("models") => {
             let refresh = raw.iter().any(|a| a == "--refresh");
             if refresh {
@@ -378,7 +471,7 @@ fn main() {
         _ => {}
     }
 
-    let (mut cont, mut prompt, mut dir) = (false, None, None);
+    let (mut cont, mut prompt, mut dir, mut session_arg) = (false, None, None, None::<String>);
     let mut model = std::env::var("MOCO_MODEL").ok();
     let mut agent_id: Option<String> = None;
     let mut args = raw.drain(..);
@@ -389,10 +482,11 @@ fn main() {
             "--model" | "-m" => model = Some(value("--model")),
             "--agent" => agent_id = Some(value("--agent")),
             "--dir" => dir = Some(value("--dir")),
+            "--session" | "-s" => session_arg = Some(value("--session")),
             "--prompt" | "-p" => prompt = Some(value("--prompt")),
             "--help" | "-h" => {
                 println!(
-                    "usage: moco [--continue] [--model PROVIDER/MODEL] [--agent ID] [--dir PATH] [-p PROMPT]\n       moco models [FILTER] [--refresh]\n       moco auth PROVIDER"
+                    "usage: moco [--continue | --session ID] [--model PROVIDER/MODEL] [--agent ID] [--dir PATH] [-p PROMPT]\n       moco sessions [--all] [--archived] | rename ID TITLE | archive ID | unarchive ID\n       moco models [FILTER] [--refresh]\n       moco auth PROVIDER"
                 );
                 return;
             }
@@ -402,9 +496,13 @@ fn main() {
     if let Some(w) = auth::permissions_warning(&app_dir) {
         eprintln!("warning: {w}");
     }
-    let cwd = match dir {
-        Some(d) => std::path::PathBuf::from(d).canonicalize().unwrap_or_else(|e| die(&format!("--dir: {e}"))),
-        None => std::env::current_dir().unwrap_or_else(|e| die(&e.to_string())),
+    let store = Store::open(&app_dir.join("data/moco.db")).unwrap_or_else(|e| die(&format!("database: {e}")));
+    let chosen: Option<Session> = session_arg.as_deref().map(|tok| pick_session(&store, tok, &[]).unwrap_or_else(|e| die(&e)));
+    let cwd = match (&chosen, dir) {
+        // A session always runs in the directory it was started in.
+        (Some(s), _) => std::path::PathBuf::from(&s.directory).canonicalize().unwrap_or_else(|e| die(&format!("the session's directory {} is not available: {e}", s.directory))),
+        (None, Some(d)) => std::path::PathBuf::from(d).canonicalize().unwrap_or_else(|e| die(&format!("--dir: {e}"))),
+        (None, None) => std::env::current_dir().unwrap_or_else(|e| die(&e.to_string())),
     };
     let cwd_str = cwd.to_string_lossy().into_owned();
     std::env::set_current_dir(&cwd).ok();
@@ -418,6 +516,7 @@ fn main() {
         std::env::set_var("MOCO_SHELL", sh);
     }
     let agents = config::resolve_agents(&cfg);
+    let agent_explicit = agent_id.is_some();
     let mut agent_id = agent_id.or(cfg.default_agent.clone()).unwrap_or_else(|| "build".into());
     if !agents.iter().any(|a| a.id == agent_id && a.selectable()) {
         die(&format!("unknown agent {agent_id}; available: {}", agents.iter().filter(|a| a.selectable()).map(|a| a.id.as_str()).collect::<Vec<_>>().join(", ")));
@@ -438,14 +537,16 @@ fn main() {
         ));
     }
 
-    let store = Store::open(&app_dir.join("data/moco.db")).unwrap_or_else(|e| die(&format!("database: {e}")));
     let recovered = store.recover_claims(3).unwrap_or_default();
-    let mut session = match cont.then(|| store.latest_session(&cwd_str).ok().flatten()).flatten() {
+    let resumed = chosen.is_some() || cont;
+    let mut session = match chosen.or_else(|| cont.then(|| store.latest_session(&cwd_str).ok().flatten()).flatten()) {
         Some(s) => s,
         None => store.create_session(&cwd_str, &agent_id).unwrap_or_else(|e| die(&e.to_string())),
     };
-    if cont {
+    if agent_explicit {
         store.set_agent(&session.id, &agent_id).ok();
+    } else if resumed && agents.iter().any(|a| a.id == session.agent && a.selectable()) {
+        agent_id = session.agent.clone(); // a resumed session keeps its own agent
     }
     // An explicit --model / MOCO_MODEL applies to this session; otherwise a resumed session keeps its own.
     let explicit_model = std::env::args().any(|a| a == "--model" || a == "-m") || std::env::var("MOCO_MODEL").is_ok();
@@ -494,8 +595,13 @@ fn main() {
         std::process::exit(if ok { 0 } else { 1 });
     }
 
+    let title_of = |sid: &str| engine.store.lock().unwrap().session(sid).ok().flatten().and_then(|s| s.title);
     let current = |sid: &str| engine.store.lock().unwrap().session(sid).ok().flatten().map(|s| engine.model_ref_for(&s)).unwrap_or_default();
     println!("{DIM}moco {} | {} | agent {agent_id} | {n_sources} config file(s) | /help for commands{RESET}", env!("CARGO_PKG_VERSION"), current(&session.id));
+    if resumed {
+        println!("{DIM}session {}: {}{RESET}", short(&session.id), title_of(&session.id).unwrap_or_else(|| "(untitled)".into()));
+    }
+    let mut last_list: Vec<SessionSummary> = vec![];
     while let Some(line) = term.read_line("> ") {
         CANCEL.store(false, Ordering::Relaxed);
         let line = line.trim();
@@ -503,8 +609,75 @@ fn main() {
             "" => continue,
             "/exit" | "/quit" => break,
             "/help" => println!(
-                "/model [FILTER|PROVIDER/MODEL]  show, search or switch the model\n/agent <id>                     switch agent\n/compact                        summarize older messages to free up context\n/undo, /redo                    undo the last turn's file changes and messages, or bring them back\n/diff                           changes in the working tree since this session started\n/new                            start a new session\n/exit                           quit (Ctrl-C interrupts a running turn)"
+                "/model [FILTER|PROVIDER/MODEL]  show, search or switch the model\n/agent <id>                     switch agent\n/compact                        summarize older messages to free up context\n/sessions [all|archived]       list sessions (/resume <n|id> to continue one)\n/rename <title>                 name this session\n/fork [N]                       copy this conversation into a new session\n/archive [n|id]                 hide a session from the list (/unarchive to restore)\n/undo, /redo                    undo the last turn's file changes and messages, or bring them back\n/diff                           changes in the working tree since this session started\n/new                            start a new session\n/exit                           quit (Ctrl-C interrupts a running turn)"
             ),
+            l if l == "/sessions" || l.starts_with("/sessions ") => {
+                let which = l.trim_start_matches("/sessions").trim();
+                let (all, archived) = (which == "all", which == "archived");
+                let list = engine.store.lock().unwrap().list_sessions(if all { None } else { Some(&cwd_str) }, archived, 30).unwrap_or_default();
+                print_sessions(&list, all);
+                if !list.is_empty() {
+                    println!("{DIM}/resume <number|id> to continue one{}{RESET}", if archived { ", /unarchive <number|id> to restore it" } else { "" });
+                }
+                last_list = list;
+            }
+            l if l.starts_with("/resume") => {
+                let tok = l.trim_start_matches("/resume").trim();
+                let picked = pick_session(&engine.store.lock().unwrap(), tok, &last_list);
+                match picked {
+                    _ if tok.is_empty() => println!("usage: /resume <number from /sessions | piece of a session id>"),
+                    Err(e) => println!("{e}"),
+                    Ok(s) if s.directory != cwd_str => println!("that session belongs to {}; start moco there, or use `moco --session {}`", tilde(&s.directory), short(&s.id)),
+                    Ok(s) => {
+                        agent_id = if engine.agents().iter().any(|a| a.id == s.agent && a.selectable()) { s.agent.clone() } else { agent_id };
+                        println!("{DIM}session {}: {}{RESET}", short(&s.id), s.title.clone().unwrap_or_else(|| "(untitled)".into()));
+                        session = s;
+                    }
+                }
+            }
+            l if l.starts_with("/rename") => {
+                let t = l.trim_start_matches("/rename").trim();
+                if t.is_empty() {
+                    println!("usage: /rename <new title>");
+                } else if engine.store.lock().unwrap().set_title(&session.id, t).is_ok() {
+                    println!("{DIM}renamed{RESET}");
+                }
+            }
+            l if l.starts_with("/fork") => {
+                let arg = l.trim_start_matches("/fork").trim();
+                match arg.parse::<usize>().or_else(|_| if arg.is_empty() { Ok(0) } else { Err(()) }) {
+                    Err(()) => println!("usage: /fork [N]   (N = branch off before the Nth most recent prompt; no N copies everything)"),
+                    Ok(n) => match engine.fork(&session.id, n) {
+                        Ok(Some(f)) => {
+                            println!("{DIM}forked into session {}: {}{RESET}", short(&f.id), f.title.clone().unwrap_or_else(|| "(untitled)".into()));
+                            session = f;
+                        }
+                        Ok(None) => println!("this session has fewer than {n} prompt(s)"),
+                        Err(e) => eprintln!("{RED}store error: {e}{RESET}"),
+                    },
+                }
+            }
+            l if l.starts_with("/archive") || l.starts_with("/unarchive") => {
+                let unarchive = l.starts_with("/unarchive");
+                let tok = l.trim_start_matches("/unarchive").trim_start_matches("/archive").trim();
+                let target = if tok.is_empty() && !unarchive { Ok(session.clone()) } else { pick_session(&engine.store.lock().unwrap(), tok, &last_list) };
+                match target {
+                    Err(e) => println!("{e}"),
+                    Ok(t) => {
+                        engine.store.lock().unwrap().set_archived(&t.id, !unarchive).ok();
+                        println!("{DIM}{} {}{RESET}", if unarchive { "unarchived" } else { "archived" }, short(&t.id));
+                        if !unarchive && t.id == session.id {
+                            match engine.store.lock().unwrap().create_session(&cwd_str, &agent_id) {
+                                Ok(n) => {
+                                    session = n;
+                                    println!("{DIM}started a new session{RESET}");
+                                }
+                                Err(e) => eprintln!("{e}"),
+                            }
+                        }
+                    }
+                }
+            }
             "/undo" => match engine.undo(&session.id) {
                 Ok(UndoResult::Done(r)) => {
                     println!("{DIM}undone: {} message(s) hidden{}{RESET}", r.hidden_messages, if r.files_restored { format!(", {} file(s) restored, {} removed", r.restored.len(), r.deleted.len()) } else { "; no file snapshot for this turn, so only the conversation was rolled back".into() });

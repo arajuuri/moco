@@ -67,6 +67,8 @@ pub struct Config {
     pub compaction: CompactionConfig,
     /// `false` turns off the per-step working-tree snapshots (and with them `/undo` and `/diff`). Default on.
     pub snapshots: Option<bool>,
+    /// `provider/model` for small background jobs such as titles (default: the session's model).
+    pub small_model: Option<String>,
     pub providers: BTreeMap<String, ProviderConfig>,
     /// `provider/model`
     pub model: Option<String>,

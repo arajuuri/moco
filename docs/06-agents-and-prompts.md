@@ -127,3 +127,10 @@ Re-inject the enter reminder on each request if it is missing (compaction or rev
 - `/compact`: manual compaction (a session operation, `POST /session/:id/compact`, not a template command).
 - MCP prompts are exposed as commands named from server and prompt.
 Command templates: if the template contains `$ARGUMENTS` replace it with the user's args; otherwise append args after a blank line.
+
+## moco implementation notes (Phase 2, session management slice)
+
+Code: `title.rs`, `engine.rs` (`title_job`, `generate_title`).
+- **Title**: the prompt in `title.rs` is moco's own, written to the contract above (one line, 3-5 words, sentence case, no quotes/period/"Title:", identifiers kept, the message's language, greetings -> "Greeting") with seven examples of my own. A small model call (`small_model` in config, else the session's model; no tools, 60 tokens) runs on a second thread alongside the first turn of an untitled top-level session, so it is usually ready before the answer ends. The first prompt is used, or the first and latest for sessions that already have history; replies are cleaned (`title::clean`). It is attempted once per session per process, never overwrites a title that is set (a rename wins even mid-flight), and only connection or DNS failures are retried (3 times, 1 s apart) because those prove the request never ran. Any other failure just leaves the session untitled; its cost counts toward the session. Subagent sessions are titled with their task description instead.
+- **Not implemented**: the `summary` agent (PR-style summary).
+

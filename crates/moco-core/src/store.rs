@@ -48,6 +48,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
             primary key(session_id, path));",
     ),
     (3, "alter table session add column revert text;"),
+    (4, "alter table session add column fork_session_id text; alter table session add column fork_boundary text;"),
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -61,6 +62,23 @@ pub struct Session {
     pub model: Option<String>,
     /// Set for subagent sessions.
     pub parent_id: Option<String>,
+}
+
+/// One row of the session list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionSummary {
+    pub id: String,
+    pub title: Option<String>,
+    pub directory: String,
+    pub agent: String,
+    pub model: Option<String>,
+    pub cost: f64,
+    pub time_created: i64,
+    pub time_updated: i64,
+    pub archived: bool,
+    /// User and assistant messages.
+    pub messages: usize,
+    pub forked_from: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -246,6 +264,114 @@ impl Store {
             .optional()?)
     }
 
+    /// Top-level sessions, most recently active first. `directory` limits to one working directory;
+    /// `archived` selects the archived ones instead of the active ones.
+    pub fn list_sessions(&self, directory: Option<&str>, archived: bool, limit: usize) -> Result<Vec<SessionSummary>> {
+        let mut stmt = self.conn.prepare(
+            "select s.id, s.title, s.directory, s.agent, s.model, s.cost, s.time_created, s.time_updated, s.time_archived is not null, s.fork_session_id,
+                    (select count(*) from message m where m.session_id=s.id and m.type in ('user','assistant'))
+             from session s
+             where s.parent_id is null and (s.time_archived is not null) = ?1 and (?2 is null or s.directory = ?2)
+             order by s.time_updated desc, s.id desc limit ?3",
+        )?;
+        let rows = stmt.query_map(params![archived, directory, limit as i64], |r| {
+            Ok(SessionSummary {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                directory: r.get(2)?,
+                agent: r.get(3)?,
+                model: r.get(4)?,
+                cost: r.get(5)?,
+                time_created: r.get(6)?,
+                time_updated: r.get(7)?,
+                archived: r.get(8)?,
+                forked_from: r.get(9)?,
+                messages: r.get::<_, i64>(10)? as usize,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Top-level sessions whose id equals `token` or starts or ends with it (session ids are long; people type a piece).
+    pub fn find_sessions(&self, token: &str) -> Result<Vec<Session>> {
+        let mut stmt = self.conn.prepare(
+            "select id from session where parent_id is null and length(?1) > 0
+             and (id = ?1 or substr(id, 1, length(?1)) = ?1 or substr(id, -length(?1)) = ?1) order by id limit 10",
+        )?;
+        let ids: Vec<String> = stmt.query_map([token], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
+        ids.iter().filter_map(|id| self.session(id).transpose()).collect()
+    }
+
+    pub fn set_archived(&self, session_id: &str, archived: bool) -> Result<()> {
+        self.conn.execute(
+            "update session set time_archived=?2 where id=?1",
+            params![session_id, if archived { Some(now_ms()) } else { None }],
+        )?;
+        Ok(())
+    }
+
+    /// Set the title only if the session has none (a title the user chose is never overwritten by a generated one).
+    pub fn set_title_if_empty(&self, session_id: &str, title: &str) -> Result<bool> {
+        Ok(self.conn.execute("update session set title=?2, time_updated=?3 where id=?1 and (title is null or title='')", params![session_id, title, now_ms()])? > 0)
+    }
+
+    /// The first user message of a session, or failing that the first prompt still waiting in its inbox;
+    /// plus the latest user message when it differs.
+    pub fn title_source(&self, session_id: &str) -> Result<Option<(String, Option<String>)>> {
+        let texts = |sql: &str| -> Result<Vec<String>> {
+            let mut stmt = self.conn.prepare(sql)?;
+            let rows = stmt.query_map([session_id], |r| r.get::<_, String>(0))?;
+            let mut out = vec![];
+            for r in rows {
+                if let Some(t) = serde_json::from_str::<Value>(&r?)?["text"].as_str().filter(|t| !t.trim().is_empty()) {
+                    out.push(t.to_string());
+                }
+            }
+            Ok(out)
+        };
+        let mut all = texts("select data from message where session_id=?1 and type='user' order by id")?;
+        all.extend(texts("select data from session_inbox where session_id=?1 and type='user' order by id")?);
+        let Some(first) = all.first().cloned() else { return Ok(None) };
+        let latest = all.last().filter(|_| all.len() > 1).cloned();
+        Ok(Some((first, latest)))
+    }
+
+    /// Copy a conversation into a new top-level session. With `before`, only messages ahead of that message id are
+    /// copied (so a fork can branch off before a prompt); a pending undo's hidden messages are never copied.
+    /// Message ids are regenerated (they must stay unique and ordered); compaction checkpoints are re-pointed.
+    /// Snapshot ids carry over, so `/undo` keeps working in the fork. Usage totals start from zero.
+    pub fn fork_session(&self, session_id: &str, before: Option<&str>) -> Result<Session> {
+        let src = self.session(session_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        let hidden_from = self.revert(session_id)?.and_then(|r| r["messageId"].as_str().map(String::from));
+        let limit = [before.map(String::from), hidden_from].into_iter().flatten().min();
+        let msgs: Vec<Message> = self.messages(session_id)?.into_iter().filter(|m| limit.as_deref().is_none_or(|l| m.id.as_str() < l)).collect();
+
+        let tx = self.conn.unchecked_transaction()?;
+        let id = new_id("ses");
+        let t = now_ms();
+        let title = src.title.as_ref().map(|t| format!("{t} (fork)"));
+        tx.execute(
+            "insert into session(id, project_id, directory, agent, model, title, time_created, time_updated, fork_session_id, fork_boundary)
+             values (?1,?2,?3,?4,?5,?6,?7,?7,?8,?9)",
+            params![id, src.project_id, src.directory, src.agent, src.model, title, t, session_id, msgs.last().map(|m| m.id.clone())],
+        )?;
+        let mut map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for m in &msgs {
+            let mut data = m.data.clone();
+            if m.kind == "compaction" {
+                if let Some(new_keep) = data["keepFrom"].as_str().and_then(|k| map.get(k)) {
+                    data["keepFrom"] = Value::String(new_keep.clone());
+                }
+            }
+            let new_id = Self::insert_message(&tx, &id, &m.kind, &data)?;
+            map.insert(m.id.clone(), new_id);
+        }
+        tx.execute("insert into todo(session_id, position, content, status) select ?2, position, content, status from todo where session_id=?1", params![session_id, id])?;
+        tx.execute("insert into instruction_state(session_id, path) select ?2, path from instruction_state where session_id=?1", params![session_id, id])?;
+        tx.commit()?;
+        Ok(Session { id, project_id: src.project_id, directory: src.directory, agent: src.agent, title, model: src.model, parent_id: None })
+    }
+
     pub fn set_title(&self, session_id: &str, title: &str) -> Result<()> {
         self.conn.execute("update session set title=?2, time_updated=?3 where id=?1", params![session_id, title, now_ms()])?;
         Ok(())
@@ -261,6 +387,7 @@ impl Store {
             "insert into message(id, session_id, type, data, time_created) values (?1,?2,?3,?4,?5)",
             params![id, session_id, kind, serde_json::to_string(data)?, now_ms()],
         )?;
+        conn.execute("update session set time_updated=?2 where id=?1", params![session_id, now_ms()])?;
         Ok(id)
     }
 
@@ -474,6 +601,110 @@ mod tests {
         let _ = a2;
         s.set_revert(&ses.id, None).unwrap();
         assert_eq!(s.revert(&ses.id).unwrap(), None);
+    }
+
+    #[test]
+    fn listing_filters_by_directory_and_archive_state() {
+        let s = Store::open_memory().unwrap();
+        let a = s.create_session("/work/a", "build").unwrap();
+        let b = s.create_session("/work/b", "plan").unwrap();
+        let child = s.create_child_session(&a, "general").unwrap();
+        s.add_message(&a.id, "user", &json!({"text":"hi"})).unwrap();
+        s.add_message(&a.id, "assistant", &json!({"parts":[]})).unwrap();
+        s.add_message(&a.id, "compaction", &json!({"summary":"x","keepFrom":"m"})).unwrap();
+        s.set_title(&a.id, "Alpha").unwrap();
+        s.add_message(&b.id, "user", &json!({"text":"yo"})).unwrap(); // b is now the most recently active
+        let all = s.list_sessions(None, false, 50).unwrap();
+        assert_eq!(all.iter().map(|x| x.id.as_str()).collect::<Vec<_>>(), [b.id.as_str(), a.id.as_str()], "children are never listed; newest activity first");
+        let only_a = s.list_sessions(Some("/work/a"), false, 50).unwrap();
+        assert_eq!((only_a.len(), only_a[0].title.as_deref(), only_a[0].messages, only_a[0].agent.as_str()), (1, Some("Alpha"), 2, "build"), "compaction messages are not counted");
+        assert_eq!(s.list_sessions(None, false, 1).unwrap().len(), 1);
+        s.set_archived(&a.id, true).unwrap();
+        assert_eq!(s.list_sessions(None, false, 50).unwrap().len(), 1);
+        let arch = s.list_sessions(None, true, 50).unwrap();
+        assert_eq!((arch.len(), arch[0].archived), (1, true));
+        assert_eq!(s.latest_session("/work/a").unwrap(), None, "an archived session is not the one --continue picks");
+        s.set_archived(&a.id, false).unwrap();
+        assert_eq!(s.list_sessions(Some("/work/a"), false, 50).unwrap().len(), 1);
+        let _ = child;
+    }
+
+    #[test]
+    fn activity_bumps_the_update_time() {
+        let (s, ses) = store();
+        let t0 = s.list_sessions(None, false, 5).unwrap()[0].time_updated;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        s.add_message(&ses.id, "user", &json!({"text":"x"})).unwrap();
+        assert!(s.list_sessions(None, false, 5).unwrap()[0].time_updated > t0);
+    }
+
+    #[test]
+    fn sessions_are_found_by_a_piece_of_their_id() {
+        let (s, ses) = store();
+        let other = s.create_session("/work/proj", "build").unwrap();
+        assert_eq!(s.find_sessions(&ses.id).unwrap().len(), 1);
+        let tail = &ses.id[ses.id.len() - 6..];
+        assert_eq!(s.find_sessions(tail).unwrap().iter().map(|x| x.id.clone()).collect::<Vec<_>>(), [ses.id.clone()], "by suffix");
+        assert!(s.find_sessions(&ses.id[..8]).unwrap().len() >= 1, "by prefix");
+        assert_eq!(s.find_sessions("ses_").unwrap().len(), 2, "an ambiguous piece returns every match so the caller can refuse");
+        assert!(s.find_sessions("").unwrap().is_empty() && s.find_sessions("zzzzzz").unwrap().is_empty());
+        let child = s.create_child_session(&ses, "general").unwrap();
+        assert!(s.find_sessions(&child.id).unwrap().is_empty(), "subagent sessions are not addressable");
+        let _ = other;
+    }
+
+    #[test]
+    fn title_helpers() {
+        let (s, ses) = store();
+        assert_eq!(s.title_source(&ses.id).unwrap(), None);
+        s.enqueue(&ses.id, None, Mode::Steer, "user", &json!({"text":"first prompt"})).unwrap();
+        assert_eq!(s.title_source(&ses.id).unwrap(), Some(("first prompt".into(), None)), "a prompt still in the inbox counts");
+        let mut s = s;
+        s.deliver(&ses.id, true).unwrap();
+        s.add_message(&ses.id, "user", &json!({"text":"second prompt"})).unwrap();
+        assert_eq!(s.title_source(&ses.id).unwrap(), Some(("first prompt".into(), Some("second prompt".into()))));
+        assert!(s.set_title_if_empty(&ses.id, "Generated").unwrap());
+        assert!(!s.set_title_if_empty(&ses.id, "Another").unwrap(), "never overwrites");
+        s.set_title(&ses.id, "Chosen by me").unwrap();
+        assert_eq!(s.session(&ses.id).unwrap().unwrap().title.as_deref(), Some("Chosen by me"));
+    }
+
+    #[test]
+    fn forking_copies_the_conversation_and_what_hangs_off_it() {
+        let (s, ses) = store();
+        s.set_title(&ses.id, "Original").unwrap();
+        s.set_model(&ses.id, Some("openai/gpt-x")).unwrap();
+        let m1 = s.add_message(&ses.id, "user", &json!({"text":"one"})).unwrap();
+        s.add_message(&ses.id, "assistant", &json!({"parts":[{"type":"text","text":"a1"}],"snapshot":"snap1"})).unwrap();
+        let m3 = s.add_message(&ses.id, "user", &json!({"text":"two"})).unwrap();
+        s.add_message(&ses.id, "compaction", &json!({"summary":"SUM","keepFrom":m3})).unwrap();
+        let m5 = s.add_message(&ses.id, "user", &json!({"text":"three"})).unwrap();
+        s.set_todos(&ses.id, &[crate::tools::Todo { content: "t".into(), status: "pending".into() }]).unwrap();
+        s.add_instruction(&ses.id, "/w/AGENTS.md").unwrap();
+        s.add_usage(&ses.id, 1.5, &crate::provider::Usage { input: 9, ..Default::default() }).unwrap();
+
+        let f = s.fork_session(&ses.id, None).unwrap();
+        assert_ne!(f.id, ses.id);
+        assert_eq!((f.title.as_deref(), f.model.as_deref(), f.parent_id.clone(), f.agent.as_str()), (Some("Original (fork)"), Some("openai/gpt-x"), None, "build"));
+        let (orig, copy) = (s.messages(&ses.id).unwrap(), s.messages(&f.id).unwrap());
+        assert_eq!(orig.iter().map(|m| (&m.kind, &m.data["text"])).collect::<Vec<_>>().len(), copy.len());
+        assert!(copy.iter().all(|c| orig.iter().all(|o| o.id != c.id)), "every copied message has a new id");
+        assert!(copy.windows(2).all(|w| w[0].id < w[1].id), "and the new ids keep the order");
+        assert_eq!(copy[1].data["snapshot"], "snap1", "snapshot ids carry over so undo works in the fork");
+        let new_m3 = &copy[2].id;
+        assert_eq!(copy[3].data["keepFrom"].as_str(), Some(new_m3.as_str()), "the checkpoint points into the copy, not the original");
+        assert_eq!(s.todos(&f.id).unwrap().len(), 1);
+        assert_eq!(s.instruction_paths(&f.id).unwrap(), ["/w/AGENTS.md"]);
+        assert_eq!(s.usage_totals(&f.id).unwrap().0, 0.0, "a fork starts with no spend");
+        let listed = s.list_sessions(None, false, 10).unwrap();
+        assert_eq!(listed.iter().find(|x| x.id == f.id).unwrap().forked_from.as_deref(), Some(ses.id.as_str()));
+
+        // Branch off before a message, and never copy what a pending undo hides.
+        let before = s.fork_session(&ses.id, Some(&m3)).unwrap();
+        assert_eq!(s.messages(&before.id).unwrap().len(), 2);
+        s.set_revert(&ses.id, Some(&json!({"messageId": m5, "redo": null}))).unwrap();
+        assert_eq!(s.messages(&s.fork_session(&ses.id, None).unwrap().id).unwrap().len(), 4, "the hidden last prompt stays behind");
+        let _ = m1;
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! produced tool calls. History is reloaded from the store on every step.
 use crate::agent::{self, Agent};
 use crate::snapshot::{FileDiff, Snapshots};
-use crate::{catalog, compaction, config, instructions};
+use crate::{catalog, compaction, config, instructions, title};
 use crate::chat;
 use crate::permission::{self, Effect, Rule};
 use crate::provider::{retry, Block, ChatMessage, Event, FinishReason, Provider, ProviderError, Request, Role, ToolDef, Usage};
@@ -45,6 +45,8 @@ pub enum UiEvent<'a> {
     Status(&'a str),
     /// The session's todo list was replaced.
     Todos(&'a [Todo]),
+    /// A generated title was stored for the session.
+    Titled(&'a str),
     /// An event from a subagent session; nests when subagents start subagents.
     Nested { agent: &'a str, inner: &'a UiEvent<'a> },
 }
@@ -102,6 +104,8 @@ pub struct EngineConfig {
     /// Capture the working tree before every step so changes can be undone (`/undo`) and diffed.
     pub snapshots: bool,
     pub snapshot_max_files: usize,
+    /// Model for titles and other small jobs (`provider/model`); the session's model when unset.
+    pub small_model: Option<String>,
     /// Waits for retry backoff; must return early when `cancel` is set.
     pub sleep: Box<dyn Fn(Duration, &AtomicBool) + Send + Sync>,
     pub jitter: Box<dyn Fn() -> f64 + Send + Sync>,
@@ -119,6 +123,7 @@ impl EngineConfig {
             compaction: compaction::Settings::default(),
             snapshots: true,
             snapshot_max_files: 50_000,
+            small_model: None,
             sleep: Box::new(|d, cancel| {
                 let end = std::time::Instant::now() + d;
                 while std::time::Instant::now() < end && !cancel.load(Ordering::Relaxed) {
@@ -143,6 +148,8 @@ pub struct Engine {
     prompt_lock: Mutex<()>,
     /// Sessions whose snapshots failed in this process (too many files, I/O error); they are skipped from then on.
     snapshot_off: Mutex<HashSet<String>>,
+    /// Sessions a title was already attempted for in this process.
+    title_tried: Mutex<HashSet<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -228,12 +235,12 @@ struct AttemptResult {
 impl Engine {
     /// Single provider answering every model ref.
     pub fn new(store: Store, provider: Box<dyn Provider>, cfg: EngineConfig) -> Self {
-        Engine { store: Mutex::new(store), providers: HashMap::new(), fallback: Some(provider), tools: tools::all(subagent_list(&cfg)), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()) }
+        Engine { store: Mutex::new(store), providers: HashMap::new(), fallback: Some(provider), tools: tools::all(subagent_list(&cfg)), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()), title_tried: Mutex::new(HashSet::new()) }
     }
 
     /// One client per provider id; a model ref's provider part picks the client.
     pub fn with_providers(store: Store, providers: HashMap<String, Box<dyn Provider>>, cfg: EngineConfig) -> Self {
-        Engine { store: Mutex::new(store), providers, fallback: None, tools: tools::all(subagent_list(&cfg)), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()) }
+        Engine { store: Mutex::new(store), providers, fallback: None, tools: tools::all(subagent_list(&cfg)), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()), title_tried: Mutex::new(HashSet::new()) }
     }
 
     pub fn catalog(&self) -> &catalog::Catalog {
@@ -280,7 +287,14 @@ impl Engine {
             return Err(e);
         }
         self.auto_failed.lock().unwrap().remove(session_id);
-        let outcome = self.drain(session_id, ui, cancel, resume);
+        // An untitled session gets a title from a small model call that runs alongside the first turn.
+        let job = self.title_job(session_id);
+        let outcome = std::thread::scope(|s| {
+            if let Some((session, text)) = &job {
+                s.spawn(move || self.generate_title(session, text, ui, cancel));
+            }
+            self.drain(session_id, ui, cancel, resume)
+        });
         self.store().release(session_id)?;
         outcome
     }
@@ -510,6 +524,83 @@ impl Engine {
         };
         self.store().update_message(&msg_id, &data)?;
         Ok(outcome)
+    }
+
+    fn title_job(&self, sid: &str) -> Option<(Session, String)> {
+        let session = self.store().session(sid).ok()??;
+        if session.title.is_some() || session.parent_id.is_some() {
+            return None;
+        }
+        let (first, latest) = self.store().title_source(sid).ok()??;
+        if !self.title_tried.lock().unwrap().insert(sid.to_string()) {
+            return None;
+        }
+        Some((session, title::request_text(&first, latest.as_deref())))
+    }
+
+    /// Best effort: any failure just leaves the session untitled. Only errors where the request provably never ran
+    /// (connection refused, DNS) are retried, up to 3 times, since this is a one-shot generation.
+    fn generate_title(&self, session: &Session, text: &str, ui: &dyn Ui, cancel: &AtomicBool) {
+        let agent = agent::find(&self.cfg.agents, &session.agent).or_else(|| self.cfg.agents.first().cloned());
+        let model_ref = self
+            .cfg
+            .small_model
+            .clone()
+            .or(session.model.clone())
+            .or(agent.and_then(|a| a.model))
+            .unwrap_or_else(|| self.cfg.model.clone());
+        let (provider_id, model_id) = config::split_model(&model_ref);
+        let Some(provider) = self.providers.get(provider_id).map(|p| p.as_ref()).or(self.fallback.as_deref()) else { return };
+        let req = Request {
+            model: model_id.to_string(),
+            system: title::SYSTEM.into(),
+            messages: vec![ChatMessage { role: Role::User, content: vec![Block::Text(text.to_string())] }],
+            tools: vec![],
+            max_tokens: 60,
+            tools_disabled: false,
+        };
+        let mut attempts = 0;
+        let (reply, usage) = loop {
+            let (mut out, mut usage) = (String::new(), Usage::default());
+            match provider.stream(&req, cancel, &mut |ev| match ev {
+                Event::TextDelta(t) => out.push_str(&t),
+                Event::Finish { usage: u, .. } => usage = u,
+                _ => {}
+            }) {
+                Ok(()) => break (out, usage),
+                Err(ProviderError::Transport { kind: crate::provider::TransportKind::Connect, .. }) if attempts < 3 && !cancel.load(Ordering::Relaxed) => {
+                    attempts += 1;
+                    (self.cfg.sleep)(Duration::from_secs(1), cancel);
+                }
+                Err(_) => return,
+            }
+        };
+        let Some(title) = title::clean(&reply) else { return };
+        let st = self.store();
+        if st.set_title_if_empty(&session.id, &title).unwrap_or(false) {
+            let cost = self.cfg.catalog.model(provider_id, model_id).and_then(|m| catalog::cost(m, &usage)).unwrap_or(0.0);
+            let _ = st.add_usage(&session.id, cost, &usage);
+            drop(st);
+            ui.event(&UiEvent::Titled(&title));
+        }
+    }
+
+    /// Copy the conversation into a new session. `turns_back` = 0 copies everything; N copies the conversation as it
+    /// was before the Nth most recent prompt (so the fork can take that prompt in a different direction).
+    /// `None` if the session has fewer than N prompts.
+    pub fn fork(&self, sid: &str, turns_back: usize) -> Result<Option<Session>, StoreError> {
+        let st = self.store();
+        let before = if turns_back == 0 {
+            None
+        } else {
+            let hidden_from = st.revert(sid)?.and_then(|r| r["messageId"].as_str().map(String::from));
+            let users: Vec<String> = st.messages(sid)?.into_iter().filter(|m| m.kind == "user" && hidden_from.as_deref().is_none_or(|h| m.id.as_str() < h)).map(|m| m.id).collect();
+            if users.len() < turns_back {
+                return Ok(None);
+            }
+            Some(users[users.len() - turns_back].clone())
+        };
+        Ok(Some(st.fork_session(sid, before.as_deref())?))
     }
 
     /// Capture the working tree before a step. Best effort: a failure disables snapshots for the session with one notice.
@@ -895,7 +986,11 @@ impl Host for EngineHost<'_> {
                     .map_err(store_err)?
                     .filter(|c| c.parent_id.as_deref() == Some(self.session.id.as_str()))
                     .ok_or_else(|| ToolError::fail(format!("sessionID {id} is not a subagent session of this conversation")))?,
-                None => st.create_child_session(self.session, &agent.id).map_err(store_err)?,
+                None => {
+                    let c = st.create_child_session(self.session, &agent.id).map_err(store_err)?;
+                    st.set_title(&c.id, &req.description).map_err(store_err)?;
+                    c
+                }
             };
             // A model chosen for this conversation carries over unless the call names one.
             match req.model.as_ref().or(self.session.model.as_ref()) {
@@ -1022,6 +1117,7 @@ mod tests {
             UiEvent::Notice(n) => format!("notice:{n}"),
             UiEvent::Status(n) => format!("status:{n}"),
             UiEvent::Todos(t) => format!("todos:{}", t.len()),
+            UiEvent::Titled(t) => format!("title:{t}"),
             UiEvent::Nested { agent, inner } => format!("{agent}>{}", describe(inner)),
         }
     }
@@ -1902,5 +1998,117 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(read_work(&f, "b.txt").as_deref(), Some("B"), "a failed undo changes nothing");
+    }
+
+    fn titles(f: &Fixture) -> Vec<Request> {
+        f.fake.title_requests.lock().unwrap().clone()
+    }
+    fn title_of(f: &Fixture) -> Option<String> {
+        f.engine.store().session(&f.session.id).unwrap().unwrap().title
+    }
+
+    #[test]
+    fn a_new_session_gets_a_title_from_its_first_prompt_once() {
+        let f = fixture(vec![text("working on it"), text("again")]);
+        f.fake.script_titles(vec![text("Title: \"Production 500 errors.\""), text("Should not be used")]);
+        f.say("debug 500 errors in production");
+        let ui = TestUi::default();
+        assert_eq!(f.run(&ui), RunOutcome::Idle);
+        assert_eq!(title_of(&f).as_deref(), Some("Production 500 errors"), "cleaned: label, quotes and period removed");
+        assert!(ui.log().contains(&"title:Production 500 errors".to_string()));
+        let t = titles(&f);
+        assert_eq!(t.len(), 1);
+        assert!(t[0].tools.is_empty() && matches!(&t[0].messages[0].content[0], Block::Text(x) if x.contains("debug 500 errors in production")));
+        assert_eq!(f.fake.calls(), 1, "title requests are not counted with the conversation's");
+        f.say("another question");
+        f.run(&TestUi::default());
+        assert_eq!(titles(&f).len(), 1, "no second title request");
+        assert_eq!(title_of(&f).as_deref(), Some("Production 500 errors"));
+        assert!(f.engine.store().usage_totals(&f.session.id).unwrap().1.input >= 10, "the title call's tokens are counted");
+    }
+
+    #[test]
+    fn a_title_you_set_is_never_replaced_or_even_requested() {
+        let f = fixture(vec![text("ok")]);
+        f.engine.store().set_title(&f.session.id, "My own title").unwrap();
+        f.fake.script_titles(vec![text("Generated")]);
+        f.say("hello");
+        f.run(&TestUi::default());
+        assert_eq!((title_of(&f).as_deref(), titles(&f).len()), (Some("My own title"), 0));
+    }
+
+    #[test]
+    fn title_failures_never_break_the_run() {
+        // A non-retryable error: no title, no retry, the turn is unaffected.
+        let f = fixture(vec![text("fine")]);
+        f.fake.script_titles(vec![Scripted::Fail(vec![], ProviderError::Auth("no".into()))]);
+        f.say("hi");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        assert_eq!((title_of(&f), titles(&f).len()), (None, 1));
+        // Connection errors (request provably never ran) are retried up to three times.
+        let conn = || Scripted::Fail(vec![], ProviderError::Transport { kind: crate::provider::TransportKind::Connect, message: "refused".into() });
+        let f = fixture(vec![text("fine")]);
+        f.fake.script_titles(vec![conn(), conn(), text("Third time lucky")]);
+        f.say("hi");
+        f.run(&TestUi::default());
+        assert_eq!(title_of(&f).as_deref(), Some("Third time lucky"));
+        assert_eq!(*f.waits.lock().unwrap(), [Duration::from_secs(1), Duration::from_secs(1)]);
+        let f = fixture(vec![text("fine")]);
+        f.fake.script_titles(vec![conn(), conn(), conn(), conn(), text("never reached")]);
+        f.say("hi");
+        f.run(&TestUi::default());
+        assert_eq!((title_of(&f), titles(&f).len()), (None, 4), "1 try + 3 retries, then give up");
+        // A timeout may have reached the provider, so it is not retried.
+        let f = fixture(vec![text("fine")]);
+        f.fake.script_titles(vec![Scripted::Fail(vec![], ProviderError::Transport { kind: crate::provider::TransportKind::Timeout, message: "t".into() }), text("nope")]);
+        f.say("hi");
+        f.run(&TestUi::default());
+        assert_eq!((title_of(&f), titles(&f).len()), (None, 1));
+    }
+
+    #[test]
+    fn small_model_is_used_for_titles_and_replies_are_cleaned_of_noise() {
+        let f = fixture_cfg(vec![text("ok")], |c| c.small_model = Some("anthropic/claude-small".into()));
+        f.fake.script_titles(vec![text("\n  **Dark mode toggle**  \nThis title names the request.")]);
+        f.say("add a dark mode toggle");
+        f.run(&TestUi::default());
+        assert_eq!(titles(&f)[0].model, "claude-small");
+        assert_eq!(f.fake.requests.lock().unwrap()[0].model, "test-model");
+        assert_eq!(title_of(&f).as_deref(), Some("Dark mode toggle"));
+    }
+
+    #[test]
+    fn subagent_sessions_are_titled_by_their_task_and_never_request_one() {
+        let f = fixture(vec![sub("t1", "general", "do the thing"), text("child answer"), text("parent answer")]);
+        f.fake.script_titles(vec![text("Delegation test")]);
+        f.say("delegate");
+        f.run(&TestUi::default());
+        let cid = child_id(&f.fake.requests.lock().unwrap()[2]);
+        assert_eq!(f.engine.store().session(&cid).unwrap().unwrap().title.as_deref(), Some("do it"));
+        assert_eq!(titles(&f).len(), 1, "only the top-level session asked for a title");
+        assert_eq!(title_of(&f).as_deref(), Some("Delegation test"));
+    }
+
+    #[test]
+    fn forking_by_turns_back() {
+        let f = fixture(vec![text("a1"), text("a2"), text("a3")]);
+        for p in ["first", "second", "third"] {
+            f.say(p);
+            f.run(&TestUi::default());
+        }
+        let users = |sid: &str| -> Vec<String> { f.engine.store().messages(sid).unwrap().iter().filter(|m| m.kind == "user").map(|m| m.data["text"].as_str().unwrap().to_string()).collect() };
+        let all = f.engine.fork(&f.session.id, 0).unwrap().unwrap();
+        assert_eq!(users(&all.id), ["first", "second", "third"]);
+        let one_back = f.engine.fork(&f.session.id, 1).unwrap().unwrap();
+        assert_eq!(users(&one_back.id), ["first", "second"], "as it was before the latest prompt");
+        assert_eq!(users(&f.engine.fork(&f.session.id, 3).unwrap().unwrap().id), Vec::<String>::new());
+        assert_eq!(f.engine.fork(&f.session.id, 4).unwrap(), None);
+        // The fork is an independent conversation.
+        f.fake.extend(vec![text("fork answer")]);
+        f.engine.submit(&one_back.id, "different third", Mode::Steer).unwrap();
+        assert_eq!(f.engine.run(&one_back.id, &TestUi::default(), &AtomicBool::new(false), false).unwrap(), RunOutcome::Idle);
+        let last = f.fake.requests.lock().unwrap().last().unwrap().clone();
+        assert!(all_text(&last).contains("second") && all_text(&last).contains("different third") && !all_text(&last).contains("third\n"));
+        assert_eq!(users(&f.session.id), ["first", "second", "third"], "the original is untouched");
     }
 }

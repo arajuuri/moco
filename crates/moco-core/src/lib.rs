@@ -12,6 +12,7 @@ pub mod permission;
 pub mod provider;
 pub mod snapshot;
 pub mod store;
+pub mod title;
 pub mod tools;
 pub mod truncate;
 pub mod wildcard;
