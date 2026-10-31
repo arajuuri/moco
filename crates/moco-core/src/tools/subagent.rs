@@ -14,7 +14,8 @@ impl Tool for Subagent {
         format!(
             "Launch a subagent to handle a self-contained task in a fresh context. Its final message is returned to you; the user does not see it. \
 The `prompt` is the subagent's only input, so include everything it needs. Run independent subagents in parallel by calling this tool several times in one \
-response. Pass a previous `sessionID` to continue that subagent's conversation.\n\nAvailable agents:\n{list}"
+response. Pass a previous `sessionID` to continue that subagent's conversation. With `background: true` the call returns at once and \
+you are told when the subagent finishes (do not poll); a background subagent cannot ask the user for permission, so give it work that needs none.\n\nAvailable agents:\n{list}"
         )
     }
     fn schema(&self) -> Value {
@@ -23,7 +24,8 @@ response. Pass a previous `sessionID` to continue that subagent's conversation.\
             "description":{"type":"string","description":"A short (3-5 words) description of the task"},
             "prompt":{"type":"string","description":"The task for the subagent to perform"},
             "model":{"type":"string","description":"Optional provider/model override"},
-            "sessionID":{"type":"string","description":"Continue an earlier subagent session"}},
+            "sessionID":{"type":"string","description":"Continue an earlier subagent session"},
+            "background":{"type":"boolean","description":"Return at once; you are told when it finishes"}},
             "required":["agent","description","prompt"]})
     }
     fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
@@ -31,9 +33,6 @@ response. Pass a previous `sessionID` to continue that subagent's conversation.\
         if !self.agents.iter().any(|(id, _)| id == agent) {
             let ids: Vec<&str> = self.agents.iter().map(|(id, _)| id.as_str()).collect();
             return Err(ToolError::fail(format!("Unknown agent '{agent}'. Available: {}", ids.join(", "))));
-        }
-        if opt_bool(input, "background").unwrap_or(false) {
-            return Err(ToolError::fail("background subagents are not supported yet; run it in the foreground"));
         }
         let req = SubagentRequest {
             agent: agent.to_string(),
@@ -43,6 +42,13 @@ response. Pass a previous `sessionID` to continue that subagent's conversation.\
             session_id: opt_str(input, "sessionID").map(String::from),
         };
         ctx.permit("subagent", vec![agent.to_string()], vec!["*".into()])?;
+        if opt_bool(input, "background").unwrap_or(false) {
+            let id = ctx.host.start_background_subagent(req)?;
+            return Ok(ToolOutput {
+                text: format!("Subagent started in the background (sessionID: {id}). You will be told when it finishes; do not poll for it."),
+                metadata: json!({"sessionID": id, "status": "running"}),
+            });
+        }
         let r = ctx.host.subagent(req)?;
         Ok(ToolOutput {
             text: format!("sessionID: {}\n\n{}", r.session_id, r.output),
@@ -73,12 +79,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_agents_and_background() {
+    fn rejects_unknown_agents() {
         let env = Env::new();
         let t = tool();
         let e = t.run(&json!({"agent":"nope","description":"d","prompt":"p"}), &env.ctx()).unwrap_err();
         assert_eq!(e.message(), "Unknown agent 'nope'. Available: general, explore");
-        assert!(t.run(&json!({"agent":"general","description":"d","prompt":"p","background":true}), &env.ctx()).is_err());
         assert!(env.host.subagents.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn background_returns_at_once_with_the_session_id() {
+        let env = Env::new();
+        let o = tool().run(&json!({"agent":"general","description":"d","prompt":"long job","background":true}), &env.ctx()).unwrap();
+        assert!(o.text.starts_with("Subagent started in the background (sessionID: ses_bg)") && o.text.contains("do not poll"));
+        assert_eq!(o.metadata["status"], "running");
+        assert_eq!(env.host.subagents.lock().unwrap()[0].prompt, "long job");
+        assert_eq!(env.perm.asked()[0].action, "subagent", "permission is still checked");
     }
 }

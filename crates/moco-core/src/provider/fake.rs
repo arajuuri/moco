@@ -16,16 +16,25 @@ pub struct FakeProvider {
     /// tests that count or order the main conversation's requests. An empty queue answers with nothing.
     titles: Mutex<std::collections::VecDeque<Scripted>>,
     pub title_requests: Mutex<Vec<Request>>,
+    pub routed_requests: Mutex<Vec<Request>>,
+    /// Requests whose first user message contains a marker get their own script (for work on other threads, such as
+    /// background subagents, whose request order against the main conversation is otherwise a race).
+    routes: Mutex<Vec<(String, std::collections::VecDeque<Scripted>)>>,
 }
 
 impl FakeProvider {
     pub fn new(script: Vec<Scripted>) -> Self {
-        FakeProvider { script: Mutex::new(script.into()), requests: Mutex::new(vec![]), titles: Mutex::new(Default::default()), title_requests: Mutex::new(vec![]) }
+        FakeProvider { script: Mutex::new(script.into()), requests: Mutex::new(vec![]), titles: Mutex::new(Default::default()), title_requests: Mutex::new(vec![]), routes: Mutex::new(vec![]), routed_requests: Mutex::new(vec![]) }
     }
     /// Queue more responses (for multi-turn tests where later script entries depend on earlier results).
     pub fn extend(&self, more: Vec<Scripted>) {
         self.script.lock().unwrap().extend(more);
     }
+    /// Answer requests whose first user message contains `marker` from `script` instead of the main script.
+    pub fn script_route(&self, marker: &str, script: Vec<Scripted>) {
+        self.routes.lock().unwrap().push((marker.to_string(), script.into()));
+    }
+
     /// Queue replies for title requests.
     pub fn script_titles(&self, more: Vec<Scripted>) {
         self.titles.lock().unwrap().extend(more);
@@ -38,18 +47,34 @@ impl FakeProvider {
 impl Provider for FakeProvider {
     fn stream(&self, req: &Request, cancel: &AtomicBool, on_event: &mut dyn FnMut(Event)) -> Result<(), ProviderError> {
         let is_title = req.system == crate::title::SYSTEM;
-        if is_title {
-            self.title_requests.lock().unwrap().push(req.clone());
-        } else {
-            self.requests.lock().unwrap().push(req.clone());
-        }
-        let next = if is_title {
-            match self.titles.lock().unwrap().pop_front() {
-                Some(n) => n,
-                None => return Ok(()),
+        let first_user = req
+            .messages
+            .first()
+            .map(|m| m.content.iter().filter_map(|b| if let Block::Text(t) = b { Some(t.as_str()) } else { None }).collect::<Vec<_>>().join(" "))
+            .unwrap_or_default();
+        // Decide where the request belongs before recording it, so it is recorded exactly once, in one place
+        // (other threads are recording theirs at the same time).
+        let route = if is_title { None } else { self.routes.lock().unwrap().iter().position(|(m, _)| first_user.contains(m.as_str())) };
+        let next = match route {
+            Some(i) => {
+                self.routed_requests.lock().unwrap().push(req.clone());
+                match self.routes.lock().unwrap()[i].1.pop_front() {
+                    Some(r) => r,
+                    // Falling through to the main script would silently eat the main conversation's replies.
+                    None => return Err(ProviderError::InvalidRequest("the scripted route for this request is exhausted".into())),
+                }
             }
-        } else {
-            self.script.lock().unwrap().pop_front().expect("FakeProvider script exhausted")
+            None if is_title => {
+                self.title_requests.lock().unwrap().push(req.clone());
+                match self.titles.lock().unwrap().pop_front() {
+                    Some(n) => n,
+                    None => return Ok(()),
+                }
+            }
+            None => {
+                self.requests.lock().unwrap().push(req.clone());
+                self.script.lock().unwrap().pop_front().expect("FakeProvider script exhausted")
+            }
         };
         let (events, err) = match next {
             Scripted::Events(e) => (e, None),

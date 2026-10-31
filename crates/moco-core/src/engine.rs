@@ -12,6 +12,8 @@ use crate::provider::{retry, Block, ChatMessage, Event, FinishReason, Provider, 
 use crate::store::{Mode, Session, Store, StoreError};
 use crate::tools::{self, project_root_of, Host, MediaCaps, PermReq, Permitter, Question, SubagentRequest, SubagentResult, Todo, Tool, ToolCtx, ToolError, ToolOutput};
 use serde_json::{json, Value};
+mod jobs;
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -157,6 +159,11 @@ pub struct Engine {
     snapshot_off: Mutex<HashSet<String>>,
     /// Sessions a title was already attempted for in this process.
     title_tried: Mutex<HashSet<String>>,
+    /// Weak handle to this engine once it is shared (`share`): detached background threads need an owner.
+    me: Mutex<std::sync::Weak<Engine>>,
+    jobs: jobs::Jobs,
+    /// Told about background job completions (the UI prints them).
+    notifier: Mutex<Option<Arc<dyn Fn(&str) + Send + Sync>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -244,12 +251,12 @@ struct AttemptResult {
 impl Engine {
     /// Single provider answering every model ref.
     pub fn new(store: Store, provider: Box<dyn Provider>, cfg: EngineConfig) -> Self {
-        Engine { store: Mutex::new(store), providers: HashMap::new(), fallback: Some(provider), tools: tools::all(subagent_list(&cfg), cfg.skills.clone()).into_iter().map(Arc::from).collect(), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()), title_tried: Mutex::new(HashSet::new()) }
+        Engine { store: Mutex::new(store), providers: HashMap::new(), fallback: Some(provider), tools: tools::all(subagent_list(&cfg), cfg.skills.clone()).into_iter().map(Arc::from).collect(), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()), title_tried: Mutex::new(HashSet::new()), me: Mutex::new(std::sync::Weak::new()), jobs: jobs::Jobs::default(), notifier: Mutex::new(None) }
     }
 
     /// One client per provider id; a model ref's provider part picks the client.
     pub fn with_providers(store: Store, providers: HashMap<String, Box<dyn Provider>>, cfg: EngineConfig) -> Self {
-        Engine { store: Mutex::new(store), providers, fallback: None, tools: tools::all(subagent_list(&cfg), cfg.skills.clone()).into_iter().map(Arc::from).collect(), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()), title_tried: Mutex::new(HashSet::new()) }
+        Engine { store: Mutex::new(store), providers, fallback: None, tools: tools::all(subagent_list(&cfg), cfg.skills.clone()).into_iter().map(Arc::from).collect(), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()), title_tried: Mutex::new(HashSet::new()), me: Mutex::new(std::sync::Weak::new()), jobs: jobs::Jobs::default(), notifier: Mutex::new(None) }
     }
 
     pub fn catalog(&self) -> &catalog::Catalog {
@@ -673,6 +680,13 @@ impl Engine {
     /// Run `req` in a child session of `parent` and return the subagent's final text. Used by the `subagent` tool and
     /// by custom commands marked `subagent`.
     pub fn run_subagent(&self, parent: &Session, req: SubagentRequest, ui: &dyn Ui, cancel: &AtomicBool) -> Result<SubagentResult, ToolError> {
+        let child = self.begin_subagent(parent, &req)?;
+        ui.event(&UiEvent::Status(&format!("subagent {}: {}", child.agent, req.description)));
+        self.finish_subagent(&child, ui, cancel)
+    }
+
+    /// Create (or find) the child session for `req` and queue its prompt, without running it.
+    pub(crate) fn begin_subagent(&self, parent: &Session, req: &SubagentRequest) -> Result<Session, ToolError> {
         let eng = self;
         let store_err = |e: StoreError| ToolError::fail(e.to_string());
         let agent = agent::find(&eng.cfg.agents, &req.agent).filter(|a| a.subagent()).ok_or_else(|| ToolError::fail(format!("Unknown agent '{}'", req.agent)))?;
@@ -701,8 +715,14 @@ impl Engine {
             child
         };
         eng.submit(&child.id, &req.prompt, Mode::Steer).map_err(store_err)?;
-        let child_ui = ChildUi { parent: ui, agent: &agent.id };
-        ui.event(&UiEvent::Status(&format!("subagent {}: {}", agent.id, req.description)));
+        Ok(child)
+    }
+
+    /// Run a child session prepared by `begin_subagent` and return its final text.
+    pub(crate) fn finish_subagent(&self, child: &Session, ui: &dyn Ui, cancel: &AtomicBool) -> Result<SubagentResult, ToolError> {
+        let eng = self;
+        let store_err = |e: StoreError| ToolError::fail(e.to_string());
+        let child_ui = ChildUi { parent: ui, agent: &child.agent };
         match eng.run(&child.id, &child_ui, cancel, false).map_err(store_err)? {
             RunOutcome::Idle => {}
             RunOutcome::Interrupted => return Err(ToolError::Interrupted),
@@ -710,19 +730,15 @@ impl Engine {
             RunOutcome::Failed(m) => return Err(ToolError::fail(format!("Subagent failed: {m}"))),
             RunOutcome::Busy => return Err(ToolError::fail("that subagent session is already running")),
         }
-        let output = eng
-            .store()
-            .messages(&child.id)
-            .map_err(store_err)?
-            .iter()
-            .rev()
-            .filter(|m| m.kind == "assistant")
-            .find_map(|m| {
-                let text: Vec<&str> = m.data["parts"].as_array()?.iter().filter(|p| p["type"] == "text").filter_map(|p| p["text"].as_str()).collect();
-                (!text.is_empty()).then(|| text.join("\n\n"))
-            })
-            .unwrap_or_else(|| "(the subagent returned no text)".to_string());
-        Ok(SubagentResult { session_id: child.id, output })
+        Ok(SubagentResult { session_id: child.id.clone(), output: eng.last_assistant_text(&child.id).unwrap_or_else(|| "(the subagent returned no text)".to_string()) })
+    }
+
+    /// Text of the latest assistant message that has any.
+    pub(crate) fn last_assistant_text(&self, sid: &str) -> Option<String> {
+        self.store().messages(sid).ok()?.iter().rev().filter(|m| m.kind == "assistant").find_map(|m| {
+            let text: Vec<&str> = m.data["parts"].as_array()?.iter().filter(|p| p["type"] == "text").filter_map(|p| p["text"].as_str()).collect();
+            (!text.is_empty()).then(|| text.join("\n\n"))
+        })
     }
 
     /// Capture the working tree before a step. Best effort: a failure disables snapshots for the session with one notice.
@@ -1109,6 +1125,30 @@ impl Host for EngineHost<'_> {
     fn subagent(&self, req: SubagentRequest) -> Result<SubagentResult, ToolError> {
         self.engine.run_subagent(self.session, req, self.ui, self.cancel)
     }
+
+    fn start_background_shell(&self, command: &str, workdir: &std::path::Path, timeout: Option<Duration>) -> Result<(String, PathBuf), ToolError> {
+        let eng = self.engine.shared()?;
+        eng.start_shell_job(self.session, command, workdir, timeout)
+    }
+
+    fn start_background_subagent(&self, req: SubagentRequest) -> Result<String, ToolError> {
+        let eng = self.engine.shared()?;
+        let child = eng.begin_subagent(self.session, &req)?;
+        eng.start_subagent_job(self.session, &child, &req.description);
+        Ok(child.id)
+    }
+
+    fn jobs(&self) -> Vec<tools::JobInfo> {
+        self.engine.background_jobs(Some(&self.session.id))
+    }
+
+    fn job_output(&self, id: &str, lines: usize) -> Result<String, ToolError> {
+        self.engine.job_output(id, lines).map_err(ToolError::fail)
+    }
+
+    fn kill_job(&self, id: &str) -> Result<String, ToolError> {
+        self.engine.kill_job(id).map_err(ToolError::fail)
+    }
 }
 
 /// Rule evaluation + user prompting for tool permission requests.
@@ -1256,7 +1296,7 @@ mod tests {
         tweak(&mut cfg);
         let store = Store::open_memory().unwrap();
         let session = store.create_session(dir.join("work").to_str().unwrap(), "build").unwrap();
-        let engine = Arc::new(Engine::new(store, Box::new(Shared(fake.clone())), cfg));
+        let engine = Engine::new(store, Box::new(Shared(fake.clone())), cfg).share();
         Fixture { engine, fake, dir, session, waits }
     }
     impl Fixture {
@@ -1297,7 +1337,7 @@ mod tests {
         assert!(f.engine.store().claim(&f.session.id).unwrap(), "claim released");
         let req = &f.fake.requests.lock().unwrap()[0];
         assert!(req.system.contains("moco") && req.system.contains("Working directory"));
-        assert_eq!(req.tools.len(), 11);
+        assert_eq!(req.tools.len(), 12);
     }
 
     #[test]
@@ -1668,7 +1708,7 @@ mod tests {
         assert!(reqs[0].tools.is_empty() && all_text(&reqs[0]).contains("OLD-USER") && all_text(&reqs[0]).contains("You MUST summarize"));
         assert!(!all_text(&reqs[0]).contains("next question"), "the tail is not summarized");
         // 2: the real step: checkpoint + tail only, same system prompt as always, tools back.
-        assert_eq!(reqs[1].tools.len(), 11);
+        assert_eq!(reqs[1].tools.len(), 12);
         let t = all_text(&reqs[1]);
         assert!(t.contains(compaction::SUMMARY_PREFIX) && t.contains("SUMMARY-BODY") && t.contains("next question"), "{t}");
         assert!(!t.contains("OLD-USER") && !t.contains("OLD-ASSISTANT"));
@@ -2439,5 +2479,170 @@ mod tests {
         assert!(!explore_req.tools.iter().any(|t| t.name.starts_with("fake_") || t.name == "mcp-resource"), "explore denies everything it does not list");
         mcp.shutdown();
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
+        let end = std::time::Instant::now() + Duration::from_secs(15);
+        while !f() {
+            assert!(std::time::Instant::now() < end, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A `sleep` duration that appears in no source text or invoking command line, so `pgrep -f` can find exactly our processes.
+    fn uniq(k: u32) -> u32 {
+        20_000 + std::process::id() % 9_000 + k * 10_000
+    }
+
+    fn alive(n: u32) -> bool {
+        std::process::Command::new("pgrep").args(["-f", &format!("sleep {n}")]).output().map(|o| o.status.success()).unwrap_or(false)
+    }
+
+    fn bg_shell(id: &str, command: &str) -> Scripted {
+        tool_call(id, "shell", json!({"command": command, "background": true}))
+    }
+
+    #[test]
+    fn a_background_command_reports_back_after_the_turn_that_started_it() {
+        let f = fixture(vec![bg_shell("t1", "sleep 0.3; echo done-bg; exit 3"), text("it is running"), text("noted the result")]);
+        f.say("start it");
+        let notes = Arc::new(Mutex::new(vec![]));
+        let n = notes.clone();
+        f.engine.set_notifier(Arc::new(move |l| n.lock().unwrap().push(l.to_string())));
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        let started = result_text(&f.fake.requests.lock().unwrap()[1]);
+        assert!(started.starts_with("Command moved to the background (shell ID: shl_") && started.contains("Output is streaming to: "), "{started}");
+        assert_eq!(f.engine.running_jobs(), 1);
+        wait_until("the command to finish", || f.engine.store().pending_inbox(&f.session.id).unwrap() > 0);
+        // The result is waiting for the next run; nobody had to prompt for it.
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        let reqs = f.fake.requests.lock().unwrap();
+        let t = all_text(&reqs[2]);
+        assert!(t.contains("Background command finished (shell ID: shl_") && t.contains("exited (code 3)") && t.contains("Command: sleep 0.3; echo done-bg; exit 3") && t.contains("done-bg"), "{t}");
+        assert_eq!(f.engine.background_jobs(None)[0].status, "exited (code 3)");
+        assert_eq!(notes.lock().unwrap().len(), 1);
+        assert!(notes.lock().unwrap()[0].contains("exited (code 3)"));
+    }
+
+    #[test]
+    fn a_command_that_finishes_during_a_turn_is_seen_at_the_next_step() {
+        let f = fixture(vec![bg_shell("t1", "sleep 0.2; echo from-bg"), tool_call("t2", "shell", json!({"command": "sleep 0.8"})), text("done")]);
+        f.say("go");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        let reqs = f.fake.requests.lock().unwrap();
+        assert_eq!(reqs.len(), 3);
+        let last = reqs[2].messages.last().unwrap();
+        assert!(matches!(&last.content[0], Block::ToolResult { .. }));
+        assert!(matches!(&last.content[1], Block::Text(t) if t.contains("Background command finished") && t.contains("from-bg")), "{:?}", last.content);
+        assert_eq!(f.engine.store().pending_inbox(&f.session.id).unwrap(), 0);
+    }
+
+    #[test]
+    fn jobs_can_be_listed_read_and_stopped_and_stopping_leaves_no_process() {
+        let n = uniq(0);
+        let f = fixture(vec![bg_shell("t1", &format!("echo started-marker; sleep {n}")), tool_call("t2", "jobs", json!({"action":"list"})), text("ok")]);
+        f.say("go");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        let list = result_text(&f.fake.requests.lock().unwrap()[2]);
+        assert!(list.contains("shell  running") && list.contains(&format!("echo started-marker; sleep {n}")), "{list}");
+        let id = f.engine.background_jobs(None)[0].id.clone();
+        wait_until("output", || f.engine.job_output(&id, 10).unwrap().contains("started-marker"));
+        assert!(f.engine.job_output(&id, 10).unwrap().starts_with(&format!("[{id}: running]")));
+        assert!(alive(n));
+        assert_eq!(f.engine.kill_job(&id).unwrap(), format!("Stopped {id}."));
+        assert_eq!(f.engine.background_jobs(None)[0].status, "stopped");
+        wait_until("the process to be gone", || !alive(n));
+        assert_eq!(f.engine.store().pending_inbox(&f.session.id).unwrap(), 0, "a job you stopped yourself is not announced");
+        assert!(f.engine.kill_job("shl_nope").is_err());
+        assert!(f.engine.kill_job(&id).unwrap().contains("is not running"));
+    }
+
+    #[test]
+    fn background_commands_can_have_a_timeout() {
+        let f = fixture(vec![tool_call("t1", "shell", json!({"command": "sleep 1235", "background": true, "timeout": 200})), text("ok"), text("saw it")]);
+        f.say("go");
+        f.run(&TestUi::default());
+        wait_until("the timeout", || f.engine.store().pending_inbox(&f.session.id).unwrap() > 0);
+        f.run(&TestUi::default());
+        let t = all_text(&f.fake.requests.lock().unwrap()[2]);
+        assert!(t.contains("timed out") && t.contains("[command timed out after 200 ms and was killed]"), "{t}");
+    }
+
+    #[test]
+    fn a_background_subagent_runs_unattended_and_reports_its_result() {
+        let cfg: config::Config = serde_json::from_value(json!({"permissions":[{"action":"shell","resource":"*","effect":"ask"}]})).unwrap();
+        let f = fixture_cfg(
+            vec![
+                tool_call("t1", "subagent", json!({"agent":"general","description":"background task","prompt":"BG-TASK-1 do the work","background":true})),
+                text("started it"),
+                text("the parent saw the report"),
+            ],
+            |c| c.agents = config::resolve_agents(&cfg),
+        );
+        f.fake.script_route("BG-TASK-1", vec![tool_call("c1", "shell", json!({"command":"echo hi"})), text("finished, but could not run the command")]);
+        f.say("delegate in the background");
+        let ui = TestUi::default();
+        assert_eq!(f.run(&ui), RunOutcome::Idle);
+        let started = result_text(&f.fake.requests.lock().unwrap()[1]);
+        assert!(started.starts_with("Subagent started in the background (sessionID: ses_"), "{started}");
+        wait_until("the subagent", || f.engine.store().pending_inbox(&f.session.id).unwrap() > 0);
+        assert!(ui.asked.lock().unwrap().is_empty(), "nobody was asked: the subagent had no one to ask");
+        // It was refused with a reason the model could act on.
+        let routed = f.fake.routed_requests.lock().unwrap().clone();
+        let refusal = result_text(&routed[1]);
+        assert!(refusal.contains("nobody is present to give it"), "{refusal}");
+        f.run(&TestUi::default());
+        let t = all_text(&f.fake.requests.lock().unwrap()[2]);
+        assert!(t.contains("Background subagent finished (sessionID: ses_") && t.contains("task: background task") && t.contains("finished, but could not run the command"), "{t}");
+        assert_eq!(f.engine.background_jobs(None)[0].status, "finished");
+    }
+
+    #[test]
+    fn shutdown_stops_running_jobs_of_both_kinds() {
+        let (n1, n2) = (uniq(1), uniq(2));
+        let f = fixture(vec![
+            bg_shell("t1", &format!("sleep {n1}")),
+            tool_call("t2", "subagent", json!({"agent":"general","description":"stuck task","prompt":"BG-TASK-2","background":true})),
+            text("both started"),
+        ]);
+        f.fake.script_route("BG-TASK-2", vec![tool_call("c1", "shell", json!({"command": format!("sleep {n2}")}))]);
+        f.say("go");
+        f.run(&TestUi::default());
+        wait_until("both to be running", || f.engine.running_jobs() == 2);
+        wait_until("both commands to exist", || alive(n1) && alive(n2));
+        assert_eq!(f.engine.kill_all_jobs(), 2);
+        assert_eq!(f.engine.running_jobs(), 0);
+        wait_until("processes gone", || !alive(n1) && !alive(n2));
+        let statuses: Vec<String> = f.engine.background_jobs(None).iter().map(|j| j.status.clone()).collect();
+        assert_eq!(statuses, ["stopped", "stopped"]);
+        assert_eq!(f.engine.store().pending_inbox(&f.session.id).unwrap(), 0);
+    }
+
+    #[test]
+    fn background_work_needs_a_shared_engine() {
+        let dir = std::env::temp_dir().join(crate::id::new_id("moco-eng-unshared"));
+        std::fs::create_dir_all(dir.join("work")).unwrap();
+        let fake = Arc::new(FakeProvider::new(vec![bg_shell("t1", "true"), text("ok")]));
+        let store = Store::open_memory().unwrap();
+        let ses = store.create_session(dir.join("work").to_str().unwrap(), "build").unwrap();
+        let engine = Engine::new(store, Box::new(Shared(fake.clone())), EngineConfig::new("m", dir.join("app"))); // no .share()
+        engine.submit(&ses.id, "go", Mode::Steer).unwrap();
+        engine.run(&ses.id, &TestUi::default(), &AtomicBool::new(false), false).unwrap();
+        assert!(result_text(&fake.requests.lock().unwrap()[1]).contains("background jobs are not available"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_users_own_shell_command_is_run_and_recorded() {
+        let f = fixture(vec![text("saw it")]);
+        f.file("a.txt", "x");
+        let out = f.engine.run_user_command(&f.session.id, "ls; echo oops >&2; exit 2", &AtomicBool::new(false)).unwrap();
+        assert!(out.contains("a.txt") && out.contains("oops") && out.contains("[exit code 2]"), "{out}");
+        f.say("what did I just run?");
+        f.run(&TestUi::default());
+        let t = all_text(&f.fake.requests.lock().unwrap()[0]);
+        assert!(t.contains("The user ran this command themselves:\n$ ls; echo oops >&2; exit 2") && t.contains("a.txt"), "{t}");
+        let (flag, _) = (AtomicBool::new(true), 0);
+        assert_eq!(f.engine.run_user_command(&f.session.id, "sleep 5", &flag).unwrap_err(), "interrupted");
     }
 }

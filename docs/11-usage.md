@@ -43,6 +43,9 @@ Check a Mojave build with `otool -l moco | grep minos` (must say 10.14). On Linu
 | `/rename <title>`, `/fork [N]`, `/archive [n\|id]`, `/unarchive <n\|id>` | Manage sessions; `/fork N` branches off before your Nth most recent prompt |
 | `/skills`, `/commands` | List the skills and custom slash commands that were found (MCP prompts included) |
 | `/mcp`, `/mcp reconnect <name>` | Show the MCP servers and their state, or restart one |
+| `/jobs`, `/jobs output <id>`, `/jobs kill <id>` | Background commands and subagents: list, read output so far, stop |
+| `!<command>` | Run a shell command yourself, right now; the assistant is told what you ran |
+| (empty line) | Let the assistant react to a background result that arrived while you were idle |
 | `/<name> [args]` | Run a custom command (built in: `/init`, `/review`) |
 | `/new`, `/help`, `/exit` | |
 
@@ -70,9 +73,13 @@ MCP servers add tools (and prompts and resources) from other programs. Declare t
 - **Servers declared in a project's own config file ask for your approval** before starting (a terminal is required; "always" is remembered for that project and that exact definition). Servers in your user config (`~/Library/Application Support/moco/config/`) start without asking.
 - `/mcp` shows what is running; a server that fails to start prints its reason and stderr at startup. Remote (HTTP) servers are not supported yet.
 
+## Background work
+
+The model can run a long command in the background (`shell` with `background: true`: a dev server, a long build or test run) or start a subagent in the background, and carry on with other things. It is told when the job ends, together with the result, so it does not poll. While a turn is running that happens at its next step; while the chat is idle you see a dim `[background ...]` line, and the assistant reacts with your next message or when you press Enter on an empty line. `moco -p` waits for background jobs after the turn and lets the assistant report. Background subagents cannot ask you for permission (anything that would ask is refused). Everything still running is stopped when moco exits.
+
 ## Tools the model has
 
-`read`, `write`, `edit`, `patch`, `glob`, `grep`, `shell`, `webfetch`, `todowrite`, `question`, `subagent` (agents `general` and `explore`), `skill` when skills exist, and `<server>_<tool>` for each tool of a configured MCP server. Paths outside the project ask for an `external_directory` permission first. Long output is cut to 2000 lines or 50 KiB and the full text is saved under `data/tool-output/`.
+`read`, `write`, `edit`, `patch`, `glob`, `grep`, `shell`, `jobs`, `webfetch`, `todowrite`, `question`, `subagent` (agents `general` and `explore`), `skill` when skills exist, and `<server>_<tool>` for each tool of a configured MCP server. Paths outside the project ask for an `external_directory` permission first. Long output is cut to 2000 lines or 50 KiB and the full text is saved under `data/tool-output/`.
 
 ## Configuration
 

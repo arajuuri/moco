@@ -3,6 +3,7 @@ pub mod edit;
 pub mod glob;
 pub mod grep;
 pub mod html;
+pub mod jobs;
 pub mod patch;
 pub mod question;
 pub mod read;
@@ -173,12 +174,35 @@ pub struct SubagentResult {
     pub output: String,
 }
 
+/// One background job (a shell command or a subagent) as shown by the `jobs` tool and `/jobs`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobInfo {
+    pub id: String,
+    /// `shell` or `subagent`
+    pub kind: String,
+    /// The command line or the task description.
+    pub title: String,
+    /// `running`, `exited (code N)`, `stopped`, `finished`, `failed: ...`
+    pub status: String,
+    pub running: bool,
+    pub seconds: u64,
+    pub output_path: Option<PathBuf>,
+}
+
 /// Engine services that some tools need. Implemented by the engine; tests use a stub.
 pub trait Host: Sync {
     fn set_todos(&self, todos: Vec<Todo>) -> Result<(), ToolError>;
     /// One answer list (chosen labels or free text) per question; `Declined` if the user dismissed the form.
     fn ask(&self, questions: &[Question]) -> Result<Vec<Vec<String>>, ToolError>;
     fn subagent(&self, req: SubagentRequest) -> Result<SubagentResult, ToolError>;
+    /// Start a command that keeps running after the tool call returns; returns its job id and output file.
+    fn start_background_shell(&self, command: &str, workdir: &Path, timeout: Option<std::time::Duration>) -> Result<(String, PathBuf), ToolError>;
+    /// Start a subagent without waiting for it; returns its session id.
+    fn start_background_subagent(&self, req: SubagentRequest) -> Result<String, ToolError>;
+    fn jobs(&self) -> Vec<JobInfo>;
+    /// Output of a job so far (its last `lines` lines) with its status.
+    fn job_output(&self, id: &str, lines: usize) -> Result<String, ToolError>;
+    fn kill_job(&self, id: &str) -> Result<String, ToolError>;
 }
 
 pub struct ToolCtx<'a> {
@@ -199,8 +223,10 @@ impl ToolCtx<'_> {
         normalize(&if p.is_absolute() { p.to_path_buf() } else { self.cwd.join(p) })
     }
 
+    /// Inside the working directory or project, or in the folder where long tool output is kept (so the model can
+    /// read what a truncated command printed without an `external_directory` prompt).
     pub fn is_internal(&self, p: &Path) -> bool {
-        p.starts_with(&self.cwd) || p.starts_with(&self.project_root)
+        p.starts_with(&self.cwd) || p.starts_with(&self.project_root) || p.starts_with(&self.spill_dir)
     }
 
     /// Relative to the working directory when internal, absolute otherwise.
@@ -272,6 +298,7 @@ pub fn all(subagents: Vec<(String, String)>, skills: Vec<crate::skills::Skill>) 
         Box::new(glob::Glob),
         Box::new(grep::Grep),
         Box::new(shell::Shell),
+        Box::new(jobs::Jobs),
         Box::new(webfetch::WebFetch),
         Box::new(todowrite::TodoWrite),
         Box::new(question::AskQuestion),
@@ -330,6 +357,8 @@ pub(crate) mod testutil {
         pub asked: Mutex<Vec<Vec<Question>>>,
         pub answers: Mutex<Option<Vec<Vec<String>>>>,
         pub subagents: Mutex<Vec<SubagentRequest>>,
+        pub shells: Mutex<Vec<(String, PathBuf, Option<std::time::Duration>)>>,
+        pub jobs: Mutex<Vec<JobInfo>>,
     }
     impl Host for TestHost {
         fn set_todos(&self, todos: Vec<Todo>) -> Result<(), ToolError> {
@@ -343,6 +372,23 @@ pub(crate) mod testutil {
         fn subagent(&self, req: SubagentRequest) -> Result<SubagentResult, ToolError> {
             self.subagents.lock().unwrap().push(req.clone());
             Ok(SubagentResult { session_id: "ses_child".into(), output: format!("done: {}", req.prompt) })
+        }
+        fn start_background_shell(&self, command: &str, workdir: &Path, timeout: Option<std::time::Duration>) -> Result<(String, PathBuf), ToolError> {
+            self.shells.lock().unwrap().push((command.to_string(), workdir.to_path_buf(), timeout));
+            Ok(("shl_test".into(), PathBuf::from("/tmp/shl_test.txt")))
+        }
+        fn start_background_subagent(&self, req: SubagentRequest) -> Result<String, ToolError> {
+            self.subagents.lock().unwrap().push(req);
+            Ok("ses_bg".into())
+        }
+        fn jobs(&self) -> Vec<JobInfo> {
+            self.jobs.lock().unwrap().clone()
+        }
+        fn job_output(&self, id: &str, lines: usize) -> Result<String, ToolError> {
+            Ok(format!("output of {id} ({lines} lines)"))
+        }
+        fn kill_job(&self, id: &str) -> Result<String, ToolError> {
+            Ok(format!("stopped {id}"))
         }
     }
 

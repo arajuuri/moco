@@ -1,27 +1,34 @@
 use super::*;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 pub struct Shell;
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 
-fn shell_program() -> String {
+/// Added to the tool description: how background commands are meant to be used.
+const BACKGROUND_INSTRUCTION: &str = "Set `background: true` for commands that keep running or take long and that you do not need to wait for \
+(dev servers, watchers, long builds or test runs). The call returns at once with a shell ID and the file the output streams to. \
+You are told automatically when the command exits, with its result: do not poll, sleep or re-run it to check on it. \
+The `jobs` tool shows the output so far or stops it. A background command has no timeout unless you pass one.";
+
+pub(crate) fn shell_program() -> String {
     std::env::var("MOCO_SHELL")
         .ok()
         .or_else(|| std::env::var("SHELL").ok().filter(|s| Path::new(s).exists()))
         .unwrap_or_else(|| "/bin/sh".into())
 }
 
-fn kill_group(pid: u32) {
+pub(crate) fn kill_group(pid: u32) {
     unsafe {
         libc::kill(-(pid as i32), libc::SIGKILL);
     }
 }
 
 /// Keep the last 2000 lines / 50 KiB (the end of command output matters most).
-fn tail(text: &str) -> Option<(String, usize, usize)> {
+pub(crate) fn tail(text: &str) -> Option<(String, usize, usize)> {
     let lines: Vec<&str> = text.split('\n').collect();
     if lines.len() <= crate::truncate::MAX_LINES && text.len() <= crate::truncate::MAX_BYTES {
         return None;
@@ -46,27 +53,118 @@ fn tail(text: &str) -> Option<(String, usize, usize)> {
     Some((kept, n, lines.len()))
 }
 
+/// Start `command` in its own process group, stdout and stderr combined into `out_path` (one file with a shared
+/// offset keeps them interleaved), no stdin.
+pub(crate) fn spawn(command: &str, workdir: &Path, out_path: &Path) -> Result<Child, ToolError> {
+    if let Some(dir) = out_path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| ToolError::fail(e.to_string()))?;
+    }
+    let file = std::fs::File::create(out_path).map_err(|e| ToolError::fail(e.to_string()))?;
+    let err_file = file.try_clone().map_err(|e| ToolError::fail(e.to_string()))?;
+    Command::new(shell_program())
+        .arg("-c")
+        .arg(command)
+        .current_dir(workdir)
+        .env("TERM", "dumb")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(file))
+        .stderr(Stdio::from(err_file))
+        .process_group(0)
+        .spawn()
+        .map_err(|e| ToolError::fail(format!("failed to start shell: {e}")))
+}
+
+/// How a command ended.
+pub(crate) struct Finished {
+    /// The output (its tail when long) followed by notices for a timeout, a signal or a non-zero exit.
+    pub text: String,
+    pub exit: Option<i32>,
+    pub signal: Option<i32>,
+    pub timed_out: bool,
+    /// `stop` fired and the process group was killed.
+    pub killed: bool,
+    pub truncated: bool,
+    pub out_path: PathBuf,
+}
+
+/// Wait for `child` (polling), killing its process group when `timeout` passes or `stop()` turns true.
+/// The output file is removed afterwards unless it was truncated or `keep_file` is set.
+pub(crate) fn wait(child: &mut Child, out_path: &Path, timeout: Option<Duration>, stop: &dyn Fn() -> bool, keep_file: bool) -> Finished {
+    let pid = child.id();
+    let start = Instant::now();
+    let (mut timed_out, mut killed) = (false, false);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) => {}
+            Err(_) => {
+                kill_group(pid);
+                break child.wait().unwrap_or_default();
+            }
+        }
+        if stop() {
+            killed = true;
+        } else if timeout.is_some_and(|t| start.elapsed() >= t) {
+            timed_out = true;
+        }
+        if killed || timed_out {
+            kill_group(pid);
+            break child.wait().unwrap_or_default();
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    };
+    // Reap stragglers left in the process group after the shell exits.
+    kill_group(pid);
+
+    let raw = std::fs::read(out_path).unwrap_or_default();
+    let full = String::from_utf8_lossy(&raw).into_owned();
+    let (mut text, truncated) = match tail(&full) {
+        Some((kept, n, total)) => (format!("[output truncated: showing last {n} of {total} lines; full output saved to {}]\n{kept}", out_path.display()), true),
+        None => (full, false),
+    };
+    if !truncated && !keep_file {
+        let _ = std::fs::remove_file(out_path);
+    }
+    if timed_out {
+        text.push_str(&format!("\n\n[command timed out after {} ms and was killed]", timeout.map_or(0, |t| t.as_millis())));
+    } else if let Some(sig) = status.signal() {
+        text.push_str(&format!("\n\n[terminated by signal {sig}]"));
+    } else if let Some(code) = status.code().filter(|c| *c != 0) {
+        text.push_str(&format!("\n\n[exit code {code}]"));
+    }
+    Finished { text, exit: status.code(), signal: status.signal(), timed_out, killed, truncated, out_path: out_path.to_path_buf() }
+}
+
+/// Run `command` to completion, no model involved. `timeout_ms` 0 means no timeout.
+pub(crate) fn run_foreground(command: &str, workdir: &Path, spill_dir: &Path, timeout_ms: u64, cancel: &AtomicBool) -> Result<Finished, ToolError> {
+    let out_path = spill_dir.join(format!("{}.txt", crate::id::new_id("shell")));
+    let mut child = spawn(command, workdir, &out_path)?;
+    let timeout = (timeout_ms > 0).then(|| Duration::from_millis(timeout_ms));
+    Ok(wait(&mut child, &out_path, timeout, &|| cancel.load(std::sync::atomic::Ordering::Relaxed), false))
+}
+
 impl Tool for Shell {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "shell"
     }
     fn description(&self) -> String {
-        "Run a shell command in the working directory (or `workdir`). stdout and stderr are combined. \
+        format!(
+            "Run a shell command in the working directory (or `workdir`). stdout and stderr are combined. \
 Default timeout is 120000 ms (0 disables). Long output is truncated to its last 2000 lines / 50 KiB; the full output is saved to a file. \
-Do not use interactive commands.".into()
+Do not use interactive commands.\n\n{BACKGROUND_INSTRUCTION}"
+        )
     }
     fn schema(&self) -> Value {
         json!({"type":"object","properties":{
             "command":{"type":"string"},"workdir":{"type":"string","description":"Directory to run in"},
-            "timeout":{"type":"integer","minimum":0,"description":"Timeout in milliseconds"}},"required":["command"]})
+            "timeout":{"type":"integer","minimum":0,"description":"Timeout in milliseconds"},
+            "background":{"type":"boolean","description":"Run in the background and return at once; you are told when it exits"}},"required":["command"]})
     }
     fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let command = str_arg(input, "command")?;
-        if opt_bool(input, "background").unwrap_or(false) {
-            return Err(ToolError::fail("background shell commands are not supported yet"));
-        }
+        let background = opt_bool(input, "background").unwrap_or(false);
         let workdir = opt_str(input, "workdir").map(|p| ctx.resolve(p)).unwrap_or_else(|| ctx.cwd.clone());
-        let timeout_ms = opt_u64(input, "timeout").unwrap_or(DEFAULT_TIMEOUT_MS);
+        let timeout_ms = opt_u64(input, "timeout");
 
         // Permission: external directories first (workdir and cd targets), then the commands.
         ctx.check_external(&workdir)?;
@@ -87,72 +185,22 @@ Do not use interactive commands.".into()
         save.dedup();
         ctx.permitter.check(&PermReq { action: "shell".into(), resources, save, force_ask: parsed.opaque })?;
 
-        // Combined stdout+stderr go to one file (shared offset keeps them interleaved).
-        std::fs::create_dir_all(&ctx.spill_dir).map_err(|e| ToolError::fail(e.to_string()))?;
-        let out_path = ctx.spill_dir.join(format!("{}.txt", crate::id::new_id("shell")));
-        let file = std::fs::File::create(&out_path).map_err(|e| ToolError::fail(e.to_string()))?;
-        let err_file = file.try_clone().map_err(|e| ToolError::fail(e.to_string()))?;
-        let mut child = Command::new(shell_program())
-            .arg("-c")
-            .arg(command)
-            .current_dir(&workdir)
-            .env("TERM", "dumb")
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(file))
-            .stderr(Stdio::from(err_file))
-            .process_group(0)
-            .spawn()
-            .map_err(|e| ToolError::fail(format!("failed to start shell: {e}")))?;
-        let pid = child.id();
-
-        let start = Instant::now();
-        let (mut timed_out, mut interrupted) = (false, false);
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(s)) => break s,
-                Ok(None) => {}
-                Err(e) => return Err(ToolError::fail(e.to_string())),
-            }
-            if ctx.cancelled() {
-                interrupted = true;
-            } else if timeout_ms > 0 && start.elapsed() >= Duration::from_millis(timeout_ms) {
-                timed_out = true;
-            }
-            if interrupted || timed_out {
-                kill_group(pid);
-                break child.wait().map_err(|e| ToolError::fail(e.to_string()))?;
-            }
-            std::thread::sleep(Duration::from_millis(15));
-        };
-        // Reap stragglers left in the process group after the shell exits.
-        kill_group(pid);
-
-        let raw = std::fs::read(&out_path).unwrap_or_default();
-        let full = String::from_utf8_lossy(&raw).into_owned();
-        let (mut text, truncated) = match tail(&full) {
-            Some((kept, n, total)) => (
-                format!("[output truncated: showing last {n} of {total} lines; full output saved to {}]\n{kept}", out_path.display()),
-                true,
-            ),
-            None => (full, false),
-        };
-        if !truncated {
-            let _ = std::fs::remove_file(&out_path);
+        if background {
+            let (id, path) = ctx.host.start_background_shell(command, &workdir, timeout_ms.filter(|t| *t > 0).map(Duration::from_millis))?;
+            return Ok(ToolOutput {
+                text: format!("Command moved to the background (shell ID: {id}).\nOutput is streaming to: {}", path.display()),
+                metadata: json!({"shellID": id, "outputPath": path.to_string_lossy(), "status": "running"}),
+            });
         }
-        if interrupted {
+
+        let f = run_foreground(command, &workdir, &ctx.spill_dir, timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS), ctx.cancel)?;
+        if f.killed {
             return Err(ToolError::Interrupted);
         }
-        if timed_out {
-            text.push_str(&format!("\n\n[command timed out after {timeout_ms} ms and was killed]"));
-        } else if let Some(sig) = status.signal() {
-            text.push_str(&format!("\n\n[terminated by signal {sig}]"));
-        } else if let Some(code) = status.code().filter(|c| *c != 0) {
-            text.push_str(&format!("\n\n[exit code {code}]"));
-        }
         Ok(ToolOutput {
-            text,
-            metadata: json!({"exit": status.code(), "signal": status.signal(), "timeout": timed_out, "truncated": truncated,
-                             "outputPath": truncated.then(|| out_path.to_string_lossy().into_owned())}),
+            text: f.text,
+            metadata: json!({"exit": f.exit, "signal": f.signal, "timeout": f.timed_out, "truncated": f.truncated,
+                             "outputPath": f.truncated.then(|| f.out_path.to_string_lossy().into_owned())}),
         })
     }
 }
@@ -250,8 +298,23 @@ mod tests {
     }
 
     #[test]
-    fn background_is_rejected_for_now() {
+    fn background_goes_through_the_host() {
         let env = Env::new();
-        assert!(run(&env, json!({"command":"true","background":true})).is_err());
+        let o = run(&env, json!({"command":"sleep 5","background":true,"timeout":1500})).unwrap();
+        assert_eq!(o.text, "Command moved to the background (shell ID: shl_test).\nOutput is streaming to: /tmp/shl_test.txt");
+        assert_eq!(o.metadata["status"], "running");
+        let started = env.host.shells.lock().unwrap().clone();
+        assert_eq!((started[0].0.as_str(), started[0].2), ("sleep 5", Some(Duration::from_millis(1500))));
+        // Permission is still checked before anything starts.
+        assert_eq!(env.perm.asked()[0].action, "shell");
+        *env.perm.reply.lock().unwrap() = Err(ToolError::Declined);
+        assert_eq!(run(&env, json!({"command":"sleep 5","background":true})).unwrap_err(), ToolError::Declined);
+        assert_eq!(env.host.shells.lock().unwrap().len(), 1, "a declined command is never started");
+    }
+
+    #[test]
+    fn the_description_tells_the_model_not_to_poll() {
+        let d = Shell.description();
+        assert!(d.contains("background: true") && d.contains("do not poll") && d.contains("`jobs` tool"));
     }
 }

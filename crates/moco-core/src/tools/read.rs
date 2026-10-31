@@ -235,6 +235,19 @@ mod tests {
     }
 
     #[test]
+    fn saved_tool_output_is_readable_without_an_external_directory_prompt() {
+        let env = Env::new();
+        let spill = env.dir.join("spill");
+        std::fs::create_dir_all(&spill).unwrap();
+        let file = spill.join("shl_1.txt");
+        std::fs::write(&file, "long output\n").unwrap();
+        let o = run(&env, json!({"path": file.to_string_lossy()})).unwrap();
+        assert_eq!(o.text, "1: long output");
+        let actions: Vec<String> = env.perm.asked().into_iter().map(|r| r.action).collect();
+        assert_eq!(actions, ["read"], "the folder where tool output is kept counts as inside the project");
+    }
+
+    #[test]
     fn denied_permission_propagates() {
         let env = Env::new();
         env.file("a.txt", b"x");

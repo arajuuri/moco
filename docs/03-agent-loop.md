@@ -149,3 +149,11 @@ Code: `snapshot.rs` (the store) and `engine.rs` (`take_snapshot`, `undo`, `redo`
 - **Pruning**: at startup, manifests older than 30 days that no session active within 30 days references (and a pending `redo`) are deleted, then orphaned blobs.
 - **Limits**: only the session's directory is covered; files edited elsewhere (after an `external_directory` approval) and side effects such as installed packages or network calls are not undone. Undo restores the whole tree to the snapshot, so a file you created yourself after that point is removed too until you `/redo` (it stays recoverable from the snapshot store until pruned). Undo is per turn, not per file or per message. Not implemented: per-turn diff views, selecting which files to revert.
 
+## moco implementation notes (Phase 3, waking on background completion)
+
+The spec has a finished background job insert a synthetic message and *resume the session*. moco queues the message as a steer and resumes the session only where that cannot interfere with you:
+- while a turn is running, the message is delivered at its next step boundary, so the model reacts mid-turn;
+- while the chat is idle at its prompt, a dim notice line is printed and the message waits; it is delivered with your next message, or immediately if you press Enter on an empty line;
+- with `moco -p`, moco waits for running jobs after the turn, runs the session again so the assistant can report, and stops any jobs left when it exits.
+Running the session on its own while you are typing a line (the full-screen UIs can do this cleanly) would interleave its output with your input and could steal your answers to permission prompts, so it is deliberately not done in the line-based chat.
+

@@ -270,10 +270,10 @@ mod tests {
     fn plan_hides_write_tools_but_build_does_not() {
         let tools = crate::tools::all(vec![], vec![]);
         let names = |a: &Agent| tools.iter().filter(|t| advertised(a, t.as_ref())).map(|t| t.name()).collect::<Vec<_>>();
-        let all = ["read", "write", "edit", "patch", "glob", "grep", "shell", "webfetch", "todowrite", "question", "subagent"];
+        let all = ["read", "write", "edit", "patch", "glob", "grep", "shell", "jobs", "webfetch", "todowrite", "question", "subagent"];
         assert_eq!(names(&find(&builtin(), "build").unwrap()), all);
-        assert_eq!(names(&find(&builtin(), "plan").unwrap()), ["read", "glob", "grep", "shell", "webfetch", "todowrite", "question", "subagent"]);
-        assert_eq!(names(&find(&builtin(), "general").unwrap()), ["read", "write", "edit", "patch", "glob", "grep", "shell", "webfetch", "todowrite"], "no question, no subagent");
+        assert_eq!(names(&find(&builtin(), "plan").unwrap()), ["read", "glob", "grep", "shell", "jobs", "webfetch", "todowrite", "question", "subagent"]);
+        assert_eq!(names(&find(&builtin(), "general").unwrap()), ["read", "write", "edit", "patch", "glob", "grep", "shell", "jobs", "webfetch", "todowrite"], "no question, no subagent");
         assert_eq!(names(&find(&builtin(), "explore").unwrap()), ["read", "glob", "grep", "shell", "webfetch"], "read-only");
     }
 

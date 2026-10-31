@@ -14,6 +14,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 static CANCEL: AtomicBool = AtomicBool::new(false);
+/// True while the chat is waiting for you to type (so a background notice can redraw the prompt).
+static AT_PROMPT: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_sigint(_: libc::c_int) {
     CANCEL.store(true, Ordering::Relaxed);
@@ -628,7 +630,16 @@ fn main() {
     }
     engine_cfg.mcp = manager.clone();
     let n_sources = loaded.sources.len();
-    let engine = Engine::with_providers(store, providers, engine_cfg);
+    let engine = Engine::with_providers(store, providers, engine_cfg).share();
+    engine.set_notifier(std::sync::Arc::new(|line| {
+        if AT_PROMPT.load(Ordering::Relaxed) {
+            // Redraw the prompt line underneath the notice.
+            print!("\r\x1b[2K{DIM}[{line}]{RESET}\n> ");
+        } else {
+            println!("\n{DIM}[{line}]{RESET}");
+        }
+        let _ = std::io::stdout().flush();
+    }));
     // Drop snapshot data that no session active in the last 30 days refers to.
     let projects = engine.store.lock().unwrap().project_ids().unwrap_or_default();
     engine.prune_snapshots(&projects, std::time::Duration::from_secs(30 * 24 * 3600));
@@ -682,7 +693,19 @@ fn main() {
         if !send(&session.id, &text) {
             die("could not queue the prompt");
         }
-        let ok = matches!(run(&session.id, false), Some(RunOutcome::Idle));
+        let mut ok = matches!(run(&session.id, false), Some(RunOutcome::Idle));
+        // Background jobs started during the run: wait for them and let the assistant report what they produced.
+        while ok && !CANCEL.load(Ordering::Relaxed) {
+            if engine.running_jobs() > 0 {
+                eprintln!("{DIM}waiting for {} background job(s)... (Ctrl-C stops them){RESET}", engine.running_jobs());
+                engine.wait_for_jobs(&CANCEL, std::time::Duration::from_secs(6 * 3600));
+            }
+            if CANCEL.load(Ordering::Relaxed) || engine.store.lock().unwrap().pending_inbox(&session.id).unwrap_or(0) == 0 {
+                break;
+            }
+            ok = matches!(run(&session.id, false), Some(RunOutcome::Idle));
+        }
+        engine.kill_all_jobs();
         if let Some(m) = &manager {
             m.shutdown(); // process::exit skips destructors, and the servers must not be left running
         }
@@ -696,11 +719,21 @@ fn main() {
         println!("{DIM}session {}: {}{RESET}", short(&session.id), title_of(&session.id).unwrap_or_else(|| "(untitled)".into()));
     }
     let mut last_list: Vec<SessionSummary> = vec![];
-    while let Some(line) = term.read_line("> ") {
+    loop {
+        AT_PROMPT.store(true, Ordering::Relaxed);
+        let line = term.read_line("> ");
+        AT_PROMPT.store(false, Ordering::Relaxed);
+        let Some(line) = line else { break };
         CANCEL.store(false, Ordering::Relaxed);
         let line = line.trim();
         match line {
-            "" => continue,
+            "" => {
+                // Enter on an empty line lets the assistant react to background results that arrived while you were idle.
+                if engine.store.lock().unwrap().pending_inbox(&session.id).unwrap_or(0) > 0 {
+                    run(&session.id, false);
+                }
+                continue;
+            }
             "/exit" | "/quit" => break,
             "/skills" => {
                 if found_skills.is_empty() {
@@ -708,6 +741,41 @@ fn main() {
                 }
                 for k in &found_skills {
                     println!("{DIM}  {:<20} {}{RESET}", k.id, clip(&k.description, 90));
+                }
+            }
+            l if l.starts_with('!') => {
+                let command = l[1..].trim();
+                if command.is_empty() {
+                    println!("usage: !<shell command>   runs it now in {}; the assistant is told what you ran", tilde(&cwd_str));
+                    continue;
+                }
+                CANCEL.store(false, Ordering::Relaxed);
+                match engine.run_user_command(&session.id, command, &CANCEL) {
+                    Ok(out) => println!("{}", out.trim_end()),
+                    Err(e) => eprintln!("{RED}{e}{RESET}"),
+                }
+            }
+            l if l == "/jobs" || l.starts_with("/jobs ") => {
+                let arg = l.trim_start_matches("/jobs").trim();
+                if let Some(id) = arg.strip_prefix("output") {
+                    match engine.job_output(id.trim(), 40) {
+                        Ok(t) => println!("{t}"),
+                        Err(e) => println!("{e}"),
+                    }
+                } else if let Some(id) = arg.strip_prefix("kill") {
+                    match engine.kill_job(id.trim()) {
+                        Ok(t) => println!("{DIM}{t}{RESET}"),
+                        Err(e) => println!("{e}"),
+                    }
+                } else {
+                    let jobs = engine.background_jobs(None);
+                    if jobs.is_empty() {
+                        println!("{DIM}no background jobs{RESET}");
+                    }
+                    for j in jobs {
+                        println!("{DIM}  {}  {:<8} {:<18} {:>5}s  {}{RESET}", j.id, j.kind, j.status, j.seconds, clip(j.title.lines().next().unwrap_or(""), 60));
+                    }
+                    println!("{DIM}  /jobs output <id>, /jobs kill <id>{RESET}");
                 }
             }
             l if l == "/mcp" || l.starts_with("/mcp ") => {
@@ -740,7 +808,7 @@ fn main() {
                 }
             }
             "/help" => println!(
-                "/model [FILTER|PROVIDER/MODEL]  show, search or switch the model\n/agent <id>                     switch agent\n/compact                        summarize older messages to free up context\n/sessions [all|archived]       list sessions (/resume <n|id> to continue one)\n/rename <title>                 name this session\n/fork [N]                       copy this conversation into a new session\n/archive [n|id]                 hide a session from the list (/unarchive to restore)\n/undo, /redo                    undo the last turn's file changes and messages, or bring them back\n/diff                           changes in the working tree since this session started\n/new                            start a new session\n/skills, /commands, /mcp       list skills, custom slash commands (also MCP prompts) and MCP servers (@name mentions a skill, agent or file)\n/exit                           quit (Ctrl-C interrupts a running turn)"
+                "/model [FILTER|PROVIDER/MODEL]  show, search or switch the model\n/agent <id>                     switch agent\n/compact                        summarize older messages to free up context\n/sessions [all|archived]       list sessions (/resume <n|id> to continue one)\n/rename <title>                 name this session\n/fork [N]                       copy this conversation into a new session\n/archive [n|id]                 hide a session from the list (/unarchive to restore)\n/undo, /redo                    undo the last turn's file changes and messages, or bring them back\n/diff                           changes in the working tree since this session started\n/new                            start a new session\n/jobs                           background commands and subagents (output <id>, kill <id>)\n!<command>                      run a shell command yourself; the assistant is told\n/skills, /commands, /mcp       list skills, custom slash commands (also MCP prompts) and MCP servers (@name mentions a skill, agent or file)\n/exit                           quit (Ctrl-C interrupts a running turn)"
             ),
             l if l == "/sessions" || l.starts_with("/sessions ") => {
                 let which = l.trim_start_matches("/sessions").trim();
@@ -979,6 +1047,10 @@ fn main() {
                 }
             }
         }
+    }
+    let stopped = engine.kill_all_jobs();
+    if stopped > 0 {
+        println!("{DIM}stopped {stopped} background job(s){RESET}");
     }
     if let Some(m) = &manager {
         m.shutdown();
