@@ -68,6 +68,10 @@ If one misbehaves, `/model` back to another provider and report the error text.
 - **Mentions**: `@src/main.rs` attaches that file, `@docs/` a directory listing, `@release` a skill, `@explore` asks the model to delegate to that subagent. What was attached is shown as a dim note.
 - **Images and PDFs**: `@screenshot.png` or `@spec.pdf` (or dragging the file into the terminal, which pastes its path) sends the file to the model; the model can also open them itself with `read`. Images up to 5 MiB and 8000 px per side, PDFs up to 10 MiB, and only for models that accept them (`moco models` shows the catalog; a text-only model gets a note instead).
 
+## Full-screen UI (preview)
+
+`moco --tui` runs the chat full screen (it needs a terminal; works over SSH). Enter sends, Esc or Ctrl-C interrupts a running turn (Ctrl-C on an empty prompt, or Ctrl-D, quits), PageUp/PageDown scroll, Ctrl-End jumps back to the newest output. A permission request replaces the prompt box: `y` once, `a` always, `n` reject, `f` reject with feedback. Slash commands other than `/help` and `/exit`, question forms and sending while a turn runs are not available yet; use the plain chat for those.
+
 ## MCP servers
 
 MCP servers add tools (and prompts and resources) from other programs. Declare them in the config:

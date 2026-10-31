@@ -1,4 +1,5 @@
-//! moco: line-based terminal chat.
+//! moco: terminal chat (line based, or full screen with --tui).
+mod tui;
 use moco_core::catalog::{Catalog, ProviderInfo};
 use moco_core::mcp::{self, oauth::LoginIo, trust, Manager, ServerSpec};
 use moco_core::tools::SubagentRequest;
@@ -539,6 +540,7 @@ fn main() {
     }
 
     let (mut cont, mut prompt, mut dir, mut session_arg) = (false, None, None, None::<String>);
+    let mut want_tui = false;
     let mut model = std::env::var("MOCO_MODEL").ok();
     let mut agent_id: Option<String> = None;
     let mut args = raw.drain(..);
@@ -551,9 +553,11 @@ fn main() {
             "--dir" => dir = Some(value("--dir")),
             "--session" | "-s" => session_arg = Some(value("--session")),
             "--prompt" | "-p" => prompt = Some(value("--prompt")),
+            "--tui" => want_tui = true,
+            "--plain" => want_tui = false,
             "--help" | "-h" => {
                 println!(
-                    "usage: moco [--continue | --session ID] [--model PROVIDER/MODEL] [--agent ID] [--dir PATH] [-p PROMPT]\n       moco sessions [--all] [--archived] | rename ID TITLE | archive ID | unarchive ID\n       moco models [FILTER] [--refresh]\n       moco auth PROVIDER"
+                    "usage: moco [--continue | --session ID] [--model PROVIDER/MODEL] [--agent ID] [--dir PATH] [-p PROMPT] [--tui]\n       moco sessions [--all] [--archived] | rename ID TITLE | archive ID | unarchive ID\n       moco models [FILTER] [--refresh]\n       moco auth PROVIDER"
                 );
                 return;
             }
@@ -701,6 +705,33 @@ fn main() {
         }
         engine.submit_with(sid, text, Some(m), Mode::Steer).is_ok()
     };
+
+    if want_tui && prompt.is_none() {
+        if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+            die("--tui needs a terminal on stdin and stdout");
+        }
+        let sid = session.id.clone();
+        let submit = |text: &str| -> Result<Vec<String>, String> {
+            let subagents = engine.subagent_names();
+            let caps = caps_of(&sid);
+            let (m, notes) = mentions::expand(text, &mentions::Ctx { cwd: &cwd, skills: &found_skills, subagents: &subagents, app_dir: &app_dir, caps, mcp: manager.as_deref() });
+            engine.submit_with(&sid, text, Some(m), Mode::Steer).map_err(|e| format!("could not queue the prompt: {e}"))?;
+            Ok(notes)
+        };
+        let title = engine.store.lock().unwrap().session(&sid).ok().flatten();
+        let model_now = title.as_ref().map(|s| engine.model_ref_for(s)).unwrap_or_default();
+        let header = format!("moco {} | {} | agent {agent_id} | {n_sources} config file(s) | /help for commands", env!("CARGO_PKG_VERSION"), model_now);
+        let host = tui::Host { engine: &engine, session_id: sid.clone(), model: model_now, agent: agent_id.clone(), title: title.and_then(|s| s.title), header, recovered: recovered.contains(&sid), submit: &submit };
+        let result = tui::run(host);
+        engine.kill_all_jobs();
+        if let Some(m) = &manager {
+            m.shutdown();
+        }
+        if let Err(e) = result {
+            die(&format!("terminal error: {e}"));
+        }
+        return;
+    }
 
     if recovered.contains(&session.id) {
         println!("{DIM}resuming interrupted run{RESET}");

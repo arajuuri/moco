@@ -1,8 +1,12 @@
 # Full-screen TUI: plan
 
-Status: planned. The feasibility check (`spike-tui/`) is done; nothing of the TUI itself is built yet. Screen concepts come from `09-ui.md`; this file decides how moco builds them.
+Status: slice 1 done (see Progress), the rest planned. Screen concepts come from `09-ui.md`; this file decides how moco builds them.
 
-## Where we stopped
+## Progress
+
+- **Slice 1 (skeleton): done.** `moco --tui` (opt-in until the slash commands exist in the TUI; then it becomes the default with `--plain` as the escape). Code: `crates/moco/src/tui/{mod,app,term}.rs`. Transcript (user, streamed assistant text, tool rows with failures, todos, subagent tool rows indented, usage line per run), single-line composer with cursor editing and paste, permission dialog (y / a / n / f for feedback, queued), Esc or Ctrl-C interrupt, PageUp/PageDown/Ctrl-Home/Ctrl-End scrolling, status bar (model, agent, title, session cost, context %, spinner), terminal restore on exit, panic (main thread), SIGTERM and SIGHUP. Not in the TUI yet: slash commands (only `/help`, `/exit`), the `question` form (dismissed with a notice), sending while a run is active, mouse. Tests: 8 model/render tests with `TestBackend`, 2 pty tests (`tests/tui.rs` + `tests/tui_pty.py`: dialog, streaming, resize, Ctrl-D, and SIGTERM while a dialog is open; the second fails if the worker is not released), on Linux and Mojave. Live on Mojave with the real model: a prompt that creates a file ran and exited cleanly. Release binary 10.8 MB, `minos 10.14`.
+
+## Where we stopped (before slice 1)
 
 - Phase 3 is committed through slice G (MCP over Streamable HTTP with OAuth, `553deef`); the plan and spike are `14ef6ee`. Working tree clean. 300 unit + 2 protocol tests pass on Linux and on the Mojave machine.
 - Next step: slice 1 (skeleton) below. Not started; the user had not yet said "go".
