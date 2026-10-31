@@ -293,6 +293,7 @@ name = "moco-spike"
 version = "0.0.0"
 dependencies = [
  "rusqlite",
+ "security-framework",
  "ureq",
 ]
 
