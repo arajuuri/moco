@@ -139,3 +139,9 @@ Code: `mcp/http.rs` (transport), `mcp/oauth.rs` (sign-in and token store), `mcp/
 ## moco implementation notes (websearch config)
 
 `websearch`: `false` (tool off), or `{provider?, url?, max_results?, key_env?[]}`. `provider` is `duckduckgo` (default), `brave`, `tavily`, `exa` or `searxng`; `url` replaces the provider's endpoint (required for `searxng`); `key_env` lists extra environment variables to read the key from. Upstream asks on first use which provider to use; moco uses the config instead and asks for permission on use. See `04`.
+
+## moco implementation notes (reasoning effort config)
+
+- Top-level `effort`: default level for every session (`low`, `medium`, `high`, `xhigh`, `max`, `none`, ...); `agents.<id>.effort` overrides it per agent; the session's own choice (`/effort`) overrides both. See `07`.
+- `providers.<id>.request` and `providers.<id>.models.<model>.request`: `{ "headers": {...}, "body": {...} }` added to every request (body objects are merged deeply, `null` deletes a field; the provider's first, then the model's).
+- `providers.<id>.models.<model>.variants.<name>`: a level you define, `{ "headers": {...}, "body": {...} }`, listed after the built-in ones in `/effort`.

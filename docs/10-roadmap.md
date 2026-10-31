@@ -55,7 +55,7 @@ Status: complete. 197 unit tests pass on Linux and on the Mojave machine; the re
 - **Snapshots**: per-step working-tree snapshots, `/undo`, `/redo`, `/diff`; an undo survives a restart.
 - **Sessions**: generated titles, list, resume by id piece, rename, fork, archive.
 - **Deviations worth knowing** (all documented where they arise): moco's own snapshot store instead of a private git dir; summarization, title and update prompts are my wording of the spec's contracts; the Plan reminder lives in the system prompt; steps run synchronously with a snapshot taken just before the request; subagents run in the foreground only; config files are `moco.json[c]`, not `opencode.json`.
-- **Not done** (carried to later phases or dropped): skills, custom commands and `@` mentions, MCP, `websearch`, background shell and background subagents, OpenAI Responses and Gemini protocols, reasoning variants and per-model request overlays, the `summary` agent, a graphical or full-screen UI (the terminal chat is line based), notifications.
+- **Not done** (carried to later phases or dropped): skills, custom commands and `@` mentions, MCP, `websearch`, background shell and background subagents, OpenAI Responses and Gemini protocols, the `summary` agent (reasoning variants and request overlays came later: see `07`), a graphical or full-screen UI (the terminal chat is line based), notifications.
 
 ## Phase 3: extensibility
 - Skills, custom commands, `@` mentions [done, see `08` implementation notes] and attachments (images/PDF) [done, see `04` implementation notes].

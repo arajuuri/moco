@@ -210,9 +210,13 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
             app.model = engine.model_ref_for(&s);
             app.agent = s.agent.clone();
             app.title = s.title.clone();
+            let info = engine.effort_info(&s);
+            app.effort = info.desired;
+            app.effort_levels = info.levels;
         }
     };
     load_rows(&mut app, &sid);
+    refresh_status(&mut app, &sid);
     app.rows.insert(0, app::Row::Banner { title: format!("moco {}", env!("CARGO_PKG_VERSION")), model: host.model.clone(), agent: host.agent.clone(), cwd: crate::tilde(&host.cwd) });
 
     std::thread::scope(|scope| -> std::io::Result<()> {
@@ -384,12 +388,22 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
                             },
                             _ => {}
                         },
+                        Action::SetEffort(level) => {
+                            engine.store.lock().unwrap().set_variant(&sid, level.as_deref()).ok();
+                            refresh_status(&mut app, &sid);
+                            app.push_info(format!("reasoning effort: {}", level.as_deref().unwrap_or("default")));
+                        }
                         Action::Palette => app.open_picker(app::Picker::new(app::PickKind::Command, "commands", builtin::palette_items(&host), "")),
                         Action::Picked { kind, value } => match kind {
                             app::PickKind::Model => {
                                 engine.store.lock().unwrap().set_model(&sid, Some(&value)).ok();
                                 refresh_status(&mut app, &sid);
                                 app.push_info(format!("model: {value}"));
+                            }
+                            app::PickKind::Effort => {
+                                engine.store.lock().unwrap().set_variant(&sid, (value != "default").then_some(value.as_str())).ok();
+                                refresh_status(&mut app, &sid);
+                                app.push_info(format!("reasoning effort: {value}"));
                             }
                             app::PickKind::Agent => {
                                 engine.store.lock().unwrap().set_agent(&sid, &value).ok();

@@ -83,6 +83,7 @@ pub fn build_body(req: &Request, max_completion_tokens: bool) -> Value {
             body["tool_choice"] = json!("none");
         }
     }
+    super::effort::shape_openai_chat(&mut body, req);
     body
 }
 
@@ -230,7 +231,7 @@ impl Provider for OpenAiChat {
         if let Some(k) = &self.api_key {
             call = call.set("authorization", &format!("Bearer {k}"));
         }
-        for (k, v) in &self.headers {
+        for (k, v) in self.headers.iter().chain(req.overlay.headers.iter().map(|(k, v)| (k, v))) {
             call = call.set(k, v);
         }
         let body = build_body(req, self.base_url.contains("api.openai.com"));
@@ -389,6 +390,7 @@ mod tests {
             tools: vec![ToolDef { name: "read".into(), description: "d".into(), schema: json!({"type":"object"}) }],
             max_tokens: 100,
             tools_disabled: false,
+            ..Default::default()
         }
     }
 
@@ -412,6 +414,7 @@ mod tests {
             tools: vec![],
             max_tokens: 5,
             tools_disabled: false,
+            ..Default::default()
         };
         let b = build_body(&req, false);
         let m = b["messages"].as_array().unwrap();

@@ -98,6 +98,7 @@ pub fn build_body(req: &Request) -> Value {
             body["tool_choice"] = json!("none");
         }
     }
+    super::effort::shape_openai_responses(&mut body, req);
     body
 }
 
@@ -201,7 +202,7 @@ impl Provider for OpenAiResponses {
         if let Some(k) = &self.api_key {
             call = call.set("authorization", &format!("Bearer {k}"));
         }
-        for (k, v) in &self.headers {
+        for (k, v) in self.headers.iter().chain(req.overlay.headers.iter().map(|(k, v)| (k, v))) {
             call = call.set(k, v);
         }
         let resp = match call.send_string(&build_body(req).to_string()) {
@@ -320,6 +321,7 @@ mod tests {
             tools: vec![ToolDef { name: "read".into(), description: "d".into(), schema: json!({"type":"object"}) }],
             max_tokens: 100,
             tools_disabled: false,
+            ..Default::default()
         }
     }
 

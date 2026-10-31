@@ -49,6 +49,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     ),
     (3, "alter table session add column revert text;"),
     (4, "alter table session add column fork_session_id text; alter table session add column fork_boundary text;"),
+    (5, "alter table session add column variant text;"),
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -60,6 +61,8 @@ pub struct Session {
     pub title: Option<String>,
     /// `provider/model` chosen for this session, if any.
     pub model: Option<String>,
+    /// Reasoning effort chosen for this session (`high`, `none`, ...), if any.
+    pub variant: Option<String>,
     /// Set for subagent sessions.
     pub parent_id: Option<String>,
 }
@@ -171,7 +174,7 @@ impl Store {
             "insert into session(id, project_id, directory, agent, time_created, time_updated) values (?1,?2,?3,?4,?5,?5)",
             params![id, project_id, directory, agent, t],
         )?;
-        Ok(Session { id, project_id, directory: directory.into(), agent: agent.into(), title: None, model: None, parent_id: None })
+        Ok(Session { id, project_id, directory: directory.into(), agent: agent.into(), title: None, model: None, variant: None, parent_id: None })
     }
 
     /// A subagent session: same project and directory as its parent, hidden from `latest_session`.
@@ -182,7 +185,7 @@ impl Store {
             "insert into session(id, project_id, parent_id, directory, agent, time_created, time_updated) values (?1,?2,?3,?4,?5,?6,?6)",
             params![id, parent.project_id, parent.id, parent.directory, agent, t],
         )?;
-        Ok(Session { id, project_id: parent.project_id.clone(), directory: parent.directory.clone(), agent: agent.into(), title: None, model: None, parent_id: Some(parent.id.clone()) })
+        Ok(Session { id, project_id: parent.project_id.clone(), directory: parent.directory.clone(), agent: agent.into(), title: None, model: None, variant: None, parent_id: Some(parent.id.clone()) })
     }
 
     /// Number of ancestors (0 for a top-level session).
@@ -217,14 +220,19 @@ impl Store {
     pub fn session(&self, id: &str) -> Result<Option<Session>> {
         Ok(self
             .conn
-            .query_row("select id, project_id, directory, agent, title, model, parent_id from session where id=?1", [id], |r| {
-                Ok(Session { id: r.get(0)?, project_id: r.get(1)?, directory: r.get(2)?, agent: r.get(3)?, title: r.get(4)?, model: r.get(5)?, parent_id: r.get(6)? })
+            .query_row("select id, project_id, directory, agent, title, model, parent_id, variant from session where id=?1", [id], |r| {
+                Ok(Session { id: r.get(0)?, project_id: r.get(1)?, directory: r.get(2)?, agent: r.get(3)?, title: r.get(4)?, model: r.get(5)?, parent_id: r.get(6)?, variant: r.get(7)? })
             })
             .optional()?)
     }
 
     pub fn set_agent(&self, session_id: &str, agent: &str) -> Result<()> {
         self.conn.execute("update session set agent=?2, time_updated=?3 where id=?1", params![session_id, agent, now_ms()])?;
+        Ok(())
+    }
+
+    pub fn set_variant(&self, session_id: &str, variant: Option<&str>) -> Result<()> {
+        self.conn.execute("update session set variant=?2, time_updated=?3 where id=?1", params![session_id, variant, now_ms()])?;
         Ok(())
     }
 
@@ -267,10 +275,10 @@ impl Store {
         Ok(self
             .conn
             .query_row(
-                "select id, project_id, directory, agent, title, model, parent_id from session
+                "select id, project_id, directory, agent, title, model, parent_id, variant from session
                  where directory=?1 and parent_id is null and time_archived is null order by id desc limit 1",
                 [directory],
-                |r| Ok(Session { id: r.get(0)?, project_id: r.get(1)?, directory: r.get(2)?, agent: r.get(3)?, title: r.get(4)?, model: r.get(5)?, parent_id: r.get(6)? }),
+                |r| Ok(Session { id: r.get(0)?, project_id: r.get(1)?, directory: r.get(2)?, agent: r.get(3)?, title: r.get(4)?, model: r.get(5)?, parent_id: r.get(6)?, variant: r.get(7)? }),
             )
             .optional()?)
     }
@@ -362,13 +370,19 @@ impl Store {
         let t = now_ms();
         let title = src.title.as_ref().map(|t| format!("{t} (fork)"));
         tx.execute(
-            "insert into session(id, project_id, directory, agent, model, title, time_created, time_updated, fork_session_id, fork_boundary)
-             values (?1,?2,?3,?4,?5,?6,?7,?7,?8,?9)",
-            params![id, src.project_id, src.directory, src.agent, src.model, title, t, session_id, msgs.last().map(|m| m.id.clone())],
+            "insert into session(id, project_id, directory, agent, model, title, time_created, time_updated, fork_session_id, fork_boundary, variant)
+             values (?1,?2,?3,?4,?5,?6,?7,?7,?8,?9,?10)",
+            params![id, src.project_id, src.directory, src.agent, src.model, title, t, session_id, msgs.last().map(|m| m.id.clone()), src.variant],
         )?;
         let mut map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         for m in &msgs {
             let mut data = m.data.clone();
+            if m.kind == "assistant" {
+                // Anthropic's thinking blocks belong to the conversation that produced them; a copy starts without.
+                if let Some(parts) = data["parts"].as_array_mut() {
+                    parts.retain(|p| !(p["type"] == "native" && p["provider"] == "anthropic"));
+                }
+            }
             if m.kind == "compaction" {
                 if let Some(new_keep) = data["keepFrom"].as_str().and_then(|k| map.get(k)) {
                     data["keepFrom"] = Value::String(new_keep.clone());
@@ -380,7 +394,7 @@ impl Store {
         tx.execute("insert into todo(session_id, position, content, status) select ?2, position, content, status from todo where session_id=?1", params![session_id, id])?;
         tx.execute("insert into instruction_state(session_id, path) select ?2, path from instruction_state where session_id=?1", params![session_id, id])?;
         tx.commit()?;
-        Ok(Session { id, project_id: src.project_id, directory: src.directory, agent: src.agent, title, model: src.model, parent_id: None })
+        Ok(Session { id, project_id: src.project_id, directory: src.directory, agent: src.agent, title, model: src.model, variant: src.variant, parent_id: None })
     }
 
     pub fn set_title(&self, session_id: &str, title: &str) -> Result<()> {
@@ -808,6 +822,26 @@ mod tests {
         let id = s.enqueue(&ses.id, None, Mode::Queue, "user", &json!({})).unwrap();
         assert!(s.cancel_inbox(&id).unwrap());
         assert_eq!(s.pending_inbox(&ses.id).unwrap(), 0);
+    }
+
+    #[test]
+    fn the_reasoning_level_is_stored_per_session_and_forks_drop_thinking_blocks() {
+        let (s, ses) = store();
+        assert_eq!(s.session(&ses.id).unwrap().unwrap().variant, None);
+        s.set_variant(&ses.id, Some("high")).unwrap();
+        assert_eq!(s.session(&ses.id).unwrap().unwrap().variant.as_deref(), Some("high"));
+        s.add_message(&ses.id, "user", &json!({"text": "hi"})).unwrap();
+        s.add_message(&ses.id, "assistant", &json!({"parts": [
+            {"type": "native", "provider": "anthropic", "data": {"type": "thinking", "signature": "s"}},
+            {"type": "native", "provider": "gemini", "data": {"call_id": "c"}},
+            {"type": "text", "text": "hello"}]})).unwrap();
+        let fork = s.fork_session(&ses.id, None).unwrap();
+        assert_eq!(fork.variant.as_deref(), Some("high"), "the copy keeps the level");
+        let parts = s.messages(&fork.id).unwrap()[1].data["parts"].clone();
+        assert_eq!(parts, json!([{"type": "native", "provider": "gemini", "data": {"call_id": "c"}}, {"type": "text", "text": "hello"}]), "Anthropic thinking belongs to the conversation that produced it");
+        assert_eq!(s.messages(&ses.id).unwrap()[1].data["parts"].as_array().unwrap().len(), 3, "the original is untouched");
+        s.set_variant(&ses.id, None).unwrap();
+        assert_eq!(s.session(&ses.id).unwrap().unwrap().variant, None);
     }
 
     #[test]

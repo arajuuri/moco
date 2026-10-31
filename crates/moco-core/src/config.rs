@@ -19,10 +19,21 @@ pub struct AgentConfig {
     pub system: Option<String>,
     pub description: Option<String>,
     pub steps: Option<u32>,
+    /// Default reasoning effort for this agent.
+    pub effort: Option<String>,
     /// `"primary"`, `"subagent"` or `"all"` (default for agents defined in config).
     pub mode: Option<String>,
     pub permissions: Vec<Rule>,
     pub disabled: bool,
+}
+
+/// Extra request customization: headers for the HTTP request and a JSON object merged into the body
+/// (objects merge deeply, `null` removes a field).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RequestOverlay {
+    pub headers: BTreeMap<String, String>,
+    pub body: Option<Value>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -31,6 +42,11 @@ pub struct ModelConfig {
     pub name: Option<String>,
     pub limit: Option<crate::catalog::Limit>,
     pub cost: Option<crate::catalog::Cost>,
+    /// Applied to every request to this model.
+    pub request: Option<RequestOverlay>,
+    /// Named reasoning levels you define, each a request overlay: `{"deep": {"body": {"thinking": {...}}}}`.
+    /// They add to (and override) the built-in levels of the same name.
+    pub variants: BTreeMap<String, RequestOverlay>,
 }
 
 /// `providers.<id>`: adds a provider (any OpenAI-compatible server, e.g. Ollama or LM Studio) or
@@ -49,6 +65,8 @@ pub struct ProviderConfig {
     pub disabled: bool,
     /// Set `false` to stop sending `cache_control` markers (Anthropic protocol only; default on).
     pub prompt_cache: Option<bool>,
+    /// Applied to every request to this provider (before the model's own).
+    pub request: Option<RequestOverlay>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -190,6 +208,8 @@ pub struct Config {
     /// `provider/model`
     pub model: Option<String>,
     pub default_agent: Option<String>,
+    /// Default reasoning effort (a variant name such as `high`); unset leaves the provider's default.
+    pub effort: Option<String>,
     pub shell: Option<String>,
     pub permissions: Vec<Rule>,
     pub agents: BTreeMap<String, AgentConfig>,
@@ -452,6 +472,7 @@ pub fn resolve_agents(cfg: &Config) -> Vec<Agent> {
             a.system = ac.system.clone().or(a.system.take());
             a.description = ac.description.clone().unwrap_or_else(|| a.description.clone());
             a.steps = ac.steps.or(a.steps);
+            a.effort = ac.effort.clone().or(a.effort.take());
             a.mode = ac.mode.as_deref().and_then(agent::Mode::parse).unwrap_or(a.mode);
         } else if !ac.disabled {
             agents.push(Agent {
@@ -461,6 +482,7 @@ pub fn resolve_agents(cfg: &Config) -> Vec<Agent> {
                 description: ac.description.clone().unwrap_or_default(),
                 system: ac.system.clone(),
                 steps: ac.steps,
+                effort: ac.effort.clone(),
                 model: ac.model.clone(),
                 permissions: crate::permission::default_rules(),
             });
@@ -611,6 +633,28 @@ mod tests {
         assert_eq!(OAuthSetting::resolve(&s["token"].oauth), None);
         let o = OAuthSetting::resolve(&s["oauth"].oauth).unwrap();
         assert_eq!((o.client_id.as_deref(), o.scope.as_deref(), o.callback_port), (Some("cid"), Some("read"), Some(8123)));
+    }
+
+    #[test]
+    fn effort_and_request_overlays() {
+        let cfg: Config = serde_json::from_value(json!({
+            "effort": "high",
+            "agents": {"plan": {"effort": "max"}, "mine": {"effort": "low"}},
+            "providers": {"anthropic": {"request": {"headers": {"x-a": "1"}},
+                "models": {"claude-opus-5-5": {"request": {"body": {"metadata": {"user_id": "u"}}},
+                                               "variants": {"deep": {"headers": {"x-mode": "deep"}, "body": {"output_config": {"effort": "xhigh"}}}}}}}}})).unwrap();
+        assert_eq!(cfg.effort.as_deref(), Some("high"));
+        let agents = resolve_agents(&cfg);
+        let eff = |id: &str| agents.iter().find(|a| a.id == id).unwrap().effort.clone();
+        assert_eq!((eff("plan").as_deref(), eff("mine").as_deref(), eff("build")), (Some("max"), Some("low"), None));
+        let mut cat = crate::catalog::Catalog::embedded();
+        cat.apply_config(&cfg.providers);
+        let p = &cat.providers["anthropic"];
+        assert_eq!(p.request.as_ref().unwrap().headers["x-a"], "1");
+        let m = cat.model("anthropic", "claude-opus-5-5").unwrap();
+        assert_eq!(m.request.as_ref().unwrap().body, Some(json!({"metadata": {"user_id": "u"}})));
+        assert_eq!(m.variants["deep"].headers["x-mode"], "deep");
+        assert!(m.limit.context > 0, "catalog data stays");
     }
 
     #[test]

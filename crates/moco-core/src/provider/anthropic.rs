@@ -27,6 +27,7 @@ impl Anthropic {
 }
 
 const EPHEMERAL: &str = "ephemeral";
+const PROVIDER: &str = "anthropic";
 
 fn mark(block: &mut Value) {
     block["cache_control"] = json!({"type": EPHEMERAL});
@@ -37,10 +38,19 @@ fn mark(block: &mut Value) {
 /// ended the previous request of an agent loop (so the previous step's cache entry is hit exactly, even if a
 /// step added more content blocks than the cache lookback covers).
 pub fn build_body(req: &Request, cache: bool) -> Value {
+    // Thinking blocks go back only within the tool-use chain that is still running (after the last message the
+    // user wrote): earlier ones are not needed, and replaying them after the history was edited (compaction,
+    // undo, fork) would make newer API versions refuse the request.
+    let chain_from = req
+        .messages
+        .iter()
+        .rposition(|m| m.role == Role::User && m.content.iter().any(|b| matches!(b, Block::Text(_) | Block::Image { .. } | Block::Document { .. })))
+        .map_or(0, |i| i + 1);
     let messages: Vec<Value> = req
         .messages
         .iter()
-        .map(|m| {
+        .enumerate()
+        .map(|(mi, m)| {
             let content: Vec<Value> = m
                 .content
                 .iter()
@@ -54,7 +64,13 @@ pub fn build_body(req: &Request, cache: bool) -> Value {
                     Block::ToolResult { id, content, is_error } => {
                         json!({"type":"tool_result","tool_use_id":id,"content":content,"is_error":is_error})
                     }
-                    Block::Native { .. } => return None, // another provider's replay data
+                    // The producing model's own thinking blocks, for the running tool-use chain only.
+                    Block::Native { provider, data } if provider == PROVIDER && mi >= chain_from && data["model"].as_str().is_none_or(|x| x == req.model) => {
+                        let mut d = data.clone();
+                        d.as_object_mut().map(|o| o.remove("model"));
+                        d
+                    }
+                    Block::Native { .. } => return None, // another provider's (or an older turn's) replay data
                 }))
                 .collect();
             json!({"role": if m.role == Role::User {"user"} else {"assistant"}, "content": content})
@@ -87,6 +103,18 @@ pub fn build_body(req: &Request, cache: bool) -> Value {
             body["tool_choice"] = json!({"type":"none"});
         }
     }
+    super::effort::shape_anthropic(&mut body, req);
+    // Without thinking on, thinking blocks have no place in the history.
+    let thinking_on = matches!(body["thinking"]["type"].as_str(), Some("adaptive") | Some("enabled"));
+    if !thinking_on {
+        if let Some(ms) = body["messages"].as_array_mut() {
+            for m in ms {
+                if let Some(c) = m["content"].as_array_mut() {
+                    c.retain(|b| !matches!(b["type"].as_str(), Some("thinking") | Some("redacted_thinking")));
+                }
+            }
+        }
+    }
     body
 }
 
@@ -113,13 +141,18 @@ fn classify(status: u16, kind: &str, msg: String, retry_after_ms: Option<u64>) -
 
 enum BlockState {
     Text,
-    Thinking,
+    /// A thinking block: its text, and the signature the API needs back (kept as replay data).
+    Thinking { text: String, signature: String },
+    /// A thinking block whose content the API encrypted; it must be passed back as it came.
+    Redacted { data: String },
     Tool { id: String, name: String, json: String },
 }
 
 /// Incremental SSE decoder: feed `(event name, data)` pairs, get neutral events.
 #[derive(Default)]
 pub struct Parser {
+    /// The model that produced the turn; stored with thinking blocks so they are only replayed to it.
+    pub model: String,
     blocks: HashMap<u64, BlockState>,
     usage: Usage,
     stop: Option<String>,
@@ -146,7 +179,8 @@ impl Parser {
                         out.push(Event::ToolInputStart { id: id.clone(), name: name.clone() });
                         BlockState::Tool { id, name, json: String::new() }
                     }
-                    "thinking" | "redacted_thinking" => BlockState::Thinking,
+                    "thinking" => BlockState::Thinking { text: String::new(), signature: b["signature"].as_str().unwrap_or("").to_string() },
+                    "redacted_thinking" => BlockState::Redacted { data: b["data"].as_str().unwrap_or("").to_string() },
                     _ => BlockState::Text,
                 };
                 self.blocks.insert(idx, state);
@@ -155,21 +189,41 @@ impl Parser {
                 let d = &v["delta"];
                 match d["type"].as_str().unwrap_or("") {
                     "text_delta" => out.push(Event::TextDelta(d["text"].as_str().unwrap_or("").into())),
-                    "thinking_delta" => out.push(Event::ReasoningDelta(d["thinking"].as_str().unwrap_or("").into())),
+                    "thinking_delta" => {
+                        let t = d["thinking"].as_str().unwrap_or("");
+                        if let Some(BlockState::Thinking { text, .. }) = self.blocks.get_mut(&idx) {
+                            text.push_str(t);
+                        }
+                        out.push(Event::ReasoningDelta(t.into()));
+                    }
+                    "signature_delta" => {
+                        if let Some(BlockState::Thinking { signature, .. }) = self.blocks.get_mut(&idx) {
+                            signature.push_str(d["signature"].as_str().unwrap_or(""));
+                        }
+                    }
                     "input_json_delta" => {
                         if let Some(BlockState::Tool { json, .. }) = self.blocks.get_mut(&idx) {
                             json.push_str(d["partial_json"].as_str().unwrap_or(""));
                         }
                     }
-                    _ => {} // signature_delta etc.
+                    _ => {}
                 }
             }
             "content_block_stop" => {
-                if let Some(BlockState::Tool { id, name, json }) = self.blocks.remove(&idx) {
-                    let input = if json.trim().is_empty() { Value::Object(Default::default()) } else {
-                        serde_json::from_str(&json).map_err(|e| ProviderError::InvalidRequest(format!("model produced invalid tool input JSON for {name}: {e}")))?
-                    };
-                    out.push(Event::ToolCall { id, name, input });
+                match self.blocks.remove(&idx) {
+                    Some(BlockState::Thinking { text, signature }) if !signature.is_empty() => {
+                        out.push(Event::Native { provider: PROVIDER.into(), data: json!({"type": "thinking", "thinking": text, "signature": signature, "model": self.model}) });
+                    }
+                    Some(BlockState::Redacted { data }) => {
+                        out.push(Event::Native { provider: PROVIDER.into(), data: json!({"type": "redacted_thinking", "data": data, "model": self.model}) });
+                    }
+                    Some(BlockState::Tool { id, name, json }) => {
+                        let input = if json.trim().is_empty() { Value::Object(Default::default()) } else {
+                            serde_json::from_str(&json).map_err(|e| ProviderError::InvalidRequest(format!("model produced invalid tool input JSON for {name}: {e}")))?
+                        };
+                        out.push(Event::ToolCall { id, name, input });
+                    }
+                    _ => {}
                 }
             }
             "message_delta" => {
@@ -217,8 +271,8 @@ impl Provider for Anthropic {
             .post(&format!("{}/v1/messages", self.base_url))
             .set("x-api-key", &self.api_key)
             .set("anthropic-version", "2023-06-01")
-            .set("content-type", "application/json")
-            .send_string(&build_body(req, self.prompt_cache).to_string());
+            .set("content-type", "application/json");
+        let resp = req.overlay.headers.iter().fold(resp, |r, (k, v)| r.set(k, v)).send_string(&build_body(req, self.prompt_cache).to_string());
         let resp = match resp {
             Ok(r) => r,
             Err(ureq::Error::Status(code, r)) => {
@@ -228,7 +282,7 @@ impl Provider for Anthropic {
             }
             Err(ureq::Error::Transport(t)) => return Err(transport(t)),
         };
-        let mut parser = Parser::default();
+        let mut parser = Parser { model: req.model.clone(), ..Default::default() };
         let mut reader = BufReader::new(resp.into_reader());
         let mut line = String::new();
         let mut finished = false;
@@ -316,7 +370,80 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(ev[0], Event::ReasoningDelta("hm".into()));
-        assert_eq!(ev[2], Event::ToolCall { id: "t".into(), name: "glob".into(), input: json!({}) });
+        // The signature is replay data: stored with the turn, before the content it belongs to.
+        assert_eq!(ev[1], Event::Native { provider: "anthropic".into(), data: json!({"type": "thinking", "thinking": "hm", "signature": "x", "model": ""}) });
+        assert_eq!(ev[3], Event::ToolCall { id: "t".into(), name: "glob".into(), input: json!({}) });
+    }
+
+    #[test]
+    fn redacted_thinking_and_unsigned_thinking() {
+        let ev = parse(&[
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"ENC"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"thinking"}}"#,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"no signature"}}"#,
+            r#"{"type":"content_block_stop","index":1}"#,
+        ])
+        .unwrap();
+        assert_eq!(ev[0], Event::Native { provider: "anthropic".into(), data: json!({"type": "redacted_thinking", "data": "ENC", "model": ""}) });
+        assert_eq!(ev.len(), 2, "a thinking block without a signature cannot be replayed, so nothing is stored: {ev:?}");
+    }
+
+    fn thinking(model: &str, text: &str) -> Block {
+        Block::Native { provider: "anthropic".into(), data: json!({"type": "thinking", "thinking": text, "signature": format!("sig-{text}"), "model": model}) }
+    }
+
+    fn turn(model: &str, think: &str, call: &str) -> Vec<ChatMessage> {
+        vec![
+            ChatMessage { role: Role::Assistant, content: vec![thinking(model, think), Block::ToolUse { id: call.into(), name: "read".into(), input: json!({}) }] },
+            ChatMessage { role: Role::User, content: vec![Block::ToolResult { id: call.into(), content: "ok".into(), is_error: false }] },
+        ]
+    }
+
+    fn types(b: &Value, i: usize) -> Vec<String> {
+        b["messages"][i]["content"].as_array().unwrap().iter().map(|c| c["type"].as_str().unwrap().to_string()).collect()
+    }
+
+    #[test]
+    fn thinking_blocks_are_replayed_for_the_running_tool_chain_only() {
+        let m = "claude-opus-5-5";
+        let mut messages = vec![ChatMessage { role: Role::User, content: vec![Block::Text("first task".into())] }];
+        messages.extend(turn(m, "one", "c1"));
+        messages.push(ChatMessage { role: Role::Assistant, content: vec![thinking(m, "two"), Block::Text("done".into())] });
+        messages.push(ChatMessage { role: Role::User, content: vec![Block::Text("second task".into())] });
+        messages.extend(turn(m, "three", "c2"));
+        let req = Request { model: m.into(), messages, effort: Some("high".into()), ..Default::default() };
+        let b = build_body(&req, false);
+        // Turn one (before the last thing the user wrote): thinking is left out. Turn two's chain keeps it, first in its message.
+        assert_eq!(types(&b, 1), ["tool_use"]);
+        assert_eq!(types(&b, 3), ["text"]);
+        assert_eq!(types(&b, 5), ["thinking", "tool_use"]);
+        assert_eq!(b["messages"][5]["content"][0], json!({"type": "thinking", "thinking": "three", "signature": "sig-three"}), "the model tag is not sent");
+        assert_eq!(b["thinking"], json!({"type": "adaptive", "display": "summarized"}));
+        assert_eq!(b["output_config"], json!({"effort": "high"}));
+    }
+
+    #[test]
+    fn thinking_blocks_of_other_models_or_without_thinking_are_not_sent() {
+        let mut messages = vec![ChatMessage { role: Role::User, content: vec![Block::Text("task".into())] }];
+        messages.extend(turn("claude-opus-5-5", "old model", "c1"));
+        let ask = |model: &str, effort: Option<&str>| {
+            let r = Request { model: model.into(), messages: messages.clone(), effort: effort.map(String::from), ..Default::default() };
+            types(&build_body(&r, false), 1)
+        };
+        assert_eq!(ask("claude-opus-5-5", None), ["thinking", "tool_use"]);
+        assert_eq!(ask("claude-sonnet-5-5", None), ["tool_use"], "the model changed in the middle of the chain");
+        // Thinking switched off (or never on): blocks would be out of place.
+        assert_eq!(ask("claude-opus-4-8", None), ["tool_use"]);
+        let mut messages2 = messages.clone();
+        messages2[1].content[0] = thinking("claude-opus-4-8", "x");
+        let r = Request { model: "claude-opus-4-8".into(), messages: messages2, effort: Some("none".into()), ..Default::default() };
+        assert_eq!(types(&build_body(&r, false), 1), ["tool_use"]);
+        // Redacted blocks go back as they came.
+        let mut m3 = messages.clone();
+        m3[1].content[0] = Block::Native { provider: "anthropic".into(), data: json!({"type": "redacted_thinking", "data": "ENC", "model": "claude-opus-5-5"}) };
+        let r = Request { model: "claude-opus-5-5".into(), messages: m3, ..Default::default() };
+        assert_eq!(build_body(&r, false)["messages"][1]["content"][0], json!({"type": "redacted_thinking", "data": "ENC"}));
     }
 
     #[test]
@@ -368,6 +495,7 @@ mod tests {
             ],
             max_tokens: 10,
             tools_disabled: false,
+            ..Default::default()
         }
     }
 
@@ -436,6 +564,7 @@ mod tests {
             tools: vec![],
             max_tokens: 10,
             tools_disabled: false,
+            ..Default::default()
         };
         let b = build_body(&req, true);
         let c = &b["messages"][0]["content"];
@@ -458,6 +587,7 @@ mod tests {
             tools: vec![ToolDef { name: "read".into(), description: "d".into(), schema: json!({"type":"object"}) }],
             max_tokens: 100,
             tools_disabled: true,
+            ..Default::default()
         };
         let b = build_body(&req, false);
         assert_eq!(b["stream"], true);

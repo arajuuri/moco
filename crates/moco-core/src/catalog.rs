@@ -60,6 +60,11 @@ pub struct Model {
     pub tool_call: Option<bool>,
     pub limit: Limit,
     pub cost: Option<Cost>,
+    /// From config (`providers.<id>.models.<m>.request` / `.variants`).
+    #[serde(skip)]
+    pub request: Option<crate::config::RequestOverlay>,
+    #[serde(skip)]
+    pub variants: BTreeMap<String, crate::config::RequestOverlay>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -76,6 +81,9 @@ pub struct ProviderInfo {
     /// Extra request headers (config only).
     #[serde(skip)]
     pub headers: BTreeMap<String, String>,
+    /// From config (`providers.<id>.request`).
+    #[serde(skip)]
+    pub request: Option<crate::config::RequestOverlay>,
     /// Set for providers defined in config: a missing API key is fine (local servers).
     #[serde(skip)]
     pub keyless_ok: bool,
@@ -272,6 +280,9 @@ impl Catalog {
             if pc.prompt_cache.is_some() {
                 p.prompt_cache = pc.prompt_cache;
             }
+            if pc.request.is_some() {
+                p.request = pc.request.clone();
+            }
             for (mid, mc) in &pc.models {
                 let m = p.models.entry(mid.clone()).or_insert_with(|| Model { id: mid.clone(), name: mid.clone(), ..Default::default() });
                 if let Some(n) = &mc.name {
@@ -283,6 +294,10 @@ impl Catalog {
                 if let Some(c) = &mc.cost {
                     m.cost = Some(c.clone());
                 }
+                if mc.request.is_some() {
+                    m.request = mc.request.clone();
+                }
+                m.variants.extend(mc.variants.clone());
             }
         }
     }

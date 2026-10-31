@@ -64,6 +64,8 @@ pub enum PickKind {
     /// Background jobs: Enter shows the output, Ctrl-D stops one.
     Job,
     Theme,
+    /// Reasoning levels of the current model.
+    Effort,
 }
 
 /// A prompt that was sent while a turn was running and has not been delivered yet.
@@ -209,6 +211,8 @@ pub enum Action {
     Poke,
     /// Ctrl-P: show the command palette.
     Palette,
+    /// Set the session's reasoning effort (`None` = the provider's default).
+    SetEffort(Option<String>),
     /// An entry was chosen in a picker.
     Picked { kind: PickKind, value: String },
     /// Ctrl-D on an entry of a queue or job picker.
@@ -285,6 +289,9 @@ pub struct App {
     /// Detail level: 0 compact, 1 normal, 2 full (Ctrl-O cycles).
     pub level: u8,
     pub keymap: Keymap,
+    /// Reasoning level asked for (None = default) and the levels the current model offers.
+    pub effort: Option<String>,
+    pub effort_levels: Vec<String>,
     pub glyphs: &'static Glyphs,
     leader_pending: bool,
     /// `None` shows the sidebar when the terminal is wide enough.
@@ -342,6 +349,8 @@ impl App {
             retry: None,
             level: 1,
             keymap: Keymap::default(),
+            effort: None,
+            effort_levels: vec![],
             glyphs: &super::glyphs::UNICODE,
             leader_pending: false,
             sidebar: None,
@@ -923,6 +932,18 @@ impl App {
             KeyAction::Detail => {
                 self.cycle_detail();
                 Some(Action::None)
+            }
+            KeyAction::Effort => {
+                if self.effort_levels.is_empty() {
+                    self.hint = Some("this model has no reasoning levels".into());
+                    return Some(Action::None);
+                }
+                // default -> first level -> ... -> last level -> default
+                let next = match self.effort.as_ref().and_then(|e| self.effort_levels.iter().position(|l| l == e)) {
+                    None => self.effort_levels.first().cloned(),
+                    Some(i) => self.effort_levels.get(i + 1).cloned(),
+                };
+                Some(Action::SetEffort(next))
             }
             KeyAction::Sidebar => {
                 self.toggle_sidebar();
@@ -1548,6 +1569,9 @@ impl App {
         }
         v.push(Line::styled(format!(" {}", clip_width(&self.model, w.saturating_sub(1))), t.dim));
         v.push(Line::styled(format!(" agent {}", self.agent), t.dim));
+        if !self.effort_levels.is_empty() {
+            v.push(Line::styled(format!(" thinking {}", self.effort.as_deref().unwrap_or("default")), t.dim));
+        }
         v.push(Line::default());
         if self.context > 0 {
             let pct = match self.limit {
@@ -1641,6 +1665,14 @@ impl App {
                 _ => spans.push(Span::styled(format!("{} ", human(self.context)), bar)),
             }
             segs.push((2, spans));
+        }
+        if !self.effort_levels.is_empty() {
+            let text = match &self.effort {
+                Some(e) if self.effort_levels.contains(e) => format!(" think {e} "),
+                Some(e) => format!(" think {e}? "),
+                None => " think default ".to_string(),
+            };
+            segs.push((5, vec![Span::styled(text, t.accent.patch(bar))]));
         }
         if self.session_cost > 0.0 {
             segs.push((3, vec![Span::styled(format!(" ${:.4} ", self.session_cost), bar)]));
@@ -2653,6 +2685,28 @@ mod tests {
         let s = screen(&mut a, 120, 40).join("\n");
         let odd: Vec<char> = s.chars().filter(|c| !c.is_ascii() && *c != '\n').collect();
         assert!(odd.is_empty(), "non-ASCII characters in ASCII mode: {odd:?}\n{s}");
+    }
+
+    #[test]
+    fn the_effort_key_steps_through_the_levels_and_the_status_shows_the_choice() {
+        let mut a = App::new("m", "build");
+        assert_eq!(a.update(ctrl('t')), Action::None);
+        assert!(a.hint.as_deref().unwrap().contains("no reasoning levels"));
+        assert!(!screen(&mut a, 100, 8).join("\n").contains("think"));
+        a.effort_levels = vec!["low".into(), "high".into()];
+        assert!(screen(&mut a, 100, 8).join("\n").contains("think default"));
+        assert_eq!(a.update(ctrl('t')), Action::SetEffort(Some("low".into())));
+        a.effort = Some("low".into());
+        assert!(screen(&mut a, 100, 8).join("\n").contains("think low"));
+        assert_eq!(a.update(ctrl('t')), Action::SetEffort(Some("high".into())));
+        a.effort = Some("high".into());
+        assert_eq!(a.update(ctrl('t')), Action::SetEffort(None), "after the last level: back to the default");
+        a.effort = Some("xhigh".into()); // chosen for another model: shown with a question mark, and cycling restarts
+        assert!(screen(&mut a, 100, 8).join("\n").contains("think xhigh?"));
+        assert_eq!(a.update(ctrl('t')), Action::SetEffort(Some("low".into())));
+        a.sidebar = Some(true);
+        a.effort = Some("high".into());
+        assert!(screen(&mut a, 120, 20).join("\n").contains("thinking high"));
     }
 
     #[test]

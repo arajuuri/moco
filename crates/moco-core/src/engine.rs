@@ -95,6 +95,15 @@ pub enum RunOutcome {
     Busy,
 }
 
+/// See `Engine::effort_info`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffortInfo {
+    pub desired: Option<String>,
+    /// The model offers `desired` (otherwise requests go out without it).
+    pub offered: bool,
+    pub levels: Vec<String>,
+}
+
 pub struct EngineConfig {
     /// Default `provider/model` (an agent's own `model` overrides it).
     pub model: String,
@@ -118,6 +127,8 @@ pub struct EngineConfig {
     pub formatters: crate::format::Formatters,
     /// The `websearch` tool is offered when this is set (see `tools/websearch.rs`).
     pub websearch: Option<tools::websearch::Settings>,
+    /// Default reasoning effort (config `effort`); a session's or agent's own choice wins.
+    pub effort: Option<String>,
     /// Waits for retry backoff; must return early when `cancel` is set.
     pub sleep: Box<dyn Fn(Duration, &AtomicBool) + Send + Sync>,
     pub jitter: Box<dyn Fn() -> f64 + Send + Sync>,
@@ -140,6 +151,7 @@ impl EngineConfig {
             mcp: None,
             formatters: Default::default(),
             websearch: None,
+            effort: None,
             sleep: Box::new(|d, cancel| {
                 let end = std::time::Instant::now() + d;
                 while std::time::Instant::now() < end && !cancel.load(Ordering::Relaxed) {
@@ -275,6 +287,78 @@ impl Engine {
         let mut v: Vec<String> = self.providers.keys().cloned().collect();
         v.sort();
         v
+    }
+
+    /// Provider-wide then model-wide request customization from config.
+    fn base_overlay(&self, provider_id: &str, model_id: &str) -> crate::provider::Overlay {
+        let mut o = crate::provider::Overlay::default();
+        let mut add = |r: &config::RequestOverlay| {
+            o.headers.extend(r.headers.iter().map(|(k, v)| (k.clone(), v.clone())));
+            if let Some(b) = &r.body {
+                match &mut o.body {
+                    Some(cur) => crate::provider::effort::merge_json(cur, b),
+                    None => o.body = Some(b.clone()),
+                }
+            }
+        };
+        if let Some(r) = self.cfg.catalog.providers.get(provider_id).and_then(|p| p.request.as_ref()) {
+            add(r);
+        }
+        if let Some(r) = self.cfg.catalog.model(provider_id, model_id).and_then(|m| m.request.as_ref()) {
+            add(r);
+        }
+        o
+    }
+
+    /// Reasoning levels a model offers: the built-in ones for its protocol, then the ones defined in config.
+    pub fn effort_levels(&self, provider_id: &str, model_id: &str) -> Vec<String> {
+        let cat = &self.cfg.catalog;
+        let model = cat.model(provider_id, model_id);
+        let mut v = match cat.providers.get(provider_id).and_then(|p| p.protocol()) {
+            Some(proto) => crate::provider::effort::variants(proto, provider_id, model_id, model.is_some_and(|m| m.reasoning)),
+            None => vec![],
+        };
+        for name in model.map(|m| m.variants.keys()).into_iter().flatten() {
+            if !v.contains(name) {
+                v.push(name.clone());
+            }
+        }
+        v
+    }
+
+    /// What a front end shows about reasoning effort: the level asked for, whether the model offers it, and the levels.
+    pub fn effort_info(&self, session: &Session) -> EffortInfo {
+        let agent = agent::find(&self.cfg.agents, &session.agent);
+        let model_ref = self.model_ref_for(session);
+        let (provider_id, model_id) = config::split_model(&model_ref);
+        let levels = self.effort_levels(provider_id, model_id);
+        let desired = self.desired_effort(session, agent.as_ref());
+        let offered = desired.as_ref().is_some_and(|d| levels.contains(d));
+        EffortInfo { desired, offered, levels }
+    }
+
+    /// The effort a request will use: the session's choice, else the agent's, else the configured default.
+    pub fn desired_effort(&self, session: &Session, agent: Option<&Agent>) -> Option<String> {
+        session.variant.clone().or_else(|| agent.and_then(|a| a.effort.clone())).or_else(|| self.cfg.effort.clone())
+    }
+
+    /// (effort for the adapter, overlay): the desired effort only counts when this model offers it; a variant
+    /// defined in config contributes its overlay instead of a built-in effort.
+    fn request_extras(&self, session: &Session, agent: &Agent, provider_id: &str, model_id: &str) -> (Option<String>, crate::provider::Overlay) {
+        let mut overlay = self.base_overlay(provider_id, model_id);
+        let Some(want) = self.desired_effort(session, Some(agent)) else { return (None, overlay) };
+        if let Some(v) = self.cfg.catalog.model(provider_id, model_id).and_then(|m| m.variants.get(&want)) {
+            overlay.headers.extend(v.headers.iter().map(|(k, v)| (k.clone(), v.clone())));
+            if let Some(b) = &v.body {
+                match &mut overlay.body {
+                    Some(cur) => crate::provider::effort::merge_json(cur, b),
+                    None => overlay.body = Some(b.clone()),
+                }
+            }
+            return (None, overlay);
+        }
+        let offered = self.effort_levels(provider_id, model_id);
+        (offered.contains(&want).then_some(want), overlay)
     }
 
     /// Model used for a session: its own choice, else the agent's, else the configured default.
@@ -467,6 +551,7 @@ impl Engine {
             system.push_str(agent::PLAN_REMINDER);
             system.push('\n');
         }
+        let (effort, overlay) = self.request_extras(&session, &agent, &provider_id, &model_id);
         let req = Request {
             model: model_id.clone(),
             system,
@@ -474,6 +559,8 @@ impl Engine {
             tools: advertised.iter().map(|t| ToolDef { name: t.name().into(), description: t.description(), schema: t.schema() }).collect(),
             max_tokens: self.cfg.max_tokens,
             tools_disabled: max_steps_hit,
+            effort,
+            overlay,
         };
         let limit = self.cfg.catalog.model(&provider_id, &model_id).map(|m| m.limit.context).filter(|l| *l > 0);
         Ok(Ok(Prepared { session, agent, req, provider, provider_id, model_id, eff, limit, tools: all_tools }))
@@ -640,7 +727,8 @@ impl Engine {
             messages: vec![ChatMessage { role: Role::User, content: vec![Block::Text(text.to_string())] }],
             tools: vec![],
             max_tokens: 60,
-            tools_disabled: false,
+            overlay: self.base_overlay(provider_id, model_id),
+            ..Default::default()
         };
         let mut attempts = 0;
         let (reply, usage) = loop {
@@ -927,7 +1015,7 @@ impl Engine {
         'attempts: for _ in 0..4 {
             let mut messages = self.chat(&portion);
             append_user_text(&mut messages, compaction::prompt(update));
-            let req = Request { model: model_id.clone(), system: compaction::SYSTEM.into(), messages, tools: vec![], max_tokens: self.cfg.max_tokens, tools_disabled: false };
+            let req = Request { model: model_id.clone(), system: compaction::SYSTEM.into(), messages, max_tokens: self.cfg.max_tokens, overlay: self.base_overlay(&provider_id, &model_id), ..Default::default() };
             match self.summarize(provider, &req, ui, cancel) {
                 Ok((text, u)) => {
                     usage_total = add_usage(usage_total, u);
@@ -1553,6 +1641,62 @@ mod tests {
         assert_eq!(f.run(&ui), RunOutcome::Idle);
         // Once for "first", once for the queued "second".
         assert_eq!(ui.delivered.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn reasoning_effort_follows_session_then_agent_then_config_and_only_when_the_model_offers_it() {
+        let f = fixture_cfg(vec![text("a"), text("b"), text("c"), text("d")], |c| {
+            c.model = "anthropic/claude-opus-5-5".into();
+            c.effort = Some("low".into());
+        });
+        let effort = |n: usize| f.fake.requests.lock().unwrap()[n].effort.clone();
+        f.say("one");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        assert_eq!(effort(0).as_deref(), Some("low"), "the configured default");
+        f.engine.store().set_variant(&f.session.id, Some("max")).unwrap();
+        f.say("two");
+        f.run(&TestUi::default());
+        assert_eq!(effort(1).as_deref(), Some("max"), "the session's choice wins");
+        f.engine.store().set_variant(&f.session.id, Some("none")).unwrap();
+        f.say("three");
+        f.run(&TestUi::default());
+        assert_eq!(effort(2), None, "Opus 5.5 cannot think less than 'low': a level it does not offer is ignored, not an error");
+        f.engine.store().set_variant(&f.session.id, None).unwrap();
+        f.say("four");
+        f.run(&TestUi::default());
+        assert_eq!(effort(3).as_deref(), Some("low"));
+        let s = f.engine.store().session(&f.session.id).unwrap().unwrap();
+        assert_eq!(f.engine.effort_levels("anthropic", "claude-opus-5-5"), ["low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(f.engine.desired_effort(&s, None).as_deref(), Some("low"));
+        let mut a = agent::find(&f.engine.cfg.agents, "build").unwrap();
+        a.effort = Some("high".into());
+        assert_eq!(f.engine.desired_effort(&s, Some(&a)).as_deref(), Some("high"), "the agent's default beats the global one");
+    }
+
+    #[test]
+    fn config_overlays_and_custom_variants_reach_the_request() {
+        use crate::config::RequestOverlay;
+        let f = fixture_cfg(vec![text("a"), text("b")], |c| {
+            c.model = "anthropic/claude-opus-5-5".into();
+            let p = c.catalog.providers.get_mut("anthropic").unwrap();
+            p.request = Some(RequestOverlay { headers: [("x-proxy".to_string(), "p".to_string())].into(), body: Some(json!({"metadata": {"user_id": "u"}})) });
+            let m = p.models.entry("claude-opus-5-5".into()).or_default();
+            m.request = Some(RequestOverlay { headers: Default::default(), body: Some(json!({"metadata": {"team": "t"}})) });
+            m.variants.insert("deep".into(), RequestOverlay { headers: [("x-mode".to_string(), "deep".to_string())].into(), body: Some(json!({"thinking": {"type": "adaptive"}, "output_config": {"effort": "xhigh"}})) });
+        });
+        f.say("one");
+        f.run(&TestUi::default());
+        let o = f.fake.requests.lock().unwrap()[0].overlay.clone();
+        assert_eq!(o.headers, [("x-proxy".to_string(), "p".to_string())]);
+        assert_eq!(o.body, Some(json!({"metadata": {"user_id": "u", "team": "t"}})), "provider overlay first, the model's merged over it");
+        assert!(f.engine.effort_levels("anthropic", "claude-opus-5-5").contains(&"deep".to_string()), "custom levels are listed after the built-in ones");
+        f.engine.store().set_variant(&f.session.id, Some("deep")).unwrap();
+        f.say("two");
+        f.run(&TestUi::default());
+        let r = f.fake.requests.lock().unwrap()[1].clone();
+        assert_eq!(r.effort, None, "a custom variant is an overlay, not a built-in effort");
+        assert_eq!(r.overlay.headers.len(), 2);
+        assert_eq!(r.overlay.body.unwrap()["output_config"], json!({"effort": "xhigh"}));
     }
 
     #[test]

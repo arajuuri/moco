@@ -1,5 +1,6 @@
 //! Provider abstraction (docs/07-providers.md): neutral request/stream types; one adapter per wire protocol.
 pub mod anthropic;
+pub mod effort;
 pub mod fake;
 pub mod gemini;
 pub mod openai_chat;
@@ -54,6 +55,25 @@ pub struct Request {
     pub max_tokens: u32,
     /// Keep tool definitions (prompt-cache prefix) but forbid calling them.
     pub tools_disabled: bool,
+    /// Reasoning effort (a "variant": `low`, `high`, ...); each adapter translates it for its protocol.
+    /// `None` leaves the provider's default.
+    pub effort: Option<String>,
+    /// Extra headers and body fields from config, applied last (see `effort::merge_json`).
+    pub overlay: Overlay,
+}
+
+impl Default for Request {
+    fn default() -> Self {
+        Request { model: String::new(), system: String::new(), messages: vec![], tools: vec![], max_tokens: 16_000, tools_disabled: false, effort: None, overlay: Overlay::default() }
+    }
+}
+
+/// Per-model request customization from config: headers added to the HTTP request and a JSON object merged
+/// into the request body.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Overlay {
+    pub headers: Vec<(String, String)>,
+    pub body: Option<Value>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

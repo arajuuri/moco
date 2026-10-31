@@ -542,6 +542,7 @@ fn main() {
 
     let (mut cont, mut prompt, mut dir, mut session_arg) = (false, None, None, None::<String>);
     let mut want_tui: Option<bool> = None;
+    let mut effort_arg: Option<String> = None;
     let mut model = std::env::var("MOCO_MODEL").ok();
     let mut agent_id: Option<String> = None;
     let mut args = raw.drain(..);
@@ -551,6 +552,7 @@ fn main() {
             "--continue" | "-c" => cont = true,
             "--model" | "-m" => model = Some(value("--model")),
             "--agent" => agent_id = Some(value("--agent")),
+            "--effort" => effort_arg = Some(value("--effort")),
             "--dir" => dir = Some(value("--dir")),
             "--session" | "-s" => session_arg = Some(value("--session")),
             "--prompt" | "-p" => prompt = Some(value("--prompt")),
@@ -558,7 +560,7 @@ fn main() {
             "--plain" => want_tui = Some(false),
             "--help" | "-h" => {
                 println!(
-                    "usage: moco [--continue | --session ID] [--model PROVIDER/MODEL] [--agent ID] [--dir PATH] [-p PROMPT] [--plain]\n       moco sessions [--all] [--archived] | rename ID TITLE | archive ID | unarchive ID\n       moco models [FILTER] [--refresh]\n       moco auth PROVIDER"
+                    "usage: moco [--continue | --session ID] [--model PROVIDER/MODEL] [--agent ID] [--effort LEVEL] [--dir PATH] [-p PROMPT] [--plain]\n       moco sessions [--all] [--archived] | rename ID TITLE | archive ID | unarchive ID\n       moco models [FILTER] [--refresh]\n       moco auth PROVIDER"
                 );
                 return;
             }
@@ -627,7 +629,11 @@ fn main() {
         session.model = Some(model.clone());
     }
 
+    if let Some(e) = &effort_arg {
+        store.set_variant(&session.id, Some(e)).ok();
+    }
     let mut engine_cfg = EngineConfig::new(&model, app_dir.clone());
+    engine_cfg.effort = cfg.effort.clone();
     engine_cfg.agents = agents;
     engine_cfg.instructions = cfg.instructions.clone();
     engine_cfg.catalog = catalog;
@@ -912,7 +918,7 @@ fn main() {
                 }
             }
             "/help" => println!(
-                "/model [FILTER|PROVIDER/MODEL]  show, search or switch the model\n/agent <id>                     switch agent\n/compact                        summarize older messages to free up context\n/sessions [all|archived]       list sessions (/resume <n|id> to continue one)\n/rename <title>                 name this session\n/fork [N]                       copy this conversation into a new session\n/archive [n|id]                 hide a session from the list (/unarchive to restore)\n/undo, /redo                    undo the last turn's file changes and messages, or bring them back\n/diff                           changes in the working tree since this session started\n/new                            start a new session\n/jobs                           background commands and subagents (output <id>, kill <id>)\n!<command>                      run a shell command yourself; the assistant is told\n/skills, /commands, /mcp       list skills, custom slash commands (also MCP prompts) and MCP servers (@name mentions a skill, agent or file)\n/exit                           quit (Ctrl-C interrupts a running turn)"
+                "/model [FILTER|PROVIDER/MODEL]  show, search or switch the model\n/agent <id>                     switch agent\n/effort [level|default]          reasoning effort for models that offer levels\n/compact                        summarize older messages to free up context\n/sessions [all|archived]       list sessions (/resume <n|id> to continue one)\n/rename <title>                 name this session\n/fork [N]                       copy this conversation into a new session\n/archive [n|id]                 hide a session from the list (/unarchive to restore)\n/undo, /redo                    undo the last turn's file changes and messages, or bring them back\n/diff                           changes in the working tree since this session started\n/new                            start a new session\n/jobs                           background commands and subagents (output <id>, kill <id>)\n!<command>                      run a shell command yourself; the assistant is told\n/skills, /commands, /mcp       list skills, custom slash commands (also MCP prompts) and MCP servers (@name mentions a skill, agent or file)\n/exit                           quit (Ctrl-C interrupts a running turn)"
             ),
             l if l == "/sessions" || l.starts_with("/sessions ") => {
                 let which = l.trim_start_matches("/sessions").trim();
@@ -1059,6 +1065,24 @@ fn main() {
                     } else if n > 25 {
                         println!("... more; narrow the filter");
                     }
+                }
+            }
+            l if l == "/effort" || l.starts_with("/effort ") => {
+                let arg = l.trim_start_matches("/effort").trim();
+                let Some(s) = engine.store.lock().unwrap().session(&session.id).ok().flatten() else { continue };
+                let info = engine.effort_info(&s);
+                if info.levels.is_empty() {
+                    println!("{DIM}{} has no reasoning levels to choose from{RESET}", current(&session.id));
+                } else if arg.is_empty() {
+                    println!("{DIM}reasoning effort: {}{}\nlevels: {}\n/effort <level> sets it, /effort default goes back to the provider's default{RESET}", info.desired.as_deref().unwrap_or("default"), if info.desired.is_some() && !info.offered { " (this model does not offer it, so it is not sent)" } else { "" }, info.levels.join(", "));
+                } else if arg == "default" {
+                    engine.store.lock().unwrap().set_variant(&session.id, None).ok();
+                    println!("{DIM}reasoning effort: default{RESET}");
+                } else if info.levels.iter().any(|x| x == arg) {
+                    engine.store.lock().unwrap().set_variant(&session.id, Some(arg)).ok();
+                    println!("{DIM}reasoning effort: {arg}{RESET}");
+                } else {
+                    println!("this model offers: {}", info.levels.join(", "));
                 }
             }
             l if l.starts_with("/agent") => {

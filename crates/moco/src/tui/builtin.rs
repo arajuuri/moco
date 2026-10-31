@@ -20,6 +20,7 @@ pub enum Effect {
 pub const NAMES: &[(&str, &str)] = &[
     ("model", "pick the model"),
     ("agent", "pick the agent"),
+    ("effort", "set the reasoning effort"),
     ("sessions", "list and resume sessions"),
     ("new", "start a new session"),
     ("undo", "undo the last turn's file changes and messages"),
@@ -134,6 +135,28 @@ pub fn run(host: &Host, app: &mut App, sid: &str, agent: &str, name: &str, args:
                 } else {
                     app.open_picker(Picker::new(PickKind::Model, "model", items, args));
                 }
+            }
+        }
+        "effort" => {
+            let Some(sess) = engine.store.lock().unwrap().session(sid).ok().flatten() else { return Some(Effect::None) };
+            let info = engine.effort_info(&sess);
+            if info.levels.is_empty() {
+                app.push_info("this model has no reasoning levels to choose from");
+            } else if args == "default" {
+                engine.store.lock().unwrap().set_variant(sid, None).ok();
+                app.push_info("reasoning effort: default");
+            } else if !args.is_empty() {
+                if info.levels.iter().any(|l| l == args) {
+                    engine.store.lock().unwrap().set_variant(sid, Some(args)).ok();
+                    app.push_info(format!("reasoning effort: {args}"));
+                } else {
+                    err(app, format!("this model offers: {}", info.levels.join(", ")));
+                }
+            } else {
+                let cur = info.desired.clone();
+                let mut items = vec![PickItem { label: "default".into(), detail: format!("the provider's own choice{}", if cur.is_none() { "  (current)" } else { "" }), value: "default".into() }];
+                items.extend(info.levels.iter().map(|l| PickItem { label: l.clone(), detail: if cur.as_ref() == Some(l) { "(current)".into() } else { String::new() }, value: l.clone() }));
+                app.open_picker(Picker::new(PickKind::Effort, "reasoning effort", items, ""));
             }
         }
         "agent" => {

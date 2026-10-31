@@ -16,6 +16,8 @@ pub enum KeyAction {
     Queue,
     /// Cycle the detail level.
     Detail,
+    /// Step through the model's reasoning levels (and back to the default).
+    Effort,
     Sidebar,
     PageUp,
     PageDown,
@@ -31,6 +33,7 @@ const NAMES: &[(&str, KeyAction)] = &[
     ("newline", KeyAction::Newline),
     ("queue", KeyAction::Queue),
     ("detail", KeyAction::Detail),
+    ("effort", KeyAction::Effort),
     ("sidebar", KeyAction::Sidebar),
     ("page_up", KeyAction::PageUp),
     ("page_down", KeyAction::PageDown),
@@ -150,6 +153,7 @@ fn defaults() -> Vec<(KeyAction, Vec<&'static str>)> {
         (KeyAction::Newline, vec!["alt+enter", "ctrl+j"]),
         (KeyAction::Queue, vec!["ctrl+q"]),
         (KeyAction::Detail, vec!["ctrl+o"]),
+        (KeyAction::Effort, vec!["ctrl+t"]),
         (KeyAction::Sidebar, vec![]),
         (KeyAction::PageUp, vec!["pageup"]),
         (KeyAction::PageDown, vec!["pagedown"]),
@@ -174,6 +178,7 @@ const DEFAULT_LEADER: &[(&str, &str)] = &[
     ("q", "/exit"),
     ("b", "sidebar"),
     ("o", "detail"),
+    ("e", "/effort"),
     ("p", "palette"),
 ];
 

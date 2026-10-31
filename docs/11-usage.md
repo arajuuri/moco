@@ -83,7 +83,7 @@ On a terminal `moco` runs the chat full screen (works over SSH). `moco --plain` 
     "sidebar": "auto",                     // true, false, or auto (from 110 columns)
     "ascii": false } }                     // true: draw with plain ASCII only (also MOCO_ASCII=1)
 ```
-Actions you can rebind: `interrupt` (Esc), `quit` (Ctrl-D), `palette` (Ctrl-P), `newline` (Alt-Enter, Ctrl-J), `queue` (Ctrl-Q), `detail` (Ctrl-O), `sidebar`, `page_up`, `page_down`, `top`, `bottom`, `leader` (Ctrl-X). Keys are written `ctrl+k`, `alt+enter`, `pageup`, `f2`, `x`; `null` unbinds. The leader menu (type Ctrl-X to see it) has n new, l sessions, m model, a agent, d diff, c compact, u undo, r redo, j jobs, t theme, h help, q exit, b sidebar, o detail. Themes: `/theme` picks one; a theme file is JSON in `~/Library/Application Support/moco/config/themes/NAME.json` (or `.moco/themes/` in a project), for example `{ "extends": "dark", "user": "#00afff bold", "bar": "white on 238" }` with the roles user, text, dim, error, accent, bar, bar_hi, code, heading, quote, link, added, removed, panel, border, ok, warn. `#rrggbb` colors become the nearest of the 256 colors on terminals without truecolor, like Terminal.app.
+Actions you can rebind: `interrupt` (Esc), `quit` (Ctrl-D), `palette` (Ctrl-P), `newline` (Alt-Enter, Ctrl-J), `queue` (Ctrl-Q), `detail` (Ctrl-O), `effort` (Ctrl-T), `sidebar`, `page_up`, `page_down`, `top`, `bottom`, `leader` (Ctrl-X). Keys are written `ctrl+k`, `alt+enter`, `pageup`, `f2`, `x`; `null` unbinds. The leader menu (type Ctrl-X to see it) has n new, l sessions, m model, a agent, d diff, c compact, u undo, r redo, j jobs, t theme, h help, q exit, b sidebar, o detail, e effort. Themes: `/theme` picks one; a theme file is JSON in `~/Library/Application Support/moco/config/themes/NAME.json` (or `.moco/themes/` in a project), for example `{ "extends": "dark", "user": "#00afff bold", "bar": "white on 238" }` with the roles user, text, dim, error, accent, bar, bar_hi, code, heading, quote, link, added, removed, panel, border, ok, warn. `#rrggbb` colors become the nearest of the 256 colors on terminals without truecolor, like Terminal.app.
 
 ## MCP servers
 
@@ -99,6 +99,19 @@ MCP servers add tools (and prompts and resources) from other programs. Declare t
 - `/mcp` shows what is running; a server that fails to start prints its reason and stderr at startup.
 - **Remote servers** (MCP Streamable HTTP): `"docs": { "url": "https://example.com/mcp", "headers": { "Authorization": "Bearer {env:TOKEN}" } }`. A server that answers 401 shows `needs authorization`; run `/mcp auth <name>` to sign in. moco prints an address to open in a browser (and tries `open`/`xdg-open`) and listens on a loopback port for the redirect. Over SSH, open the address on your own machine and paste the address the browser ended up on at the prompt. Tokens are stored in `mcp-auth.json` in the app directory (mode 600, never in the Keychain) and refreshed automatically; `/mcp logout <name>` removes them. `"oauth": { "client_id", "client_secret", "scope", "callback_port", "redirect_uri", "auth_server_metadata_url" }` pre-configures a client, `"oauth": false` disables sign-in.
 - Remote HTTP and OAuth support is experimental: it has been verified against local fake servers and a live model on Mojave, not against real hosted MCP services.
+
+## Reasoning effort
+
+Models that can think more or less offer *levels*: `/effort` shows the ones the current model has and `/effort high` (or `/effort default`) sets it for the session; `moco --effort high` sets it at start; in the full-screen UI Ctrl-T steps through the levels and the status bar shows `think high`. Leader `e` opens the level list. A level the model does not have is ignored, so you can switch models freely. Defaults come from the config:
+
+```jsonc
+{ "effort": "medium",                                   // for every session
+  "agents": { "plan": { "effort": "high" } },           // per agent
+  "providers": { "myserver": { "models": { "big": {
+      "request":  { "headers": { "x-team": "me" } },    // sent with every request to this model
+      "variants": { "deep": { "body": { "reasoning": { "effort": "high" } } } } } } } } }  // a level of your own
+```
+Anthropic's current models take `low` to `max` (and `none` where thinking can be switched off); OpenAI's reasoning models `minimal` to `high`; Gemini a budget. Reasoning is shown in the transcript (Ctrl-O for the full text). More about how each provider is asked: `docs/07`.
 
 ## Web search
 

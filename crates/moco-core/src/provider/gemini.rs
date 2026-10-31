@@ -169,6 +169,7 @@ pub fn build_body(req: &Request) -> Value {
             body["toolConfig"] = json!({"functionCallingConfig":{"mode":"NONE"}});
         }
     }
+    super::effort::shape_gemini(&mut body, req);
     body
 }
 
@@ -286,7 +287,7 @@ impl Provider for Gemini {
         if let Some(k) = &self.api_key {
             call = call.set("x-goog-api-key", k);
         }
-        for (k, v) in &self.headers {
+        for (k, v) in self.headers.iter().chain(req.overlay.headers.iter().map(|(k, v)| (k, v))) {
             call = call.set(k, v);
         }
         let resp = match call.send_string(&build_body(req).to_string()) {
@@ -441,6 +442,7 @@ mod tests {
             ],
             max_tokens: 100,
             tools_disabled: false,
+            ..Default::default()
         }
     }
 

@@ -13,6 +13,8 @@ pub struct Agent {
     pub model: Option<String>,
     /// Max steps per run; `None` is unlimited.
     pub steps: Option<u32>,
+    /// Default reasoning effort for this agent (a variant name); a session's own choice wins.
+    pub effort: Option<String>,
     pub permissions: Vec<Rule>,
 }
 
@@ -91,6 +93,7 @@ pub fn builtin() -> Vec<Agent> {
             system: None,
             model: None,
             steps: None,
+            effort: None,
             permissions: build,
         },
         Agent {
@@ -101,6 +104,7 @@ pub fn builtin() -> Vec<Agent> {
             system: None,
             model: None,
             steps: None,
+            effort: None,
             permissions: plan,
         },
         Agent {
@@ -111,6 +115,7 @@ pub fn builtin() -> Vec<Agent> {
             system: None,
             model: None,
             steps: None,
+            effort: None,
             permissions: general,
         },
         Agent {
@@ -121,6 +126,7 @@ pub fn builtin() -> Vec<Agent> {
             system: Some(EXPLORE_PROMPT.into()),
             model: None,
             steps: None,
+            effort: None,
             permissions: explore,
         },
     ]
