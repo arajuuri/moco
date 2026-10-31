@@ -6,6 +6,6 @@ Status: Phases 0-2 are implemented and verified on a real Mojave machine: stream
 
 - Using it: `docs/11-usage.md`
 - Design and specification: `docs/00-overview.md`; build order, results and what is left: `docs/10-roadmap.md`
-- Working on it: `CLAUDE.md`
+- Working on it: `AGENTS.md`
 
 Upstream reference: opencode at commit `6c24ec9532`. Source paths cited in the docs are relative to that checkout.
