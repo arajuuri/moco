@@ -12,7 +12,7 @@ env.pop("ANTHROPIC_API_KEY", None)
 pid, fd = pty.fork()
 if pid == 0:
     os.chdir(work)
-    os.execve(moco, [moco, "--tui", "--model", "fake/m", "--dir", work], env)
+    os.execve(moco, [moco, "--model", "fake/m", "--dir", work], env)
 fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
 raw = b""
 
@@ -92,7 +92,36 @@ def check_restored(status, code_ok=True):
 
 
 wait_for(r"/helpforcommands")
-if scenario == "chat":
+if scenario == "steer":
+    send(b"SLOW read a.txt\r")
+    wait_for(r"\(running\)")  # the turn is going (the model is slow on purpose)
+    send(b"also steer this\r")
+    wait_for(r"nextstep>alsosteerthis")  # waiting in the strip above the composer
+    send(b"and queue this\x11")  # Ctrl-Q
+    pump(0.3)
+    # Both are delivered by the engine: the steer at a step boundary, the queued one when the turn ends.
+    import sqlite3, json
+    db = os.path.join(home, "data", "moco.db")
+    end = time.time() + 30
+    texts = []
+    while time.time() < end:
+        pump(0.3)
+        try:
+            rows = sqlite3.connect(db).execute("select type, data from message order by id").fetchall()
+        except sqlite3.Error:
+            continue
+        texts = [json.loads(d)["text"] for t, d in rows if t == "user"]
+        if len(texts) == 3 and rows[-1][0] == "assistant":
+            break
+    if texts != ["SLOW read a.txt", "also steer this", "and queue this"]:
+        fail("user messages in the store: %r" % texts)
+    kinds = [t for t, _ in rows]
+    # the steer went in after the first step (tool call + result), before the final answer; the queued one after it
+    if kinds[:2] != ["user", "assistant"] or kinds.index("user", 1) > 3:
+        fail("unexpected message order %r" % kinds)
+    send(b"\x04")
+    check_restored(wait_exit())
+elif scenario == "chat":
     send(b"Read a.txt and tell me what it says.\r")
     wait_for(r"Permissionneeded:read")
     send(b"y")

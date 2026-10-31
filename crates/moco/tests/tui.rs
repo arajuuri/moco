@@ -25,9 +25,10 @@ fn scenario(name: &str) {
         format!(
             r#"{{ "providers": {{ "fake": {{ "base_url": "http://127.0.0.1:{}/v1", "protocol": "openai-responses",
                  "models": {{ "m": {{ "limit": {{ "context": 100000, "output": 4000 }} }} }} }} }},
-               "permissions": [ {{ "action": "read", "resource": "*", "effect": "ask" }} ],
+               "permissions": [ {{ "action": "read", "resource": "*", "effect": "{}" }} ],
                "snapshots": false }}"#,
-            port.trim()
+            port.trim(),
+            if name == "steer" { "allow" } else { "ask" }
         ),
     )
     .unwrap();
@@ -54,4 +55,9 @@ fn chat_with_permission_dialog_resize_and_clean_exit() {
 #[test]
 fn sigterm_while_a_dialog_is_open_restores_the_terminal() {
     scenario("sigterm");
+}
+
+#[test]
+fn prompts_typed_during_a_turn_are_steered_or_queued_and_delivered() {
+    scenario("steer");
 }

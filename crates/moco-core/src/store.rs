@@ -103,6 +103,17 @@ impl Mode {
     }
 }
 
+/// A not yet delivered prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxItem {
+    pub id: String,
+    /// Steer (delivered at the next step boundary) or queue (when the session is idle).
+    pub steer: bool,
+    /// `user`, `synthetic`, ...
+    pub kind: String,
+    pub text: String,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -485,6 +496,24 @@ impl Store {
         Ok(self.conn.query_row("select count(*) from session_inbox where session_id=?1", [session_id], |r| r.get::<_, i64>(0))? as usize)
     }
 
+    /// Everything waiting in the session's inbox, in enqueue order (what a UI shows as "queued").
+    pub fn inbox_items(&self, session_id: &str) -> Result<Vec<InboxItem>> {
+        let mut stmt = self.conn.prepare("select id, mode, type, data from session_inbox where session_id=?1 order by id")?;
+        let rows = stmt.query_map([session_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?)))?;
+        let mut out = vec![];
+        for row in rows {
+            let (id, mode, kind, data) = row?;
+            let data: Value = serde_json::from_str(&data)?;
+            out.push(InboxItem { id, steer: mode == "steer", kind, text: data["text"].as_str().unwrap_or("").to_string() });
+        }
+        Ok(out)
+    }
+
+    /// Switch a waiting item between steer and queue. False when it was already delivered.
+    pub fn set_inbox_mode(&self, inbox_id: &str, mode: Mode) -> Result<bool> {
+        Ok(self.conn.execute("update session_inbox set mode=?2 where id=?1", params![inbox_id, mode.as_str()])? > 0)
+    }
+
     pub fn cancel_inbox(&self, inbox_id: &str) -> Result<bool> {
         Ok(self.conn.execute("delete from session_inbox where id=?1", [inbox_id])? > 0)
     }
@@ -779,6 +808,20 @@ mod tests {
         let id = s.enqueue(&ses.id, None, Mode::Queue, "user", &json!({})).unwrap();
         assert!(s.cancel_inbox(&id).unwrap());
         assert_eq!(s.pending_inbox(&ses.id).unwrap(), 0);
+    }
+
+    #[test]
+    fn inbox_items_can_be_listed_and_switched() {
+        let (mut s, ses) = store();
+        let a = s.enqueue(&ses.id, None, Mode::Steer, "user", &json!({"text": "first"})).unwrap();
+        let b = s.enqueue(&ses.id, None, Mode::Queue, "synthetic", &json!({"text": "job done"})).unwrap();
+        let items = s.inbox_items(&ses.id).unwrap();
+        assert_eq!(items.iter().map(|i| (i.id.clone(), i.steer, i.kind.as_str(), i.text.as_str())).collect::<Vec<_>>(), vec![(a.clone(), true, "user", "first"), (b.clone(), false, "synthetic", "job done")]);
+        assert!(s.set_inbox_mode(&a, Mode::Queue).unwrap());
+        assert!(!s.inbox_items(&ses.id).unwrap()[0].steer);
+        s.deliver(&ses.id, true).unwrap(); // idle: one queued item
+        assert_eq!(s.inbox_items(&ses.id).unwrap().len(), 1);
+        assert!(!s.set_inbox_mode(&a, Mode::Steer).unwrap()); // already delivered
     }
 
     #[test]

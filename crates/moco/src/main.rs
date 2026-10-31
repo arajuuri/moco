@@ -1,4 +1,4 @@
-//! moco: terminal chat (line based, or full screen with --tui).
+//! moco: terminal chat (full screen on a terminal; line based with --plain, with -p or when piped).
 mod tui;
 use moco_core::catalog::{Catalog, ProviderInfo};
 use moco_core::mcp::{self, oauth::LoginIo, trust, Manager, ServerSpec};
@@ -201,7 +201,7 @@ impl Ui for Terminal {
                 print!("{t}");
                 self.mid_line.store(!t.ends_with('\n'), Ordering::Relaxed);
             }
-            UiEvent::ReasoningDelta(_) | UiEvent::Titled(_) => return,
+            UiEvent::ReasoningDelta(_) | UiEvent::Titled(_) | UiEvent::Delivered => return,
             UiEvent::StepUsage { usage, cost, session_cost, context_tokens, context_limit } => {
                 let mut r = self.run.lock().unwrap();
                 r.usage.input += usage.input;
@@ -540,7 +540,7 @@ fn main() {
     }
 
     let (mut cont, mut prompt, mut dir, mut session_arg) = (false, None, None, None::<String>);
-    let mut want_tui = false;
+    let mut want_tui: Option<bool> = None;
     let mut model = std::env::var("MOCO_MODEL").ok();
     let mut agent_id: Option<String> = None;
     let mut args = raw.drain(..);
@@ -553,11 +553,11 @@ fn main() {
             "--dir" => dir = Some(value("--dir")),
             "--session" | "-s" => session_arg = Some(value("--session")),
             "--prompt" | "-p" => prompt = Some(value("--prompt")),
-            "--tui" => want_tui = true,
-            "--plain" => want_tui = false,
+            "--tui" => want_tui = Some(true),
+            "--plain" => want_tui = Some(false),
             "--help" | "-h" => {
                 println!(
-                    "usage: moco [--continue | --session ID] [--model PROVIDER/MODEL] [--agent ID] [--dir PATH] [-p PROMPT] [--tui]\n       moco sessions [--all] [--archived] | rename ID TITLE | archive ID | unarchive ID\n       moco models [FILTER] [--refresh]\n       moco auth PROVIDER"
+                    "usage: moco [--continue | --session ID] [--model PROVIDER/MODEL] [--agent ID] [--dir PATH] [-p PROMPT] [--plain]\n       moco sessions [--all] [--archived] | rename ID TITLE | archive ID | unarchive ID\n       moco models [FILTER] [--refresh]\n       moco auth PROVIDER"
                 );
                 return;
             }
@@ -706,26 +706,28 @@ fn main() {
         engine.submit_with(sid, text, Some(m), Mode::Steer).is_ok()
     };
 
-    if want_tui && prompt.is_none() {
-        if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
-            die("--tui needs a terminal on stdin and stdout");
-        }
+    let on_terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    if want_tui == Some(true) && !on_terminal {
+        die("--tui needs a terminal on stdin and stdout");
+    }
+    // The full-screen UI is the default on a terminal; -p, pipes and --plain keep the line-based chat.
+    if prompt.is_none() && want_tui.unwrap_or(on_terminal) {
         let sid = session.id.clone();
-        let submit = |text: &str| -> Result<Vec<String>, String> {
+        let submit = |text: &str, mode: Mode| -> Result<(String, Vec<String>), String> {
             let subagents = engine.subagent_names();
             let caps = caps_of(&sid);
             let (m, notes) = mentions::expand(text, &mentions::Ctx { cwd: &cwd, skills: &found_skills, subagents: &subagents, app_dir: &app_dir, caps, mcp: manager.as_deref() });
-            engine.submit_with(&sid, text, Some(m), Mode::Steer).map_err(|e| format!("could not queue the prompt: {e}"))?;
-            Ok(notes)
+            let id = engine.submit_with(&sid, text, Some(m), mode).map_err(|e| format!("could not queue the prompt: {e}"))?;
+            Ok((id, notes))
         };
         let command = |line: &str| -> Result<tui::Resolved, String> {
             let (name, args) = line[1..].split_once(char::is_whitespace).unwrap_or((&line[1..], ""));
             if let Some(m) = manager.as_ref().filter(|m| m.prompts().iter().any(|p| p.command == name)) {
                 return m.get_prompt(name, args).map(|text| tui::Resolved { text, agent: None, model: None });
             }
-            let cmd = found_commands.iter().find(|c| c.name == name).ok_or_else(|| format!("unknown command /{name}: the full-screen UI has /help, /exit, custom commands and MCP prompts so far; run `moco` without --tui for the rest"))?;
+            let cmd = found_commands.iter().find(|c| c.name == name).ok_or_else(|| format!("unknown command /{name} (Ctrl-P lists the commands)"))?;
             if cmd.subagent {
-                return Err(format!("/{name} runs in a subagent, which the full-screen UI cannot show yet; run `moco` without --tui for it"));
+                return Err(format!("/{name} runs in a subagent, which the full-screen UI cannot show yet; run `moco --plain` for it"));
             }
             Ok(tui::Resolved { text: commands::expand(cmd, args), agent: cmd.agent.clone(), model: cmd.model.clone() })
         };

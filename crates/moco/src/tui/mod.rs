@@ -10,6 +10,7 @@ pub use complete::Completer;
 use app::{Action, App, AppEvent, Ev};
 use crossterm::event::{self, Event};
 use moco_core::engine::{Engine, PermissionPrompt, Reply, Ui, UiEvent};
+use moco_core::store::Mode;
 use moco_core::tools::Question;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,8 +46,8 @@ pub struct Host<'a> {
     pub header: String,
     /// The previous process died mid-run: continue that run first.
     pub recovered: bool,
-    /// Expand mentions and queue the prompt; returns notes about attachments.
-    pub submit: &'a dyn Fn(&str) -> Result<Vec<String>, String>,
+    /// Expand mentions and put the prompt in the inbox; returns its inbox id and notes about attachments.
+    pub submit: &'a dyn Fn(&str, Mode) -> Result<(String, Vec<String>), String>,
     /// Turn `/name args` into a prompt (custom commands, MCP prompts). `Err` carries a message for the user.
     pub command: &'a dyn Fn(&str) -> Result<Resolved, String>,
     pub completer: Option<Completer>,
@@ -99,6 +100,12 @@ impl TuiUi {
             UiEvent::Nested { agent, inner } => return self.convert(depth + 1, agent, inner),
             UiEvent::TextDelta(t) => Ev::Text(t.to_string()),
             UiEvent::ReasoningDelta(_) => return,
+            UiEvent::Delivered => {
+                if depth == 0 {
+                    self.send(AppEvent::Delivered);
+                }
+                return;
+            }
             UiEvent::ToolStarted { name, input } => Ev::Tool { name: name.to_string(), summary: crate::summary(name, input) },
             UiEvent::ToolFinished { name, ok, text } => Ev::ToolDone { name: name.to_string(), ok: *ok, msg: text.lines().next().unwrap_or("").to_string() },
             UiEvent::Retry { attempt, wait, error } => Ev::Retry { attempt: *attempt, secs: wait.as_secs(), error: error.to_string() },
@@ -217,8 +224,8 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
         };
 
         // Queue a prompt for the session and start the run, showing attachment notes.
-        let send_prompt = |app: &mut App, sid: &str, text: &str| match (host.submit)(text) {
-            Ok(notes) => {
+        let send_prompt = |app: &mut App, sid: &str, text: &str| match (host.submit)(text, Mode::Steer) {
+            Ok((_, notes)) => {
                 for n in notes {
                     app.push_info(n);
                 }
@@ -232,11 +239,33 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
             start_run(&mut app, &sid, true);
         }
 
+        // Prompts that were sent during a turn leave the inbox when the engine delivers them: that is when
+        // they become part of the conversation, so that is when they appear in the transcript.
+        let sync_queue = |app: &mut App, sid: &str| {
+            let waiting = engine.store.lock().unwrap().inbox_items(sid).unwrap_or_default();
+            let (still, gone): (Vec<_>, Vec<_>) = std::mem::take(&mut app.queued).into_iter().partition(|q| waiting.iter().any(|w| w.id == q.id));
+            for q in gone {
+                app.push_user(q.text);
+            }
+            app.queued = still
+                .into_iter()
+                .map(|mut q| {
+                    q.steer = waiting.iter().find(|w| w.id == q.id).is_none_or(|w| w.steer);
+                    q
+                })
+                .collect();
+            app.jobs = engine.running_jobs();
+        };
+        let mut last_sync = std::time::Instant::now();
         let mut actions: VecDeque<Action> = VecDeque::new();
         let mut quit = false;
         while !quit {
             if SIGNALLED.load(Ordering::Relaxed) {
                 break;
+            }
+            if (app.running || !app.queued.is_empty() || app.jobs > 0) && last_sync.elapsed() >= Duration::from_millis(200) {
+                sync_queue(&mut app, &sid);
+                last_sync = std::time::Instant::now();
             }
             terminal.draw(|f| app::render(f, &mut app))?;
             let first = match rx.recv_timeout(Duration::from_millis(150)) {
@@ -255,7 +284,20 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
                         st.set_model(&sid, model.as_deref()).ok();
                     }
                 }
+                if matches!(ev, AppEvent::Delivered) {
+                    // The engine moved waiting prompts into the conversation: show them before what follows.
+                    sync_queue(&mut app, &sid);
+                    last_sync = std::time::Instant::now();
+                }
+                let finished_idle = matches!(ev, AppEvent::RunDone(Ok(moco_core::engine::RunOutcome::Idle)));
                 actions.push_back(app.update(ev));
+                if finished_idle {
+                    // A prompt that arrived as the turn ended is still waiting: run again to deliver it.
+                    sync_queue(&mut app, &sid);
+                    if !app.queued.is_empty() && !app.running {
+                        start_run(&mut app, &sid, false);
+                    }
+                }
                 while let Some(action) = actions.pop_front() {
                     match action {
                         Action::None => {}
@@ -267,6 +309,31 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
                                 start_run(&mut app, &sid, false);
                             }
                         }
+                        Action::Enqueue { text, shown, queue } => match (host.submit)(&text, if queue { Mode::Queue } else { Mode::Steer }) {
+                            Ok((id, notes)) => {
+                                for n in notes {
+                                    app.push_info(n);
+                                }
+                                app.queued.push(app::Queued { id, steer: !queue, text: shown });
+                                if !app.running {
+                                    sync_queue(&mut app, &sid);
+                                    start_run(&mut app, &sid, false); // the turn ended meanwhile
+                                }
+                            }
+                            Err(e) => app.rows.push(app::Row::Error(e)),
+                        },
+                        Action::Dropped { kind, value } => match kind {
+                            app::PickKind::Queue => {
+                                engine.store.lock().unwrap().cancel_inbox(&value).ok();
+                                app.queued.retain(|q| q.id != value);
+                                app.push_info("removed the waiting prompt");
+                            }
+                            app::PickKind::Job => match engine.kill_job(&value) {
+                                Ok(t) => app.push_info(t),
+                                Err(e) => app.rows.push(app::Row::Error(e)),
+                            },
+                            _ => {}
+                        },
                         Action::Palette => app.open_picker(app::Picker::new(app::PickKind::Command, "commands", builtin::palette_items(&host), "")),
                         Action::Picked { kind, value } => match kind {
                             app::PickKind::Model => {
@@ -292,6 +359,21 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
                                     }
                                 }
                             }
+                            app::PickKind::Queue => {
+                                if let Some(q) = app.queued.iter().find(|q| q.id == value).cloned() {
+                                    let mode = if q.steer { Mode::Queue } else { Mode::Steer };
+                                    if engine.store.lock().unwrap().set_inbox_mode(&value, mode).unwrap_or(false) {
+                                        sync_queue(&mut app, &sid);
+                                        app.push_info(format!("\"{}\" now goes {}", crate::clip(q.text.lines().next().unwrap_or(""), 40), if q.steer { "after the turn" } else { "into the next step" }));
+                                    } else {
+                                        app.push_info("it was delivered already");
+                                    }
+                                }
+                            }
+                            app::PickKind::Job => match engine.job_output(&value, 40) {
+                                Ok(t) => app.rows.push(app::Row::Shell(t)),
+                                Err(e) => app.rows.push(app::Row::Error(e)),
+                            },
                             app::PickKind::Command => {
                                 if let Some(cmd) = value.strip_prefix("run:") {
                                     actions.push_back(Action::Submit { text: cmd.to_string(), shown: cmd.to_string() });
@@ -328,7 +410,7 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
                                 app.push_user(shown.clone());
                                 let is_builtin = builtin::NAMES.iter().any(|(n, _)| *n == name) || matches!(name, "resume" | "unarchive");
                                 if is_builtin {
-                                    if app.running && !matches!(name, "jobs" | "skills" | "commands" | "mcp" | "diff") {
+                                    if app.running && !matches!(name, "jobs" | "skills" | "commands" | "mcp" | "diff" | "queue") {
                                         app.rows.push(app::Row::Error("a turn is running: wait for it (or press Esc) first".into()));
                                     } else {
                                         let agent = app.agent.clone();
@@ -343,6 +425,12 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
                                                 let keep: Vec<app::Row> = std::mem::take(&mut app.rows).into_iter().rev().take_while(|r| !matches!(r, app::Row::User(_))).collect();
                                                 load_rows(&mut app, &sid);
                                                 app.rows.extend(keep.into_iter().rev());
+                                            }
+                                            Some(builtin::Effect::Enqueued) => {
+                                                if !app.running {
+                                                    sync_queue(&mut app, &sid);
+                                                    start_run(&mut app, &sid, false);
+                                                }
                                             }
                                             Some(builtin::Effect::Compact) => {
                                                 app.running = true;

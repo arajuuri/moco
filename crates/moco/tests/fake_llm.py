@@ -6,7 +6,7 @@ Usage: fake_llm.py VIOLATIONS_FILE   (prints the port on the first line of stdou
 Every conversation takes two turns: the first answers with a tool call (preceded by the provider-private replay data a
 real reasoning model sends), the second must contain that replay data and the tool result, and answers with text that
 quotes the file. Anything wrong with the second request is appended to VIOLATIONS_FILE, which the test reads."""
-import json, sys
+import json, sys, time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 VIOLATIONS = sys.argv[1]
@@ -37,6 +37,8 @@ def responses(handler, body):
     items = body["input"]
     outputs = [i for i in items if i.get("type") == "function_call_output"]
     if not outputs:
+        if "SLOW" in json.dumps(items):
+            time.sleep(1.5)  # lets a test type while the turn is running
         reasoning = {"type": "reasoning", "id": "rs_1", "encrypted_content": "ENC-1", "summary": []}
         call = {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "read", "arguments": json.dumps({"path": "a.txt"}), "status": "completed"}
         return sse(handler, [

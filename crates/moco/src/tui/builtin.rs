@@ -13,6 +13,8 @@ pub enum Effect {
     Reload,
     /// Summarize older messages; slow, so the loop runs it on a worker.
     Compact,
+    /// A prompt was queued; start a run if none is going.
+    Enqueued,
 }
 
 pub const NAMES: &[(&str, &str)] = &[
@@ -27,6 +29,7 @@ pub const NAMES: &[(&str, &str)] = &[
     ("fork", "copy this conversation into a new session"),
     ("rename", "name this session"),
     ("archive", "hide a session from the list"),
+    ("queue", "send a prompt after the current turn, or manage waiting prompts"),
     ("jobs", "background commands and subagents"),
     ("skills", "list skills"),
     ("commands", "list custom commands"),
@@ -79,12 +82,19 @@ fn session_items(host: &Host, all: bool, archived: bool) -> Vec<PickItem> {
         .collect()
 }
 
+pub fn queue_items(app: &App) -> Vec<PickItem> {
+    app.queued
+        .iter()
+        .map(|q| PickItem { label: crate::clip(q.text.lines().next().unwrap_or(""), 60), detail: if q.steer { "next step".into() } else { "after the turn".into() }, value: q.id.clone() })
+        .collect()
+}
+
 pub fn palette_items(host: &Host) -> Vec<PickItem> {
     let mut v: Vec<PickItem> = vec![];
     let mut add = |name: &str, desc: &str, run: bool| v.push(PickItem { label: format!("/{name}"), detail: desc.to_string(), value: format!("{}/{name}{}", if run { "run:" } else { "ins:" }, if run { "" } else { " " }) });
     for (n, d) in NAMES {
         // Commands that need an argument are inserted into the composer; the rest run at once.
-        add(n, d, !matches!(*n, "rename" | "fork" | "archive" | "mcp" | "jobs"));
+        add(n, d, !matches!(*n, "rename" | "fork" | "archive" | "mcp" | "queue"));
     }
     add("help", "show the keys", true);
     add("exit", "quit", true);
@@ -243,8 +253,37 @@ pub fn run(host: &Host, app: &mut App, sid: &str, agent: &str, name: &str, args:
             Err(e) => err(app, format!("store error: {e}")),
         },
         "compact" => return Some(Effect::Compact),
+        "queue" => {
+            if args.is_empty() {
+                let items = queue_items(app);
+                if items.is_empty() {
+                    app.push_info("no prompts are waiting (type while a turn runs: Enter steers it into the turn, Ctrl-Q or /queue <text> waits for the end)");
+                } else {
+                    app.open_picker(Picker::new(PickKind::Queue, "waiting prompts: Enter switches next-step/after-turn, Ctrl-D removes", items, ""));
+                }
+            } else {
+                match (host.submit)(args, moco_core::store::Mode::Queue) {
+                    Ok((id, notes)) => {
+                        for n in notes {
+                            app.push_info(n);
+                        }
+                        app.queued.push(super::app::Queued { id, steer: false, text: args.to_string() });
+                        return Some(Effect::Enqueued);
+                    }
+                    Err(e) => err(app, e),
+                }
+            }
+        }
         "jobs" => {
-            if let Some(id) = args.strip_prefix("output") {
+            if args.is_empty() {
+                let jobs = engine.background_jobs(None);
+                if jobs.is_empty() {
+                    app.push_info("no background jobs");
+                } else {
+                    let items = jobs.iter().map(|j| PickItem { label: format!("{} {}", j.id, crate::clip(j.title.lines().next().unwrap_or(""), 50)), detail: format!("{} {} {}s", j.kind, j.status, j.seconds), value: j.id.clone() }).collect();
+                    app.open_picker(Picker::new(PickKind::Job, "background jobs: Enter shows output, Ctrl-D stops", items, ""));
+                }
+            } else if let Some(id) = args.strip_prefix("output") {
                 match engine.job_output(id.trim(), 40) {
                     Ok(t) => app.rows.push(Row::Shell(t)),
                     Err(e) => err(app, e),
@@ -255,14 +294,7 @@ pub fn run(host: &Host, app: &mut App, sid: &str, agent: &str, name: &str, args:
                     Err(e) => err(app, e),
                 }
             } else {
-                let jobs = engine.background_jobs(None);
-                if jobs.is_empty() {
-                    app.push_info("no background jobs");
-                }
-                for j in jobs {
-                    app.push_info(format!("  {}  {:<8} {:<18} {:>5}s  {}", j.id, j.kind, j.status, j.seconds, crate::clip(j.title.lines().next().unwrap_or(""), 60)));
-                }
-                app.push_info("  /jobs output <id>, /jobs kill <id>");
+                err(app, "usage: /jobs [output <id> | kill <id>]");
             }
         }
         "skills" => {
@@ -301,7 +333,7 @@ pub fn run(host: &Host, app: &mut App, sid: &str, agent: &str, name: &str, args:
                     Err(e) => err(app, e),
                 }
             } else if args.starts_with("auth") {
-                err(app, "signing in needs a browser address and a paste prompt: run `moco` without --tui and use /mcp auth <name>");
+                err(app, "signing in needs a browser address and a paste prompt: run `moco --plain` and use /mcp auth <name>");
             }
             for i in m.status() {
                 app.push_info(format!("  {:<14} {}   [{}]", i.name, moco_core::mcp::manager::describe(&i), crate::clip(&i.command, 50)));

@@ -49,6 +49,8 @@ pub enum UiEvent<'a> {
     Todos(&'a [Todo]),
     /// A generated title was stored for the session.
     Titled(&'a str),
+    /// Prompts from the inbox became part of the conversation (at a step boundary or when the session was idle).
+    Delivered,
     /// An event from a subagent session; nests when subagents start subagents.
     Nested { agent: &'a str, inner: &'a UiEvent<'a> },
 }
@@ -379,6 +381,7 @@ impl Engine {
             let delivered = self.store().deliver(sid, !continuing)?;
             if !delivered.is_empty() {
                 step = 0; // new user input resets the step allowance
+                ui.event(&UiEvent::Delivered);
             }
             if !continuing && delivered.is_empty() {
                 return Ok(RunOutcome::Idle);
@@ -1230,6 +1233,8 @@ mod tests {
         hook: Mutex<Option<Box<dyn Fn(&str) + Send>>>,
         questions: Mutex<Vec<Vec<Question>>>,
         answers: Mutex<Option<Vec<Vec<String>>>>,
+        /// `Delivered` events are counted, not logged, so event-sequence assertions stay about the model's output.
+        delivered: std::sync::atomic::AtomicUsize,
     }
     impl TestUi {
         fn replying(r: Vec<Reply>) -> Self {
@@ -1251,12 +1256,17 @@ mod tests {
             UiEvent::Status(n) => format!("status:{n}"),
             UiEvent::Todos(t) => format!("todos:{}", t.len()),
             UiEvent::Titled(t) => format!("title:{t}"),
+            UiEvent::Delivered => "delivered".into(),
             UiEvent::Nested { agent, inner } => format!("{agent}>{}", describe(inner)),
         }
     }
 
     impl Ui for TestUi {
         fn event(&self, e: &UiEvent) {
+            if matches!(e, UiEvent::Delivered) {
+                self.delivered.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
             let line = describe(e);
             if let Some(h) = &*self.hook.lock().unwrap() {
                 h(&line);
@@ -1529,6 +1539,17 @@ mod tests {
         let tail = last_user_blocks(&reqs[1]);
         assert!(matches!(&tail[0], Block::ToolResult { .. }));
         assert!(matches!(&tail[1], Block::Text(t) if t == "actually, also this"));
+    }
+
+    #[test]
+    fn delivery_is_announced_to_the_ui_in_order_with_the_output() {
+        let f = fixture(vec![text("one"), text("two")]);
+        f.say("first");
+        f.engine.submit(&f.session.id, "second", Mode::Queue).unwrap();
+        let ui = TestUi::default();
+        assert_eq!(f.run(&ui), RunOutcome::Idle);
+        // Once for "first", once for the queued "second".
+        assert_eq!(ui.delivered.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
     #[test]

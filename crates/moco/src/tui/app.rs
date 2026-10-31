@@ -55,6 +55,8 @@ pub enum AppEvent {
     /// `depth` is 0 for the session itself and grows with nested subagents.
     Engine { depth: usize, agent: String, ev: Ev },
     Ask { action: String, resources: Vec<String>, save: Vec<String>, reply: Sender<Reply> },
+    /// The engine delivered waiting prompts (the UI syncs its queue and shows them).
+    Delivered,
     /// A line from the engine's notifier (background job finished, ...).
     Background(String),
     RunDone(Result<moco_core::engine::RunOutcome, String>),
@@ -72,6 +74,19 @@ pub enum PickKind {
     Session,
     Agent,
     Command,
+    /// Prompts waiting in the inbox: Enter switches steer/queue, Ctrl-D removes.
+    Queue,
+    /// Background jobs: Enter shows the output, Ctrl-D stops one.
+    Job,
+}
+
+/// A prompt that was sent while a turn was running and has not been delivered yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Queued {
+    pub id: String,
+    /// Delivered at the next step boundary (true) or when the turn is over (false).
+    pub steer: bool,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,6 +179,10 @@ pub enum Action {
     Palette,
     /// An entry was chosen in a picker.
     Picked { kind: PickKind, value: String },
+    /// Ctrl-D on an entry of a queue or job picker.
+    Dropped { kind: PickKind, value: String },
+    /// A prompt typed while a turn runs: steer it into the turn, or queue it for after.
+    Enqueue { text: String, shown: String, queue: bool },
     Interrupt,
     Quit,
 }
@@ -224,6 +243,12 @@ pub struct App {
     pub limit: Option<u64>,
     pub hint: Option<String>,
     pub tick: u64,
+    pub queued: Vec<Queued>,
+    pub jobs: usize,
+    /// A retry is pending: when the next attempt starts, which attempt, and why.
+    pub retry: Option<(std::time::Instant, u32, String)>,
+    /// Show every tool call of subagents instead of one summary line per run of calls.
+    pub expand_sub: bool,
     pub history: Vec<String>,
     hist: Option<usize>,
     draft: String,
@@ -259,6 +284,10 @@ impl App {
             limit: None,
             hint: None,
             tick: 0,
+            queued: vec![],
+            jobs: 0,
+            retry: None,
+            expand_sub: false,
             history: vec![],
             hist: None,
             draft: String::new(),
@@ -294,7 +323,7 @@ impl App {
                     self.refresh_popup();
                 }
             }
-            AppEvent::Resize => {}
+            AppEvent::Resize | AppEvent::Delivered => {}
             AppEvent::Tick => self.tick += 1,
             AppEvent::Engine { depth, agent, ev } => self.engine(depth, agent, ev),
             AppEvent::Ask { action, resources, save, reply } => {
@@ -327,6 +356,7 @@ impl App {
             AppEvent::RunDone(outcome) => {
                 use moco_core::engine::RunOutcome::*;
                 self.running = false;
+                self.retry = None;
                 self.dialogs.clear(); // a dialog whose run is gone cannot be answered
                 self.forms.clear();
                 match outcome {
@@ -357,6 +387,9 @@ impl App {
     }
 
     fn engine(&mut self, depth: usize, agent: String, ev: Ev) {
+        if !matches!(ev, Ev::Retry { .. }) {
+            self.retry = None;
+        }
         match ev {
             Ev::Text(t) => {
                 if depth > 0 {
@@ -374,7 +407,10 @@ impl App {
                     *state = if ok { ToolState::Done } else { ToolState::Failed(msg) };
                 }
             }
-            Ev::Retry { attempt, secs, error } => self.push_info(format!("retrying in {secs}s (attempt {attempt}): {error}")),
+            Ev::Retry { attempt, secs, error } => {
+                self.retry = Some((std::time::Instant::now() + std::time::Duration::from_secs(secs), attempt, error.clone()));
+                self.push_info(format!("retrying in {secs}s (attempt {attempt}): {error}"));
+            }
             Ev::Usage { usage, cost, session_cost, context, limit } => {
                 self.run.usage.input += usage.input;
                 self.run.usage.output += usage.output;
@@ -608,7 +644,8 @@ impl App {
         self.refresh_popup();
     }
 
-    fn submit(&mut self) -> Action {
+    /// Take the composer's content: (text with pasted blocks expanded, text as typed).
+    fn take_input(&mut self) -> (String, String) {
         let shown = self.input.trim().to_string();
         let mut text = shown.clone();
         for (tag, content) in &self.pastes {
@@ -623,7 +660,22 @@ impl App {
         if self.history.last() != Some(&shown) {
             self.history.push(shown.clone());
         }
+        (text, shown)
+    }
+
+    fn submit(&mut self) -> Action {
+        let (text, shown) = self.take_input();
         Action::Submit { text, shown }
+    }
+
+    fn enqueue(&mut self, queue: bool) -> Action {
+        let (text, shown) = self.take_input();
+        Action::Enqueue { text, shown, queue }
+    }
+
+    /// Commands (`/x`, `!x`) are handled at once even while a turn runs; plain text is queued for the turn.
+    fn is_command(&self) -> bool {
+        matches!(self.input.trim_start().chars().next(), Some('/') | Some('!'))
     }
 
     fn key(&mut self, k: KeyEvent) -> Action {
@@ -684,6 +736,16 @@ impl App {
                 self.scroll = 0;
             }
             KeyCode::Char('p') if ctrl => return Action::Palette,
+            KeyCode::Char('o') if ctrl => {
+                self.expand_sub = !self.expand_sub;
+                self.hint = Some(if self.expand_sub { "showing every subagent tool call".into() } else { "subagent tool calls are summarized".into() });
+            }
+            KeyCode::Char('q') if ctrl => {
+                if self.input.trim().is_empty() {
+                    return Action::None;
+                }
+                return if self.running && !self.is_command() { self.enqueue(true) } else { self.submit() };
+            }
             KeyCode::Char('j') if ctrl => self.insert("\n"),
             KeyCode::Enter if alt => self.insert("\n"),
             KeyCode::Tab => self.accept_completion(),
@@ -695,12 +757,11 @@ impl App {
                         return Action::None;
                     }
                 }
-                if self.running {
-                    self.hint = Some("a run is in progress: Esc interrupts it".into());
-                    return Action::None;
-                }
                 if self.input.trim().is_empty() {
-                    return Action::Poke;
+                    return if self.running { Action::None } else { Action::Poke };
+                }
+                if self.running && !self.is_command() {
+                    return self.enqueue(false);
                 }
                 return self.submit();
             }
@@ -779,6 +840,16 @@ impl App {
             KeyCode::Char('u') if ctrl => {
                 p.filter.clear();
                 p.sel = 0;
+            }
+            KeyCode::Char('d') if ctrl && matches!(p.kind, PickKind::Queue | PickKind::Job) => {
+                let vis = p.visible();
+                if let Some(&i) = vis.get(p.sel) {
+                    let value = p.items[i].value.clone();
+                    let kind = p.kind;
+                    p.items.remove(i);
+                    p.sel = p.sel.min(p.visible().len().saturating_sub(1));
+                    return Action::Dropped { kind, value };
+                }
             }
             KeyCode::Char(c) if !ctrl => {
                 p.filter.push(c);
@@ -930,7 +1001,10 @@ impl App {
         let t = &self.theme;
         let width = width.max(8);
         let mut out: Vec<Line<'static>> = vec![];
-        for (i, row) in self.rows.iter().enumerate() {
+        let mut next = 0;
+        while next < self.rows.len() {
+            let (i, row) = (next, &self.rows[next]);
+            next += 1;
             match row {
                 Row::User(s) => {
                     if i > 0 {
@@ -943,6 +1017,26 @@ impl App {
                 Row::Assistant(s) => {
                     for l in wrap(s.trim_end(), width) {
                         out.push(Line::styled(l, t.text));
+                    }
+                }
+                Row::Tool { depth, agent, name, summary, state } if *depth > 0 && !self.expand_sub => {
+                    // A run of a subagent's calls becomes one line (Ctrl-O shows them all).
+                    let (mut n, mut failed, mut running) = (1, matches!(state, ToolState::Failed(_)) as usize, matches!(state, ToolState::Running));
+                    let (mut last_name, mut last_summary) = (name, summary);
+                    while let Some(Row::Tool { depth: d, agent: a, name: nm, summary: sm, state: st }) = self.rows.get(next) {
+                        if d != depth || a != agent {
+                            break;
+                        }
+                        n += 1;
+                        failed += matches!(st, ToolState::Failed(_)) as usize;
+                        running |= matches!(st, ToolState::Running);
+                        (last_name, last_summary) = (nm, sm);
+                        next += 1;
+                    }
+                    let pad = "  ".repeat(*depth);
+                    let text = format!("{pad}[{agent}] {n} tool call{}{}: {} > {last_name} {last_summary}", if n == 1 { "" } else { "s" }, if failed > 0 { format!(", {failed} failed") } else { String::new() }, if running { "now" } else { "last" });
+                    for l in wrap(&text, width) {
+                        out.push(Line::styled(l, if failed > 0 { t.error } else { t.dim }));
                     }
                 }
                 Row::Tool { depth, agent, name, summary, state } => {
@@ -1056,15 +1150,21 @@ impl App {
                 _ => format!("ctx {}", human(self.context)),
             });
         }
+        if self.jobs > 0 {
+            parts.push(format!("{} job{} (/jobs)", self.jobs, if self.jobs == 1 { "" } else { "s" }));
+        }
         let mut s = format!(" {}", parts.join(" | "));
         let right = if let Some(h) = &self.hint {
             h.clone()
+        } else if let (true, Some((at, attempt, _))) = (self.running, &self.retry) {
+            let left = at.saturating_duration_since(std::time::Instant::now()).as_secs() + 1;
+            format!("{spin} retrying in {left}s (attempt {attempt}), Esc stops")
         } else if self.running {
-            format!("{spin} running (Esc interrupts)")
+            format!("{spin} running: Enter steers, Ctrl-Q queues, Esc stops")
         } else if self.scroll > 0 {
             "scrolled (Ctrl-End follows)".to_string()
         } else {
-            "Enter sends, Ctrl-D quits".to_string()
+            "Enter sends, Ctrl-P commands, Ctrl-D quits".to_string()
         };
         let used = display_width(&s) + display_width(&right) + 2;
         if used < width {
@@ -1172,8 +1272,24 @@ pub fn render(f: &mut Frame, app: &mut App) {
     let comp_lines = app.layout(comp_w);
     let visible = comp_lines.len().min(MAX_COMPOSER_LINES);
     let bottom_h = modal.as_ref().map_or(visible as u16 + 2, |m| m.1.len() as u16 + 2).min(area.height.saturating_sub(2).max(1));
-    let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(bottom_h), Constraint::Length(1)]).split(area);
-    let (main, bottom, status) = (parts[0], parts[1], parts[2]);
+    // Prompts waiting for delivery sit between the transcript and the composer.
+    let shown_q = app.queued.len().min(3);
+    let strip_h = (shown_q + (app.queued.len() > 3) as usize).min((area.height as usize).saturating_sub(6)) as u16;
+    let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(strip_h), Constraint::Length(bottom_h), Constraint::Length(1)]).split(area);
+    let (main, strip, bottom, status) = (parts[0], parts[1], parts[2], parts[3]);
+    if strip_h > 0 {
+        let mut ql: Vec<Line> = app
+            .queued
+            .iter()
+            .take(shown_q)
+            .map(|q| Line::styled(clip_width(&format!(" {} {}", if q.steer { "next step>" } else { "after turn>" }, q.text.lines().next().unwrap_or("")), area.width as usize), app.theme.dim))
+            .collect();
+        if app.queued.len() > 3 {
+            ql.push(Line::styled(format!(" +{} more (/queue)", app.queued.len() - 3), app.theme.dim));
+        }
+        ql.truncate(strip_h as usize);
+        f.render_widget(Paragraph::new(ql), strip);
+    }
 
     let lines = app.lines(main.width as usize);
     let h = main.height as usize;
@@ -1309,8 +1425,8 @@ mod tests {
         assert_eq!(a.input, "");
         a.running = true;
         type_str(&mut a, "more");
-        assert_eq!(press(&mut a, KeyCode::Enter), Action::None);
-        assert!(a.hint.is_some());
+        assert_eq!(press(&mut a, KeyCode::Enter), Action::Enqueue { text: "more".into(), shown: "more".into(), queue: false });
+        type_str(&mut a, "more");
         assert_eq!(a.update(key(KeyCode::Char('c'), KeyModifiers::CONTROL)), Action::Interrupt);
         assert_eq!(press(&mut a, KeyCode::Esc), Action::Interrupt);
         a.running = false;
@@ -1339,7 +1455,7 @@ mod tests {
         a.update(AppEvent::Engine { depth: 1, agent: "explore".into(), ev: Ev::Text("secret".into()) });
         a.update(AppEvent::Engine { depth: 1, agent: "explore".into(), ev: Ev::Tool { name: "grep".into(), summary: "x".into() } });
         let joined = screen(&mut a, 40, 14).join("\n");
-        assert!(!joined.contains("secret") && joined.contains("  [explore] > grep x"), "{joined}");
+        assert!(!joined.contains("secret") && joined.contains("  [explore] 1 tool call: now > grep x"), "{joined}");
     }
 
     #[test]
@@ -1634,6 +1750,78 @@ mod tests {
         let lines = a.lines(40);
         let color = |i: usize| lines[i].style.fg;
         assert_eq!((color(3), color(4), color(0)), (Some(Color::Red), Some(Color::Green), None));
+    }
+
+    #[test]
+    fn typing_during_a_turn_steers_or_queues_and_commands_still_run() {
+        let mut a = App::new("m", "build");
+        a.running = true;
+        type_str(&mut a, "also this");
+        assert_eq!(press(&mut a, KeyCode::Enter), Action::Enqueue { text: "also this".into(), shown: "also this".into(), queue: false });
+        type_str(&mut a, "later");
+        assert_eq!(a.update(key(KeyCode::Char('q'), KeyModifiers::CONTROL)), Action::Enqueue { text: "later".into(), shown: "later".into(), queue: true });
+        type_str(&mut a, "/jobs");
+        assert_eq!(press(&mut a, KeyCode::Enter), Action::Submit { text: "/jobs".into(), shown: "/jobs".into() }); // commands are not queued
+        assert_eq!(press(&mut a, KeyCode::Enter), Action::None); // empty composer during a turn does nothing
+        // Idle: Ctrl-Q just sends.
+        a.running = false;
+        type_str(&mut a, "go");
+        assert_eq!(a.update(key(KeyCode::Char('q'), KeyModifiers::CONTROL)), Action::Submit { text: "go".into(), shown: "go".into() });
+    }
+
+    #[test]
+    fn waiting_prompts_show_above_the_composer_and_the_status_shows_jobs_and_retries() {
+        let mut a = App::new("m", "build");
+        a.running = true;
+        for (i, steer) in [true, false, false, true, false].into_iter().enumerate() {
+            a.queued.push(Queued { id: format!("i{i}"), steer, text: format!("prompt {i}") });
+        }
+        a.jobs = 2;
+        let s = screen(&mut a, 110, 16).join("\n");
+        assert!(s.contains("next step> prompt 0") && s.contains("after turn> prompt 1") && s.contains("after turn> prompt 2") && s.contains("+2 more"), "{s}");
+        assert!(!s.contains("prompt 3") && s.contains("2 jobs (/jobs)") && s.contains("Enter steers, Ctrl-Q queues"), "{s}");
+        // A pending retry counts down in the status bar until something else arrives.
+        text(&mut a, Ev::Retry { attempt: 2, secs: 30, error: "overloaded".into() });
+        let s = screen(&mut a, 90, 16).join("\n");
+        assert!(s.contains("retrying in 30s (attempt 2)") || s.contains("retrying in 29s (attempt 2)"), "{s}");
+        text(&mut a, Ev::Text("back".into()));
+        assert!(!screen(&mut a, 90, 16).join("\n").contains("(attempt 2), Esc"));
+    }
+
+    #[test]
+    fn queue_and_job_pickers_can_drop_entries() {
+        let mut a = App::new("m", "build");
+        a.open_picker(Picker::new(PickKind::Queue, "queue", items(&["one", "two"]), ""));
+        press(&mut a, KeyCode::Down);
+        assert_eq!(a.update(key(KeyCode::Char('d'), KeyModifiers::CONTROL)), Action::Dropped { kind: PickKind::Queue, value: "v-two".into() });
+        assert_eq!(a.picker.as_ref().unwrap().items.len(), 1); // the entry leaves the list at once
+        // Other pickers ignore Ctrl-D.
+        a.open_picker(Picker::new(PickKind::Model, "model", items(&["one"]), ""));
+        assert_eq!(a.update(key(KeyCode::Char('d'), KeyModifiers::CONTROL)), Action::None);
+    }
+
+    #[test]
+    fn subagent_tool_calls_collapse_into_one_line_until_expanded() {
+        let mut a = App::new("m", "build");
+        let nested = |a: &mut App, ev: Ev| {
+            a.update(AppEvent::Engine { depth: 1, agent: "explore".into(), ev });
+        };
+        nested(&mut a, Ev::Tool { name: "grep".into(), summary: "foo".into() });
+        nested(&mut a, Ev::ToolDone { name: "grep".into(), ok: true, msg: String::new() });
+        nested(&mut a, Ev::Tool { name: "read".into(), summary: "a.rs".into() });
+        nested(&mut a, Ev::ToolDone { name: "read".into(), ok: false, msg: "no such file".into() });
+        nested(&mut a, Ev::Tool { name: "glob".into(), summary: "*.rs".into() });
+        let joined = screen(&mut a, 80, 12).join("\n");
+        assert!(joined.contains("[explore] 3 tool calls, 1 failed: now > glob *.rs") && !joined.contains("> grep foo"), "{joined}");
+        a.update(key(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        let joined = screen(&mut a, 80, 12).join("\n");
+        assert!(joined.contains("> grep foo") && joined.contains("> read a.rs") && joined.contains("failed: no such file"), "{joined}");
+        // A top-level call between two runs of subagent calls keeps them apart.
+        a.update(key(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        text(&mut a, Ev::Tool { name: "read".into(), summary: "top".into() });
+        nested(&mut a, Ev::Tool { name: "grep".into(), summary: "again".into() });
+        let joined = screen(&mut a, 80, 14).join("\n");
+        assert!(joined.contains("[explore] 1 tool call: now > grep again"), "{joined}");
     }
 
     #[test]
