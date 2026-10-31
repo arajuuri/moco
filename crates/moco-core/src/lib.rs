@@ -10,6 +10,7 @@ pub mod id;
 pub mod instructions;
 pub mod permission;
 pub mod provider;
+pub mod snapshot;
 pub mod store;
 pub mod tools;
 pub mod truncate;

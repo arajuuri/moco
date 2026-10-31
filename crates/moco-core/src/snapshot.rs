@@ -1,0 +1,482 @@
+//! Working-tree snapshots for undo and diffs (docs/03-agent-loop.md "Revert").
+//!
+//! A snapshot is a content-addressed manifest: every non-ignored file of a directory with its SHA-256 and mode,
+//! file contents stored once as blobs. Capturing walks the tree (honoring `.gitignore`, skipping `.git`) and
+//! re-hashes only files whose size or mtime changed since the previous snapshot. Restoring writes back changed
+//! files and deletes files that did not exist; ignored files are never touched. Self-contained: no `git` needed.
+use ignore::WalkBuilder;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashSet};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapError {
+    /// More files than `max_files`: probably not a project directory (a home directory, a build tree).
+    TooManyFiles(usize),
+    Missing(String),
+    Io(String),
+}
+
+impl std::fmt::Display for SnapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SnapError::TooManyFiles(n) => write!(f, "more than {n} files; snapshots are skipped for this directory"),
+            SnapError::Missing(m) => write!(f, "snapshot data missing: {m}"),
+            SnapError::Io(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+impl From<std::io::Error> for SnapError {
+    fn from(e: std::io::Error) -> Self {
+        SnapError::Io(e.to_string())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Entry {
+    pub hash: String,
+    pub size: u64,
+    pub mode: u32,
+    /// Modification time hint (ns since epoch) so unchanged files are not re-read.
+    #[serde(default)]
+    pub mtime_ns: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Manifest {
+    pub files: BTreeMap<String, Entry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    Added,
+    Modified,
+    Deleted,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileDiff {
+    pub path: String,
+    pub status: Status,
+    pub additions: usize,
+    pub deletions: usize,
+    pub binary: bool,
+    /// Unified diff text (empty for binary files).
+    pub patch: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RestoreReport {
+    pub restored: Vec<String>,
+    pub deleted: Vec<String>,
+    /// Snapshot of the state before the restore, so it can be undone.
+    pub before: String,
+}
+
+pub struct Snapshots {
+    root: PathBuf,
+    pub max_files: usize,
+    pub max_file_bytes: u64,
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn sha(bytes: &[u8]) -> String {
+    hex(&Sha256::digest(bytes))
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
+}
+
+fn is_binary(b: &[u8]) -> bool {
+    b[..b.len().min(8192)].contains(&0) || std::str::from_utf8(b).is_err()
+}
+
+/// Relative path from a manifest is only ever used if it stays inside the directory.
+fn safe_rel(p: &str) -> bool {
+    !p.is_empty() && Path::new(p).components().all(|c| matches!(c, Component::Normal(_)))
+}
+
+impl Snapshots {
+    pub fn new(root: PathBuf) -> Self {
+        Snapshots { root, max_files: 50_000, max_file_bytes: 2 * 1024 * 1024 }
+    }
+
+    fn blob_path(&self, hash: &str) -> PathBuf {
+        self.root.join("blobs").join(&hash[..2]).join(&hash[2..])
+    }
+
+    fn manifest_path(&self, id: &str) -> PathBuf {
+        self.root.join("manifests").join(format!("{id}.json"))
+    }
+
+    pub fn manifest(&self, id: &str) -> Result<Manifest, SnapError> {
+        let text = std::fs::read_to_string(self.manifest_path(id)).map_err(|_| SnapError::Missing(format!("snapshot {id}")))?;
+        serde_json::from_str(&text).map_err(|e| SnapError::Io(format!("snapshot {id}: {e}")))
+    }
+
+    fn blob(&self, hash: &str) -> Result<Vec<u8>, SnapError> {
+        std::fs::read(self.blob_path(hash)).map_err(|_| SnapError::Missing(format!("file content {}", &hash[..12])))
+    }
+
+    /// Snapshot `dir` as it is now. `prev` (an earlier snapshot of the same directory) lets unchanged files skip hashing.
+    pub fn capture(&self, dir: &Path, prev: Option<&str>) -> Result<String, SnapError> {
+        let prev = prev.and_then(|p| self.manifest(p).ok()).unwrap_or_default();
+        let mut files = BTreeMap::new();
+        let walker = WalkBuilder::new(dir)
+            .hidden(false)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
+            .require_git(false)
+            .follow_links(false)
+            .filter_entry(|e| e.file_name() != ".git")
+            .build();
+        for entry in walker.filter_map(|e| e.ok()) {
+            if !entry.file_type().is_some_and(|t| t.is_file()) {
+                continue;
+            }
+            let Ok(rel) = entry.path().strip_prefix(dir) else { continue };
+            let Some(rel) = rel.to_str().map(String::from) else { continue };
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.len() > self.max_file_bytes {
+                continue;
+            }
+            if files.len() >= self.max_files {
+                return Err(SnapError::TooManyFiles(self.max_files));
+            }
+            let mtime_ns = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_nanos() as u64).unwrap_or(0);
+            let mode = meta.permissions().mode() & 0o777;
+            let cached = prev.files.get(&rel).filter(|e| e.size == meta.len() && e.mtime_ns == mtime_ns && mtime_ns != 0 && self.blob_path(&e.hash).exists());
+            let hash = match cached {
+                Some(e) => e.hash.clone(),
+                None => {
+                    let Ok(bytes) = std::fs::read(entry.path()) else { continue };
+                    let h = sha(&bytes);
+                    let bp = self.blob_path(&h);
+                    if !bp.exists() {
+                        write_atomic(&bp, &bytes)?;
+                    }
+                    h
+                }
+            };
+            files.insert(rel, Entry { hash, size: meta.len(), mode, mtime_ns });
+        }
+        let mut id_src = String::new();
+        for (p, e) in &files {
+            id_src.push_str(&format!("{p}\0{}\0{:o}\n", e.hash, e.mode));
+        }
+        let id = sha(id_src.as_bytes());
+        let manifest = Manifest { files };
+        write_atomic(&self.manifest_path(&id), serde_json::to_string(&manifest).map_err(|e| SnapError::Io(e.to_string()))?.as_bytes())?;
+        Ok(id)
+    }
+
+    /// Files that differ between two snapshots, with unified diffs.
+    pub fn diff(&self, from: &str, to: &str) -> Result<Vec<FileDiff>, SnapError> {
+        let (a, b) = (self.manifest(from)?, self.manifest(to)?);
+        let mut paths: Vec<&String> = a.files.keys().chain(b.files.keys()).collect();
+        paths.sort();
+        paths.dedup();
+        let mut out = vec![];
+        for p in paths {
+            let (ea, eb) = (a.files.get(p), b.files.get(p));
+            if let (Some(x), Some(y)) = (ea, eb) {
+                if x.hash == y.hash {
+                    continue; // a mode-only change is not shown as a content diff
+                }
+            }
+            let old = ea.map(|e| self.blob(&e.hash)).transpose()?.unwrap_or_default();
+            let new = eb.map(|e| self.blob(&e.hash)).transpose()?.unwrap_or_default();
+            let status = match (ea, eb) {
+                (None, _) => Status::Added,
+                (_, None) => Status::Deleted,
+                _ => Status::Modified,
+            };
+            if is_binary(&old) || is_binary(&new) {
+                out.push(FileDiff { path: p.clone(), status, additions: 0, deletions: 0, binary: true, patch: String::new() });
+                continue;
+            }
+            let (old, new) = (String::from_utf8_lossy(&old).into_owned(), String::from_utf8_lossy(&new).into_owned());
+            let diff = similar::TextDiff::from_lines(&old, &new);
+            let (mut additions, mut deletions) = (0, 0);
+            for c in diff.iter_all_changes() {
+                match c.tag() {
+                    similar::ChangeTag::Insert => additions += 1,
+                    similar::ChangeTag::Delete => deletions += 1,
+                    similar::ChangeTag::Equal => {}
+                }
+            }
+            let (la, lb) = (if ea.is_some() { format!("a/{p}") } else { "/dev/null".into() }, if eb.is_some() { format!("b/{p}") } else { "/dev/null".into() });
+            let patch = diff.unified_diff().context_radius(3).header(&la, &lb).to_string();
+            out.push(FileDiff { path: p.clone(), status, additions, deletions, binary: false, patch });
+        }
+        Ok(out)
+    }
+
+    /// Make `dir` match snapshot `id`. The current state is captured first (`before`) so the restore can be undone.
+    /// `hint` is a recent snapshot of the directory, used to avoid re-hashing unchanged files.
+    pub fn restore(&self, dir: &Path, id: &str, hint: Option<&str>) -> Result<RestoreReport, SnapError> {
+        let target = self.manifest(id)?;
+        if let Some(bad) = target.files.keys().find(|p| !safe_rel(p)) {
+            return Err(SnapError::Io(format!("refusing to restore unsafe path {bad:?}")));
+        }
+        let before = self.capture(dir, hint)?;
+        let current = self.manifest(&before)?;
+        let mut report = RestoreReport { before, ..Default::default() };
+        for (p, e) in &target.files {
+            if current.files.get(p).is_some_and(|c| c.hash == e.hash && c.mode == e.mode) {
+                continue;
+            }
+            let bytes = self.blob(&e.hash)?;
+            let dest = dir.join(p);
+            if dest.is_dir() {
+                return Err(SnapError::Io(format!("{p} is a directory now; cannot restore the file")));
+            }
+            write_atomic(&dest, &bytes)?;
+            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(e.mode))?;
+            report.restored.push(p.clone());
+        }
+        for p in current.files.keys().filter(|p| !target.files.contains_key(*p)) {
+            if !safe_rel(p) {
+                continue;
+            }
+            let path = dir.join(p);
+            if std::fs::remove_file(&path).is_ok() {
+                report.deleted.push(p.clone());
+                // Drop directories this emptied, but never the root.
+                let mut parent = path.parent();
+                while let Some(d) = parent.filter(|d| *d != dir && d.starts_with(dir)) {
+                    if std::fs::remove_dir(d).is_err() {
+                        break;
+                    }
+                    parent = d.parent();
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// Delete snapshots older than `max_age` that are not in `keep`, then blobs no remaining snapshot refers to.
+    /// Returns (manifests removed, blobs removed).
+    pub fn prune(&self, keep: &HashSet<String>, max_age: Duration) -> (usize, usize) {
+        let mut removed_manifests = 0;
+        let mut live: HashSet<String> = HashSet::new();
+        if let Ok(rd) = std::fs::read_dir(self.root.join("manifests")) {
+            for e in rd.filter_map(|e| e.ok()) {
+                let id = e.file_name().to_string_lossy().trim_end_matches(".json").to_string();
+                let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| SystemTime::now().duration_since(t).ok()).is_some_and(|age| age > max_age);
+                if old && !keep.contains(&id) && std::fs::remove_file(e.path()).is_ok() {
+                    removed_manifests += 1;
+                    continue;
+                }
+                if let Ok(m) = self.manifest(&id) {
+                    live.extend(m.files.into_values().map(|f| f.hash));
+                }
+            }
+        }
+        let mut removed_blobs = 0;
+        if let Ok(shards) = std::fs::read_dir(self.root.join("blobs")) {
+            for shard in shards.filter_map(|e| e.ok()) {
+                let prefix = shard.file_name().to_string_lossy().to_string();
+                if let Ok(blobs) = std::fs::read_dir(shard.path()) {
+                    for b in blobs.filter_map(|e| e.ok()) {
+                        let hash = format!("{prefix}{}", b.file_name().to_string_lossy());
+                        if !live.contains(&hash) && std::fs::remove_file(b.path()).is_ok() {
+                            removed_blobs += 1;
+                        }
+                    }
+                }
+                let _ = std::fs::remove_dir(shard.path());
+            }
+        }
+        (removed_manifests, removed_blobs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Tree {
+        root: PathBuf,
+        snaps: Snapshots,
+    }
+    impl Tree {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(crate::id::new_id("moco-snap"));
+            std::fs::create_dir_all(root.join("work")).unwrap();
+            let snaps = Snapshots::new(root.join("store"));
+            Tree { root, snaps }
+        }
+        fn dir(&self) -> PathBuf {
+            self.root.join("work")
+        }
+        fn put(&self, rel: &str, content: &str) {
+            let p = self.dir().join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, content).unwrap();
+        }
+        fn read(&self, rel: &str) -> Option<String> {
+            std::fs::read_to_string(self.dir().join(rel)).ok()
+        }
+        fn cap(&self, prev: Option<&str>) -> String {
+            self.snaps.capture(&self.dir(), prev).unwrap()
+        }
+    }
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn same_content_same_id_and_changes_change_it() {
+        let t = Tree::new();
+        t.put("a.txt", "one");
+        t.put("sub/b.txt", "two");
+        let s1 = t.cap(None);
+        assert_eq!(t.cap(Some(&s1)), s1, "unchanged tree, same id (with or without the hash cache)");
+        assert_eq!(t.cap(None), s1);
+        t.put("a.txt", "ONE");
+        let s2 = t.cap(Some(&s1));
+        assert_ne!(s1, s2);
+        let m = t.snaps.manifest(&s2).unwrap();
+        assert_eq!(m.files.keys().collect::<Vec<_>>(), ["a.txt", "sub/b.txt"]);
+        assert_eq!(m.files["a.txt"].size, 3);
+    }
+
+    #[test]
+    fn same_size_edit_with_a_new_mtime_is_noticed() {
+        let t = Tree::new();
+        t.put("a.txt", "aaa");
+        let s1 = t.cap(None);
+        std::thread::sleep(Duration::from_millis(20));
+        t.put("a.txt", "bbb"); // same size
+        assert_ne!(t.cap(Some(&s1)), s1, "mtime differs, so the file is re-hashed");
+    }
+
+    #[test]
+    fn ignore_rules_hidden_files_symlinks_and_size_limit() {
+        let t = Tree::new();
+        t.put(".gitignore", "build/\n*.log\n");
+        t.put("build/out.bin", "x");
+        t.put("run.log", "x");
+        t.put("src/main.rs", "fn main() {}");
+        t.put(".github/ci.yml", "on: push");
+        t.put(".git/config", "[core]");
+        t.put("big.dat", &"x".repeat(3 * 1024 * 1024));
+        std::os::unix::fs::symlink(t.dir().join("src/main.rs"), t.dir().join("link.rs")).unwrap();
+        let m = t.snaps.manifest(&t.cap(None)).unwrap();
+        assert_eq!(m.files.keys().map(String::as_str).collect::<Vec<_>>(), [".github/ci.yml", ".gitignore", "src/main.rs"]);
+    }
+
+    #[test]
+    fn too_many_files_is_an_error_not_a_hang() {
+        let t = Tree::new();
+        for i in 0..5 {
+            t.put(&format!("f{i}"), "x");
+        }
+        let mut s = Snapshots::new(t.root.join("store2"));
+        s.max_files = 3;
+        assert_eq!(s.capture(&t.dir(), None), Err(SnapError::TooManyFiles(3)));
+    }
+
+    #[test]
+    fn diff_reports_added_modified_deleted_with_counts_and_patches() {
+        let t = Tree::new();
+        t.put("keep.txt", "same\n");
+        t.put("mod.txt", "a\nb\nc\n");
+        t.put("del.txt", "gone\n");
+        t.put("bin.dat", "x");
+        std::fs::write(t.dir().join("bin.dat"), [0u8, 1, 2]).unwrap();
+        let s1 = t.cap(None);
+        t.put("mod.txt", "a\nB\nc\nd\n");
+        t.put("new.txt", "fresh\n");
+        std::fs::remove_file(t.dir().join("del.txt")).unwrap();
+        std::fs::write(t.dir().join("bin.dat"), [0u8, 9]).unwrap();
+        let s2 = t.cap(Some(&s1));
+        let d = t.snaps.diff(&s1, &s2).unwrap();
+        let summary: Vec<_> = d.iter().map(|f| (f.path.as_str(), f.status, f.additions, f.deletions, f.binary)).collect();
+        assert_eq!(
+            summary,
+            [("bin.dat", Status::Modified, 0, 0, true), ("del.txt", Status::Deleted, 0, 1, false), ("mod.txt", Status::Modified, 2, 1, false), ("new.txt", Status::Added, 1, 0, false)]
+        );
+        let m = d.iter().find(|f| f.path == "mod.txt").unwrap();
+        assert!(m.patch.contains("--- a/mod.txt") && m.patch.contains("+++ b/mod.txt") && m.patch.contains("-b\n+B\n") && m.patch.contains("+d"), "{}", m.patch);
+        assert!(d.iter().find(|f| f.path == "new.txt").unwrap().patch.contains("--- /dev/null"));
+        assert_eq!(t.snaps.diff(&s1, &s1).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn restore_reverts_edits_recreates_deletes_and_removes_new_files() {
+        let t = Tree::new();
+        t.put("a.txt", "original");
+        t.put("dir/keep.txt", "keep");
+        t.put("dir/gone.txt", "will be deleted");
+        t.put(".gitignore", "ignored.txt\n");
+        t.put("ignored.txt", "never touched");
+        let script = t.dir().join("run.sh");
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let s1 = t.cap(None);
+
+        t.put("a.txt", "edited");
+        std::fs::remove_file(t.dir().join("dir/gone.txt")).unwrap();
+        t.put("brand/new/file.txt", "new");
+        t.put("ignored.txt", "changed but ignored");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let s2 = t.cap(Some(&s1));
+
+        let r = t.snaps.restore(&t.dir(), &s1, Some(&s2)).unwrap();
+        assert_eq!(r.before, s2, "the state before the restore is returned (so it can be undone)");
+        assert_eq!(r.restored, ["a.txt", "dir/gone.txt", "run.sh"]);
+        assert_eq!(r.deleted, ["brand/new/file.txt"]);
+        assert_eq!((t.read("a.txt").as_deref(), t.read("dir/gone.txt").as_deref()), (Some("original"), Some("will be deleted")));
+        assert!(!t.dir().join("brand").exists(), "directories emptied by the restore are removed");
+        assert_eq!(t.read("ignored.txt").as_deref(), Some("changed but ignored"), "ignored files are never touched");
+        assert_eq!(std::fs::metadata(&script).unwrap().permissions().mode() & 0o777, 0o755, "mode restored");
+        assert_eq!(t.cap(None), s1, "the tree is back to the snapshot exactly");
+        // And forward again.
+        t.snaps.restore(&t.dir(), &r.before, None).unwrap();
+        assert_eq!(t.cap(None), s2);
+        assert_eq!(t.read("brand/new/file.txt").as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn restore_rejects_unsafe_manifests_and_missing_snapshots() {
+        let t = Tree::new();
+        t.put("a.txt", "x");
+        let evil = Manifest { files: BTreeMap::from([("../outside.txt".to_string(), Entry { hash: sha(b"x"), size: 1, mode: 0o644, mtime_ns: 0 })]) };
+        write_atomic(&t.snaps.manifest_path("evil"), serde_json::to_string(&evil).unwrap().as_bytes()).unwrap();
+        assert!(t.snaps.restore(&t.dir(), "evil", None).unwrap_err().to_string().contains("unsafe path"));
+        assert!(matches!(t.snaps.restore(&t.dir(), "nope", None), Err(SnapError::Missing(_))));
+        assert!(!t.root.join("outside.txt").exists());
+    }
+
+    #[test]
+    fn prune_drops_old_unreferenced_snapshots_and_orphan_blobs() {
+        let t = Tree::new();
+        t.put("a.txt", "v1");
+        let s1 = t.cap(None);
+        t.put("a.txt", "v2");
+        let s2 = t.cap(Some(&s1));
+        assert_eq!(t.snaps.prune(&HashSet::new(), Duration::from_secs(3600)), (0, 0), "nothing is old enough");
+        let (m, b) = t.snaps.prune(&HashSet::from([s2.clone()]), Duration::ZERO);
+        assert_eq!((m, b), (1, 1), "s1 and its blob go; s2 is kept");
+        assert!(t.snaps.manifest(&s1).is_err() && t.snaps.manifest(&s2).is_ok());
+        assert_eq!(t.snaps.restore(&t.dir(), &s2, None).unwrap().restored.len(), 0);
+    }
+}

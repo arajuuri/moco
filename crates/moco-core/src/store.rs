@@ -47,6 +47,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
             session_id text not null references session(id) on delete cascade, path text not null,
             primary key(session_id, path));",
     ),
+    (3, "alter table session add column revert text;"),
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -268,6 +269,64 @@ impl Store {
         Ok(())
     }
 
+    /// Replace only the `parts` of a message (keeps `snapshot`, `usage` and the other fields).
+    pub fn set_message_parts(&self, id: &str, parts: &[Value]) -> Result<()> {
+        self.conn.execute("update message set data=json_set(data,'$.parts',json(?2)) where id=?1", params![id, serde_json::to_string(parts)?])?;
+        Ok(())
+    }
+
+    /// Delete the message `from_id` and everything after it (committing an undo). Returns how many were removed.
+    pub fn delete_messages_from(&self, session_id: &str, from_id: &str) -> Result<usize> {
+        Ok(self.conn.execute("delete from message where session_id=?1 and id>=?2", params![session_id, from_id])?)
+    }
+
+    /// The most recent step snapshot recorded in the session, if any.
+    pub fn last_snapshot(&self, session_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "select json_extract(data,'$.snapshot') from message
+                 where session_id=?1 and type='assistant' and json_extract(data,'$.snapshot') is not null order by id desc limit 1",
+                [session_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// The pending undo of a session: `{messageId, redo}` while staged.
+    pub fn revert(&self, session_id: &str) -> Result<Option<Value>> {
+        let t: Option<String> = self.conn.query_row("select revert from session where id=?1", [session_id], |r| r.get(0))?;
+        Ok(t.and_then(|t| serde_json::from_str(&t).ok()))
+    }
+
+    pub fn set_revert(&self, session_id: &str, revert: Option<&Value>) -> Result<()> {
+        self.conn.execute("update session set revert=?2, time_updated=?3 where id=?1", params![session_id, revert.map(|v| v.to_string()), now_ms()])?;
+        Ok(())
+    }
+
+    pub fn project_ids(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("select id from project")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Snapshot ids still referenced by sessions of a project that were active since `since_ms` (for pruning).
+    pub fn live_snapshots(&self, project_id: &str, since_ms: i64) -> Result<std::collections::HashSet<String>> {
+        let mut out = std::collections::HashSet::new();
+        let mut stmt = self.conn.prepare(
+            "select json_extract(m.data,'$.snapshot') from message m join session s on s.id=m.session_id
+             where s.project_id=?1 and s.time_updated>=?2 and m.type='assistant' and json_extract(m.data,'$.snapshot') is not null",
+        )?;
+        for r in stmt.query_map(params![project_id, since_ms], |r| r.get::<_, String>(0))? {
+            out.insert(r?);
+        }
+        let mut stmt = self.conn.prepare("select json_extract(revert,'$.redo') from session where project_id=?1 and revert is not null")?;
+        for r in stmt.query_map([project_id], |r| r.get::<_, Option<String>>(0))? {
+            out.extend(r?);
+        }
+        Ok(out)
+    }
+
     /// Replace a message's content (assistant messages are updated as parts stream in).
     pub fn update_message(&self, id: &str, data: &Value) -> Result<()> {
         self.conn.execute("update message set data=?2 where id=?1", params![id, serde_json::to_string(data)?])?;
@@ -388,6 +447,33 @@ mod tests {
         let s = Store::open_memory().unwrap();
         let ses = s.create_session("/work/proj", "build").unwrap();
         (s, ses)
+    }
+
+    #[test]
+    fn snapshots_revert_marker_and_message_surgery() {
+        let (s, ses) = store();
+        assert_eq!(s.last_snapshot(&ses.id).unwrap(), None);
+        let m1 = s.add_message(&ses.id, "user", &json!({"text":"one"})).unwrap();
+        let a1 = s.add_message(&ses.id, "assistant", &json!({"parts":[],"snapshot":"snapA","usage":{"input":5}})).unwrap();
+        let m2 = s.add_message(&ses.id, "user", &json!({"text":"two"})).unwrap();
+        let a2 = s.add_message(&ses.id, "assistant", &json!({"parts":[],"snapshot":"snapB"})).unwrap();
+        assert_eq!(s.last_snapshot(&ses.id).unwrap().as_deref(), Some("snapB"));
+        s.set_message_parts(&a1, &[json!({"type":"text","text":"hi"})]).unwrap();
+        let m = s.messages(&ses.id).unwrap();
+        assert_eq!((m[1].data["parts"][0]["text"].as_str(), m[1].data["snapshot"].as_str(), m[1].data["usage"]["input"].as_u64()), (Some("hi"), Some("snapA"), Some(5)), "other fields survive");
+        assert_eq!(s.revert(&ses.id).unwrap(), None);
+        s.set_revert(&ses.id, Some(&json!({"messageId": m2, "redo": "snapX"}))).unwrap();
+        assert_eq!(s.revert(&ses.id).unwrap().unwrap()["redo"], "snapX");
+        let live = s.live_snapshots(&ses.id.replace("ses_", "prj_"), 0).unwrap();
+        assert!(live.is_empty(), "other project");
+        let live = s.live_snapshots(&ses.project_id, 0).unwrap();
+        assert_eq!(live, ["snapA", "snapB", "snapX"].iter().map(|x| x.to_string()).collect());
+        assert!(s.live_snapshots(&ses.project_id, i64::MAX).unwrap().contains("snapX"), "pending redo snapshots are always kept");
+        assert_eq!(s.delete_messages_from(&ses.id, &m2).unwrap(), 2);
+        assert_eq!(s.messages(&ses.id).unwrap().iter().map(|x| x.id.clone()).collect::<Vec<_>>(), [m1, a1]);
+        let _ = a2;
+        s.set_revert(&ses.id, None).unwrap();
+        assert_eq!(s.revert(&ses.id).unwrap(), None);
     }
 
     #[test]

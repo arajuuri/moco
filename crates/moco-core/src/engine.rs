@@ -4,6 +4,7 @@
 //! (one LLM call, tools executing concurrently as their calls complete), continue while the step
 //! produced tool calls. History is reloaded from the store on every step.
 use crate::agent::{self, Agent};
+use crate::snapshot::{FileDiff, Snapshots};
 use crate::{catalog, compaction, config, instructions};
 use crate::chat;
 use crate::permission::{self, Effect, Rule};
@@ -98,6 +99,9 @@ pub struct EngineConfig {
     pub instructions: Vec<String>,
     pub catalog: catalog::Catalog,
     pub compaction: compaction::Settings,
+    /// Capture the working tree before every step so changes can be undone (`/undo`) and diffed.
+    pub snapshots: bool,
+    pub snapshot_max_files: usize,
     /// Waits for retry backoff; must return early when `cancel` is set.
     pub sleep: Box<dyn Fn(Duration, &AtomicBool) + Send + Sync>,
     pub jitter: Box<dyn Fn() -> f64 + Send + Sync>,
@@ -113,6 +117,8 @@ impl EngineConfig {
             instructions: vec![],
             catalog: catalog::Catalog::embedded(),
             compaction: compaction::Settings::default(),
+            snapshots: true,
+            snapshot_max_files: 50_000,
             sleep: Box::new(|d, cancel| {
                 let end = std::time::Instant::now() + d;
                 while std::time::Instant::now() < end && !cancel.load(Ordering::Relaxed) {
@@ -135,6 +141,33 @@ pub struct Engine {
     auto_failed: Mutex<HashSet<String>>,
     /// One user prompt at a time across the whole process (parent and subagent sessions).
     prompt_lock: Mutex<()>,
+    /// Sessions whose snapshots failed in this process (too many files, I/O error); they are skipped from then on.
+    snapshot_off: Mutex<HashSet<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct UndoReport {
+    pub restored: Vec<String>,
+    pub deleted: Vec<String>,
+    /// Messages hidden by this undo.
+    pub hidden_messages: usize,
+    /// False when the turn has no snapshot (or snapshots are off): only the conversation was rolled back.
+    pub files_restored: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum UndoResult {
+    Done(UndoReport),
+    NothingToUndo,
+    Busy,
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DiffResult {
+    Files(Vec<FileDiff>),
+    NoSnapshots,
+    Failed(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -195,12 +228,12 @@ struct AttemptResult {
 impl Engine {
     /// Single provider answering every model ref.
     pub fn new(store: Store, provider: Box<dyn Provider>, cfg: EngineConfig) -> Self {
-        Engine { store: Mutex::new(store), providers: HashMap::new(), fallback: Some(provider), tools: tools::all(subagent_list(&cfg)), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()) }
+        Engine { store: Mutex::new(store), providers: HashMap::new(), fallback: Some(provider), tools: tools::all(subagent_list(&cfg)), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()) }
     }
 
     /// One client per provider id; a model ref's provider part picks the client.
     pub fn with_providers(store: Store, providers: HashMap<String, Box<dyn Provider>>, cfg: EngineConfig) -> Self {
-        Engine { store: Mutex::new(store), providers, fallback: None, tools: tools::all(subagent_list(&cfg)), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()) }
+        Engine { store: Mutex::new(store), providers, fallback: None, tools: tools::all(subagent_list(&cfg)), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()) }
     }
 
     pub fn catalog(&self) -> &catalog::Catalog {
@@ -240,6 +273,11 @@ impl Engine {
     pub fn run(&self, session_id: &str, ui: &dyn Ui, cancel: &AtomicBool, resume: bool) -> Result<RunOutcome, StoreError> {
         if !resume && !self.store().claim(session_id)? {
             return Ok(RunOutcome::Busy);
+        }
+        // Sending a new prompt after /undo makes the undo permanent.
+        if let Err(e) = self.commit_pending(session_id) {
+            self.store().release(session_id)?;
+            return Err(e);
         }
         self.auto_failed.lock().unwrap().remove(session_id);
         let outcome = self.drain(session_id, ui, cancel, resume);
@@ -375,7 +413,12 @@ impl Engine {
         let Prepared { session, agent, req, provider, provider_id, model_id, .. } = p;
         let (provider_id, model_id) = (provider_id.as_str(), model_id.as_str());
 
-        let msg_id = self.store().add_message(sid, "assistant", &json!({ "parts": [] }))?;
+        let snapshot = self.take_snapshot(&session, ui);
+        let mut first = json!({ "parts": [] });
+        if let Some(id) = &snapshot {
+            first["snapshot"] = json!(id);
+        }
+        let msg_id = self.store().add_message(sid, "assistant", &first)?;
         let declined = AtomicBool::new(false);
         let permitter = EnginePermitter {
             rules: agent.permissions.clone(),
@@ -395,7 +438,7 @@ impl Engine {
                     retries += 1;
                     if let Some(wait) = retry::delay(retries, e, (self.cfg.jitter)()) {
                         ui.event(&UiEvent::Retry { attempt: retries, wait, error: &e.message() });
-                        self.store().update_message(&msg_id, &json!({ "parts": [] }))?;
+                        self.store().set_message_parts(&msg_id, &[])?;
                         (self.cfg.sleep)(wait, cancel);
                         if cancel.load(Ordering::Relaxed) {
                             break r;
@@ -430,6 +473,9 @@ impl Engine {
         let tool_calls = result.parts.iter().filter(|p| p["type"] == "tool").count();
         let interrupted = cancel.load(Ordering::Relaxed) || matches!(result.stream, Err(ProviderError::Interrupted));
         let mut data = json!({ "parts": result.parts });
+        if let Some(id) = &snapshot {
+            data["snapshot"] = json!(id);
+        }
         if let Some((reason, usage)) = &result.finish {
             data["finish"] = json!(format!("{reason:?}"));
             data["usage"] = json!({"input": usage.input, "output": usage.output, "cacheRead": usage.cache_read, "cacheWrite": usage.cache_write});
@@ -466,12 +512,146 @@ impl Engine {
         Ok(outcome)
     }
 
+    /// Capture the working tree before a step. Best effort: a failure disables snapshots for the session with one notice.
+    fn take_snapshot(&self, session: &Session, ui: &dyn Ui) -> Option<String> {
+        if !self.cfg.snapshots || self.snapshot_off.lock().unwrap().contains(&session.id) {
+            return None;
+        }
+        let prev = {
+            let st = self.store();
+            st.last_snapshot(&session.id).ok().flatten().or_else(|| session.parent_id.as_ref().and_then(|p| st.last_snapshot(p).ok().flatten()))
+        };
+        match self.snaps(session).capture(std::path::Path::new(&session.directory), prev.as_deref()) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                self.snapshot_off.lock().unwrap().insert(session.id.clone());
+                ui.event(&UiEvent::Notice(&format!("snapshots are off for this session (undo and diff unavailable): {e}")));
+                None
+            }
+        }
+    }
+
+    fn snaps(&self, session: &Session) -> Snapshots {
+        let mut s = Snapshots::new(self.cfg.app_dir.join("data/snapshots").join(&session.project_id));
+        s.max_files = self.cfg.snapshot_max_files;
+        s
+    }
+
+    /// Remove old snapshot data that no recent session refers to. Returns (manifests, blobs) removed.
+    pub fn prune_snapshots(&self, project_ids: &[String], max_age: Duration) -> (usize, usize) {
+        let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0) - max_age.as_millis() as i64;
+        let mut total = (0, 0);
+        for pid in project_ids {
+            let keep = self.store().live_snapshots(pid, since).unwrap_or_default();
+            let (m, b) = Snapshots::new(self.cfg.app_dir.join("data/snapshots").join(pid)).prune(&keep, max_age);
+            total = (total.0 + m, total.1 + b);
+        }
+        total
+    }
+
+    /// Undo the latest turn (user message and everything after): files go back to how they were before the turn's
+    /// first step, the messages are hidden. Repeat to go further back. `redo` reverses it; the next prompt commits it.
+    pub fn undo(&self, sid: &str) -> Result<UndoResult, StoreError> {
+        if !self.store().claim(sid)? {
+            return Ok(UndoResult::Busy);
+        }
+        let r = self.undo_inner(sid);
+        self.store().release(sid)?;
+        r
+    }
+
+    fn undo_inner(&self, sid: &str) -> Result<UndoResult, StoreError> {
+        let (session, msgs, revert) = {
+            let st = self.store();
+            (st.session(sid)?.expect("session exists"), st.messages(sid)?, st.revert(sid)?)
+        };
+        let marker = revert.as_ref().and_then(|r| r["messageId"].as_str()).map(String::from);
+        let Some(turn) = msgs.iter().filter(|m| m.kind == "user" && marker.as_deref().is_none_or(|mk| m.id.as_str() < mk)).last() else {
+            return Ok(UndoResult::NothingToUndo);
+        };
+        let snapshot = msgs.iter().filter(|m| m.kind == "assistant" && m.id > turn.id).find_map(|m| m.data["snapshot"].as_str().map(String::from));
+        let mut redo = revert.as_ref().and_then(|r| r["redo"].as_str()).map(String::from);
+        let mut report = UndoReport { hidden_messages: msgs.iter().filter(|m| m.id >= turn.id && (m.kind == "user" || m.kind == "assistant")).count(), ..Default::default() };
+        if let (true, Some(snap)) = (self.cfg.snapshots, snapshot) {
+            let hint = self.store().last_snapshot(sid)?;
+            match self.snaps(&session).restore(std::path::Path::new(&session.directory), &snap, hint.as_deref()) {
+                Ok(r) => {
+                    report.restored = r.restored;
+                    report.deleted = r.deleted;
+                    report.files_restored = true;
+                    redo = redo.or(Some(r.before)); // the state before the first undo is what redo returns to
+                }
+                Err(e) => return Ok(UndoResult::Failed(e.to_string())),
+            }
+        }
+        self.store().set_revert(sid, Some(&json!({ "messageId": turn.id, "redo": redo })))?;
+        Ok(UndoResult::Done(report))
+    }
+
+    /// Reverse staged undo(s): files and messages come back as they were before the first `undo`.
+    pub fn redo(&self, sid: &str) -> Result<UndoResult, StoreError> {
+        if !self.store().claim(sid)? {
+            return Ok(UndoResult::Busy);
+        }
+        let r = (|| {
+            let (session, revert) = {
+                let st = self.store();
+                (st.session(sid)?.expect("session exists"), st.revert(sid)?)
+            };
+            let Some(revert) = revert else { return Ok(UndoResult::NothingToUndo) };
+            let mut report = UndoReport::default();
+            if let (true, Some(redo)) = (self.cfg.snapshots, revert["redo"].as_str()) {
+                match self.snaps(&session).restore(std::path::Path::new(&session.directory), redo, None) {
+                    Ok(r) => {
+                        report.restored = r.restored;
+                        report.deleted = r.deleted;
+                        report.files_restored = true;
+                    }
+                    Err(e) => return Ok(UndoResult::Failed(e.to_string())),
+                }
+            }
+            self.store().set_revert(sid, None)?;
+            Ok(UndoResult::Done(report))
+        })();
+        self.store().release(sid)?;
+        r
+    }
+
+    /// Make a staged undo permanent: the hidden messages are deleted.
+    pub fn commit_pending(&self, sid: &str) -> Result<usize, StoreError> {
+        let st = self.store();
+        let Some(revert) = st.revert(sid)? else { return Ok(0) };
+        let n = match revert["messageId"].as_str() {
+            Some(id) => st.delete_messages_from(sid, id)?,
+            None => 0,
+        };
+        st.set_revert(sid, None)?;
+        Ok(n)
+    }
+
+    /// Changes in the working tree since the session's first step.
+    pub fn session_diff(&self, sid: &str) -> Result<DiffResult, StoreError> {
+        let (session, msgs, last) = {
+            let st = self.store();
+            (st.session(sid)?.expect("session exists"), st.messages(sid)?, st.last_snapshot(sid)?)
+        };
+        let Some(first) = msgs.iter().filter(|m| m.kind == "assistant").find_map(|m| m.data["snapshot"].as_str().map(String::from)) else {
+            return Ok(DiffResult::NoSnapshots);
+        };
+        let snaps = self.snaps(&session);
+        let now = match snaps.capture(std::path::Path::new(&session.directory), last.as_deref()) {
+            Ok(id) => id,
+            Err(e) => return Ok(DiffResult::Failed(e.to_string())),
+        };
+        Ok(snaps.diff(&first, &now).map_or_else(|e| DiffResult::Failed(e.to_string()), DiffResult::Files))
+    }
+
     /// Manual compaction (`/compact`). Holds the session claim while it runs.
     pub fn compact(&self, sid: &str, ui: &dyn Ui, cancel: &AtomicBool) -> Result<CompactResult, StoreError> {
         if !self.store().claim(sid)? {
             return Ok(CompactResult::Failed("session is busy".into()));
         }
-        let r = self.compact_inner(sid, "manual", ui, cancel);
+        let r = self.commit_pending(sid).and_then(|_| self.compact_inner(sid, "manual", ui, cancel));
         self.store().release(sid)?;
         r
     }
@@ -624,7 +804,7 @@ impl Engine {
                     ui.event(&UiEvent::ToolStarted { name: &name, input: &input });
                     parts.push(chat::tool_part(&id, &name, &input));
                     let idx = parts.len() - 1;
-                    let _ = self.store().update_message(msg_id, &json!({ "parts": parts }));
+                    let _ = self.store().set_message_parts(msg_id, &parts);
                     let tool = self.tools.iter().find(|t| t.name() == name).map(|t| t.as_ref());
                     let (cwd, root, spill) = (cwd.clone(), root.clone(), spill.clone());
                     handles.push((
@@ -1582,5 +1762,145 @@ mod tests {
                 assert!(w[1].messages.len() > w[0].messages.len());
             }
         }
+    }
+
+    fn write_call(id: &str, path: &str, content: &str) -> Event {
+        Event::ToolCall { id: id.into(), name: "write".into(), input: json!({"path": path, "content": content}) }
+    }
+    fn tool_step(calls: Vec<Event>) -> Scripted {
+        let mut ev = calls;
+        ev.push(Event::Finish { reason: FinishReason::ToolUse, usage: Usage::default() });
+        Scripted::Events(ev)
+    }
+    fn read_work(f: &Fixture, rel: &str) -> Option<String> {
+        std::fs::read_to_string(f.dir.join("work").join(rel)).ok()
+    }
+    fn two_turns() -> Fixture {
+        let f = fixture(vec![
+            tool_step(vec![write_call("w1", "a.txt", "v1")]),
+            text("done one"),
+            tool_step(vec![write_call("w2", "a.txt", "v2"), write_call("w3", "b.txt", "B")]),
+            text("done two"),
+        ]);
+        f.say("one");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        f.say("two");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        assert_eq!((read_work(&f, "a.txt").as_deref(), read_work(&f, "b.txt").as_deref()), (Some("v2"), Some("B")));
+        f
+    }
+
+    #[test]
+    fn every_step_records_the_state_before_it_ran() {
+        let f = two_turns();
+        let snaps: Vec<Option<String>> = f.msgs().iter().filter(|m| m.kind == "assistant").map(|m| m.data["snapshot"].as_str().map(String::from)).collect();
+        assert_eq!(snaps.len(), 4);
+        assert!(snaps.iter().all(Option::is_some));
+        // Step 1 saw an empty directory, step 3 saw what turn one left behind (same as step 2's start).
+        let s = f.engine.snaps(&f.engine.store().session(&f.session.id).unwrap().unwrap());
+        let files = |i: usize| s.manifest(snaps[i].as_ref().unwrap()).unwrap().files.keys().cloned().collect::<Vec<_>>();
+        assert_eq!((files(0), files(1), files(2), files(3)), (vec![], vec!["a.txt".to_string()], vec!["a.txt".to_string()], vec!["a.txt".to_string(), "b.txt".to_string()]));
+        assert_eq!(snaps[1], snaps[2], "identical trees share one snapshot id");
+    }
+
+    #[test]
+    fn undo_redo_and_commit_with_real_files() {
+        let f = two_turns();
+        let sid = &f.session.id;
+        // Undo turn two: a.txt back to v1, b.txt gone.
+        let UndoResult::Done(r) = f.engine.undo(sid).unwrap() else { panic!() };
+        assert_eq!((r.restored, r.deleted, r.hidden_messages, r.files_restored), (vec!["a.txt".to_string()], vec!["b.txt".to_string()], 3, true));
+        assert_eq!((read_work(&f, "a.txt").as_deref(), read_work(&f, "b.txt")), (Some("v1"), None));
+        // Undo turn one as well: a.txt did not exist before.
+        let UndoResult::Done(r) = f.engine.undo(sid).unwrap() else { panic!() };
+        assert_eq!((r.deleted, r.hidden_messages), (vec!["a.txt".to_string()], 6));
+        assert_eq!(read_work(&f, "a.txt"), None);
+        assert_eq!(f.engine.undo(sid).unwrap(), UndoResult::NothingToUndo);
+        // Redo returns to the state before the first undo, and the conversation is whole again.
+        let UndoResult::Done(r) = f.engine.redo(sid).unwrap() else { panic!() };
+        assert_eq!(r.restored, ["a.txt", "b.txt"]);
+        assert_eq!((read_work(&f, "a.txt").as_deref(), read_work(&f, "b.txt").as_deref()), (Some("v2"), Some("B")));
+        assert_eq!(f.engine.store().revert(sid).unwrap(), None);
+        assert_eq!(f.engine.redo(sid).unwrap(), UndoResult::NothingToUndo);
+
+        // Undo turn two again, then continue: the next prompt makes it permanent.
+        f.engine.undo(sid).unwrap();
+        f.fake.extend(vec![text("three done")]);
+        f.say("three");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        assert_eq!(f.engine.store().revert(sid).unwrap(), None);
+        let users: Vec<String> = f.msgs().iter().filter(|m| m.kind == "user").map(|m| m.data["text"].as_str().unwrap().to_string()).collect();
+        assert_eq!(users, ["one", "three"], "turn two is gone for good");
+        let last = f.fake.requests.lock().unwrap().last().unwrap().clone();
+        assert!(all_text(&last).contains("one") && all_text(&last).contains("three") && !all_text(&last).contains("two"));
+        assert_eq!((read_work(&f, "a.txt").as_deref(), read_work(&f, "b.txt")), (Some("v1"), None), "files stay as the undo left them");
+    }
+
+    #[test]
+    fn session_diff_shows_everything_since_the_first_step() {
+        let f = two_turns();
+        let DiffResult::Files(d) = f.engine.session_diff(&f.session.id).unwrap() else { panic!() };
+        let s: Vec<_> = d.iter().map(|x| (x.path.as_str(), x.status, x.additions)).collect();
+        assert_eq!(s, [("a.txt", crate::snapshot::Status::Added, 1), ("b.txt", crate::snapshot::Status::Added, 1)]);
+        assert!(d[0].patch.contains("+v2"));
+        f.file("a.txt", "v3 by hand");
+        let DiffResult::Files(d) = f.engine.session_diff(&f.session.id).unwrap() else { panic!() };
+        assert!(d[0].patch.contains("+v3 by hand"), "edits made outside the agent show up too");
+        let empty = fixture(vec![]);
+        assert_eq!(empty.engine.session_diff(&empty.session.id).unwrap(), DiffResult::NoSnapshots);
+    }
+
+    #[test]
+    fn with_snapshots_off_undo_only_rolls_back_the_conversation() {
+        let f = fixture_cfg(vec![tool_step(vec![write_call("w1", "a.txt", "v1")]), text("done")], |c| c.snapshots = false);
+        f.say("one");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        assert!(f.msgs().iter().all(|m| m.data.get("snapshot").is_none()));
+        let UndoResult::Done(r) = f.engine.undo(&f.session.id).unwrap() else { panic!() };
+        assert!(!r.files_restored && r.restored.is_empty());
+        assert_eq!(read_work(&f, "a.txt").as_deref(), Some("v1"), "files untouched");
+        assert!(matches!(f.engine.redo(&f.session.id).unwrap(), UndoResult::Done(_)));
+    }
+
+    #[test]
+    fn too_many_files_turns_snapshots_off_with_one_notice() {
+        let f = fixture_cfg(vec![tool_call("t1", "glob", json!({"pattern":"*"})), text("done")], |c| c.snapshot_max_files = 2);
+        for i in 0..4 {
+            f.file(&format!("f{i}.txt"), "x");
+        }
+        f.say("go");
+        let ui = TestUi::default();
+        assert_eq!(f.run(&ui), RunOutcome::Idle);
+        let notices: Vec<_> = ui.log().into_iter().filter(|l| l.contains("snapshots are off")).collect();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(f.msgs().iter().all(|m| m.data.get("snapshot").is_none()));
+    }
+
+    #[test]
+    fn undo_refuses_while_the_session_is_running() {
+        let f = two_turns();
+        assert!(f.engine.store().claim(&f.session.id).unwrap());
+        assert_eq!(f.engine.undo(&f.session.id).unwrap(), UndoResult::Busy);
+        assert_eq!(f.engine.redo(&f.session.id).unwrap(), UndoResult::Busy);
+        assert_eq!(read_work(&f, "b.txt").as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn pruning_keeps_what_recent_sessions_use_and_undo_degrades_gracefully() {
+        let f = two_turns();
+        let pid = f.session.project_id.clone();
+        let dir = f.dir.join("app/data/snapshots").join(&pid).join("manifests");
+        assert!(std::fs::read_dir(&dir).unwrap().count() >= 3);
+        // A session active within the window protects its snapshots, however old the files are.
+        assert_eq!(f.engine.prune_snapshots(&[pid.clone()], Duration::from_secs(3600)), (0, 0));
+        // With a zero window every session counts as stale: old snapshots go (the files on disk never do).
+        let (manifests, blobs) = f.engine.prune_snapshots(&[pid.clone()], Duration::ZERO);
+        assert!(manifests >= 3 && blobs >= 3, "{manifests} {blobs}");
+        assert_eq!(read_work(&f, "a.txt").as_deref(), Some("v2"));
+        match f.engine.undo(&f.session.id).unwrap() {
+            UndoResult::Failed(m) => assert!(m.contains("snapshot data missing"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(read_work(&f, "b.txt").as_deref(), Some("B"), "a failed undo changes nothing");
     }
 }

@@ -1,7 +1,7 @@
 //! moco: line-based terminal chat.
 use moco_core::catalog::{Catalog, ProviderInfo};
 use moco_core::compaction;
-use moco_core::engine::{CompactResult, Engine, EngineConfig, PermissionPrompt, Reply, RunOutcome, Ui, UiEvent};
+use moco_core::engine::{CompactResult, DiffResult, Engine, UndoReport, UndoResult, EngineConfig, PermissionPrompt, Reply, RunOutcome, Ui, UiEvent};
 use moco_core::provider::registry;
 use moco_core::provider::Usage;
 use moco_core::tools::{Question, Todo};
@@ -250,6 +250,18 @@ impl Ui for Terminal {
     }
 }
 
+fn print_files(r: &UndoReport) {
+    let mut lines: Vec<String> = r.restored.iter().map(|p| format!("  restored {p}")).chain(r.deleted.iter().map(|p| format!("  removed {p}"))).collect();
+    let extra = lines.len().saturating_sub(15);
+    lines.truncate(15);
+    for l in lines {
+        println!("{DIM}{l}{RESET}");
+    }
+    if extra > 0 {
+        println!("{DIM}  ... and {extra} more{RESET}");
+    }
+}
+
 fn die(msg: &str) -> ! {
     eprintln!("moco: {msg}");
     std::process::exit(2)
@@ -447,8 +459,12 @@ fn main() {
     engine_cfg.instructions = cfg.instructions.clone();
     engine_cfg.catalog = catalog;
     engine_cfg.compaction = compaction::Settings::from_config(&cfg.compaction);
+    engine_cfg.snapshots = cfg.snapshots.unwrap_or(true);
     let n_sources = loaded.sources.len();
     let engine = Engine::with_providers(store, providers, engine_cfg);
+    // Drop snapshot data that no session active in the last 30 days refers to.
+    let projects = engine.store.lock().unwrap().project_ids().unwrap_or_default();
+    engine.prune_snapshots(&projects, std::time::Duration::from_secs(30 * 24 * 3600));
 
     install_sigint();
     let term = Terminal { mid_line: AtomicBool::new(false), run: Mutex::new(RunUsage::default()) };
@@ -487,8 +503,51 @@ fn main() {
             "" => continue,
             "/exit" | "/quit" => break,
             "/help" => println!(
-                "/model [FILTER|PROVIDER/MODEL]  show, search or switch the model\n/agent <id>                     switch agent\n/compact                        summarize older messages to free up context\n/new                            start a new session\n/exit                           quit (Ctrl-C interrupts a running turn)"
+                "/model [FILTER|PROVIDER/MODEL]  show, search or switch the model\n/agent <id>                     switch agent\n/compact                        summarize older messages to free up context\n/undo, /redo                    undo the last turn's file changes and messages, or bring them back\n/diff                           changes in the working tree since this session started\n/new                            start a new session\n/exit                           quit (Ctrl-C interrupts a running turn)"
             ),
+            "/undo" => match engine.undo(&session.id) {
+                Ok(UndoResult::Done(r)) => {
+                    println!("{DIM}undone: {} message(s) hidden{}{RESET}", r.hidden_messages, if r.files_restored { format!(", {} file(s) restored, {} removed", r.restored.len(), r.deleted.len()) } else { "; no file snapshot for this turn, so only the conversation was rolled back".into() });
+                    print_files(&r);
+                    println!("{DIM}/undo goes further back, /redo brings it all back, sending a message makes the undo permanent{RESET}");
+                }
+                Ok(UndoResult::NothingToUndo) => println!("{DIM}nothing to undo{RESET}"),
+                Ok(UndoResult::Busy) => eprintln!("session is busy"),
+                Ok(UndoResult::Failed(e)) => eprintln!("{RED}undo failed: {e}{RESET}"),
+                Err(e) => eprintln!("{RED}store error: {e}{RESET}"),
+            },
+            "/redo" => match engine.redo(&session.id) {
+                Ok(UndoResult::Done(r)) => {
+                    println!("{DIM}redone: {} file(s) restored, {} removed{RESET}", r.restored.len(), r.deleted.len());
+                    print_files(&r);
+                }
+                Ok(UndoResult::NothingToUndo) => println!("{DIM}nothing to redo{RESET}"),
+                Ok(UndoResult::Busy) => eprintln!("session is busy"),
+                Ok(UndoResult::Failed(e)) => eprintln!("{RED}redo failed: {e}{RESET}"),
+                Err(e) => eprintln!("{RED}store error: {e}{RESET}"),
+            },
+            "/diff" => match engine.session_diff(&session.id) {
+                Ok(DiffResult::Files(d)) if d.is_empty() => println!("{DIM}no changes since the session started{RESET}"),
+                Ok(DiffResult::Files(d)) => {
+                    let (a, r): (usize, usize) = d.iter().fold((0, 0), |(a, r), f| (a + f.additions, r + f.deletions));
+                    println!("{DIM}{} file(s) changed, +{a} -{r}{RESET}", d.len());
+                    for f in &d {
+                        if f.binary {
+                            println!("{DIM}Binary file {} changed{RESET}", f.path);
+                        }
+                        for l in f.patch.lines() {
+                            match l.chars().next() {
+                                Some('+') if !l.starts_with("+++") => println!("\x1b[32m{l}{RESET}"),
+                                Some('-') if !l.starts_with("---") => println!("{RED}{l}{RESET}"),
+                                _ => println!("{DIM}{l}{RESET}"),
+                            }
+                        }
+                    }
+                }
+                Ok(DiffResult::NoSnapshots) => println!("{DIM}no snapshots yet: nothing has run in this session{RESET}"),
+                Ok(DiffResult::Failed(e)) => eprintln!("{RED}diff failed: {e}{RESET}"),
+                Err(e) => eprintln!("{RED}store error: {e}{RESET}"),
+            },
             "/compact" => {
                 CANCEL.store(false, Ordering::Relaxed);
                 match engine.compact(&session.id, &term, &CANCEL) {
