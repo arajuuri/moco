@@ -2,11 +2,18 @@
 pub mod edit;
 pub mod glob;
 pub mod grep;
+pub mod html;
+pub mod patch;
+pub mod question;
 pub mod read;
 pub mod shell;
 pub mod shellparse;
+pub mod subagent;
+pub mod todowrite;
+pub mod webfetch;
 pub mod write;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -65,7 +72,57 @@ pub trait Permitter: Sync {
     fn check(&self, req: &PermReq) -> Result<(), ToolError>;
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Todo {
+    pub content: String,
+    /// `pending`, `in_progress`, `completed` or `cancelled`.
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QuestionOption {
+    pub label: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Question {
+    pub question: String,
+    #[serde(default)]
+    pub header: String,
+    pub options: Vec<QuestionOption>,
+    #[serde(default)]
+    pub multiple: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubagentRequest {
+    pub agent: String,
+    pub description: String,
+    pub prompt: String,
+    pub model: Option<String>,
+    /// Continue an earlier child session instead of starting a new one.
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubagentResult {
+    pub session_id: String,
+    pub output: String,
+}
+
+/// Engine services that some tools need. Implemented by the engine; tests use a stub.
+pub trait Host: Sync {
+    fn set_todos(&self, todos: Vec<Todo>) -> Result<(), ToolError>;
+    /// One answer list (chosen labels or free text) per question; `Declined` if the user dismissed the form.
+    fn ask(&self, questions: &[Question]) -> Result<Vec<Vec<String>>, ToolError>;
+    fn subagent(&self, req: SubagentRequest) -> Result<SubagentResult, ToolError>;
+}
+
 pub struct ToolCtx<'a> {
+    pub session_id: &'a str,
+    pub host: &'a dyn Host,
     pub cwd: PathBuf,
     pub project_root: PathBuf,
     /// Where truncated / long outputs are written.
@@ -138,19 +195,25 @@ pub fn normalize(p: &Path) -> PathBuf {
 
 pub trait Tool: Send + Sync {
     fn name(&self) -> &'static str;
-    fn description(&self) -> &'static str;
+    fn description(&self) -> String;
     fn schema(&self) -> Value;
     fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError>;
 }
 
-pub fn all() -> Vec<Box<dyn Tool>> {
+/// Every built-in tool. `subagents` lists `(id, description)` of the agents the subagent tool may start.
+pub fn all(subagents: Vec<(String, String)>) -> Vec<Box<dyn Tool>> {
     vec![
         Box::new(read::Read),
         Box::new(write::Write),
         Box::new(edit::Edit),
+        Box::new(patch::Patch),
         Box::new(glob::Glob),
         Box::new(grep::Grep),
         Box::new(shell::Shell),
+        Box::new(webfetch::WebFetch),
+        Box::new(todowrite::TodoWrite),
+        Box::new(question::AskQuestion),
+        Box::new(subagent::Subagent { agents: subagents }),
     ]
 }
 
@@ -194,22 +257,45 @@ pub(crate) mod testutil {
         }
     }
 
+    #[derive(Default)]
+    pub struct TestHost {
+        pub todos: Mutex<Vec<Todo>>,
+        pub asked: Mutex<Vec<Vec<Question>>>,
+        pub answers: Mutex<Option<Vec<Vec<String>>>>,
+        pub subagents: Mutex<Vec<SubagentRequest>>,
+    }
+    impl Host for TestHost {
+        fn set_todos(&self, todos: Vec<Todo>) -> Result<(), ToolError> {
+            *self.todos.lock().unwrap() = todos;
+            Ok(())
+        }
+        fn ask(&self, questions: &[Question]) -> Result<Vec<Vec<String>>, ToolError> {
+            self.asked.lock().unwrap().push(questions.to_vec());
+            self.answers.lock().unwrap().clone().ok_or(ToolError::Declined)
+        }
+        fn subagent(&self, req: SubagentRequest) -> Result<SubagentResult, ToolError> {
+            self.subagents.lock().unwrap().push(req.clone());
+            Ok(SubagentResult { session_id: "ses_child".into(), output: format!("done: {}", req.prompt) })
+        }
+    }
+
     pub struct Env {
         pub dir: PathBuf,
         pub perm: TestPermitter,
         pub cancel: AtomicBool,
+        pub host: TestHost,
     }
     impl Env {
         pub fn new() -> Self {
             let dir = std::env::temp_dir().join(crate::id::new_id("moco-tool"));
             std::fs::create_dir_all(dir.join("work")).unwrap();
-            Env { dir, perm: TestPermitter::allow(), cancel: AtomicBool::new(false) }
+            Env { dir, perm: TestPermitter::allow(), cancel: AtomicBool::new(false), host: TestHost::default() }
         }
         pub fn work(&self) -> PathBuf {
             self.dir.join("work")
         }
         pub fn ctx(&self) -> ToolCtx<'_> {
-            ToolCtx { cwd: self.work(), project_root: self.work(), spill_dir: self.dir.join("spill"), permitter: &self.perm, cancel: &self.cancel }
+            ToolCtx { session_id: "ses_test", host: &self.host, cwd: self.work(), project_root: self.work(), spill_dir: self.dir.join("spill"), permitter: &self.perm, cancel: &self.cancel }
         }
         pub fn file(&self, rel: &str, content: &[u8]) -> PathBuf {
             let p = self.work().join(rel);

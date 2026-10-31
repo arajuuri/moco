@@ -4,6 +4,7 @@ use moco_core::compaction;
 use moco_core::engine::{CompactResult, Engine, EngineConfig, PermissionPrompt, Reply, RunOutcome, Ui, UiEvent};
 use moco_core::provider::registry;
 use moco_core::provider::Usage;
+use moco_core::tools::{Question, Todo};
 use moco_core::store::{Mode, Store};
 use moco_core::{auth, config};
 use std::io::{BufRead, IsTerminal, Write};
@@ -86,20 +87,109 @@ fn human(n: u64) -> String {
     }
 }
 
+/// One-line description of a tool call for the transcript.
 fn summary(name: &str, input: &serde_json::Value) -> String {
-    let key = match name {
-        "shell" => "command",
-        "glob" | "grep" => "pattern",
-        _ => "path",
+    let get = |k: &str| input[k].as_str().unwrap_or("").to_string();
+    let text = match name {
+        "shell" => get("command"),
+        "glob" | "grep" => get("pattern"),
+        "webfetch" => get("url"),
+        "subagent" => format!("{}: {}", get("agent"), get("description")),
+        "question" => input["questions"][0]["question"].as_str().unwrap_or("").to_string(),
+        "todowrite" => format!("{} item(s)", input["todos"].as_array().map_or(0, |t| t.len())),
+        "patch" => {
+            let patch = get("patchText");
+            let files: Vec<&str> = patch
+                .lines()
+                .filter_map(|l| l.strip_prefix("*** ").and_then(|r| r.split_once(" File: ")).map(|(_, path)| path))
+                .collect();
+            files.join(", ")
+        }
+        _ => get("path"),
     };
-    let s = input[key].as_str().unwrap_or("");
-    let first = s.lines().next().unwrap_or("");
+    let first = text.lines().next().unwrap_or("");
     if first.chars().count() > 100 { format!("{}...", first.chars().take(100).collect::<String>()) } else { first.to_string() }
 }
 
+impl Terminal {
+    /// Events from subagent sessions: tool activity indented, cost counted, assistant text hidden.
+    fn nested(&self, depth: usize, agent: &str, e: &UiEvent) {
+        let pad = "  ".repeat(depth);
+        match e {
+            UiEvent::Nested { agent, inner } => self.nested(depth + 1, agent, inner),
+            UiEvent::ToolStarted { name, input } => {
+                self.newline_if_needed();
+                println!("{DIM}{pad}[{agent}] > {name} {}{RESET}", summary(name, input));
+            }
+            UiEvent::ToolFinished { ok: false, text, .. } => println!("{RED}{pad}  failed: {}{RESET}", text.lines().next().unwrap_or("")),
+            UiEvent::StepUsage { usage, cost, .. } => {
+                let mut r = self.run.lock().unwrap();
+                r.usage.input += usage.input;
+                r.usage.output += usage.output;
+                r.usage.cache_read += usage.cache_read;
+                r.cost += cost.unwrap_or(0.0);
+                r.priced |= cost.is_some();
+                r.steps += 1;
+            }
+            UiEvent::Retry { attempt, wait, error } => println!("{DIM}{pad}[{agent}] retrying in {}s (attempt {attempt}): {error}{RESET}", wait.as_secs()),
+            UiEvent::Notice(n) => eprintln!("{RED}{pad}[{agent}] {n}{RESET}"),
+            _ => {}
+        }
+        let _ = std::io::stdout().flush();
+    }
+}
+
+fn print_todos(todos: &[Todo]) {
+    for t in todos {
+        let mark = match t.status.as_str() {
+            "completed" => "[x]",
+            "in_progress" => "[~]",
+            "cancelled" => "[-]",
+            _ => "[ ]",
+        };
+        println!("{DIM}  {mark} {}{RESET}", t.content);
+    }
+}
+
 impl Ui for Terminal {
+    fn ask_questions(&self, questions: &[Question]) -> Option<Vec<Vec<String>>> {
+        self.newline_if_needed();
+        let mut answers = vec![];
+        for q in questions {
+            println!("{}{}", if q.header.is_empty() { String::new() } else { format!("[{}] ", q.header) }, q.question);
+            for (i, o) in q.options.iter().enumerate() {
+                println!("  {}. {}{}", i + 1, o.label, if o.description.is_empty() { String::new() } else { format!(" - {}", o.description) });
+            }
+            let hint = if q.multiple { "numbers separated by commas" } else { "a number" };
+            let line = self.read_line(&format!("  answer ({hint}, or type your own; Enter to dismiss): "))?;
+            if line.trim().is_empty() {
+                return None;
+            }
+            let picked: Vec<String> = line
+                .split(',')
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(|t| match t.parse::<usize>() {
+                    Ok(n) if n >= 1 && n <= q.options.len() => q.options[n - 1].label.clone(),
+                    _ => t.to_string(),
+                })
+                .take(if q.multiple { usize::MAX } else { 1 })
+                .collect();
+            answers.push(picked);
+        }
+        Some(answers)
+    }
+
     fn event(&self, e: &UiEvent) {
         match e {
+            UiEvent::Nested { agent, inner } => {
+                self.nested(1, agent, inner);
+                return;
+            }
+            UiEvent::Todos(t) => {
+                self.newline_if_needed();
+                print_todos(t);
+            }
             UiEvent::TextDelta(t) => {
                 print!("{t}");
                 self.mid_line.store(!t.ends_with('\n'), Ordering::Relaxed);
@@ -315,8 +405,8 @@ fn main() {
     }
     let agents = config::resolve_agents(&cfg);
     let mut agent_id = agent_id.or(cfg.default_agent.clone()).unwrap_or_else(|| "build".into());
-    if !agents.iter().any(|a| a.id == agent_id) {
-        die(&format!("unknown agent {agent_id}; available: {}", agents.iter().map(|a| a.id.as_str()).collect::<Vec<_>>().join(", ")));
+    if !agents.iter().any(|a| a.id == agent_id && a.selectable()) {
+        die(&format!("unknown agent {agent_id}; available: {}", agents.iter().filter(|a| a.selectable()).map(|a| a.id.as_str()).collect::<Vec<_>>().join(", ")));
     }
     let model = model.or(cfg.model.clone()).unwrap_or_else(|| "anthropic/claude-sonnet-5-5".into());
 
@@ -436,13 +526,13 @@ fn main() {
             }
             l if l.starts_with("/agent") => {
                 let want = l.trim_start_matches("/agent").trim();
-                match engine.agents().iter().find(|a| a.id == want) {
+                match engine.agents().iter().find(|a| a.id == want && a.selectable()) {
                     Some(a) => {
                         agent_id = a.id.clone();
                         engine.store.lock().unwrap().set_agent(&session.id, &a.id).ok();
                         println!("{DIM}agent: {}{RESET}", a.name);
                     }
-                    None => println!("unknown agent; available: {}", engine.agents().iter().map(|a| a.id.as_str()).collect::<Vec<_>>().join(", ")),
+                    None => println!("unknown agent; available: {}", engine.agents().iter().filter(|a| a.selectable()).map(|a| a.id.as_str()).collect::<Vec<_>>().join(", ")),
                 }
             }
             l if l.starts_with('/') => println!("unknown command (try /help)"),

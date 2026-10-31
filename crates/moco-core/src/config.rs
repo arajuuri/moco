@@ -19,6 +19,8 @@ pub struct AgentConfig {
     pub system: Option<String>,
     pub description: Option<String>,
     pub steps: Option<u32>,
+    /// `"primary"`, `"subagent"` or `"all"` (default for agents defined in config).
+    pub mode: Option<String>,
     pub permissions: Vec<Rule>,
     pub disabled: bool,
 }
@@ -262,9 +264,11 @@ pub fn resolve_agents(cfg: &Config) -> Vec<Agent> {
             a.system = ac.system.clone().or(a.system.take());
             a.description = ac.description.clone().unwrap_or_else(|| a.description.clone());
             a.steps = ac.steps.or(a.steps);
+            a.mode = ac.mode.as_deref().and_then(agent::Mode::parse).unwrap_or(a.mode);
         } else if !ac.disabled {
             agents.push(Agent {
                 id: id.clone(),
+                mode: ac.mode.as_deref().and_then(agent::Mode::parse).unwrap_or(agent::Mode::All),
                 name: id.clone(),
                 description: ac.description.clone().unwrap_or_default(),
                 system: ac.system.clone(),
@@ -383,14 +387,14 @@ mod tests {
         .unwrap();
         let agents = resolve_agents(&cfg);
         let ids: Vec<_> = agents.iter().map(|a| a.id.as_str()).collect();
-        assert_eq!(ids, ["build", "docs"]);
+        assert_eq!(ids, ["build", "general", "explore", "docs"]);
         let build = &agents[0];
         assert_eq!(build.steps, Some(30));
         use crate::permission::evaluate;
         assert_eq!(evaluate("shell", "ls", &build.permissions), Effect::Ask, "global rule beats the default allow");
         assert_eq!(evaluate("shell", "git status", &build.permissions), Effect::Allow, "agent rule beats the global one");
-        assert_eq!(agents[1].system.as_deref(), Some("Be brief."));
-        assert_eq!(evaluate("edit", "x", &agents[1].permissions), Effect::Ask);
+        assert_eq!(agents[3].system.as_deref(), Some("Be brief."));
+        assert_eq!(evaluate("edit", "x", &agents[3].permissions), Effect::Ask);
     }
 
     #[test]

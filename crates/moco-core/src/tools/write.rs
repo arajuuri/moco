@@ -6,9 +6,9 @@ impl Tool for Write {
     fn name(&self) -> &'static str {
         "write"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> String {
         "Writes a file to the local filesystem, overwriting if one exists. Missing parent directories are created automatically. \
-For partial changes, use the edit tool instead."
+For partial changes, use the edit tool instead.".into()
     }
     fn schema(&self) -> Value {
         json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]})

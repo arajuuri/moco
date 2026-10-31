@@ -9,8 +9,8 @@ impl Tool for Grep {
     fn name(&self) -> &'static str {
         "grep"
     }
-    fn description(&self) -> &'static str {
-        "Search file contents with a regular expression (Rust regex syntax) or a literal string. Returns `path:line: text`. Respects .gitignore."
+    fn description(&self) -> String {
+        "Search file contents with a regular expression (Rust regex syntax) or a literal string. Returns `path:line: text`. Respects .gitignore.".into()
     }
     fn schema(&self) -> Value {
         json!({"type":"object","properties":{

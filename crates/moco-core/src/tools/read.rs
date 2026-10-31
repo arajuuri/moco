@@ -7,9 +7,9 @@ impl Tool for Read {
     fn name(&self) -> &'static str {
         "read"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> String {
         "Read the contents of a file or directory. Supports text files; lines are prefixed with their line number. \
-Prefer one larger read over many small slices, and use grep to find specific content in large files."
+Prefer one larger read over many small slices, and use grep to find specific content in large files.".into()
     }
     fn schema(&self) -> Value {
         json!({"type":"object","properties":{

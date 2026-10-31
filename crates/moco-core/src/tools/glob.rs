@@ -11,8 +11,8 @@ impl Tool for Glob {
     fn name(&self) -> &'static str {
         "glob"
     }
-    fn description(&self) -> &'static str {
-        "Search file paths using a glob pattern (examples: \"**/*.ts\", \"src/**/*.tsx\"). Respects .gitignore."
+    fn description(&self) -> String {
+        "Search file paths using a glob pattern (examples: \"**/*.ts\", \"src/**/*.tsx\"). Respects .gitignore.".into()
     }
     fn schema(&self) -> Value {
         json!({"type":"object","properties":{

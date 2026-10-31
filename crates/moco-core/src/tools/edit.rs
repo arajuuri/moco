@@ -6,10 +6,10 @@ impl Tool for Edit {
     fn name(&self) -> &'static str {
         "edit"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> String {
         "Performs exact string replacement in a file. `oldString` must match exactly once unless `replaceAll` is set; \
 include enough surrounding context to make it unique. Do not include the `N: ` line-number prefix shown by the read tool. \
-`newString` must differ from `oldString`."
+`newString` must differ from `oldString`.".into()
     }
     fn schema(&self) -> Value {
         json!({"type":"object","properties":{
@@ -55,7 +55,7 @@ fn to_crlf(s: &str) -> String {
     s.replace("\r\n", "\n").replace('\n', "\r\n")
 }
 
-fn fold(c: char) -> char {
+pub(crate) fn fold(c: char) -> char {
     match c {
         '\u{2018}' | '\u{2019}' | '\u{201b}' => '\'',
         '\u{201c}' | '\u{201d}' | '\u{201e}' => '"',

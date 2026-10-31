@@ -50,10 +50,10 @@ impl Tool for Shell {
     fn name(&self) -> &'static str {
         "shell"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> String {
         "Run a shell command in the working directory (or `workdir`). stdout and stderr are combined. \
 Default timeout is 120000 ms (0 disables). Long output is truncated to its last 2000 lines / 50 KiB; the full output is saved to a file. \
-Do not use interactive commands."
+Do not use interactive commands.".into()
     }
     fn schema(&self) -> Value {
         json!({"type":"object","properties":{

@@ -9,7 +9,7 @@ use crate::chat;
 use crate::permission::{self, Effect, Rule};
 use crate::provider::{retry, Block, ChatMessage, Event, FinishReason, Provider, ProviderError, Request, Role, ToolDef, Usage};
 use crate::store::{Mode, Session, Store, StoreError};
-use crate::tools::{self, project_root_of, PermReq, Permitter, Tool, ToolCtx, ToolError, ToolOutput};
+use crate::tools::{self, project_root_of, Host, PermReq, Permitter, Question, SubagentRequest, SubagentResult, Todo, Tool, ToolCtx, ToolError, ToolOutput};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -42,6 +42,10 @@ pub enum UiEvent<'a> {
     Notice(&'a str),
     /// Progress that is not an error (compaction started or finished).
     Status(&'a str),
+    /// The session's todo list was replaced.
+    Todos(&'a [Todo]),
+    /// An event from a subagent session; nests when subagents start subagents.
+    Nested { agent: &'a str, inner: &'a UiEvent<'a> },
 }
 
 /// Implemented by the front end. `ask` may be called from several tool threads; implementations
@@ -49,6 +53,28 @@ pub enum UiEvent<'a> {
 pub trait Ui: Sync {
     fn event(&self, e: &UiEvent);
     fn ask(&self, p: &PermissionPrompt) -> Reply;
+    /// Show a form for the `question` tool. `None` means the user dismissed it (which stops the run).
+    fn ask_questions(&self, _questions: &[Question]) -> Option<Vec<Vec<String>>> {
+        None
+    }
+}
+
+/// Wraps the parent's UI for a subagent session: events are tagged, prompts go to the same user.
+struct ChildUi<'a> {
+    parent: &'a dyn Ui,
+    agent: &'a str,
+}
+
+impl Ui for ChildUi<'_> {
+    fn event(&self, e: &UiEvent) {
+        self.parent.event(&UiEvent::Nested { agent: self.agent, inner: e });
+    }
+    fn ask(&self, p: &PermissionPrompt) -> Reply {
+        self.parent.ask(p)
+    }
+    fn ask_questions(&self, q: &[Question]) -> Option<Vec<Vec<String>>> {
+        self.parent.ask_questions(q)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +133,8 @@ pub struct Engine {
     tools: Vec<Box<dyn Tool>>,
     /// Sessions whose automatic compaction failed during this process; they are not retried every step.
     auto_failed: Mutex<HashSet<String>>,
+    /// One user prompt at a time across the whole process (parent and subagent sessions).
+    prompt_lock: Mutex<()>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -128,6 +156,10 @@ struct Prepared<'a> {
     /// History after the latest compaction.
     eff: Vec<crate::store::Message>,
     limit: Option<u64>,
+}
+
+fn subagent_list(cfg: &EngineConfig) -> Vec<(String, String)> {
+    cfg.agents.iter().filter(|a| a.subagent()).map(|a| (a.id.clone(), a.description.clone())).collect()
 }
 
 /// Add text to the trailing user message, or start one (consecutive user content merges).
@@ -163,12 +195,12 @@ struct AttemptResult {
 impl Engine {
     /// Single provider answering every model ref.
     pub fn new(store: Store, provider: Box<dyn Provider>, cfg: EngineConfig) -> Self {
-        Engine { store: Mutex::new(store), providers: HashMap::new(), fallback: Some(provider), cfg, tools: tools::all(), auto_failed: Mutex::new(HashSet::new()) }
+        Engine { store: Mutex::new(store), providers: HashMap::new(), fallback: Some(provider), tools: tools::all(subagent_list(&cfg)), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()) }
     }
 
     /// One client per provider id; a model ref's provider part picks the client.
     pub fn with_providers(store: Store, providers: HashMap<String, Box<dyn Provider>>, cfg: EngineConfig) -> Self {
-        Engine { store: Mutex::new(store), providers, fallback: None, cfg, tools: tools::all(), auto_failed: Mutex::new(HashSet::new()) }
+        Engine { store: Mutex::new(store), providers, fallback: None, tools: tools::all(subagent_list(&cfg)), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()) }
     }
 
     pub fn catalog(&self) -> &catalog::Catalog {
@@ -300,7 +332,7 @@ impl Engine {
                 &agent::EnvInfo { cwd: &session.directory, platform: std::env::consts::OS, date: &agent::date_from_unix(now), instructions: &ins },
             ),
             messages,
-            tools: advertised.iter().map(|t| ToolDef { name: t.name().into(), description: t.description().into(), schema: t.schema() }).collect(),
+            tools: advertised.iter().map(|t| ToolDef { name: t.name().into(), description: t.description(), schema: t.schema() }).collect(),
             max_tokens: self.cfg.max_tokens,
             tools_disabled: max_steps_hit,
         };
@@ -346,7 +378,7 @@ impl Engine {
             store: &self.store,
             ui,
             declined: &declined,
-            ask_lock: Mutex::new(()),
+            ask_lock: &self.prompt_lock,
         };
 
         let mut retries = 0u32;
@@ -594,7 +626,10 @@ impl Engine {
                         idx,
                         s.spawn(move || match tool {
                             None => Err(ToolError::fail(format!("Unknown tool: {name}"))),
-                            Some(t) => t.run(&input, &ToolCtx { cwd, project_root: root, spill_dir: spill, permitter, cancel }),
+                            Some(t) => {
+                                let host = EngineHost { engine: self, session, ui, cancel };
+                                t.run(&input, &ToolCtx { session_id: &session.id, host: &host, cwd, project_root: root, spill_dir: spill, permitter, cancel })
+                            }
                         }),
                     ));
                 }
@@ -638,6 +673,78 @@ impl Engine {
     }
 }
 
+/// The engine services a tool can use: todos, questions and subagents of the calling session.
+struct EngineHost<'a> {
+    engine: &'a Engine,
+    session: &'a Session,
+    ui: &'a dyn Ui,
+    cancel: &'a AtomicBool,
+}
+
+const MAX_SUBAGENT_DEPTH: usize = 3;
+
+impl Host for EngineHost<'_> {
+    fn set_todos(&self, todos: Vec<Todo>) -> Result<(), ToolError> {
+        self.engine.store().set_todos(&self.session.id, &todos).map_err(|e| ToolError::fail(e.to_string()))?;
+        self.ui.event(&UiEvent::Todos(&todos));
+        Ok(())
+    }
+
+    fn ask(&self, questions: &[Question]) -> Result<Vec<Vec<String>>, ToolError> {
+        let _one_prompt_at_a_time = self.engine.prompt_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.ui.ask_questions(questions).ok_or(ToolError::Declined)
+    }
+
+    fn subagent(&self, req: SubagentRequest) -> Result<SubagentResult, ToolError> {
+        let eng = self.engine;
+        let store_err = |e: StoreError| ToolError::fail(e.to_string());
+        let agent = agent::find(&eng.cfg.agents, &req.agent).filter(|a| a.subagent()).ok_or_else(|| ToolError::fail(format!("Unknown agent '{}'", req.agent)))?;
+        let child = {
+            let st = eng.store();
+            if st.depth(&self.session.id).map_err(store_err)? + 1 > MAX_SUBAGENT_DEPTH {
+                return Err(ToolError::fail("subagent depth limit reached; do this work yourself"));
+            }
+            let child = match &req.session_id {
+                Some(id) => st
+                    .session(id)
+                    .map_err(store_err)?
+                    .filter(|c| c.parent_id.as_deref() == Some(self.session.id.as_str()))
+                    .ok_or_else(|| ToolError::fail(format!("sessionID {id} is not a subagent session of this conversation")))?,
+                None => st.create_child_session(self.session, &agent.id).map_err(store_err)?,
+            };
+            // A model chosen for this conversation carries over unless the call names one.
+            match req.model.as_ref().or(self.session.model.as_ref()) {
+                Some(m) => st.set_model(&child.id, Some(m)).map_err(store_err)?,
+                None => {}
+            }
+            child
+        };
+        eng.submit(&child.id, &req.prompt, Mode::Steer).map_err(store_err)?;
+        let child_ui = ChildUi { parent: self.ui, agent: &agent.id };
+        self.ui.event(&UiEvent::Status(&format!("subagent {}: {}", agent.id, req.description)));
+        match eng.run(&child.id, &child_ui, self.cancel, false).map_err(store_err)? {
+            RunOutcome::Idle => {}
+            RunOutcome::Interrupted => return Err(ToolError::Interrupted),
+            RunOutcome::Declined => return Err(ToolError::Declined),
+            RunOutcome::Failed(m) => return Err(ToolError::fail(format!("Subagent failed: {m}"))),
+            RunOutcome::Busy => return Err(ToolError::fail("that subagent session is already running")),
+        }
+        let output = eng
+            .store()
+            .messages(&child.id)
+            .map_err(store_err)?
+            .iter()
+            .rev()
+            .filter(|m| m.kind == "assistant")
+            .find_map(|m| {
+                let text: Vec<&str> = m.data["parts"].as_array()?.iter().filter(|p| p["type"] == "text").filter_map(|p| p["text"].as_str()).collect();
+                (!text.is_empty()).then(|| text.join("\n\n"))
+            })
+            .unwrap_or_else(|| "(the subagent returned no text)".to_string());
+        Ok(SubagentResult { session_id: child.id, output })
+    }
+}
+
 /// Rule evaluation + user prompting for tool permission requests.
 struct EnginePermitter<'a> {
     rules: Vec<Rule>,
@@ -646,7 +753,7 @@ struct EnginePermitter<'a> {
     ui: &'a dyn Ui,
     /// Set when the user declines without feedback: every other pending/future request of the batch fails too.
     declined: &'a AtomicBool,
-    ask_lock: Mutex<()>,
+    ask_lock: &'a Mutex<()>,
 }
 
 impl EnginePermitter<'_> {
@@ -708,6 +815,8 @@ mod tests {
         replies: Mutex<VecDeque<Reply>>,
         asked: Mutex<Vec<String>>,
         hook: Mutex<Option<Box<dyn Fn(&str) + Send>>>,
+        questions: Mutex<Vec<Vec<Question>>>,
+        answers: Mutex<Option<Vec<Vec<String>>>>,
     }
     impl TestUi {
         fn replying(r: Vec<Reply>) -> Self {
@@ -717,22 +826,32 @@ mod tests {
             self.log.lock().unwrap().clone()
         }
     }
+    fn describe(e: &UiEvent) -> String {
+        match e {
+            UiEvent::TextDelta(t) => format!("text:{t}"),
+            UiEvent::ReasoningDelta(_) => "reasoning".into(),
+            UiEvent::ToolStarted { name, .. } => format!("start:{name}"),
+            UiEvent::ToolFinished { name, ok, .. } => format!("done:{name}:{ok}"),
+            UiEvent::Retry { attempt, wait, .. } => format!("retry:{attempt}:{}", wait.as_secs()),
+            UiEvent::StepUsage { .. } => "usage".into(),
+            UiEvent::Notice(n) => format!("notice:{n}"),
+            UiEvent::Status(n) => format!("status:{n}"),
+            UiEvent::Todos(t) => format!("todos:{}", t.len()),
+            UiEvent::Nested { agent, inner } => format!("{agent}>{}", describe(inner)),
+        }
+    }
+
     impl Ui for TestUi {
         fn event(&self, e: &UiEvent) {
-            let line = match e {
-                UiEvent::TextDelta(t) => format!("text:{t}"),
-                UiEvent::ReasoningDelta(_) => "reasoning".into(),
-                UiEvent::ToolStarted { name, .. } => format!("start:{name}"),
-                UiEvent::ToolFinished { name, ok, .. } => format!("done:{name}:{ok}"),
-                UiEvent::Retry { attempt, wait, .. } => format!("retry:{attempt}:{}", wait.as_secs()),
-                UiEvent::StepUsage { .. } => "usage".into(),
-                UiEvent::Notice(n) => format!("notice:{n}"),
-                UiEvent::Status(n) => format!("status:{n}"),
-            };
+            let line = describe(e);
             if let Some(h) = &*self.hook.lock().unwrap() {
                 h(&line);
             }
             self.log.lock().unwrap().push(line);
+        }
+        fn ask_questions(&self, q: &[Question]) -> Option<Vec<Vec<String>>> {
+            self.questions.lock().unwrap().push(q.to_vec());
+            self.answers.lock().unwrap().clone()
         }
         fn ask(&self, p: &PermissionPrompt) -> Reply {
             self.asked.lock().unwrap().push(format!("{} {}", p.action, p.resources.join(",")));
@@ -811,7 +930,7 @@ mod tests {
         assert!(f.engine.store().claim(&f.session.id).unwrap(), "claim released");
         let req = &f.fake.requests.lock().unwrap()[0];
         assert!(req.system.contains("moco") && req.system.contains("Working directory"));
-        assert_eq!(req.tools.len(), 6);
+        assert_eq!(req.tools.len(), 11);
     }
 
     #[test]
@@ -1181,7 +1300,7 @@ mod tests {
         assert!(reqs[0].tools.is_empty() && all_text(&reqs[0]).contains("OLD-USER") && all_text(&reqs[0]).contains("You MUST summarize"));
         assert!(!all_text(&reqs[0]).contains("next question"), "the tail is not summarized");
         // 2: the real step: checkpoint + tail only, same system prompt as always, tools back.
-        assert_eq!(reqs[1].tools.len(), 6);
+        assert_eq!(reqs[1].tools.len(), 11);
         let t = all_text(&reqs[1]);
         assert!(t.contains(compaction::SUMMARY_PREFIX) && t.contains("SUMMARY-BODY") && t.contains("next question"), "{t}");
         assert!(!t.contains("OLD-USER") && !t.contains("OLD-ASSISTANT"));
@@ -1299,5 +1418,137 @@ mod tests {
         g.say("go");
         assert_eq!(g.run(&TestUi::default()), RunOutcome::Idle);
         assert_eq!(g.fake.calls(), 1);
+    }
+
+    fn result_text(req: &Request) -> String {
+        req.messages
+            .last()
+            .unwrap()
+            .content
+            .iter()
+            .filter_map(|b| if let Block::ToolResult { content, .. } = b { Some(content.as_str()) } else { None })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn child_id(req: &Request) -> String {
+        result_text(req).lines().next().unwrap().trim_start_matches("sessionID: ").to_string()
+    }
+
+    fn sub(id: &str, agent: &str, prompt: &str) -> Scripted {
+        tool_call(id, "subagent", json!({"agent": agent, "description": "do it", "prompt": prompt}))
+    }
+
+    #[test]
+    fn subagent_runs_in_a_child_session_and_returns_its_final_text() {
+        let f = fixture(vec![sub("t1", "general", "find the thing"), text("child result"), text("parent done")]);
+        f.say("delegate");
+        let ui = TestUi::default();
+        assert_eq!(f.run(&ui), RunOutcome::Idle);
+        let reqs = f.fake.requests.lock().unwrap();
+        assert_eq!(reqs.len(), 3);
+        // The child sees only its prompt, with its own agent's tool set (no question, no subagent).
+        assert_eq!(all_text(&reqs[1]).trim(), "find the thing");
+        let names: Vec<&str> = reqs[1].tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"shell") && !names.contains(&"subagent") && !names.contains(&"question"), "{names:?}");
+        // The parent gets the text plus the id to continue with.
+        let out = result_text(&reqs[2]);
+        assert!(out.starts_with("sessionID: ses_") && out.ends_with("child result"), "{out}");
+        let cid = child_id(&reqs[2]);
+        let child = f.engine.store().session(&cid).unwrap().unwrap();
+        assert_eq!((child.parent_id.as_deref(), child.agent.as_str()), (Some(f.session.id.as_str()), "general"));
+        assert_eq!(f.engine.store().messages(&cid).unwrap().len(), 2);
+        let log = ui.log();
+        assert!(log.contains(&"status:subagent general: do it".to_string()) && log.contains(&"general>text:child result".to_string()), "{log:?}");
+        // The tool description lists the agents it can start.
+        let desc = &reqs[0].tools.iter().find(|t| t.name == "subagent").unwrap().description;
+        assert!(desc.contains("- general:") && desc.contains("- explore:") && !desc.contains("- build:"));
+    }
+
+    #[test]
+    fn a_subagent_session_can_be_continued_by_id() {
+        let f = fixture(vec![sub("t1", "general", "first job"), text("c1"), text("p1")]);
+        f.say("go");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        let cid = child_id(&f.fake.requests.lock().unwrap()[2]);
+        f.fake.extend(vec![
+            tool_call("t2", "subagent", json!({"agent":"general","description":"more","prompt":"second job","sessionID":cid})),
+            text("c2"),
+            tool_call("t3", "subagent", json!({"agent":"general","description":"more","prompt":"x","sessionID":"ses_not_mine"})),
+            text("p2"),
+        ]);
+        f.say("again");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        let reqs = f.fake.requests.lock().unwrap();
+        let t = all_text(&reqs[4]);
+        assert!(t.contains("first job") && t.contains("c1") && t.contains("second job"), "the child kept its history: {t}");
+        assert!(matches!(&reqs[6].messages.last().unwrap().content[0], Block::ToolResult { is_error: true, content, .. } if content.contains("not a subagent session")));
+    }
+
+    #[test]
+    fn child_permission_prompts_go_through_the_parent_ui() {
+        let cfg: config::Config = serde_json::from_value(json!({"permissions":[{"action":"shell","resource":"*","effect":"ask"}]})).unwrap();
+        let script = || vec![sub("t1", "general", "run it"), tool_call("c1", "shell", json!({"command":"echo hi"})), text("ran"), text("done")];
+        let f = fixture_cfg(script(), |c| c.agents = config::resolve_agents(&cfg));
+        f.say("go");
+        let ui = TestUi::replying(vec![Reply::Once]);
+        assert_eq!(f.run(&ui), RunOutcome::Idle);
+        assert_eq!(ui.asked.lock().unwrap().as_slice(), ["shell echo hi"]);
+        // Rejecting inside the child stops the whole run.
+        let f = fixture_cfg(script(), |c| c.agents = config::resolve_agents(&cfg));
+        f.say("go");
+        let ui = TestUi::replying(vec![Reply::Reject(None)]);
+        assert_eq!(f.run(&ui), RunOutcome::Declined);
+        assert_eq!(f.fake.calls(), 2, "no further model calls after the rejection");
+    }
+
+    #[test]
+    fn explore_is_read_only() {
+        let f = fixture(vec![sub("t1", "explore", "look"), tool_call("c1", "write", json!({"path":"x.txt","content":"c"})), text("could not write"), text("done")]);
+        f.say("go");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        let reqs = f.fake.requests.lock().unwrap();
+        let names: Vec<&str> = reqs[1].tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["read", "glob", "grep", "shell", "webfetch"]);
+        assert!(reqs[1].system.contains("file search specialist"));
+        assert!(matches!(&reqs[2].messages.last().unwrap().content[0], Block::ToolResult { is_error: true, content, .. } if content.starts_with("Permission denied: edit")));
+        assert!(!f.dir.join("work/x.txt").exists());
+    }
+
+    #[test]
+    fn subagent_depth_is_limited() {
+        let cfg: config::Config = serde_json::from_value(json!({"agents":{"deep":{"mode":"all","description":"recurses"}}})).unwrap();
+        let mut script: Vec<Scripted> = (0..4).map(|i| sub(&format!("t{i}"), "deep", "go deeper")).collect();
+        script.extend([text("c3"), text("c2"), text("c1"), text("p")]);
+        let f = fixture_cfg(script, |c| c.agents = config::resolve_agents(&cfg));
+        f.engine.store().set_agent(&f.session.id, "deep").unwrap();
+        f.say("go");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        let reqs = f.fake.requests.lock().unwrap();
+        assert_eq!(reqs.len(), 8);
+        assert!(result_text(&reqs[4]).contains("depth limit"), "{}", result_text(&reqs[4]));
+    }
+
+    #[test]
+    fn todowrite_and_question_reach_the_user() {
+        let f = fixture(vec![
+            tool_call("t1", "todowrite", json!({"todos":[{"content":"a","status":"in_progress"},{"content":"b","status":"pending"}]})),
+            tool_call("t2", "question", json!({"questions":[{"question":"Which DB?","header":"DB","options":[{"label":"SQLite","description":"embedded"}]}]})),
+            text("ok"),
+        ]);
+        f.say("plan it");
+        let ui = TestUi::default();
+        *ui.answers.lock().unwrap() = Some(vec![vec!["SQLite".into()]]);
+        assert_eq!(f.run(&ui), RunOutcome::Idle);
+        assert_eq!(f.engine.store().todos(&f.session.id).unwrap().len(), 2);
+        assert!(ui.log().contains(&"todos:2".to_string()));
+        assert_eq!(ui.questions.lock().unwrap()[0][0].question, "Which DB?");
+        let reqs = f.fake.requests.lock().unwrap();
+        assert!(result_text(&reqs[2]).contains("\"Which DB?\"=\"SQLite\""));
+        // Dismissing the form stops the run.
+        let f = fixture(vec![tool_call("t2", "question", json!({"questions":[{"question":"Q?","header":"Q","options":[]}]}))]);
+        f.say("ask");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Declined);
+        assert_eq!(f.fake.calls(), 1);
     }
 }

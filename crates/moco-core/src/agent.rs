@@ -5,6 +5,7 @@ use crate::tools::Tool;
 #[derive(Debug, Clone)]
 pub struct Agent {
     pub id: String,
+    pub mode: Mode,
     pub name: String,
     pub description: String,
     pub system: Option<String>,
@@ -15,15 +16,75 @@ pub struct Agent {
     pub permissions: Vec<Rule>,
 }
 
+/// Where an agent may be used: chosen by the user (`Primary`), started by the subagent tool (`Subagent`), or both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Primary,
+    Subagent,
+    All,
+}
+
+impl Mode {
+    pub fn parse(s: &str) -> Option<Mode> {
+        match s {
+            "primary" => Some(Mode::Primary),
+            "subagent" => Some(Mode::Subagent),
+            "all" => Some(Mode::All),
+            _ => None,
+        }
+    }
+}
+
+impl Agent {
+    /// The user can pick it as the session agent.
+    pub fn selectable(&self) -> bool {
+        self.mode != Mode::Subagent
+    }
+    /// The subagent tool may start it.
+    pub fn subagent(&self) -> bool {
+        self.mode != Mode::Primary
+    }
+}
+
+pub const EXPLORE_PROMPT: &str = "You are a file search specialist. You excel at thoroughly navigating and exploring codebases.
+
+Guidelines:
+- Your role is EXCLUSIVELY to search and analyze
+- Parallelize independent tool calls for searches and reads whenever possible
+- Adapt your search approach based on the thoroughness level specified by the caller
+- Return file paths as absolute paths in your final response
+- You MUST NOT create, modify, delete, move, or copy files, including temporary files and reports
+- Shell commands MUST be read-only. NEVER run commands that write files or change system state
+
+Complete the user's search request efficiently and report your findings clearly.";
+
 pub fn builtin() -> Vec<Agent> {
     let mut build = crate::permission::default_rules();
     build.push(Rule::new("question", "*", Effect::Allow));
     let mut plan = crate::permission::default_rules();
     plan.push(Rule::new("question", "*", Effect::Allow));
     plan.push(Rule::new("edit", "*", Effect::Deny));
+    let mut general = crate::permission::default_rules();
+    general.push(Rule::new("question", "*", Effect::Deny));
+    general.push(Rule::new("subagent", "*", Effect::Deny));
+    let mut explore = crate::permission::default_rules();
+    explore.extend([
+        Rule::new("*", "*", Effect::Deny),
+        Rule::new("shell", "*", Effect::Allow),
+        Rule::new("grep", "*", Effect::Allow),
+        Rule::new("glob", "*", Effect::Allow),
+        Rule::new("webfetch", "*", Effect::Allow),
+        Rule::new("read", "*", Effect::Allow),
+        Rule::new("read", "*.env", Effect::Ask),
+        Rule::new("read", "*.env.*", Effect::Ask),
+        Rule::new("read", "*.env.example", Effect::Allow),
+        Rule::new("subagent", "*", Effect::Deny),
+        Rule::new("external_directory", "*", Effect::Allow),
+    ]);
     vec![
         Agent {
             id: "build".into(),
+            mode: Mode::Primary,
             name: "Build".into(),
             description: "The default agent. Executes tools based on configured permissions.".into(),
             system: None,
@@ -33,12 +94,33 @@ pub fn builtin() -> Vec<Agent> {
         },
         Agent {
             id: "plan".into(),
+            mode: Mode::Primary,
             name: "Plan".into(),
             description: "Read-only agent for exploring the codebase and planning work before implementation.".into(),
             system: None,
             model: None,
             steps: None,
             permissions: plan,
+        },
+        Agent {
+            id: "general".into(),
+            mode: Mode::Subagent,
+            name: "General".into(),
+            description: "General-purpose agent for researching complex questions and executing multi-step tasks. Use this agent to execute multiple units of work in parallel.".into(),
+            system: None,
+            model: None,
+            steps: None,
+            permissions: general,
+        },
+        Agent {
+            id: "explore".into(),
+            mode: Mode::Subagent,
+            name: "Explore".into(),
+            description: "Fast agent specialized for exploring codebases: finding files by pattern, searching code for keywords, answering questions about the code. Read-only. Say how thorough the search should be: \"quick\", \"medium\" or \"very thorough\".".into(),
+            system: Some(EXPLORE_PROMPT.into()),
+            model: None,
+            steps: None,
+            permissions: explore,
         },
     ]
 }
@@ -154,6 +236,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn modes_and_explore_permissions() {
+        let agents = builtin();
+        let sel: Vec<_> = agents.iter().filter(|a| a.selectable()).map(|a| a.id.as_str()).collect();
+        let sub: Vec<_> = agents.iter().filter(|a| a.subagent()).map(|a| a.id.as_str()).collect();
+        assert_eq!((sel, sub), (vec!["build", "plan"], vec!["general", "explore"]));
+        let ex = find(&agents, "explore").unwrap();
+        use crate::permission::evaluate;
+        assert_eq!(evaluate("write", "x", &ex.permissions), Effect::Deny);
+        assert_eq!(evaluate("edit", "x", &ex.permissions), Effect::Deny);
+        assert_eq!(evaluate("shell", "ls", &ex.permissions), Effect::Allow);
+        assert_eq!(evaluate("read", ".env", &ex.permissions), Effect::Ask);
+        assert_eq!(evaluate("read", ".env.example", &ex.permissions), Effect::Allow);
+        assert_eq!(evaluate("subagent", "general", &ex.permissions), Effect::Deny);
+        assert_eq!(evaluate("external_directory", "/etc/*", &ex.permissions), Effect::Allow);
+        assert!(ex.system.as_deref().unwrap().starts_with("You are a file search specialist"));
+    }
+
+    #[test]
     fn dates() {
         assert_eq!(date_from_unix(0), "1970-01-01");
         assert_eq!(date_from_unix(951_782_400), "2000-02-29");
@@ -162,20 +262,23 @@ mod tests {
 
     #[test]
     fn plan_hides_write_tools_but_build_does_not() {
-        let tools = crate::tools::all();
+        let tools = crate::tools::all(vec![]);
         let names = |a: &Agent| tools.iter().filter(|t| advertised(a, t.as_ref())).map(|t| t.name()).collect::<Vec<_>>();
-        assert_eq!(names(&find(&builtin(), "build").unwrap()), ["read", "write", "edit", "glob", "grep", "shell"]);
-        assert_eq!(names(&find(&builtin(), "plan").unwrap()), ["read", "glob", "grep", "shell"]);
+        let all = ["read", "write", "edit", "patch", "glob", "grep", "shell", "webfetch", "todowrite", "question", "subagent"];
+        assert_eq!(names(&find(&builtin(), "build").unwrap()), all);
+        assert_eq!(names(&find(&builtin(), "plan").unwrap()), ["read", "glob", "grep", "shell", "webfetch", "todowrite", "question", "subagent"]);
+        assert_eq!(names(&find(&builtin(), "general").unwrap()), ["read", "write", "edit", "patch", "glob", "grep", "shell", "webfetch", "todowrite"], "no question, no subagent");
+        assert_eq!(names(&find(&builtin(), "explore").unwrap()), ["read", "glob", "grep", "shell", "webfetch"], "read-only");
     }
 
     #[test]
     fn prompt_guidance_follows_enabled_tools() {
-        let tools = crate::tools::all();
+        let tools = crate::tools::all(vec![]);
         let refs: Vec<&dyn Tool> = tools.iter().map(|t| t.as_ref()).collect();
         let env = EnvInfo { cwd: "/w", platform: "macos", date: "2026-10-31", instructions: "" };
         let full = system_prompt(&find(&builtin(), "build").unwrap(), &refs, &env);
         assert!(full.contains("Use the edit tool for targeted changes") && full.contains("Working directory: /w"));
-        let no_edit = system_prompt(&find(&builtin(), "build").unwrap(), &refs[3..], &env);
+        let no_edit = system_prompt(&find(&builtin(), "build").unwrap(), &refs[4..], &env);
         assert!(!no_edit.contains("edit tool") && no_edit.contains("Prefer dedicated tools"));
         assert!(!full.contains("Project instructions"));
         let with = EnvInfo { instructions: "Instructions from: /w/AGENTS.md\nuse tabs\n", ..env };

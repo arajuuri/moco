@@ -18,6 +18,10 @@ impl FakeProvider {
     pub fn new(script: Vec<Scripted>) -> Self {
         FakeProvider { script: Mutex::new(script.into()), requests: Mutex::new(vec![]) }
     }
+    /// Queue more responses (for multi-turn tests where later script entries depend on earlier results).
+    pub fn extend(&self, more: Vec<Scripted>) {
+        self.script.lock().unwrap().extend(more);
+    }
     pub fn calls(&self) -> usize {
         self.requests.lock().unwrap().len()
     }

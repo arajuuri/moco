@@ -58,6 +58,8 @@ pub struct Session {
     pub title: Option<String>,
     /// `provider/model` chosen for this session, if any.
     pub model: Option<String>,
+    /// Set for subagent sessions.
+    pub parent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -139,14 +141,54 @@ impl Store {
             "insert into session(id, project_id, directory, agent, time_created, time_updated) values (?1,?2,?3,?4,?5,?5)",
             params![id, project_id, directory, agent, t],
         )?;
-        Ok(Session { id, project_id, directory: directory.into(), agent: agent.into(), title: None, model: None })
+        Ok(Session { id, project_id, directory: directory.into(), agent: agent.into(), title: None, model: None, parent_id: None })
+    }
+
+    /// A subagent session: same project and directory as its parent, hidden from `latest_session`.
+    pub fn create_child_session(&self, parent: &Session, agent: &str) -> Result<Session> {
+        let id = new_id("ses");
+        let t = now_ms();
+        self.conn.execute(
+            "insert into session(id, project_id, parent_id, directory, agent, time_created, time_updated) values (?1,?2,?3,?4,?5,?6,?6)",
+            params![id, parent.project_id, parent.id, parent.directory, agent, t],
+        )?;
+        Ok(Session { id, project_id: parent.project_id.clone(), directory: parent.directory.clone(), agent: agent.into(), title: None, model: None, parent_id: Some(parent.id.clone()) })
+    }
+
+    /// Number of ancestors (0 for a top-level session).
+    pub fn depth(&self, session_id: &str) -> Result<usize> {
+        let (mut depth, mut cur) = (0, session_id.to_string());
+        while let Some(p) = self.conn.query_row("select parent_id from session where id=?1", [&cur], |r| r.get::<_, Option<String>>(0)).optional()?.flatten() {
+            depth += 1;
+            cur = p;
+            if depth > 32 {
+                break;
+            }
+        }
+        Ok(depth)
+    }
+
+    pub fn set_todos(&self, session_id: &str, todos: &[crate::tools::Todo]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("delete from todo where session_id=?1", [session_id])?;
+        for (i, t) in todos.iter().enumerate() {
+            tx.execute("insert into todo(session_id, position, content, status) values (?1,?2,?3,?4)", params![session_id, i as i64, t.content, t.status])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn todos(&self, session_id: &str) -> Result<Vec<crate::tools::Todo>> {
+        let mut stmt = self.conn.prepare("select content, status from todo where session_id=?1 order by position")?;
+        let rows = stmt.query_map([session_id], |r| Ok(crate::tools::Todo { content: r.get(0)?, status: r.get(1)? }))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
     pub fn session(&self, id: &str) -> Result<Option<Session>> {
         Ok(self
             .conn
-            .query_row("select id, project_id, directory, agent, title, model from session where id=?1", [id], |r| {
-                Ok(Session { id: r.get(0)?, project_id: r.get(1)?, directory: r.get(2)?, agent: r.get(3)?, title: r.get(4)?, model: r.get(5)? })
+            .query_row("select id, project_id, directory, agent, title, model, parent_id from session where id=?1", [id], |r| {
+                Ok(Session { id: r.get(0)?, project_id: r.get(1)?, directory: r.get(2)?, agent: r.get(3)?, title: r.get(4)?, model: r.get(5)?, parent_id: r.get(6)? })
             })
             .optional()?)
     }
@@ -162,13 +204,23 @@ impl Store {
     }
 
     /// Add one step's usage to the session totals (`cost` in USD; `tokens` is a JSON object of running sums).
+    /// Subagent spend also counts toward every ancestor session, so a parent's total covers its whole tree.
     pub fn add_usage(&self, session_id: &str, cost: f64, usage: &crate::provider::Usage) -> Result<()> {
-        let prev: Option<String> = self.conn.query_row("select tokens from session where id=?1", [session_id], |r| r.get(0))?;
-        let mut t: Value = prev.and_then(|p| serde_json::from_str(&p).ok()).unwrap_or_else(|| serde_json::json!({}));
-        for (k, v) in [("input", usage.input), ("output", usage.output), ("cacheRead", usage.cache_read), ("cacheWrite", usage.cache_write)] {
-            t[k] = serde_json::json!(t[k].as_u64().unwrap_or(0) + v);
+        let mut cur = Some(session_id.to_string());
+        let mut hops = 0;
+        while let Some(id) = cur {
+            let prev: Option<String> = self.conn.query_row("select tokens from session where id=?1", [&id], |r| r.get(0))?;
+            let mut t: Value = prev.and_then(|p| serde_json::from_str(&p).ok()).unwrap_or_else(|| serde_json::json!({}));
+            for (k, v) in [("input", usage.input), ("output", usage.output), ("cacheRead", usage.cache_read), ("cacheWrite", usage.cache_write)] {
+                t[k] = serde_json::json!(t[k].as_u64().unwrap_or(0) + v);
+            }
+            self.conn.execute("update session set cost=cost+?2, tokens=?3, time_updated=?4 where id=?1", params![id, cost, t.to_string(), now_ms()])?;
+            cur = self.conn.query_row("select parent_id from session where id=?1", [&id], |r| r.get::<_, Option<String>>(0)).optional()?.flatten();
+            hops += 1;
+            if hops > 32 {
+                break;
+            }
         }
-        self.conn.execute("update session set cost=cost+?2, tokens=?3, time_updated=?4 where id=?1", params![session_id, cost, t.to_string(), now_ms()])?;
         Ok(())
     }
 
@@ -185,10 +237,10 @@ impl Store {
         Ok(self
             .conn
             .query_row(
-                "select id, project_id, directory, agent, title, model from session
+                "select id, project_id, directory, agent, title, model, parent_id from session
                  where directory=?1 and parent_id is null and time_archived is null order by id desc limit 1",
                 [directory],
-                |r| Ok(Session { id: r.get(0)?, project_id: r.get(1)?, directory: r.get(2)?, agent: r.get(3)?, title: r.get(4)?, model: r.get(5)? }),
+                |r| Ok(Session { id: r.get(0)?, project_id: r.get(1)?, directory: r.get(2)?, agent: r.get(3)?, title: r.get(4)?, model: r.get(5)?, parent_id: r.get(6)? }),
             )
             .optional()?)
     }
@@ -336,6 +388,30 @@ mod tests {
         let s = Store::open_memory().unwrap();
         let ses = s.create_session("/work/proj", "build").unwrap();
         (s, ses)
+    }
+
+    #[test]
+    fn child_sessions_todos_and_depth() {
+        use crate::tools::Todo;
+        let (s, ses) = store();
+        let child = s.create_child_session(&ses, "general").unwrap();
+        let grandchild = s.create_child_session(&child, "general").unwrap();
+        assert_eq!((child.parent_id.as_deref(), child.project_id.as_str(), child.directory.as_str()), (Some(ses.id.as_str()), ses.project_id.as_str(), "/work/proj"));
+        assert_eq!((s.depth(&ses.id).unwrap(), s.depth(&child.id).unwrap(), s.depth(&grandchild.id).unwrap()), (0, 1, 2));
+        assert_eq!(s.latest_session("/work/proj").unwrap().unwrap().id, ses.id, "children never show up as the latest session");
+        assert_eq!(s.session(&child.id).unwrap().unwrap().parent_id.as_deref(), Some(ses.id.as_str()));
+        let t = |c: &str, st: &str| Todo { content: c.into(), status: st.into() };
+        s.set_todos(&ses.id, &[t("a", "pending"), t("b", "completed")]).unwrap();
+        s.set_todos(&ses.id, &[t("c", "in_progress")]).unwrap();
+        assert_eq!(s.todos(&ses.id).unwrap(), [t("c", "in_progress")], "replaced wholesale");
+        assert!(s.todos(&child.id).unwrap().is_empty());
+        // Usage rolls up: the child's spend shows in the parent's total, not the other way round.
+        let u = crate::provider::Usage { input: 10, output: 5, ..Default::default() };
+        s.add_usage(&child.id, 0.25, &u).unwrap();
+        s.add_usage(&ses.id, 0.5, &u).unwrap();
+        assert_eq!(s.usage_totals(&child.id).unwrap().0, 0.25);
+        assert!((s.usage_totals(&ses.id).unwrap().0 - 0.75).abs() < 1e-9);
+        assert_eq!(s.usage_totals(&ses.id).unwrap().1.input, 20);
     }
 
     #[test]
