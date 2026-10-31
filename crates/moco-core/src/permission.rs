@@ -40,6 +40,8 @@ pub fn default_rules() -> Vec<Rule> {
         Rule::new("read", "*.env", Effect::Ask),
         Rule::new("read", "*.env.*", Effect::Ask),
         Rule::new("read", "*.env.example", Effect::Allow),
+        // A search sends your words to a third party: ask first (then "always" remembers it for the project).
+        Rule::new("websearch", "*", Effect::Ask),
     ]
 }
 
@@ -83,6 +85,7 @@ mod tests {
         assert_eq!(evaluate("read", "app/.env.local", &d), Ask);
         assert_eq!(evaluate("read", ".env.example", &d), Allow);
         assert_eq!(evaluate("shell", "rm -rf /", &d), Allow);
+        assert_eq!(evaluate("websearch", "rust ureq timeout", &d), Ask, "queries leave the machine: ask first");
     }
 
     #[test]

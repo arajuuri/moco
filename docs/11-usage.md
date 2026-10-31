@@ -100,6 +100,17 @@ MCP servers add tools (and prompts and resources) from other programs. Declare t
 - **Remote servers** (MCP Streamable HTTP): `"docs": { "url": "https://example.com/mcp", "headers": { "Authorization": "Bearer {env:TOKEN}" } }`. A server that answers 401 shows `needs authorization`; run `/mcp auth <name>` to sign in. moco prints an address to open in a browser (and tries `open`/`xdg-open`) and listens on a loopback port for the redirect. Over SSH, open the address on your own machine and paste the address the browser ended up on at the prompt. Tokens are stored in `mcp-auth.json` in the app directory (mode 600, never in the Keychain) and refreshed automatically; `/mcp logout <name>` removes them. `"oauth": { "client_id", "client_secret", "scope", "callback_port", "redirect_uri", "auth_server_metadata_url" }` pre-configures a client, `"oauth": false` disables sign-in.
 - Remote HTTP and OAuth support is experimental: it has been verified against local fake servers and a live model on Mojave, not against real hosted MCP services.
 
+## Web search
+
+The assistant can search the web with the `websearch` tool and read pages with `webfetch`. By default it uses DuckDuckGo, which needs no account or key. **moco asks before every new kind of search** (your words are sent to the search service); answer `a` to allow searches for the project, or add `{ "action": "websearch", "resource": "*", "effect": "allow" }` to `permissions` in the config.
+
+```jsonc
+{ "websearch": { "provider": "brave", "max_results": 8 } }   // duckduckgo (default), brave, tavily, exa, searxng
+{ "websearch": { "provider": "searxng", "url": "https://searx.example.org" } }
+{ "websearch": false }                                        // no web search at all
+```
+Brave, Tavily and Exa need an API key: set `BRAVE_API_KEY` (`TAVILY_API_KEY`, `EXA_API_KEY`) or run `moco auth brave`. DuckDuckGo may show a captcha after many searches in a short time; moco then says so and you can switch provider.
+
 ## Formatters
 
 moco can run a formatter on every file the model writes, edits or patches. Nothing runs unless you configure it:

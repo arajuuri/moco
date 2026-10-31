@@ -64,7 +64,7 @@ Status: complete. 197 unit tests pass on Linux and on the Mojave machine; the re
 - Notifications, themes, keybinding config: done as part of the full-screen TUI, see `12-tui-plan.md` (all six slices implemented; ratatui + crossterm on Mojave over SSH).
 
 ## Phase 4: nice to have
-Terminal pane, worktrees, LSP diagnostics, websearch, references, multi-window, scheduled runs.
+Terminal pane, worktrees, LSP diagnostics, references, multi-window, scheduled runs. (`websearch` is done: see `04` implementation notes.)
 
 ## Deliberately dropped from upstream (do not need to reproduce)
 - Client/server HTTP API (about 170 endpoints in `packages/protocol/src/groups/*`), OpenAPI SDK generation, pairing, tunnels, remote workspaces, multi-client SSE feed. Add later only if you want a remote UI or SDK.

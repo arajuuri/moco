@@ -8,7 +8,7 @@ enum Tok {
     Close(String),
 }
 
-fn decode_entities(s: &str) -> String {
+pub fn decode_entities(s: &str) -> String {
     if !s.contains('&') {
         return s.to_string();
     }

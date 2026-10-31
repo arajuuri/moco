@@ -13,6 +13,7 @@ pub mod skill;
 pub mod subagent;
 pub mod todowrite;
 pub mod webfetch;
+pub mod websearch;
 pub mod write;
 
 use serde::{Deserialize, Serialize};
@@ -299,7 +300,7 @@ pub trait Tool: Send + Sync {
 }
 
 /// Every built-in tool. `subagents` lists `(id, description)` of the agents the subagent tool may start.
-pub fn all(subagents: Vec<(String, String)>, skills: Vec<crate::skills::Skill>) -> Vec<Box<dyn Tool>> {
+pub fn all(subagents: Vec<(String, String)>, skills: Vec<crate::skills::Skill>, search: Option<websearch::Settings>) -> Vec<Box<dyn Tool>> {
     let mut tools: Vec<Box<dyn Tool>> = vec![
         Box::new(read::Read),
         Box::new(write::Write),
@@ -314,6 +315,9 @@ pub fn all(subagents: Vec<(String, String)>, skills: Vec<crate::skills::Skill>) 
         Box::new(question::AskQuestion),
         Box::new(subagent::Subagent { agents: subagents }),
     ];
+    if let Some(settings) = search {
+        tools.insert(9, Box::new(websearch::WebSearch { settings }));
+    }
     // Only offered when there is something to load: an empty skill tool is noise in every request.
     if !skills.is_empty() {
         tools.push(Box::new(skill::SkillTool { skills }));

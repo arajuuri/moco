@@ -50,7 +50,6 @@ pub struct Host<'a> {
     pub model: String,
     pub agent: String,
     pub title: Option<String>,
-    pub header: String,
     /// The previous process died mid-run: continue that run first.
     pub recovered: bool,
     /// Expand mentions and put the prompt in the inbox; returns its inbox id and notes about attachments.

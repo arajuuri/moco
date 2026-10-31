@@ -177,6 +177,7 @@ pub struct Config {
     pub formatter: Option<FormatterSetting>,
     pub mcp: McpConfig,
     pub tui: TuiConfig,
+    pub websearch: Option<WebSearchSetting>,
     /// Extra skill locations: a directory of skills, or a single skill directory.
     pub skills: Vec<String>,
     pub commands: BTreeMap<String, CommandConfig>,
@@ -194,6 +195,38 @@ pub struct Config {
     pub agents: BTreeMap<String, AgentConfig>,
     /// Extra instruction files (paths, `~/` allowed; relative paths resolve against the working directory).
     pub instructions: Vec<String>,
+}
+
+/// `websearch`: which service the `websearch` tool uses.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct WebSearchConfig {
+    /// `duckduckgo` (default, no key), `brave`, `tavily`, `exa` or `searxng`.
+    pub provider: Option<String>,
+    /// Endpoint override; required for `searxng`.
+    pub url: Option<String>,
+    pub max_results: Option<u32>,
+    /// Environment variables to read the API key from, besides `<PROVIDER>_API_KEY` and `auth.json`.
+    pub key_env: Vec<String>,
+}
+
+/// `"websearch": false` switches the tool off; an object configures it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum WebSearchSetting {
+    Flag(bool),
+    Config(WebSearchConfig),
+}
+
+impl WebSearchSetting {
+    /// `None` when switched off; the defaults when not mentioned at all.
+    pub fn resolve(s: &Option<WebSearchSetting>) -> Option<WebSearchConfig> {
+        match s {
+            Some(WebSearchSetting::Flag(false)) => None,
+            Some(WebSearchSetting::Config(c)) => Some(c.clone()),
+            _ => Some(WebSearchConfig::default()),
+        }
+    }
 }
 
 /// `tui`: settings of the full-screen UI.
@@ -578,6 +611,18 @@ mod tests {
         assert_eq!(OAuthSetting::resolve(&s["token"].oauth), None);
         let o = OAuthSetting::resolve(&s["oauth"].oauth).unwrap();
         assert_eq!((o.client_id.as_deref(), o.scope.as_deref(), o.callback_port), (Some("cid"), Some("read"), Some(8123)));
+    }
+
+    #[test]
+    fn websearch_settings() {
+        let cfg: Config = serde_json::from_value(json!({"websearch": {"provider": "Brave", "max_results": 5, "key_env": ["MY_KEY"]}})).unwrap();
+        let c = WebSearchSetting::resolve(&cfg.websearch).unwrap();
+        assert_eq!((c.provider.as_deref(), c.max_results, c.key_env), (Some("Brave"), Some(5), vec!["MY_KEY".to_string()]));
+        let off: Config = serde_json::from_value(json!({"websearch": false})).unwrap();
+        assert_eq!(WebSearchSetting::resolve(&off.websearch), None);
+        let on: Config = serde_json::from_value(json!({"websearch": true})).unwrap();
+        assert_eq!(WebSearchSetting::resolve(&on.websearch), Some(WebSearchConfig::default()));
+        assert_eq!(WebSearchSetting::resolve(&Config::default().websearch), Some(WebSearchConfig::default()), "on by default");
     }
 
     #[test]

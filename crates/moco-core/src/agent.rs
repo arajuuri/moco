@@ -74,6 +74,7 @@ pub fn builtin() -> Vec<Agent> {
         Rule::new("grep", "*", Effect::Allow),
         Rule::new("glob", "*", Effect::Allow),
         Rule::new("webfetch", "*", Effect::Allow),
+        Rule::new("websearch", "*", Effect::Ask),
         Rule::new("read", "*", Effect::Allow),
         Rule::new("read", "*.env", Effect::Ask),
         Rule::new("read", "*.env.*", Effect::Ask),
@@ -268,7 +269,7 @@ mod tests {
 
     #[test]
     fn plan_hides_write_tools_but_build_does_not() {
-        let tools = crate::tools::all(vec![], vec![]);
+        let tools = crate::tools::all(vec![], vec![], None);
         let names = |a: &Agent| tools.iter().filter(|t| advertised(a, t.as_ref())).map(|t| t.name()).collect::<Vec<_>>();
         let all = ["read", "write", "edit", "patch", "glob", "grep", "shell", "jobs", "webfetch", "todowrite", "question", "subagent"];
         assert_eq!(names(&find(&builtin(), "build").unwrap()), all);
@@ -278,8 +279,20 @@ mod tests {
     }
 
     #[test]
+    fn websearch_is_offered_to_every_agent_but_always_asks() {
+        let tools = crate::tools::all(vec![], vec![], Some(crate::tools::websearch::Settings::default_for("/x".into())));
+        let names = |a: &Agent| tools.iter().filter(|t| advertised(a, t.as_ref())).map(|t| t.name()).collect::<Vec<_>>();
+        for id in ["build", "plan", "general", "explore"] {
+            let n = names(&find(&builtin(), id).unwrap());
+            let at = n.iter().position(|x| *x == "websearch").unwrap_or_else(|| panic!("{id}: {n:?}"));
+            assert_eq!(n[at - 1], "webfetch", "{id}: it sits right after webfetch");
+            assert_eq!(crate::permission::evaluate("websearch", "some query", &find(&builtin(), id).unwrap().permissions), Effect::Ask, "{id}");
+        }
+    }
+
+    #[test]
     fn prompt_guidance_follows_enabled_tools() {
-        let tools = crate::tools::all(vec![], vec![]);
+        let tools = crate::tools::all(vec![], vec![], None);
         let refs: Vec<&dyn Tool> = tools.iter().map(|t| t.as_ref()).collect();
         let env = EnvInfo { cwd: "/w", platform: "macos", date: "2026-10-31", instructions: "", skills: "" };
         let full = system_prompt(&find(&builtin(), "build").unwrap(), &refs, &env);
