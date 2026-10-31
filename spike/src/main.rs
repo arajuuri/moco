@@ -37,11 +37,32 @@ fn tls() {
             Err(e) => report(url, expect_fail, format!("{e} (expected failure: {expect_fail})")),
         }
     }
-    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+    if let Some(key) = anthropic_key() {
         sse(&key);
     } else {
-        println!("SKIP sse: set ANTHROPIC_API_KEY to test streaming");
+        println!("SKIP sse: no key (set ANTHROPIC_API_KEY or create ~/Library/Application Support/moco/auth.json)");
     }
+}
+
+/// Key lookup: env var first, then `auth.json` (shape: {"anthropic": {"key": "..."}}).
+/// Warns if the file is readable by anyone but the owner.
+fn anthropic_key() -> Option<String> {
+    if let Ok(k) = std::env::var("ANTHROPIC_API_KEY") {
+        return Some(k);
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::path::PathBuf::from(std::env::var("HOME").ok()?)
+        .join("Library/Application Support/moco/auth.json");
+    let mode = std::fs::metadata(&path).ok()?.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        println!("WARN {} has mode {mode:o}; run: chmod 600 on it", path.display());
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    let at = text.find("\"key\"")?;
+    let rest = &text[at + 5..];
+    let q1 = rest.find('"')? + 1;
+    let q2 = rest[q1..].find('"')? + q1;
+    Some(rest[q1..q2].to_string())
 }
 
 fn sse(key: &str) {

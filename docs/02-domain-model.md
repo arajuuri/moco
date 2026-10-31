@@ -61,7 +61,7 @@ Durable-event rule (repo `AGENTS.md`): record only irreducible new facts; derive
 ## Storage
 
 SQLite, WAL mode. Minimum tables for the rewrite: `project`, `session`, `message` (or parts split out: upstream stores assistant content in a parts table),
-`session_inbox`, `permission_saved`, `credential`, `kv`, `blob` (large attachments by hash), `instruction_state`, `todo`, `snapshot_ref`.
+`session_inbox`, `permission_saved`, `kv`, `blob` (large attachments by hash), `instruction_state`, `todo`, `snapshot_ref`.
 JSON columns for variable data. Use a migrations table; upstream uses timestamped migrations in `core/src/database/migration`.
 
 Filesystem layout (upstream uses XDG; on macOS pick `~/Library/Application Support/<app>/`):
@@ -69,4 +69,4 @@ Filesystem layout (upstream uses XDG; on macOS pick `~/Library/Application Suppo
 - `config/` global `opencode.json(c)`, global `AGENTS.md`
 - `cache/` downloaded model catalog, installed binaries
 
-Credentials: upstream keeps API keys in its DB. moco keeps them in a separate `auth.json` in the app data directory, created with mode `0600`, not in SQLite. No Keychain: the app must work headless (SSH, no GUI session), and the Phase 0 spike showed the login keychain is unusable there (`-25308 User interaction is not allowed`).
+Credentials: upstream keeps API keys in its DB. moco keeps them in a separate `auth.json` in the app data directory, created with mode `0600`, not in SQLite. No Keychain: the app must work headless (SSH, no GUI session), and the Phase 0 spike showed the login keychain is unusable there (`-25308 User interaction is not allowed`). Path: `~/Library/Application Support/moco/auth.json`. Shape (spike, provisional): `{"<provider-id>": {"key": "..."}}`; environment variables take precedence.
