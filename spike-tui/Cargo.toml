@@ -1,0 +1,11 @@
+[package]
+name = "moco-spike-tui"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ratatui = { version = "*", default-features = false, features = ["crossterm"] }
+crossterm = "*"
+
+[workspace]

@@ -61,7 +61,7 @@ Status: complete. 197 unit tests pass on Linux and on the Mojave machine; the re
 - Skills, custom commands, `@` mentions [done, see `08` implementation notes] and attachments (images/PDF) [done, see `04` implementation notes].
 - MCP stdio [done], Streamable HTTP + OAuth [done, experimental; see `08` implementation notes].
 - Background shell [done, with background subagents and `!command`; see `04` and `03` implementation notes], formatter hooks [done, see `08` implementation notes], OpenAI Responses and Gemini protocols [done but experimental: verified only against local test servers, see `07` implementation notes].
-- Notifications, themes, keybinding config.
+- Notifications, themes, keybinding config: folded into the full-screen TUI, see `12-tui-plan.md` (feasibility spike done: ratatui + crossterm run on Mojave over SSH).
 
 ## Phase 4: nice to have
 Terminal pane, worktrees, LSP diagnostics, websearch, references, multi-window, scheduled runs.
