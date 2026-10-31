@@ -1,16 +1,19 @@
 //! Terminal setup and restore: raw mode, alternate screen, bracketed paste.
 use crossterm::{
     cursor::Show,
-    event::{DisableBracketedPaste, EnableBracketedPaste},
+    event::{DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io::{self, Stdout};
 
 /// Undo everything `enter` did. Safe to call twice.
 pub fn restore() {
-    let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen, Show);
+    // Pop the window title saved by `enter` (terminals that do not know the sequence ignore it).
+    let _ = execute!(io::stdout(), DisableFocusChange, DisableBracketedPaste, LeaveAlternateScreen, Show);
+    let _ = io::Write::write_all(&mut io::stdout(), b"\x1b[23;0t");
+    let _ = io::Write::flush(&mut io::stdout());
     let _ = disable_raw_mode();
 }
 
@@ -27,7 +30,8 @@ pub fn enter() -> io::Result<(Terminal<CrosstermBackend<Stdout>>, Guard)> {
     enable_raw_mode()?;
     let guard = Guard;
     let mut out = io::stdout();
-    execute!(out, EnterAlternateScreen, EnableBracketedPaste)?;
+    io::Write::write_all(&mut out, b"\x1b[22;0t")?; // push the current window title
+    execute!(out, EnterAlternateScreen, EnableBracketedPaste, EnableFocusChange, SetTitle("moco"))?;
     // A panic on the main thread must leave the terminal usable before the message is printed.
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {

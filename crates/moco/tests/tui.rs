@@ -26,12 +26,17 @@ fn scenario(name: &str) {
             r#"{{ "providers": {{ "fake": {{ "base_url": "http://127.0.0.1:{}/v1", "protocol": "openai-responses",
                  "models": {{ "m": {{ "limit": {{ "context": 100000, "output": 4000 }} }} }} }} }},
                "permissions": [ {{ "action": "read", "resource": "*", "effect": "{}" }} ],
+               "tui": {},
                "snapshots": false }}"#,
             port.trim(),
-            if name == "steer" { "allow" } else { "ask" }
+            if name == "steer" { "allow" } else { "ask" },
+            if name == "config" { r#"{ "theme": "neon", "keys": { "palette": "f2" }, "away_after": 0, "sidebar": true }"# } else { "{}" }
         ),
     )
     .unwrap();
+    // A theme file for the "config" scenario: green user rows, which a 256-color terminal gets as palette entry 46.
+    std::fs::create_dir_all(dir.join("home/config/themes")).unwrap();
+    std::fs::write(dir.join("home/config/themes/neon.json"), r##"{ "extends": "mono", "user": "#00ff00 bold" }"##).unwrap();
     let out = Command::new("python3")
         .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/tui_pty.py"))
         .arg(env!("CARGO_BIN_EXE_moco"))
@@ -60,4 +65,9 @@ fn sigterm_while_a_dialog_is_open_restores_the_terminal() {
 #[test]
 fn prompts_typed_during_a_turn_are_steered_or_queued_and_delivered() {
     scenario("steer");
+}
+
+#[test]
+fn configured_theme_keys_and_bell() {
+    scenario("config");
 }

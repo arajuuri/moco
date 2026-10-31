@@ -8,39 +8,11 @@ use moco_core::tools::{Question, Todo};
 use ratatui::{prelude::*, widgets::*};
 use std::collections::VecDeque;
 use std::sync::mpsc::Sender;
+use super::keys::{KeyAction, Keymap};
 use super::md;
 use unicode_width::UnicodeWidthChar;
 
-/// Semantic colors. Named ANSI colors only, so Terminal.app (256 colors) and light/dark profiles work.
-pub struct Theme {
-    pub user: Style,
-    pub text: Style,
-    pub dim: Style,
-    pub error: Style,
-    pub accent: Style,
-    pub bar: Style,
-    pub code: Style,
-    pub heading: Style,
-    pub quote: Style,
-    pub link: Style,
-}
-
-impl Default for Theme {
-    fn default() -> Self {
-        Theme {
-            user: Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            text: Style::new(),
-            dim: Style::new().add_modifier(Modifier::DIM),
-            error: Style::new().fg(Color::Red),
-            accent: Style::new().fg(Color::Cyan),
-            bar: Style::new().add_modifier(Modifier::REVERSED),
-            code: Style::new().fg(Color::Yellow),
-            heading: Style::new().fg(Color::Cyan),
-            quote: Style::new().add_modifier(Modifier::DIM),
-            link: Style::new().fg(Color::Blue).add_modifier(Modifier::UNDERLINED),
-        }
-    }
-}
+pub use super::theme::Theme;
 
 /// An engine event converted to owned data (the engine's `UiEvent` borrows).
 #[derive(Debug, Clone)]
@@ -65,6 +37,8 @@ pub enum AppEvent {
     /// `depth` is 0 for the session itself and grows with nested subagents.
     Engine { depth: usize, agent: String, ev: Ev },
     Ask { action: String, resources: Vec<String>, save: Vec<String>, reply: Sender<Reply> },
+    /// The terminal window gained or lost focus.
+    Focus(bool),
     /// The engine delivered waiting prompts (the UI syncs its queue and shows them).
     Delivered,
     /// A line from the engine's notifier (background job finished, ...).
@@ -88,6 +62,7 @@ pub enum PickKind {
     Queue,
     /// Background jobs: Enter shows the output, Ctrl-D stops one.
     Job,
+    Theme,
 }
 
 /// A prompt that was sent while a turn was running and has not been delivered yet.
@@ -213,6 +188,7 @@ const PASTE_LINES: usize = 6;
 const PASTE_CHARS: usize = 800;
 /// Lines of an edit's diff shown inline at the normal detail level.
 const DETAIL_LINES: usize = 24;
+const SIDEBAR_W: u16 = 32;
 
 /// What the event loop must do after an update.
 #[derive(Debug, PartialEq, Eq)]
@@ -297,6 +273,22 @@ pub struct App {
     pub retry: Option<(std::time::Instant, u32, String)>,
     /// Detail level: 0 compact, 1 normal, 2 full (Ctrl-O cycles).
     pub level: u8,
+    pub keymap: Keymap,
+    leader_pending: bool,
+    /// `None` shows the sidebar when the terminal is wide enough.
+    pub sidebar: Option<bool>,
+    side_visible: bool,
+    side_fits: Option<bool>,
+    /// Latest todo list, MCP server states and background jobs, for the sidebar.
+    pub todos: Vec<Todo>,
+    pub mcp: Vec<(String, String)>,
+    pub job_list: Vec<(String, String)>,
+    /// Something happened that deserves attention if the user is away (set by `update`, taken by the loop).
+    pub attention: Option<String>,
+    pub last_input: std::time::Instant,
+    /// `Some` once the terminal has reported focus changes.
+    pub focused: Option<bool>,
+    pub away_after: std::time::Duration,
     pub history: Vec<String>,
     hist: Option<usize>,
     draft: String,
@@ -337,6 +329,18 @@ impl App {
             jobs: 0,
             retry: None,
             level: 1,
+            keymap: Keymap::default(),
+            leader_pending: false,
+            sidebar: None,
+            side_visible: false,
+            side_fits: None,
+            todos: vec![],
+            mcp: vec![],
+            job_list: vec![],
+            attention: None,
+            last_input: std::time::Instant::now(),
+            focused: None,
+            away_after: std::time::Duration::from_secs(8),
             history: vec![],
             hist: None,
             draft: String::new(),
@@ -363,7 +367,16 @@ impl App {
 
     pub fn update(&mut self, ev: AppEvent) -> Action {
         match ev {
-            AppEvent::Key(k) => return self.key(k),
+            AppEvent::Key(k) => {
+                self.last_input = std::time::Instant::now();
+                return self.key(k);
+            }
+            AppEvent::Focus(f) => {
+                self.focused = Some(f);
+                if f {
+                    self.last_input = std::time::Instant::now();
+                }
+            }
             AppEvent::Paste(s) => {
                 if let Some(Permission { feedback: Some(f), .. }) = self.dialogs.front_mut() {
                     f.push_str(&s.replace(['\r', '\n'], " "));
@@ -376,6 +389,7 @@ impl App {
             AppEvent::Tick => self.tick += 1,
             AppEvent::Engine { depth, agent, ev } => self.engine(depth, agent, ev),
             AppEvent::Ask { action, resources, save, reply } => {
+                self.attention = Some(format!("{action} needs permission"));
                 self.dialogs.push_back(Permission { action, resources, save, reply, feedback: None });
                 self.scroll = 0;
             }
@@ -384,6 +398,7 @@ impl App {
                 if questions.is_empty() {
                     let _ = reply.send(Some(vec![]));
                 } else {
+                    self.attention = Some("a question needs your answer".into());
                     self.forms.push_back(Form::new(questions, reply));
                     self.scroll = 0;
                 }
@@ -409,9 +424,13 @@ impl App {
                 self.dialogs.clear(); // a dialog whose run is gone cannot be answered
                 self.forms.clear();
                 match outcome {
-                    Ok(Idle) | Ok(Failed(_)) => {} // failures were reported as notices
+                    Ok(Idle) => self.attention = Some("done".into()),
+                    Ok(Failed(_)) => self.attention = Some("the turn failed".into()),
                     Ok(Interrupted) => self.push_info("interrupted"),
-                    Ok(Declined) => self.push_info("stopped: tool call rejected"),
+                    Ok(Declined) => {
+                        self.attention = Some("stopped: a tool call was rejected".into());
+                        self.push_info("stopped: tool call rejected")
+                    }
                     Ok(Busy) => self.rows.push(Row::Error("session is busy".into())),
                     Err(e) => self.rows.push(Row::Error(format!("store error: {e}"))),
                 }
@@ -419,6 +438,15 @@ impl App {
             }
         }
         Action::None
+    }
+
+    /// Is the user probably not looking? The terminal's own focus reports decide when it sends them;
+    /// otherwise a stretch without key presses does.
+    pub fn away(&self) -> bool {
+        match self.focused {
+            Some(f) => !f,
+            None => self.last_input.elapsed() >= self.away_after,
+        }
     }
 
     fn finish_usage(&mut self) {
@@ -491,6 +519,7 @@ impl App {
             }
             Ev::Todos(t) => {
                 if depth == 0 {
+                    self.todos = t.clone();
                     self.rows.push(Row::Todos(t))
                 }
             }
@@ -767,6 +796,17 @@ impl App {
             self.goal_col = None;
         }
         let page = self.view_h.saturating_sub(1).max(1);
+        if self.leader_pending {
+            self.leader_pending = false;
+            return self.leader_key(&k);
+        }
+        if !(ctrl && k.code == KeyCode::Char('c')) {
+            if let Some(act) = self.keymap.action(&k) {
+                if let Some(done) = self.run_action(act, page) {
+                    return done;
+                }
+            }
+        }
         match k.code {
             KeyCode::Char('c') if ctrl => {
                 if self.running {
@@ -779,36 +819,11 @@ impl App {
                 self.cursor = 0;
             }
             KeyCode::Char('d') if ctrl => {
-                if self.input.is_empty() && !self.running {
-                    return Action::Quit;
-                }
+                // (When Ctrl-D is the quit key and nothing is in the way, the keymap already handled it.)
                 if self.cursor < self.len_chars() {
                     self.delete_range(self.cursor, self.cursor + 1);
                 }
             }
-            KeyCode::Esc => {
-                if let Some(p) = self.popup.take() {
-                    self.dismissed = Some(p.token);
-                    return Action::None;
-                }
-                if self.running {
-                    return Action::Interrupt;
-                }
-                self.scroll = 0;
-            }
-            KeyCode::Char('p') if ctrl => return Action::Palette,
-            KeyCode::Char('o') if ctrl => {
-                self.level = (self.level + 1) % 3;
-                self.hint = Some(["detail: compact (no reasoning, no diffs)", "detail: normal (diffs, reasoning summarized)", "detail: full (reasoning, tool output, every subagent call)"][self.level as usize].into());
-            }
-            KeyCode::Char('q') if ctrl => {
-                if self.input.trim().is_empty() {
-                    return Action::None;
-                }
-                return if self.running && !self.is_command() { self.enqueue(true) } else { self.submit() };
-            }
-            KeyCode::Char('j') if ctrl => self.insert("\n"),
-            KeyCode::Enter if alt => self.insert("\n"),
             KeyCode::Tab => self.accept_completion(),
             KeyCode::Enter => {
                 if let Some(p) = &self.popup {
@@ -835,10 +850,6 @@ impl App {
                     self.history_step(up);
                 }
             }
-            KeyCode::PageUp => self.scroll = self.scroll.saturating_add(page),
-            KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(page),
-            KeyCode::End if ctrl => self.scroll = 0,
-            KeyCode::Home if ctrl => self.scroll = usize::MAX / 2,
             KeyCode::Left if alt || ctrl => self.cursor = self.word_start(),
             KeyCode::Right if alt || ctrl => self.cursor = self.word_end(),
             KeyCode::Char('b') if alt => self.cursor = self.word_start(),
@@ -871,6 +882,103 @@ impl App {
             _ => {}
         }
         Action::None
+    }
+
+    /// A bound action. `None` lets the key fall through to normal editing.
+    fn run_action(&mut self, act: KeyAction, page: usize) -> Option<Action> {
+        match act {
+            KeyAction::Interrupt => {
+                if let Some(p) = self.popup.take() {
+                    self.dismissed = Some(p.token);
+                    return Some(Action::None);
+                }
+                if self.running {
+                    return Some(Action::Interrupt);
+                }
+                self.scroll = 0;
+                Some(Action::None)
+            }
+            KeyAction::Quit => (self.input.is_empty() && !self.running).then_some(Action::Quit),
+            KeyAction::Palette => Some(Action::Palette),
+            KeyAction::Newline => {
+                self.insert("\n");
+                Some(Action::None)
+            }
+            KeyAction::Queue => {
+                if self.input.trim().is_empty() {
+                    return Some(Action::None);
+                }
+                Some(if self.running && !self.is_command() { self.enqueue(true) } else { self.submit() })
+            }
+            KeyAction::Detail => {
+                self.cycle_detail();
+                Some(Action::None)
+            }
+            KeyAction::Sidebar => {
+                self.toggle_sidebar();
+                Some(Action::None)
+            }
+            KeyAction::PageUp => {
+                self.scroll = self.scroll.saturating_add(page);
+                Some(Action::None)
+            }
+            KeyAction::PageDown => {
+                self.scroll = self.scroll.saturating_sub(page);
+                Some(Action::None)
+            }
+            KeyAction::Top => {
+                self.scroll = usize::MAX / 2;
+                Some(Action::None)
+            }
+            KeyAction::Bottom => {
+                self.scroll = 0;
+                Some(Action::None)
+            }
+            KeyAction::Leader => {
+                self.leader_pending = true;
+                self.hint = Some(format!("leader: {}", self.keymap.leader_hint()));
+                Some(Action::None)
+            }
+        }
+    }
+
+    fn leader_key(&mut self, k: &KeyEvent) -> Action {
+        if k.code == KeyCode::Esc {
+            return Action::None;
+        }
+        match self.keymap.leader_target(k).map(String::from) {
+            Some(t) if t.starts_with('/') => Action::Submit { text: t.clone(), shown: t },
+            Some(t) => {
+                match t.as_str() {
+                    "sidebar" => self.toggle_sidebar(),
+                    "detail" => self.cycle_detail(),
+                    "palette" => return Action::Palette,
+                    "quit" => return Action::Quit,
+                    _ => {}
+                }
+                Action::None
+            }
+            None => {
+                self.hint = Some("that key does nothing after the leader (Esc cancels)".into());
+                Action::None
+            }
+        }
+    }
+
+    pub fn cycle_detail(&mut self) {
+        self.level = (self.level + 1) % 3;
+        self.hint = Some(["detail: compact (no reasoning, no diffs)", "detail: normal (diffs, reasoning summarized)", "detail: full (reasoning, tool output, every subagent call)"][self.level as usize].into());
+    }
+
+    pub fn sidebar_shown(&self) -> bool {
+        self.side_visible
+    }
+
+    pub fn toggle_sidebar(&mut self) {
+        self.sidebar = Some(!self.side_visible);
+        if !self.side_visible && self.side_fits == Some(false) {
+            self.hint = Some("the terminal is too narrow for the sidebar".into());
+        }
     }
 
     /// Is a dialog, form or picker taking the keys?
@@ -1217,7 +1325,7 @@ impl App {
     fn modal_lines(&self, width: usize, max_h: usize) -> Option<(String, Vec<Line<'static>>, Option<(u16, u16)>)> {
         let t = &self.theme;
         if let Some(d) = self.dialogs.front() {
-            return Some((" permission ".into(), dialog_lines(d, width), None));
+            return Some((" permission ".into(), dialog_lines(d, width, &self.theme), None));
         }
         if let Some(f) = self.forms.front() {
             let q = f.q();
@@ -1265,6 +1373,69 @@ impl App {
         None
     }
 
+    /// The right-hand panel: session, context, todos, MCP servers, jobs, waiting prompts.
+    fn sidebar_lines(&self, width: usize) -> Vec<Line<'static>> {
+        let t = &self.theme;
+        let bold = Style::new().add_modifier(Modifier::BOLD);
+        let head = |s: &str| Line::styled(format!("-- {s} {}", "-".repeat(width.saturating_sub(s.len() + 4))), t.dim);
+        let mut v: Vec<Line<'static>> = vec![];
+        for l in wrap(self.title.as_deref().unwrap_or("(untitled session)"), width.saturating_sub(1)).into_iter().take(2) {
+            v.push(Line::styled(format!(" {l}"), bold));
+        }
+        v.push(Line::styled(format!(" {}", clip_width(&self.model, width.saturating_sub(1))), t.dim));
+        v.push(Line::styled(format!(" agent {}", self.agent), t.dim));
+        let pct = match self.limit {
+            Some(l) if l > 0 => (self.context * 100 / l).min(100) as usize,
+            _ => 0,
+        };
+        if self.context > 0 {
+            let bar_w = width.saturating_sub(12).clamp(4, 16);
+            let filled = pct * bar_w / 100;
+            v.push(Line::raw(format!(" ctx [{}{}] {}", "#".repeat(filled), "-".repeat(bar_w - filled), if self.limit.is_some() { format!("{pct}%") } else { human(self.context) })));
+        }
+        if self.session_cost > 0.0 {
+            v.push(Line::styled(format!(" cost ${:.4}", self.session_cost), t.dim));
+        }
+        if !self.todos.is_empty() {
+            v.push(Line::default());
+            v.push(head("todos"));
+            for td in &self.todos {
+                let mark = match td.status.as_str() {
+                    "completed" => "[x]",
+                    "in_progress" => "[~]",
+                    "cancelled" => "[-]",
+                    _ => "[ ]",
+                };
+                let style = if td.status == "completed" || td.status == "cancelled" { t.dim } else { t.text };
+                for (n, l) in wrap(&td.content, width.saturating_sub(6)).into_iter().take(2).enumerate() {
+                    v.push(Line::styled(format!(" {} {l}", if n == 0 { mark } else { "   " }), style));
+                }
+            }
+        }
+        if !self.mcp.is_empty() {
+            v.push(Line::default());
+            v.push(head("mcp"));
+            for (name, state) in &self.mcp {
+                v.push(Line::styled(clip_width(&format!(" {name}: {state}"), width), if state.starts_with("connected") { t.text } else { t.error }));
+            }
+        }
+        if !self.job_list.is_empty() {
+            v.push(Line::default());
+            v.push(head("jobs"));
+            for (id, what) in &self.job_list {
+                v.push(Line::styled(clip_width(&format!(" {id} {what}"), width), t.text));
+            }
+        }
+        if !self.queued.is_empty() {
+            v.push(Line::default());
+            v.push(head("waiting"));
+            for q in self.queued.iter().take(4) {
+                v.push(Line::styled(clip_width(&format!(" {} {}", if q.steer { ">" } else { "~" }, q.text.lines().next().unwrap_or("")), width), t.dim));
+            }
+        }
+        v
+    }
+
     fn status_text(&self, width: usize) -> String {
         let spin = ["|", "/", "-", "\\"][(self.tick % 4) as usize];
         let mut parts = vec![self.model.clone(), format!("agent {}", self.agent)];
@@ -1288,13 +1459,13 @@ impl App {
             h.clone()
         } else if let (true, Some((at, attempt, _))) = (self.running, &self.retry) {
             let left = at.saturating_duration_since(std::time::Instant::now()).as_secs() + 1;
-            format!("{spin} retrying in {left}s (attempt {attempt}), Esc stops")
+            format!("{spin} retrying in {left}s (attempt {attempt}), {} stops", self.keymap.label(KeyAction::Interrupt))
         } else if self.running {
-            format!("{spin} running: Enter steers, Ctrl-Q queues, Esc stops")
+            format!("{spin} running: Enter steers, {} queues, {} stops", self.keymap.label(KeyAction::Queue), self.keymap.label(KeyAction::Interrupt))
         } else if self.scroll > 0 {
-            "scrolled (Ctrl-End follows)".to_string()
+            format!("scrolled ({} follows)", self.keymap.label(KeyAction::Bottom))
         } else {
-            "Enter sends, Ctrl-P commands, Ctrl-D quits".to_string()
+            format!("Enter sends, {} commands, {} quits", self.keymap.label(KeyAction::Palette), self.keymap.label(KeyAction::Quit))
         };
         let used = display_width(&s) + display_width(&right) + 2;
         if used < width {
@@ -1312,8 +1483,8 @@ impl App {
 /// One line of a unified diff, colored by its first character.
 fn diff_line(raw: &str, width: usize, t: &Theme) -> Vec<Line<'static>> {
     let style = match raw.chars().next() {
-        Some('+') if !raw.starts_with("+++") => Style::new().fg(Color::Green),
-        Some('-') if !raw.starts_with("---") => t.error,
+        Some('+') if !raw.starts_with("+++") => t.added,
+        Some('-') if !raw.starts_with("---") => t.removed,
         Some('@') | Some('*') => t.accent,
         _ => t.dim,
     };
@@ -1386,7 +1557,7 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
     out
 }
 
-fn dialog_lines(d: &Permission, width: usize) -> Vec<Line<'static>> {
+fn dialog_lines(d: &Permission, width: usize, t: &Theme) -> Vec<Line<'static>> {
     let mut v = vec![Line::styled(format!("Permission needed: {}", d.action), Style::new().add_modifier(Modifier::BOLD))];
     for r in d.resources.iter().take(4) {
         v.push(Line::raw(format!("  {}", clip_width(r.lines().next().unwrap_or(""), width.saturating_sub(4)))));
@@ -1398,7 +1569,7 @@ fn dialog_lines(d: &Permission, width: usize) -> Vec<Line<'static>> {
         Some(f) => v.push(Line::raw(format!("feedback (Enter sends, Esc back): {f}"))),
         None => {
             let always = if d.save.is_empty() { String::new() } else { format!(" ({})", clip_width(&d.save.join(", "), width.saturating_sub(40))) };
-            v.push(Line::styled(format!("[y] once  [a] always{always}  [n] reject  [f] reject with feedback"), Style::new().fg(Color::Cyan)));
+            v.push(Line::styled(format!("[y] once  [a] always{always}  [n] reject  [f] reject with feedback"), t.accent));
         }
     }
     v
@@ -1428,7 +1599,24 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if app.viewer.is_some() && app.dialogs.is_empty() && app.forms.is_empty() {
         return render_viewer(f, app);
     }
-    let area = f.area();
+    let full = f.area();
+    // The sidebar needs room: at least 76 columns in all, and it is shown by default from 110.
+    let fits = full.width >= 76;
+    app.side_fits = Some(fits);
+    app.side_visible = app.sidebar.unwrap_or(full.width >= 110) && fits;
+    let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(full);
+    let (body, status) = (rows[0], rows[1]);
+    let (area, side) = if app.side_visible {
+        let c = Layout::horizontal([Constraint::Min(40), Constraint::Length(SIDEBAR_W)]).split(body);
+        (c[0], Some(c[1]))
+    } else {
+        (body, None)
+    };
+    if let Some(side) = side {
+        let block = Block::new().borders(Borders::LEFT).border_style(app.theme.dim);
+        let inner = block.inner(side);
+        f.render_widget(Paragraph::new(app.sidebar_lines(inner.width as usize)).block(block), side);
+    }
     let max_modal = (area.height as usize).saturating_sub(5).max(3);
     let modal = app.modal_lines(area.width as usize, max_modal);
     let comp_w = (area.width as usize).saturating_sub(2).max(1);
@@ -1439,8 +1627,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // Prompts waiting for delivery sit between the transcript and the composer.
     let shown_q = app.queued.len().min(3);
     let strip_h = (shown_q + (app.queued.len() > 3) as usize).min((area.height as usize).saturating_sub(6)) as u16;
-    let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(strip_h), Constraint::Length(bottom_h), Constraint::Length(1)]).split(area);
-    let (main, strip, bottom, status) = (parts[0], parts[1], parts[2], parts[3]);
+    let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(strip_h), Constraint::Length(bottom_h)]).split(area);
+    let (main, strip, bottom) = (parts[0], parts[1], parts[2]);
     if strip_h > 0 {
         let mut ql: Vec<Line> = app
             .queued
@@ -2026,6 +2214,137 @@ mod tests {
         a.scroll = usize::MAX / 4;
         let s = screen(&mut a, 80, 20);
         assert!(a.scroll < 200_000 && s.join("\n").contains("Heading 0"), "scroll {}", a.scroll);
+    }
+
+    fn ctrl(c: char) -> AppEvent {
+        key(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn the_leader_key_runs_commands_and_actions() {
+        let mut a = App::new("m", "build");
+        assert_eq!(a.update(ctrl('x')), Action::None);
+        assert!(a.hint.as_deref().unwrap().starts_with("leader: ") && a.hint.as_deref().unwrap().contains("n new") && a.hint.as_deref().unwrap().contains("b sidebar"), "{:?}", a.hint);
+        assert_eq!(type_str_last(&mut a, "n"), Action::Submit { text: "/new".into(), shown: "/new".into() });
+        assert!(a.input.is_empty(), "the key after the leader is not typed");
+        a.update(ctrl('x'));
+        assert_eq!(type_str_last(&mut a, "z"), Action::None);
+        assert!(a.hint.as_deref().unwrap().contains("does nothing"));
+        assert!(a.input.is_empty());
+        a.update(ctrl('x'));
+        assert_eq!(press(&mut a, KeyCode::Esc), Action::None); // cancels
+        type_str(&mut a, "n");
+        assert_eq!(a.input, "n");
+        a.input.clear();
+        a.cursor = 0;
+        a.update(ctrl('x'));
+        assert_eq!(type_str_last(&mut a, "p"), Action::Palette);
+        a.update(ctrl('x'));
+        assert_eq!(type_str_last(&mut a, "q"), Action::Submit { text: "/exit".into(), shown: "/exit".into() });
+        a.update(ctrl('x'));
+        type_str(&mut a, "o");
+        assert_eq!(a.level, 2);
+    }
+
+    fn type_str_last(a: &mut App, s: &str) -> Action {
+        let mut last = Action::None;
+        for c in s.chars() {
+            last = press(a, KeyCode::Char(c));
+        }
+        last
+    }
+
+    #[test]
+    fn configured_keys_replace_the_defaults() {
+        let mut a = App::new("m", "build");
+        let keys = serde_json::json!({"palette": "ctrl+k", "quit": "ctrl+q", "sidebar": "f3", "page_up": "alt+u"}).as_object().unwrap().clone().into_iter().collect();
+        a.keymap = Keymap::from_config(&keys, &Default::default()).0;
+        assert_eq!(a.update(ctrl('k')), Action::Palette);
+        assert_eq!(a.update(ctrl('p')), Action::None);
+        assert_eq!(a.update(ctrl('q')), Action::Quit); // empty composer, idle
+        type_str(&mut a, "abc");
+        assert_eq!(a.update(ctrl('q')), Action::None); // not with text in the way
+        assert_eq!(a.update(ctrl('d')), Action::None); // Ctrl-D is just an edit key now
+        assert_eq!(a.input, "abc");
+        a.update(key(KeyCode::Char('u'), KeyModifiers::ALT));
+        assert!(a.scroll > 0);
+        a.update(key(KeyCode::F(3), KeyModifiers::NONE));
+        assert_eq!(a.sidebar, Some(true));
+        // The status bar names the configured keys.
+        a.input.clear();
+        a.cursor = 0;
+        assert!(screen(&mut a, 90, 8).join("\n").contains("Ctrl-K commands, Ctrl-Q quits"));
+    }
+
+    #[test]
+    fn the_sidebar_appears_on_wide_terminals_and_shows_session_state() {
+        let mut a = App::new("anthropic/sonnet", "build");
+        a.title = Some("Fix the parser".into());
+        a.session_cost = 0.0123;
+        a.context = 50_000;
+        a.limit = Some(200_000);
+        a.todos = vec![Todo { content: "write tests".into(), status: "in_progress".into() }, Todo { content: "ship".into(), status: "pending".into() }];
+        a.mcp = vec![("files".into(), "connected: 3 tool(s)".into()), ("web".into(), "failed: no url".into())];
+        a.job_list = vec![("shl_1".into(), "shell 12s".into())];
+        a.queued = vec![Queued { id: "i1".into(), steer: true, text: "also this".into() }];
+        let wide = screen(&mut a, 120, 24).join("\n");
+        for want in ["Fix the parser", "ctx [####------------] 25%", "cost $0.0123", "-- todos --", "[~] write tests", "-- mcp --", "files: connected", "web: failed", "-- jobs --", "shl_1 shell 12s", "-- waiting --", "> also this"] {
+            assert!(wide.contains(want), "missing {want:?}:\n{wide}");
+        }
+        assert!(!screen(&mut a, 100, 24).join("\n").contains("-- todos --"), "narrower than 110: hidden by default");
+        a.sidebar = Some(true);
+        assert!(screen(&mut a, 100, 24).join("\n").contains("-- todos --"), "forced on");
+        a.sidebar = Some(true);
+        assert!(!screen(&mut a, 70, 24).join("\n").contains("-- todos --"), "too narrow even when forced");
+        screen(&mut a, 120, 24); // the toggle flips what was last shown
+        a.update(ctrl('x'));
+        type_str(&mut a, "b"); // leader + b toggles
+        assert_eq!(a.sidebar, Some(false));
+        assert!(!screen(&mut a, 120, 24).join("\n").contains("-- todos --"));
+        a.update(ctrl('x'));
+        type_str(&mut a, "b");
+        assert!(screen(&mut a, 120, 24).join("\n").contains("-- todos --"));
+    }
+
+    #[test]
+    fn attention_is_raised_for_finished_turns_and_requests_and_away_follows_focus_or_idleness() {
+        let mut a = App::new("m", "build");
+        a.running = true;
+        a.update(AppEvent::RunDone(Ok(RunOutcome::Idle)));
+        assert_eq!(a.attention.take().as_deref(), Some("done"));
+        a.update(AppEvent::RunDone(Ok(RunOutcome::Interrupted)));
+        assert!(a.attention.is_none(), "you interrupted it yourself");
+        let (tx, _rx) = channel();
+        a.update(AppEvent::Ask { action: "shell".into(), resources: vec![], save: vec![], reply: tx });
+        assert_eq!(a.attention.take().as_deref(), Some("shell needs permission"));
+        let (tx, _rx) = channel();
+        a.update(AppEvent::Questions { questions: vec![q("Which?", &["a"], false)], reply: tx });
+        assert!(a.attention.take().unwrap().contains("question"));
+        // Away: the terminal's focus report wins; without one, idleness decides.
+        let mut a = App::new("m", "build");
+        a.away_after = std::time::Duration::from_millis(30);
+        assert!(!a.away());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(a.away());
+        press(&mut a, KeyCode::Char('x'));
+        assert!(!a.away(), "a key press means you are here");
+        a.update(AppEvent::Focus(false));
+        assert!(a.away());
+        a.update(AppEvent::Focus(true));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!a.away(), "focused terminals never count as away, however idle");
+    }
+
+    #[test]
+    fn themes_change_how_rows_are_styled() {
+        let mut a = App::new("m", "build");
+        a.push_user("hi");
+        let fg = |a: &App| a.lines_window(40, 10).0.iter().find(|l| l.spans.iter().any(|s| s.content.contains("> "))).map(|l| l.spans[0].style.fg);
+        assert_eq!(fg(&a), Some(Some(Color::Cyan)));
+        a.theme = Theme::light();
+        assert_eq!(fg(&a), Some(Some(Color::Blue)));
+        a.theme = Theme::mono();
+        assert_eq!(fg(&a), Some(None));
     }
 
     #[test]

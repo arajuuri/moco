@@ -4,8 +4,10 @@ mod app;
 mod builtin;
 mod complete;
 mod diff;
+mod keys;
 mod md;
 mod term;
+mod theme;
 
 pub use complete::Completer;
 
@@ -62,6 +64,8 @@ pub struct Host<'a> {
     /// (name, description) of the custom commands found, subagent ones included.
     pub custom_commands: Vec<(String, String)>,
     pub manager: Option<Arc<moco_core::mcp::Manager>>,
+    pub app_dir: std::path::PathBuf,
+    pub tui: moco_core::config::TuiConfig,
 }
 
 /// A slash command resolved to a prompt. `agent` and `model` apply to this one prompt only.
@@ -160,6 +164,25 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
     let mut app = App::new(&host.model, &host.agent);
     app.title = host.title.clone();
     app.history = load_history(&host.history_path);
+    // Settings from `tui` in the config; mistakes are shown, never fatal.
+    let (keymap, key_warnings) = keys::Keymap::from_config(&host.tui.keys, &host.tui.leader);
+    app.keymap = keymap;
+    let cwd_path = std::path::PathBuf::from(&host.cwd);
+    match theme::load(host.tui.theme.as_deref().unwrap_or("auto"), &host.app_dir, &cwd_path, theme::truecolor()) {
+        Ok(t) => app.theme = t,
+        Err(e) => app.rows.push(app::Row::Error(format!("tui.theme: {e}"))),
+    }
+    for w in key_warnings {
+        app.rows.push(app::Row::Error(w));
+    }
+    app.sidebar = match &host.tui.sidebar {
+        Some(serde_json::Value::Bool(b)) => Some(*b),
+        _ => None,
+    };
+    if let Some(n) = host.tui.away_after {
+        app.away_after = Duration::from_secs(n);
+    }
+    let bell = host.tui.bell.unwrap_or(true);
     if let Some(completer) = host.completer.take() {
         app.completer = Some(Box::new(move |t| completer.items(t)));
     }
@@ -201,6 +224,8 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
                             Ok(Event::Key(k)) => AppEvent::Key(k),
                             Ok(Event::Paste(s)) => AppEvent::Paste(s),
                             Ok(Event::Resize(..)) => AppEvent::Resize,
+                            Ok(Event::FocusGained) => AppEvent::Focus(true),
+                            Ok(Event::FocusLost) => AppEvent::Focus(false),
                             Ok(_) => continue,
                             Err(_) => break,
                         };
@@ -257,15 +282,20 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
                 })
                 .collect();
             app.jobs = engine.running_jobs();
+            if app.sidebar_shown() {
+                app.mcp = host.manager.as_ref().map(|m| m.status().iter().map(|i| (i.name.clone(), moco_core::mcp::manager::describe(i))).collect()).unwrap_or_default();
+                app.job_list = engine.background_jobs(None).iter().filter(|j| j.status.starts_with("running")).map(|j| (j.id.clone(), format!("{} {}s", j.kind, j.seconds))).collect();
+            }
         };
         let mut last_sync = std::time::Instant::now();
+        let mut title_marked = false;
         let mut actions: VecDeque<Action> = VecDeque::new();
         let mut quit = false;
         while !quit {
             if SIGNALLED.load(Ordering::Relaxed) {
                 break;
             }
-            if (app.running || !app.queued.is_empty() || app.jobs > 0) && last_sync.elapsed() >= Duration::from_millis(200) {
+            if (app.running || !app.queued.is_empty() || app.jobs > 0 || app.sidebar_shown()) && last_sync.elapsed() >= Duration::from_millis(200) {
                 sync_queue(&mut app, &sid);
                 last_sync = std::time::Instant::now();
             }
@@ -292,7 +322,22 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
                     last_sync = std::time::Instant::now();
                 }
                 let finished_idle = matches!(ev, AppEvent::RunDone(Ok(moco_core::engine::RunOutcome::Idle)));
+                let was_key = matches!(ev, AppEvent::Key(_) | AppEvent::Focus(true));
                 actions.push_back(app.update(ev));
+                if was_key && title_marked {
+                    title_marked = false;
+                    let _ = crossterm::execute!(terminal.backend_mut(), crossterm::terminal::SetTitle("moco"));
+                }
+                if let Some(msg) = app.attention.take() {
+                    if bell && app.away() {
+                        // A bell and a marked window title: the terminal can flag the window or tab.
+                        let clean: String = msg.chars().filter(|c| !c.is_control()).take(80).collect();
+                        let out = terminal.backend_mut();
+                        let _ = std::io::Write::write_all(out, b"\x07");
+                        let _ = crossterm::execute!(out, crossterm::terminal::SetTitle(format!("moco: {clean}")));
+                        title_marked = true;
+                    }
+                }
                 if finished_idle {
                     // A prompt that arrived as the turn ended is still waiting: run again to deliver it.
                     sync_queue(&mut app, &sid);
@@ -372,6 +417,7 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
                                     }
                                 }
                             }
+                            app::PickKind::Theme => builtin::set_theme(&host, &mut app, &value),
                             app::PickKind::Job => match engine.job_output(&value, 40) {
                                 Ok(t) => app.rows.push(app::Row::Shell(t)),
                                 Err(e) => app.rows.push(app::Row::Error(e)),
@@ -392,7 +438,24 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
                             if matches!(text.as_str(), "/exit" | "/quit") {
                                 quit = true;
                             } else if text == "/help" {
-                                app.push_info("Enter sends, Alt-Enter or Ctrl-J adds a line, Up/Down move or browse history, Tab completes / and @, Ctrl-P opens the command palette, Esc or Ctrl-C interrupts, PageUp/PageDown scroll, Ctrl-End follows the output, Ctrl-D quits. !command runs a shell command. Commands: /model /agent /sessions /resume /new /rename /fork /archive /undo /redo /diff /compact /jobs /skills /commands /mcp /exit.");
+                                {
+                                    use keys::KeyAction as K;
+                                    let km = &app.keymap;
+                                    let help = format!(
+                                        "Enter sends, {} adds a line, Up/Down move or browse history, Tab completes / and @, {} opens the command palette, {} interrupts (Ctrl-C too), {}/{} scroll, {} follows the output, {} cycles the detail level, {} quits. Leader {}: {}. !command runs a shell command. Commands: /model /agent /sessions /resume /new /rename /fork /archive /undo /redo /diff /compact /queue /jobs /theme /skills /commands /mcp /exit.",
+                                        km.label(K::Newline),
+                                        km.label(K::Palette),
+                                        km.label(K::Interrupt),
+                                        km.label(K::PageUp),
+                                        km.label(K::PageDown),
+                                        km.label(K::Bottom),
+                                        km.label(K::Detail),
+                                        km.label(K::Quit),
+                                        km.label(K::Leader),
+                                        km.leader_hint()
+                                    );
+                                    app.push_info(help);
+                                }
                             } else if let Some(cmd) = text.strip_prefix('!') {
                                 let cmd = cmd.trim().to_string();
                                 app.push_user(shown.clone());
@@ -412,7 +475,7 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
                                 app.push_user(shown.clone());
                                 let is_builtin = builtin::NAMES.iter().any(|(n, _)| *n == name) || matches!(name, "resume" | "unarchive");
                                 if is_builtin {
-                                    if app.running && !matches!(name, "jobs" | "skills" | "commands" | "mcp" | "diff" | "queue") {
+                                    if app.running && !matches!(name, "jobs" | "skills" | "commands" | "mcp" | "diff" | "queue" | "theme") {
                                         app.rows.push(app::Row::Error("a turn is running: wait for it (or press Esc) first".into()));
                                     } else {
                                         let agent = app.agent.clone();

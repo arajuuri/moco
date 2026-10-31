@@ -29,6 +29,7 @@ pub const NAMES: &[(&str, &str)] = &[
     ("fork", "copy this conversation into a new session"),
     ("rename", "name this session"),
     ("archive", "hide a session from the list"),
+    ("theme", "pick a color theme"),
     ("queue", "send a prompt after the current turn, or manage waiting prompts"),
     ("jobs", "background commands and subagents"),
     ("skills", "list skills"),
@@ -80,6 +81,16 @@ fn session_items(host: &Host, all: bool, archived: bool) -> Vec<PickItem> {
             value: s.id.clone(),
         })
         .collect()
+}
+
+pub fn set_theme(host: &Host, app: &mut App, name: &str) {
+    match super::theme::load(name, &host.app_dir, std::path::Path::new(&host.cwd), super::theme::truecolor()) {
+        Ok(t) => {
+            app.theme = t;
+            app.push_info(format!("theme: {name}"));
+        }
+        Err(e) => err(app, e),
+    }
 }
 
 pub fn queue_items(app: &App) -> Vec<PickItem> {
@@ -249,6 +260,14 @@ pub fn run(host: &Host, app: &mut App, sid: &str, agent: &str, name: &str, args:
             Err(e) => err(app, format!("store error: {e}")),
         },
         "compact" => return Some(Effect::Compact),
+        "theme" => {
+            if args.is_empty() {
+                let items = super::theme::available(&host.app_dir, std::path::Path::new(&host.cwd)).into_iter().map(|n| PickItem { detail: String::new(), label: n.clone(), value: n }).collect();
+                app.open_picker(Picker::new(PickKind::Theme, "theme", items, ""));
+            } else {
+                set_theme(host, app, args);
+            }
+        }
         "queue" => {
             if args.is_empty() {
                 let items = queue_items(app);

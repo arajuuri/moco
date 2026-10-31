@@ -176,6 +176,7 @@ pub struct CommandConfig {
 pub struct Config {
     pub formatter: Option<FormatterSetting>,
     pub mcp: McpConfig,
+    pub tui: TuiConfig,
     /// Extra skill locations: a directory of skills, or a single skill directory.
     pub skills: Vec<String>,
     pub commands: BTreeMap<String, CommandConfig>,
@@ -193,6 +194,24 @@ pub struct Config {
     pub agents: BTreeMap<String, AgentConfig>,
     /// Extra instruction files (paths, `~/` allowed; relative paths resolve against the working directory).
     pub instructions: Vec<String>,
+}
+
+/// `tui`: settings of the full-screen UI.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct TuiConfig {
+    /// `auto` (default), `dark`, `light`, `mono`, or the name of a theme file.
+    pub theme: Option<String>,
+    /// Rebind actions: `{"palette": "ctrl+k", "quit": ["ctrl+d", "ctrl+q"]}`. Values are one key or a list.
+    pub keys: BTreeMap<String, Value>,
+    /// What `leader` followed by a key does: `{"n": "/new", "b": "sidebar"}`.
+    pub leader: BTreeMap<String, String>,
+    /// Ring the terminal bell (and mark the window title) when a turn ends or input is needed while you are away. Default on.
+    pub bell: Option<bool>,
+    /// Seconds without a key press after which you count as away when the terminal reports no focus. Default 8.
+    pub away_after: Option<u64>,
+    /// `true`, `false` or `"auto"` (default: shown when the terminal is wide enough).
+    pub sidebar: Option<Value>,
 }
 
 #[derive(Debug, Default)]
@@ -557,6 +576,16 @@ mod tests {
         assert_eq!(OAuthSetting::resolve(&s["token"].oauth), None);
         let o = OAuthSetting::resolve(&s["oauth"].oauth).unwrap();
         assert_eq!((o.client_id.as_deref(), o.scope.as_deref(), o.callback_port), (Some("cid"), Some("read"), Some(8123)));
+    }
+
+    #[test]
+    fn tui_settings() {
+        let cfg: Config = serde_json::from_value(json!({"tui": {"theme": "light", "keys": {"palette": "ctrl+k", "quit": ["ctrl+d", "ctrl+q"]},
+            "leader": {"n": "/new"}, "bell": false, "away_after": 30, "sidebar": "auto"}})).unwrap();
+        assert_eq!((cfg.tui.theme.as_deref(), cfg.tui.bell, cfg.tui.away_after), (Some("light"), Some(false), Some(30)));
+        assert_eq!(cfg.tui.keys["quit"], json!(["ctrl+d", "ctrl+q"]));
+        assert_eq!(cfg.tui.leader["n"], "/new");
+        assert!(Config::default().tui.theme.is_none());
     }
 
     #[test]

@@ -8,12 +8,13 @@ import fcntl, os, pty, re, select, signal, struct, sys, termios, time
 moco, config, home, work, scenario = sys.argv[1:6]
 env = dict(os.environ, MOCO_CONFIG=config, MOCO_HOME=home, TERM="xterm-256color")
 env.pop("ANTHROPIC_API_KEY", None)
+env.pop("COLORTERM", None)  # no truecolor: #rrggbb theme colors must fall back to the 256-color palette
 
 pid, fd = pty.fork()
 if pid == 0:
     os.chdir(work)
     os.execve(moco, [moco, "--model", "fake/m", "--dir", work], env)
-fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
+fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 130 if scenario == "config" else 100, 0, 0))
 raw = b""
 
 
@@ -92,7 +93,32 @@ def check_restored(status, code_ok=True):
 
 
 wait_for(r"/helpforcommands")
-if scenario == "steer":
+if scenario == "config":
+    send(b"\x1bOQ")  # F2 is the configured palette key
+    wait_for(r"commands\(\d+\)")
+    send(b"\x1b")
+    pump(0.4)
+    send(b"\x18")  # the leader key, then h: help, which names the configured key
+    send(b"h")
+    wait_for(r"F2opensthecommandpalette")
+    send(b"Read a.txt and tell me what it says.\r")
+    wait_for(r"Permissionneeded:read")
+    # tui.away_after is 0: the user counts as away, so the request rings the bell and marks the window title.
+    if "\x1b]0;moco: read needs permission\x07" not in raw.decode("utf-8", "replace"):
+        fail("no window title mark for the permission request")
+    send(b"y")
+    wait_for(r"Thefilesays:ONE-LINE-OF-TEXT")
+    end = time.time() + 10
+    while "\x1b]0;moco: done\x07" not in raw.decode("utf-8", "replace") and time.time() < end:
+        pump(0.2)
+    t = raw.decode("utf-8", "replace")
+    if "\x1b]0;moco: done\x07" not in t or "\x07" not in t.replace("\x1b]0;moco: done\x07", "").replace("\x1b]0;moco: read needs permission\x07", "").replace("\x1b]0;moco\x07", ""):
+        fail("no bell or no title mark when the turn finished")
+    if not re.search(r"\x1b\[38;5;46[;m]", t):
+        fail("the theme file's user color (#00ff00 -> palette 46) was not used; colors seen: %r" % sorted(set(re.findall(r"\x1b\[[0-9;]*m", t)))[:30])
+    send(b"\x04")
+    check_restored(wait_exit())
+elif scenario == "steer":
     send(b"SLOW read a.txt\r")
     wait_for(r"\(running\)")  # the turn is going (the model is slow on purpose)
     send(b"also steer this\r")

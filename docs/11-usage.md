@@ -72,6 +72,18 @@ If one misbehaves, `/model` back to another provider and report the error text.
 
 On a terminal `moco` runs the chat full screen (works over SSH). `moco --plain` gives the line-based chat described below (it is also used with `-p` and when output is piped). Enter sends, Esc or Ctrl-C interrupts a running turn (Ctrl-C on an empty prompt, or Ctrl-D, quits), PageUp/PageDown scroll, Ctrl-End jumps back to the newest output. A permission request replaces the prompt box: `y` once, `a` always, `n` reject, `f` reject with feedback. Alt-Enter (or Ctrl-J) adds a line, Up/Down move through lines and then your prompt history, Tab completes `/commands` and `@files`, `@skills`, `@agents`; big pastes collapse to a placeholder; `!command` runs a shell command. `Ctrl-P` opens a command palette. The built-in commands (`/model`, `/agent`, `/sessions`, `/undo`, `/diff`, `/compact`, ...), custom commands, MCP prompts and the assistant's question forms work. While a turn runs, Enter steers your text into it (delivered at the next step), Ctrl-Q or `/queue <text>` queues it for after the turn, and waiting prompts are listed above the box (`/queue` manages them); Ctrl-O cycles how much is shown: normal (inline diffs of file changes, reasoning summarized), full (all reasoning, tool output, every subagent call) and compact (call lines only). Replies are rendered as Markdown. `/diff` opens a full-screen viewer of the session's file changes (`j`/`k`, Space/`b`, `n`/`p` for the next or previous file, `q` closes). Not available yet: `/mcp auth` and subagent-style custom commands; use `moco --plain` for those.
 
+### Full-screen UI settings
+
+```jsonc
+{ "tui": {
+    "theme": "auto",                       // auto, dark, light, mono, or a theme file name
+    "keys": { "palette": "ctrl+k", "quit": ["ctrl+d", "ctrl+q"], "sidebar": "f3" },
+    "leader": { "n": "/new", "g": "/diff" },   // Ctrl-X then a key
+    "bell": true, "away_after": 8,          // bell + window title when a turn ends or input is needed while you are away
+    "sidebar": "auto" } }                   // true, false, or auto (from 110 columns)
+```
+Actions you can rebind: `interrupt` (Esc), `quit` (Ctrl-D), `palette` (Ctrl-P), `newline` (Alt-Enter, Ctrl-J), `queue` (Ctrl-Q), `detail` (Ctrl-O), `sidebar`, `page_up`, `page_down`, `top`, `bottom`, `leader` (Ctrl-X). Keys are written `ctrl+k`, `alt+enter`, `pageup`, `f2`, `x`; `null` unbinds. The leader menu (type Ctrl-X to see it) has n new, l sessions, m model, a agent, d diff, c compact, u undo, r redo, j jobs, t theme, h help, q exit, b sidebar, o detail. Themes: `/theme` picks one; a theme file is JSON in `~/Library/Application Support/moco/config/themes/NAME.json` (or `.moco/themes/` in a project), for example `{ "extends": "dark", "user": "#00afff bold", "bar": "white on 238" }` with the roles user, text, dim, error, accent, bar, code, heading, quote, link, added, removed. `#rrggbb` colors become the nearest of the 256 colors on terminals without truecolor, like Terminal.app.
+
 ## MCP servers
 
 MCP servers add tools (and prompts and resources) from other programs. Declare them in the config:
