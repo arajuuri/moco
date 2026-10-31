@@ -21,7 +21,8 @@ pins Electron 44 (macOS 12+). Nothing in this repo's runtime stack can be made t
 | `07-providers.md`             | Provider abstraction, wire protocols to implement, model catalog   |
 | `08-config-and-extensions.md` | Config files, instructions (AGENTS.md), skills, commands, MCP      |
 | `09-ui.md`                    | Screens, interactions, key bindings                                |
-| `10-roadmap.md`               | Phased build order with acceptance checks                          |
+| `10-roadmap.md`               | Phased build order with acceptance checks and results per phase    |
+| `11-usage.md`                 | User reference for the app as built: commands, config, storage     |
 
 ## Scope
 
