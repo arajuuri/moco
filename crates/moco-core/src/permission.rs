@@ -34,7 +34,7 @@ pub fn evaluate(action: &str, resource: &str, rules: &[Rule]) -> Effect {
 }
 
 /// How much moco asks before it acts. `Manual` is the default; `Auto` allows what the default ruleset allows.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PermissionMode {
     #[default]
     Manual,
@@ -53,6 +53,20 @@ impl PermissionMode {
         match self {
             PermissionMode::Manual => "manual",
             PermissionMode::Auto => "auto",
+        }
+    }
+    /// What the mode means to the user, for status messages.
+    pub fn describe(self) -> &'static str {
+        match self {
+            PermissionMode::Manual => "asks before changing files, running commands, fetching the web or starting subagents",
+            PermissionMode::Auto => "runs tools without asking, except where your permission rules ask",
+        }
+    }
+    /// The mode Tab switches to.
+    pub fn toggled(self) -> PermissionMode {
+        match self {
+            PermissionMode::Manual => PermissionMode::Auto,
+            PermissionMode::Auto => PermissionMode::Manual,
         }
     }
 }
@@ -132,6 +146,14 @@ mod tests {
         assert_eq!(evaluate("read", ".env.example", &d), Allow);
         assert_eq!(evaluate("shell", "rm -rf /", &d), Allow);
         assert_eq!(evaluate("websearch", "rust ureq timeout", &d), Ask, "queries leave the machine: ask first");
+    }
+
+    #[test]
+    fn tab_toggles_between_the_two_modes() {
+        assert_eq!(PermissionMode::Manual.toggled(), PermissionMode::Auto);
+        assert_eq!(PermissionMode::Auto.toggled(), PermissionMode::Manual);
+        assert_eq!(PermissionMode::parse("auto"), Some(PermissionMode::Auto));
+        assert_eq!(PermissionMode::parse("Auto"), None, "names are lowercase in config and flags");
     }
 
     #[test]

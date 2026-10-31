@@ -50,6 +50,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (3, "alter table session add column revert text;"),
     (4, "alter table session add column fork_session_id text; alter table session add column fork_boundary text;"),
     (5, "alter table session add column variant text;"),
+    (6, "alter table session add column permission_mode text;"),
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -63,6 +64,8 @@ pub struct Session {
     pub model: Option<String>,
     /// Reasoning effort chosen for this session (`high`, `none`, ...), if any.
     pub variant: Option<String>,
+    /// `manual` or `auto` (see `permission.rs`); unset means the configured default.
+    pub permission_mode: Option<String>,
     /// Set for subagent sessions.
     pub parent_id: Option<String>,
 }
@@ -174,7 +177,7 @@ impl Store {
             "insert into session(id, project_id, directory, agent, time_created, time_updated) values (?1,?2,?3,?4,?5,?5)",
             params![id, project_id, directory, agent, t],
         )?;
-        Ok(Session { id, project_id, directory: directory.into(), agent: agent.into(), title: None, model: None, variant: None, parent_id: None })
+        Ok(Session { id, project_id, directory: directory.into(), agent: agent.into(), title: None, model: None, variant: None, permission_mode: None, parent_id: None })
     }
 
     /// A subagent session: same project and directory as its parent, hidden from `latest_session`.
@@ -185,7 +188,7 @@ impl Store {
             "insert into session(id, project_id, parent_id, directory, agent, time_created, time_updated) values (?1,?2,?3,?4,?5,?6,?6)",
             params![id, parent.project_id, parent.id, parent.directory, agent, t],
         )?;
-        Ok(Session { id, project_id: parent.project_id.clone(), directory: parent.directory.clone(), agent: agent.into(), title: None, model: None, variant: None, parent_id: Some(parent.id.clone()) })
+        Ok(Session { id, project_id: parent.project_id.clone(), directory: parent.directory.clone(), agent: agent.into(), title: None, model: None, variant: None, permission_mode: None, parent_id: Some(parent.id.clone()) })
     }
 
     /// Number of ancestors (0 for a top-level session).
@@ -220,14 +223,19 @@ impl Store {
     pub fn session(&self, id: &str) -> Result<Option<Session>> {
         Ok(self
             .conn
-            .query_row("select id, project_id, directory, agent, title, model, parent_id, variant from session where id=?1", [id], |r| {
-                Ok(Session { id: r.get(0)?, project_id: r.get(1)?, directory: r.get(2)?, agent: r.get(3)?, title: r.get(4)?, model: r.get(5)?, parent_id: r.get(6)?, variant: r.get(7)? })
+            .query_row("select id, project_id, directory, agent, title, model, parent_id, variant, permission_mode from session where id=?1", [id], |r| {
+                Ok(Session { id: r.get(0)?, project_id: r.get(1)?, directory: r.get(2)?, agent: r.get(3)?, title: r.get(4)?, model: r.get(5)?, parent_id: r.get(6)?, variant: r.get(7)?, permission_mode: r.get(8)? })
             })
             .optional()?)
     }
 
     pub fn set_agent(&self, session_id: &str, agent: &str) -> Result<()> {
         self.conn.execute("update session set agent=?2, time_updated=?3 where id=?1", params![session_id, agent, now_ms()])?;
+        Ok(())
+    }
+
+    pub fn set_permission_mode(&self, session_id: &str, mode: Option<&str>) -> Result<()> {
+        self.conn.execute("update session set permission_mode=?2, time_updated=?3 where id=?1", params![session_id, mode, now_ms()])?;
         Ok(())
     }
 
@@ -275,10 +283,10 @@ impl Store {
         Ok(self
             .conn
             .query_row(
-                "select id, project_id, directory, agent, title, model, parent_id, variant from session
+                "select id, project_id, directory, agent, title, model, parent_id, variant, permission_mode from session
                  where directory=?1 and parent_id is null and time_archived is null order by id desc limit 1",
                 [directory],
-                |r| Ok(Session { id: r.get(0)?, project_id: r.get(1)?, directory: r.get(2)?, agent: r.get(3)?, title: r.get(4)?, model: r.get(5)?, parent_id: r.get(6)?, variant: r.get(7)? }),
+                |r| Ok(Session { id: r.get(0)?, project_id: r.get(1)?, directory: r.get(2)?, agent: r.get(3)?, title: r.get(4)?, model: r.get(5)?, parent_id: r.get(6)?, variant: r.get(7)?, permission_mode: r.get(8)? }),
             )
             .optional()?)
     }
@@ -370,9 +378,9 @@ impl Store {
         let t = now_ms();
         let title = src.title.as_ref().map(|t| format!("{t} (fork)"));
         tx.execute(
-            "insert into session(id, project_id, directory, agent, model, title, time_created, time_updated, fork_session_id, fork_boundary, variant)
-             values (?1,?2,?3,?4,?5,?6,?7,?7,?8,?9,?10)",
-            params![id, src.project_id, src.directory, src.agent, src.model, title, t, session_id, msgs.last().map(|m| m.id.clone()), src.variant],
+            "insert into session(id, project_id, directory, agent, model, title, time_created, time_updated, fork_session_id, fork_boundary, variant, permission_mode)
+             values (?1,?2,?3,?4,?5,?6,?7,?7,?8,?9,?10,?11)",
+            params![id, src.project_id, src.directory, src.agent, src.model, title, t, session_id, msgs.last().map(|m| m.id.clone()), src.variant, src.permission_mode],
         )?;
         let mut map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         for m in &msgs {
@@ -394,7 +402,7 @@ impl Store {
         tx.execute("insert into todo(session_id, position, content, status) select ?2, position, content, status from todo where session_id=?1", params![session_id, id])?;
         tx.execute("insert into instruction_state(session_id, path) select ?2, path from instruction_state where session_id=?1", params![session_id, id])?;
         tx.commit()?;
-        Ok(Session { id, project_id: src.project_id, directory: src.directory, agent: src.agent, title, model: src.model, variant: src.variant, parent_id: None })
+        Ok(Session { id, project_id: src.project_id, directory: src.directory, agent: src.agent, title, model: src.model, variant: src.variant, permission_mode: src.permission_mode, parent_id: None })
     }
 
     pub fn set_title(&self, session_id: &str, title: &str) -> Result<()> {

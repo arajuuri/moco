@@ -3,6 +3,7 @@
 use crate::human;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use moco_core::engine::Reply;
+use moco_core::permission::PermissionMode;
 use moco_core::provider::Usage;
 use moco_core::tools::{Question, Todo};
 use ratatui::{prelude::*, widgets::*};
@@ -213,6 +214,8 @@ pub enum Action {
     Palette,
     /// Set the session's reasoning effort (`None` = the provider's default).
     SetEffort(Option<String>),
+    /// Set the session's permission mode (Tab, or `/mode`).
+    SetPermissionMode(PermissionMode),
     /// An entry was chosen in a picker.
     Picked { kind: PickKind, value: String },
     /// Ctrl-D on an entry of a queue or job picker.
@@ -276,6 +279,8 @@ pub struct App {
     pub viewer: Option<Viewer>,
     pub model: String,
     pub agent: String,
+    /// Shown in the status line; Tab switches it.
+    pub permission_mode: PermissionMode,
     pub title: Option<String>,
     pub session_cost: f64,
     pub context: u64,
@@ -338,6 +343,7 @@ impl App {
             viewer: None,
             model: model.to_string(),
             agent: agent.to_string(),
+            permission_mode: PermissionMode::default(),
             title: None,
             session_cost: 0.0,
             context: 0,
@@ -843,7 +849,14 @@ impl App {
                     self.delete_range(self.cursor, self.cursor + 1);
                 }
             }
-            KeyCode::Tab => self.accept_completion(),
+            KeyCode::Tab => {
+                if self.popup.is_some() {
+                    self.accept_completion();
+                } else {
+                    // Tab switches the permission mode (the fixed key; completion takes it while its popup is open).
+                    return Action::SetPermissionMode(self.permission_mode.toggled());
+                }
+            }
             KeyCode::Enter => {
                 if let Some(p) = &self.popup {
                     // Enter accepts the highlighted candidate, unless it is already what was typed.
@@ -1651,6 +1664,12 @@ impl App {
             (0, vec![Span::styled(format!(" {} ", self.model), t.bar_hi)]),
             (0, vec![Span::styled(format!(" {} ", self.agent), bar.add_modifier(Modifier::BOLD))]),
         ];
+        // Auto runs tools without asking, so it stands out from manual.
+        let mode_style = match self.permission_mode {
+            PermissionMode::Manual => bar.add_modifier(Modifier::BOLD),
+            PermissionMode::Auto => t.warn.patch(bar).add_modifier(Modifier::BOLD),
+        };
+        segs.push((0, vec![Span::styled(format!(" {} ", self.permission_mode.name()), mode_style)]));
         if let Some(title) = &self.title {
             segs.push((4, vec![Span::styled(format!(" {} ", clip_width(title, 36)), bar.add_modifier(Modifier::DIM))]));
         }
@@ -2264,6 +2283,28 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn tab_switches_the_permission_mode_and_the_status_line_shows_it() {
+        let mut a = App::new("m", "build");
+        assert_eq!(a.permission_mode, PermissionMode::Manual, "manual is the default");
+        assert!(screen(&mut a, 100, 4).last().unwrap().contains(" manual "));
+        assert_eq!(press(&mut a, KeyCode::Tab), Action::SetPermissionMode(PermissionMode::Auto));
+        // The app shows the mode the engine confirms (set by the event loop).
+        a.permission_mode = PermissionMode::Auto;
+        assert!(screen(&mut a, 100, 4).last().unwrap().contains(" auto "));
+        assert_eq!(press(&mut a, KeyCode::Tab), Action::SetPermissionMode(PermissionMode::Manual));
+    }
+
+    #[test]
+    fn tab_completes_instead_while_the_completion_popup_is_open() {
+        let mut a = App::new("m", "build");
+        fake_completer(&mut a);
+        type_str(&mut a, "/");
+        assert_eq!(press(&mut a, KeyCode::Tab), Action::None);
+        assert!(a.popup.is_none(), "Tab accepted the candidate");
+        assert_eq!(a.permission_mode, PermissionMode::Manual, "and did not switch the mode");
     }
 
     #[test]

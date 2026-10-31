@@ -7,14 +7,14 @@ use crate::agent::{self, Agent};
 use crate::snapshot::{FileDiff, Snapshots};
 use crate::{blobs, catalog, compaction, config, instructions, skills, title};
 use crate::chat;
-use crate::permission::{self, Effect, Rule};
+use crate::permission::{self, Effect, PermissionMode, Rule};
 use crate::provider::{retry, Block, ChatMessage, Event, FinishReason, Provider, ProviderError, Request, Role, ToolDef, Usage};
 use crate::store::{Mode, Session, Store, StoreError};
 use crate::tools::{self, project_root_of, Host, MediaCaps, PermReq, Permitter, Question, SubagentRequest, SubagentResult, Todo, Tool, ToolCtx, ToolError, ToolOutput};
 use serde_json::{json, Value};
 mod jobs;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -109,7 +109,12 @@ pub struct EngineConfig {
     pub model: String,
     pub max_tokens: u32,
     pub app_dir: PathBuf,
+    /// The agents in the default permission mode (`permission_mode`); also the list for sessions without agents of their own.
     pub agents: Vec<Agent>,
+    /// Default permission mode for sessions that have not chosen one.
+    pub permission_mode: PermissionMode,
+    /// The agent list for each mode. A session uses the list of its own mode; when a mode has no entry, `agents` is used.
+    pub agents_by_mode: BTreeMap<PermissionMode, Vec<Agent>>,
     /// Extra instruction files from config.
     pub instructions: Vec<String>,
     pub catalog: catalog::Catalog,
@@ -141,6 +146,8 @@ impl EngineConfig {
             max_tokens: 16_000,
             app_dir,
             agents: agent::builtin(),
+            permission_mode: PermissionMode::default(),
+            agents_by_mode: BTreeMap::new(),
             instructions: vec![],
             catalog: catalog::Catalog::embedded(),
             compaction: compaction::Settings::default(),
@@ -328,7 +335,7 @@ impl Engine {
 
     /// What a front end shows about reasoning effort: the level asked for, whether the model offers it, and the levels.
     pub fn effort_info(&self, session: &Session) -> EffortInfo {
-        let agent = agent::find(&self.cfg.agents, &session.agent);
+        let agent = agent::find(self.agents_of(session), &session.agent);
         let model_ref = self.model_ref_for(session);
         let (provider_id, model_id) = config::split_model(&model_ref);
         let levels = self.effort_levels(provider_id, model_id);
@@ -363,12 +370,24 @@ impl Engine {
 
     /// Model used for a session: its own choice, else the agent's, else the configured default.
     pub fn model_ref_for(&self, session: &Session) -> String {
-        let agent = agent::find(&self.cfg.agents, &session.agent);
+        let agent = agent::find(self.agents_of(session), &session.agent);
         session.model.clone().or(agent.and_then(|a| a.model)).unwrap_or_else(|| self.cfg.model.clone())
     }
 
+    /// The agents of the default permission mode (the agent picker lists these; the names are the same in every mode).
     pub fn agents(&self) -> &[Agent] {
         &self.cfg.agents
+    }
+
+    /// The permission mode a session runs in: its own choice, else the configured default.
+    pub fn permission_mode_of(&self, session: &Session) -> PermissionMode {
+        session.permission_mode.as_deref().and_then(PermissionMode::parse).unwrap_or(self.cfg.permission_mode)
+    }
+
+    /// The agents with the rules of the session's permission mode.
+    pub fn agents_of(&self, session: &Session) -> &[Agent] {
+        let mode = self.permission_mode_of(session);
+        self.cfg.agents_by_mode.get(&mode).map(Vec::as_slice).unwrap_or(&self.cfg.agents)
     }
 
     fn store(&self) -> std::sync::MutexGuard<'_, Store> {
@@ -511,9 +530,8 @@ impl Engine {
             let st = self.store();
             (st.session(sid)?.expect("session exists"), st.messages(sid)?)
         };
-        let agent = agent::find(&self.cfg.agents, &session.agent)
-            .or_else(|| self.cfg.agents.first().cloned())
-            .expect("at least one agent is configured");
+        let agents = self.agents_of(&session);
+        let agent = agent::find(agents, &session.agent).or_else(|| agents.first().cloned()).expect("at least one agent is configured");
         let all_tools = self.current_tools();
         let advertised: Vec<&dyn Tool> = all_tools.iter().map(|t| t.as_ref()).filter(|t| agent::advertised(&agent, *t)).collect();
 
@@ -711,7 +729,7 @@ impl Engine {
     /// Best effort: any failure just leaves the session untitled. Only errors where the request provably never ran
     /// (connection refused, DNS) are retried, up to 3 times, since this is a one-shot generation.
     fn generate_title(&self, session: &Session, text: &str, ui: &dyn Ui, cancel: &AtomicBool) {
-        let agent = agent::find(&self.cfg.agents, &session.agent).or_else(|| self.cfg.agents.first().cloned());
+        let agent = agent::find(self.agents_of(session), &session.agent).or_else(|| self.agents_of(session).first().cloned());
         let model_ref = self
             .cfg
             .small_model
@@ -786,7 +804,7 @@ impl Engine {
     pub(crate) fn begin_subagent(&self, parent: &Session, req: &SubagentRequest) -> Result<Session, ToolError> {
         let eng = self;
         let store_err = |e: StoreError| ToolError::fail(e.to_string());
-        let agent = agent::find(&eng.cfg.agents, &req.agent).filter(|a| a.subagent()).ok_or_else(|| ToolError::fail(format!("Unknown agent '{}'", req.agent)))?;
+        let agent = agent::find(eng.agents_of(parent), &req.agent).filter(|a| a.subagent()).ok_or_else(|| ToolError::fail(format!("Unknown agent '{}'", req.agent)))?;
         let child = {
             let st = eng.store();
             if st.depth(&parent.id).map_err(store_err)? + 1 > MAX_SUBAGENT_DEPTH {
@@ -801,6 +819,8 @@ impl Engine {
                 None => {
                     let c = st.create_child_session(parent, &agent.id).map_err(store_err)?;
                     st.set_title(&c.id, &req.description).map_err(store_err)?;
+                    // A subagent works under the permission mode its parent had when it started.
+                    st.set_permission_mode(&c.id, Some(eng.permission_mode_of(parent).name())).map_err(store_err)?;
                     c
                 }
             };
@@ -988,7 +1008,7 @@ impl Engine {
             let st = self.store();
             (st.session(sid)?.expect("session exists"), st.messages(sid)?)
         };
-        let agent = agent::find(&self.cfg.agents, &session.agent).or_else(|| self.cfg.agents.first().cloned()).expect("an agent");
+        let agent = agent::find(self.agents_of(&session), &session.agent).or_else(|| self.agents_of(&session).first().cloned()).expect("an agent");
         let (provider, provider_id, model_id) = match self.resolve_model(&session, &agent) {
             Ok(r) => r,
             Err(e) => return Ok(CompactResult::Failed(e)),
@@ -2085,6 +2105,36 @@ mod tests {
         let ui = TestUi::replying(vec![Reply::Reject(None)]);
         assert_eq!(f.run(&ui), RunOutcome::Declined);
         assert_eq!(f.fake.calls(), 2, "no further model calls after the rejection");
+    }
+
+    #[test]
+    fn the_session_permission_mode_decides_what_asks() {
+        let f = fixture_cfg(
+            vec![tool_call("t1", "shell", json!({"command":"true"})), text("ok"), tool_call("t2", "shell", json!({"command":"true"})), text("done")],
+            |c| {
+                c.permission_mode = PermissionMode::Manual;
+                c.agents_by_mode = BTreeMap::from([(PermissionMode::Manual, agent::builtin_for(PermissionMode::Manual)), (PermissionMode::Auto, agent::builtin_for(PermissionMode::Auto))]);
+            },
+        );
+        // Auto: the shell command runs without asking (the UI would panic on a prompt).
+        f.engine.store().set_permission_mode(&f.session.id, Some("auto")).unwrap();
+        f.say("go");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        // Switched to manual: the next command asks, and the rejection stops the run.
+        f.engine.store().set_permission_mode(&f.session.id, Some("manual")).unwrap();
+        f.say("again");
+        assert_eq!(f.run(&TestUi::replying(vec![Reply::Reject(None)])), RunOutcome::Declined);
+    }
+
+    #[test]
+    fn a_subagent_inherits_its_parents_permission_mode() {
+        let f = fixture(vec![sub("t1", "general", "do it"), text("child"), text("parent done")]);
+        f.engine.store().set_permission_mode(&f.session.id, Some("auto")).unwrap();
+        f.say("delegate");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        let reqs = f.fake.requests.lock().unwrap();
+        let child = f.engine.store().session(&child_id(&reqs[2])).unwrap().unwrap();
+        assert_eq!(child.permission_mode.as_deref(), Some("auto"));
     }
 
     #[test]

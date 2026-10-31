@@ -213,6 +213,7 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
             let info = engine.effort_info(&s);
             app.effort = info.desired;
             app.effort_levels = info.levels;
+            app.permission_mode = engine.permission_mode_of(&s);
         }
     };
     load_rows(&mut app, &sid);
@@ -388,6 +389,7 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
                             },
                             _ => {}
                         },
+                        Action::SetPermissionMode(mode) => builtin::set_permission_mode(engine, &sid, &mut app, mode),
                         Action::SetEffort(level) => {
                             engine.store.lock().unwrap().set_variant(&sid, level.as_deref()).ok();
                             refresh_status(&mut app, &sid);
@@ -459,7 +461,7 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
                                     use keys::KeyAction as K;
                                     let km = &app.keymap;
                                     let help = format!(
-                                        "Enter sends, {} adds a line, Up/Down move or browse history, Tab completes / and @, {} opens the command palette, {} interrupts (Ctrl-C too), {}/{} scroll, {} follows the output, {} cycles the detail level, {} quits. Leader {}: {}. !command runs a shell command. Commands: /model /agent /sessions /resume /new /rename /fork /archive /undo /redo /diff /compact /queue /jobs /theme /skills /commands /mcp /exit.",
+                                        "Enter sends, {} adds a line, Up/Down move or browse history, Tab completes / and @ (or switches the permission mode when no completion is open), {} opens the command palette, {} interrupts (Ctrl-C too), {}/{} scroll, {} follows the output, {} cycles the detail level, {} quits. Leader {}: {}. !command runs a shell command. Commands: /model /agent /mode /sessions /resume /new /rename /fork /archive /undo /redo /diff /compact /queue /jobs /theme /skills /commands /mcp /exit.",
                                         km.label(K::Newline),
                                         km.label(K::Palette),
                                         km.label(K::Interrupt),

@@ -42,14 +42,21 @@ Outcomes: `allow` -> proceed. `deny` -> tool fails with `BlockedError` (message 
 
 ## Permission modes (moco)
 
-moco has two modes, chosen with `permission_mode` in config or `--permission-mode manual|auto` (the flag wins). The default is `manual`. The mode sets the starting rules of every agent (built-in and config-defined); your own `permissions` rules come after it and win.
+moco has two modes. The default is `manual`. The mode sets the starting rules of every agent (built-in and config-defined); your own `permissions` rules come after it and win.
+
+**Choosing a mode.** Each session has its own mode, shown in the status line as `manual` or `auto`:
+- Full-screen chat: Tab switches it (when no completion popup is open). `/mode [manual|auto]` does the same, and `/mode` alone shows it.
+- Plain chat: `/mode [manual|auto]`.
+- `--permission-mode manual|auto` sets it for this session and is the default for new ones. `permission_mode` in config sets the default when no flag is given.
+
+A switch applies from the next step of a run: a tool call already running is not interrupted, and the next step's prompts follow the new mode. A subagent takes the mode its parent had when it started.
 
 - **manual** (default): `*` asks. Allowed without a prompt: `read`, `glob`, `grep`, `question`, `todowrite`, `skill`. Reading `.env` files asks, `.env.example` is allowed, `websearch` asks, and so does `external_directory` (it falls under `*`).
 - **auto**: the upstream default ruleset below. Everything is allowed except `.env` reads and `websearch`.
 
 The `explore` subagent denies `shell` in both modes, because a shell command can write and the rules must enforce its read-only role.
 
-Not done: switching mode during a session (`/mode`), which needs the mode stored per session; and the automatic check that is meant to replace the prompt in auto mode.
+Not done: the automatic check that is meant to replace the prompt in auto mode.
 
 ## Default ruleset (`auto`, and the upstream base)
 

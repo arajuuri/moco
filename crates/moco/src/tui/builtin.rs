@@ -1,7 +1,8 @@
 //! The built-in slash commands of the full-screen UI, and the transcript of a stored session.
 use super::app::{App, PickItem, PickKind, Picker, Row, ToolState};
 use super::Host;
-use moco_core::engine::{DiffResult, UndoReport, UndoResult};
+use moco_core::engine::{DiffResult, Engine, UndoReport, UndoResult};
+use moco_core::permission::PermissionMode;
 use moco_core::store::{Message, Session};
 
 /// What the event loop must do after a built-in command.
@@ -20,6 +21,7 @@ pub enum Effect {
 pub const NAMES: &[(&str, &str)] = &[
     ("model", "pick the model"),
     ("agent", "pick the agent"),
+    ("mode", "ask before acting (manual) or run tools without asking (auto); Tab switches"),
     ("effort", "set the reasoning effort"),
     ("sessions", "list and resume sessions"),
     ("new", "start a new session"),
@@ -49,6 +51,13 @@ fn files(app: &mut App, r: &UndoReport) {
     for f in &r.deleted {
         app.push_info(format!("  removed {f}"));
     }
+}
+
+/// Switch the session's permission mode, from `/mode` or Tab, and say what it now means.
+pub fn set_permission_mode(engine: &Engine, sid: &str, app: &mut App, mode: PermissionMode) {
+    engine.store.lock().unwrap().set_permission_mode(sid, Some(mode.name())).ok();
+    app.permission_mode = mode;
+    app.push_info(format!("permission mode: {} ({})", mode.name(), mode.describe()));
 }
 
 fn err(app: &mut App, msg: impl Into<String>) {
@@ -157,6 +166,17 @@ pub fn run(host: &Host, app: &mut App, sid: &str, agent: &str, name: &str, args:
                 let mut items = vec![PickItem { label: "default".into(), detail: format!("the provider's own choice{}", if cur.is_none() { "  (current)" } else { "" }), value: "default".into() }];
                 items.extend(info.levels.iter().map(|l| PickItem { label: l.clone(), detail: if cur.as_ref() == Some(l) { "(current)".into() } else { String::new() }, value: l.clone() }));
                 app.open_picker(Picker::new(PickKind::Effort, "reasoning effort", items, ""));
+            }
+        }
+        "mode" => {
+            if args.is_empty() {
+                let current = engine.store.lock().unwrap().session(sid).ok().flatten().map(|s| engine.permission_mode_of(&s)).unwrap_or_default();
+                app.push_info(format!("permission mode: {} ({}). Tab switches it.", current.name(), current.describe()));
+            } else {
+                match PermissionMode::parse(args) {
+                    Some(m) => set_permission_mode(engine, sid, app, m),
+                    None => err(app, "usage: /mode [manual|auto]"),
+                }
             }
         }
         "agent" => {

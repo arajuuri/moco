@@ -28,7 +28,7 @@ By hand: `MACOSX_DEPLOYMENT_TARGET=10.14 CARGO_TARGET_DIR=<a directory outside t
 | `moco --session ID` / `-s` | Resume any session by a piece of its id (it runs in its own directory) |
 | `moco --model provider/model` / `-m` | Model for this session (also `MOCO_MODEL`) |
 | `moco --agent ID` | Agent for this session (`build` default, `plan` read-only); only primary agents can be chosen |
-| `moco --permission-mode manual\|auto` | Ask before acting (`manual`, the default) or allow what the default rules allow (`auto`); overrides `permission_mode` in config |
+| `moco --permission-mode manual\|auto` | Mode for this session: ask before acting (`manual`, the default) or run tools without asking (`auto`); also the default for new sessions, overriding `permission_mode` in config |
 | `moco --dir PATH` | Work in another directory |
 | `moco models [filter] [--refresh]` | Providers with connection state, or models with context size and price; `--refresh` downloads the full catalog |
 | `moco auth PROVIDER` | Store an API key |
@@ -40,6 +40,7 @@ By hand: `MACOSX_DEPLOYMENT_TARGET=10.14 CARGO_TARGET_DIR=<a directory outside t
 |---|---|
 | `/model [filter \| provider/model]` | Show, search or switch the model for this session |
 | `/agent <id>` | Switch agent |
+| `/mode [manual\|auto]` | Show or switch the permission mode (Tab does the same in the full-screen chat) |
 | `/compact` | Summarize older messages to free up context (also automatic near the limit) |
 | `/undo`, `/redo` | Undo the last turn's file changes and messages (repeat to go back further) or bring them back; the next prompt makes an undo permanent |
 | `/diff` | Changes in the working tree since the session started |
@@ -56,7 +57,7 @@ By hand: `MACOSX_DEPLOYMENT_TARGET=10.14 CARGO_TARGET_DIR=<a directory outside t
 
 `Ctrl-C` interrupts a running turn (running commands are killed); `Ctrl-D` at the prompt quits.
 
-**Permission prompts** show the action and what it touches: `y` allow once, `a` allow always (saved for this project with a pattern such as `git push *`), `n` reject and stop, or type feedback to reject and tell the model why. In the default `manual` mode, anything that changes files, runs a command, or fetches from the web asks; reads and searches do not. In `auto` mode everything is allowed except reading `.env` files and web searches. Your own rules (below) apply in both modes. The `question` tool shows a numbered form; Enter dismisses it.
+The status line shows the session's permission mode (`manual`, or `auto` in a warning colour). **Permission prompts** show the action and what it touches: `y` allow once, `a` allow always (saved for this project with a pattern such as `git push *`), `n` reject and stop, or type feedback to reject and tell the model why. In the default `manual` mode, anything that changes files, runs a command, or fetches from the web asks; reads and searches do not. In `auto` mode everything is allowed except reading `.env` files and web searches. Your own rules (below) apply in both modes. The `question` tool shows a numbered form; Enter dismisses it.
 
 ## Other providers and protocols
 
@@ -74,7 +75,7 @@ If one misbehaves, `/model` back to another provider and report the error text.
 
 ## Full-screen UI
 
-On a terminal `moco` runs the chat full screen (works over SSH). `moco --plain` gives the line-based chat described below (it is also used with `-p` and when output is piped). Enter sends, Esc or Ctrl-C interrupts a running turn (Ctrl-C on an empty prompt, or Ctrl-D, quits), PageUp/PageDown scroll, Ctrl-End jumps back to the newest output. A permission request replaces the prompt box: `y` once, `a` always, `n` reject, `f` reject with feedback. Alt-Enter (or Ctrl-J) adds a line, Up/Down move through lines and then your prompt history, Tab completes `/commands` and `@files`, `@skills`, `@agents`; big pastes collapse to a placeholder; `!command` runs a shell command. `Ctrl-P` opens a command palette. The built-in commands (`/model`, `/agent`, `/sessions`, `/undo`, `/diff`, `/compact`, ...), custom commands, MCP prompts and the assistant's question forms work. While a turn runs, Enter steers your text into it (delivered at the next step), Ctrl-Q or `/queue <text>` queues it for after the turn, and waiting prompts are listed above the box (`/queue` manages them); Ctrl-O cycles how much is shown: normal (inline diffs of file changes, reasoning summarized), full (all reasoning, tool output, every subagent call) and compact (call lines only). Replies are rendered as Markdown. `/diff` opens a full-screen viewer of the session's file changes (`j`/`k`, Space/`b`, `n`/`p` for the next or previous file, `q` closes). Not available yet: `/mcp auth` and subagent-style custom commands; use `moco --plain` for those.
+On a terminal `moco` runs the chat full screen (works over SSH). `moco --plain` gives the line-based chat described below (it is also used with `-p` and when output is piped). Enter sends, Esc or Ctrl-C interrupts a running turn (Ctrl-C on an empty prompt, or Ctrl-D, quits), PageUp/PageDown scroll, Ctrl-End jumps back to the newest output. A permission request replaces the prompt box: `y` once, `a` always, `n` reject, `f` reject with feedback. Alt-Enter (or Ctrl-J) adds a line, Up/Down move through lines and then your prompt history, Tab completes `/commands` and `@files`, `@skills`, `@agents` (and switches the permission mode when no completion is open); big pastes collapse to a placeholder; `!command` runs a shell command. `Ctrl-P` opens a command palette. The built-in commands (`/model`, `/agent`, `/sessions`, `/undo`, `/diff`, `/compact`, ...), custom commands, MCP prompts and the assistant's question forms work. While a turn runs, Enter steers your text into it (delivered at the next step), Ctrl-Q or `/queue <text>` queues it for after the turn, and waiting prompts are listed above the box (`/queue` manages them); Ctrl-O cycles how much is shown: normal (inline diffs of file changes, reasoning summarized), full (all reasoning, tool output, every subagent call) and compact (call lines only). Replies are rendered as Markdown. `/diff` opens a full-screen viewer of the session's file changes (`j`/`k`, Space/`b`, `n`/`p` for the next or previous file, `q` closes). Not available yet: `/mcp auth` and subagent-style custom commands; use `moco --plain` for those.
 
 ### Full-screen UI settings
 
@@ -156,7 +157,7 @@ Files named `moco.json` or `moco.jsonc` (comments and trailing commas allowed), 
   "model": "anthropic/claude-sonnet-5-5",
   "small_model": "anthropic/claude-haiku-5-5",          // titles
   "default_agent": "build",
-  "permission_mode": "manual",                           // or "auto": see docs/05-permissions.md
+  "permission_mode": "manual",                           // default for new sessions: see docs/05-permissions.md
   "shell": "/bin/zsh",
   "permissions": [                                       // last matching rule wins
     { "action": "shell", "resource": "ls *", "effect": "allow" },

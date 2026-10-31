@@ -595,12 +595,14 @@ fn main() {
     if let (Some(sh), None) = (&cfg.shell, std::env::var_os("MOCO_SHELL")) {
         std::env::set_var("MOCO_SHELL", sh);
     }
-    // The flag wins over the config key; both default to manual.
-    let permission_mode = match &permission_mode_arg {
-        Some(s) => permission::PermissionMode::parse(s).unwrap_or_else(|| die(&format!("--permission-mode must be manual or auto, not {s}"))),
+    // The flag applies to this session and is the default for new ones; otherwise the config key is the default (manual).
+    let flag_mode = permission_mode_arg.as_deref().map(|s| permission::PermissionMode::parse(s).unwrap_or_else(|| die(&format!("--permission-mode must be manual or auto, not {s}"))));
+    let default_mode = match flag_mode {
+        Some(m) => m,
         None => config::permission_mode(&cfg).unwrap_or_else(|e| die(&e)),
     };
-    let agents = config::resolve_agents_in(&cfg, permission_mode);
+    let mode_agents: std::collections::BTreeMap<_, _> = [permission::PermissionMode::Manual, permission::PermissionMode::Auto].into_iter().map(|m| (m, config::resolve_agents_in(&cfg, m))).collect();
+    let agents = mode_agents[&default_mode].clone();
     let agent_explicit = agent_id.is_some();
     let mut agent_id = agent_id.or(cfg.default_agent.clone()).unwrap_or_else(|| "build".into());
     if !agents.iter().any(|a| a.id == agent_id && a.selectable()) {
@@ -633,6 +635,10 @@ fn main() {
     } else if resumed && agents.iter().any(|a| a.id == session.agent && a.selectable()) {
         agent_id = session.agent.clone(); // a resumed session keeps its own agent
     }
+    if let Some(m) = flag_mode {
+        store.set_permission_mode(&session.id, Some(m.name())).ok();
+        session.permission_mode = Some(m.name().into());
+    }
     // An explicit --model / MOCO_MODEL applies to this session; otherwise a resumed session keeps its own.
     let explicit_model = std::env::args().any(|a| a == "--model" || a == "-m") || std::env::var("MOCO_MODEL").is_ok();
     if explicit_model {
@@ -646,6 +652,8 @@ fn main() {
     let mut engine_cfg = EngineConfig::new(&model, app_dir.clone());
     engine_cfg.effort = cfg.effort.clone();
     engine_cfg.agents = agents;
+    engine_cfg.permission_mode = default_mode;
+    engine_cfg.agents_by_mode = mode_agents;
     engine_cfg.instructions = cfg.instructions.clone();
     engine_cfg.catalog = catalog;
     engine_cfg.compaction = compaction::Settings::from_config(&cfg.compaction);
@@ -811,7 +819,7 @@ fn main() {
 
     let title_of = |sid: &str| engine.store.lock().unwrap().session(sid).ok().flatten().and_then(|s| s.title);
     let current = |sid: &str| engine.store.lock().unwrap().session(sid).ok().flatten().map(|s| engine.model_ref_for(&s)).unwrap_or_default();
-    println!("{DIM}moco {} | {} | agent {agent_id} | {n_sources} config file(s) | /help for commands{RESET}", env!("CARGO_PKG_VERSION"), current(&session.id));
+    println!("{DIM}moco {} | {} | agent {agent_id} | mode {} | {n_sources} config file(s) | /help for commands{RESET}", env!("CARGO_PKG_VERSION"), current(&session.id), engine.permission_mode_of(&session).name());
     if resumed {
         println!("{DIM}session {}: {}{RESET}", short(&session.id), title_of(&session.id).unwrap_or_else(|| "(untitled)".into()));
     }
@@ -929,7 +937,7 @@ fn main() {
                 }
             }
             "/help" => println!(
-                "/model [FILTER|PROVIDER/MODEL]  show, search or switch the model\n/agent <id>                     switch agent\n/effort [level|default]          reasoning effort for models that offer levels\n/compact                        summarize older messages to free up context\n/sessions [all|archived]       list sessions (/resume <n|id> to continue one)\n/rename <title>                 name this session\n/fork [N]                       copy this conversation into a new session\n/archive [n|id]                 hide a session from the list (/unarchive to restore)\n/undo, /redo                    undo the last turn's file changes and messages, or bring them back\n/diff                           changes in the working tree since this session started\n/new                            start a new session\n/jobs                           background commands and subagents (output <id>, kill <id>)\n!<command>                      run a shell command yourself; the assistant is told\n/skills, /commands, /mcp       list skills, custom slash commands (also MCP prompts) and MCP servers (@name mentions a skill, agent or file)\n/exit                           quit (Ctrl-C interrupts a running turn)"
+                "/model [FILTER|PROVIDER/MODEL]  show, search or switch the model\n/agent <id>                     switch agent\n/mode [manual|auto]             ask before acting (manual, the default) or run tools without asking (auto)\n/effort [level|default]          reasoning effort for models that offer levels\n/compact                        summarize older messages to free up context\n/sessions [all|archived]       list sessions (/resume <n|id> to continue one)\n/rename <title>                 name this session\n/fork [N]                       copy this conversation into a new session\n/archive [n|id]                 hide a session from the list (/unarchive to restore)\n/undo, /redo                    undo the last turn's file changes and messages, or bring them back\n/diff                           changes in the working tree since this session started\n/new                            start a new session\n/jobs                           background commands and subagents (output <id>, kill <id>)\n!<command>                      run a shell command yourself; the assistant is told\n/skills, /commands, /mcp       list skills, custom slash commands (also MCP prompts) and MCP servers (@name mentions a skill, agent or file)\n/exit                           quit (Ctrl-C interrupts a running turn)"
             ),
             l if l == "/sessions" || l.starts_with("/sessions ") => {
                 let which = l.trim_start_matches("/sessions").trim();
@@ -1094,6 +1102,19 @@ fn main() {
                     println!("{DIM}reasoning effort: {arg}{RESET}");
                 } else {
                     println!("this model offers: {}", info.levels.join(", "));
+                }
+            }
+            l if l == "/mode" || l.starts_with("/mode ") => {
+                let want = l.trim_start_matches("/mode").trim();
+                let fresh = engine.store.lock().unwrap().session(&session.id).ok().flatten().unwrap_or_else(|| session.clone());
+                let current = engine.permission_mode_of(&fresh);
+                if want.is_empty() {
+                    println!("{DIM}permission mode: {} ({}){RESET}", current.name(), current.describe());
+                } else if let Some(m) = permission::PermissionMode::parse(want) {
+                    engine.store.lock().unwrap().set_permission_mode(&session.id, Some(m.name())).ok();
+                    println!("{DIM}permission mode: {} ({}){RESET}", m.name(), m.describe());
+                } else {
+                    println!("usage: /mode [manual|auto]");
                 }
             }
             l if l.starts_with("/agent") => {

@@ -20,7 +20,7 @@ Implemented in `crates/moco-core/src/config.rs` and `instructions.rs`.
 - File names are `moco.json` / `moco.jsonc` (upstream's `opencode.json` is not read). Locations, lowest priority first: `<app dir>/config/`; then each ancestor of the working directory, outermost first, as `<dir>/moco.json[c]` and `<dir>/.moco/moco.json[c]`; then the file named by `$MOCO_CONFIG`. A file that fails to parse is skipped with a warning.
 - Merge: objects merge by key, `permissions` and `instructions` arrays concatenate (lowest priority first), anything else is replaced.
 - Keys read so far: `permission_mode`, `model` (`provider/model`), `default_agent`, `shell`, `permissions` (list of `{action, resource, effect}`), `agents.<id>` (`model`, `system`, `description`, `steps`, `permissions`, `disabled`; unknown ids define new agents), `instructions` (extra files), `providers` (see `07`), `compaction{auto, buffer, keep}` `snapshots` (bool, see `03`) and `small_model` (see `06`). Other keys are ignored.
-- `permission_mode`: `"manual"` (default) or `"auto"`, see `05`. `moco --permission-mode` overrides it; any other value is an error.
+- `permission_mode`: `"manual"` (default) or `"auto"`, see `05`. It is the mode of sessions that have not chosen one; `moco --permission-mode` sets the mode of the session it starts, and Tab or `/mode` change it. Any other value is an error.
 - Rule order per agent: mode defaults, then top-level `permissions`, then the agent's own `permissions`; last match wins. In auto mode, this is how to make `shell` or `edit` ask (manual mode already asks for them):
 ```jsonc
 { "permissions": [

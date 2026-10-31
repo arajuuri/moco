@@ -71,3 +71,8 @@ fn prompts_typed_during_a_turn_are_steered_or_queued_and_delivered() {
 fn configured_theme_keys_and_bell() {
     scenario("config");
 }
+
+#[test]
+fn tab_switches_the_permission_mode() {
+    scenario("mode");
+}

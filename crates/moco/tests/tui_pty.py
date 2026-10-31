@@ -207,6 +207,15 @@ elif scenario == "chat":
     pump(0.3)
     send(b"\x04")  # Ctrl-D on an empty composer
     check_restored(wait_exit())
+elif scenario == "mode":
+    # Tab switches the permission mode; the transcript confirms each switch.
+    wait_for(r"fake/mbuildmanual")  # the status line starts in manual
+    send(b"\t")
+    wait_for(r"permissionmode:auto")
+    send(b"\t")
+    wait_for(r"permissionmode:manual")
+    send(b"\x04")
+    check_restored(wait_exit())
 elif scenario == "sigterm":
     send(b"Read a.txt and tell me what it says.\r")
     wait_for(r"permissionneeded:read")  # the run is blocked on the dialog
