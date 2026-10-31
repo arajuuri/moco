@@ -2,13 +2,16 @@
 
 moco is a coding agent for the terminal. This is the reference for the app as built; the other documents describe the design. Phases 0-2 are implemented (see `10-roadmap.md` for results and what is left).
 
-## Build and run
+## Install
+
+On the Mac (Mojave or newer, Intel), from a checkout of this repository:
 
 ```
-CARGO_TARGET_DIR=<a directory outside the repo> cargo build --release     # target dir/release/moco
-MACOSX_DEPLOYMENT_TARGET=10.14 ...                                         # for a binary that runs on Mojave
+scripts/install.sh --add-to-path
 ```
-Check a Mojave build with `otool -l moco | grep minos` (must say 10.14). On Linux and macOS alike the binary needs no runtime besides the system libraries.
+It checks the system, builds a release binary for macOS 10.14 into `~/.cache/moco/target` (the Xcode command line tools must be installed: `xcode-select --install`; if Rust is missing it offers to install it with rustup), verifies the binary's minimum macOS version, installs it to `~/.local/bin/moco` and, with `--add-to-path`, adds that directory to `~/.bash_profile` (or `~/.zprofile` for zsh) once. Open a new terminal afterwards, or `export PATH="$HOME/.local/bin:$PATH"`. Other options: `--prefix /usr/local` (installs to `/usr/local/bin`; you need write access), `--target-dir DIR` for the build cache, `--yes` to never ask. Running it again after a `git pull` updates the install. `scripts/install.sh --uninstall` removes the binary and keeps your sessions and keys (`--purge` removes those too). `moco --version` prints the version.
+
+By hand: `MACOSX_DEPLOYMENT_TARGET=10.14 CARGO_TARGET_DIR=<a directory outside the repo> cargo build --release`, then check `otool -l moco | grep minos` (must say 10.14). The binary needs no runtime besides the system libraries.
 
 ## First run
 

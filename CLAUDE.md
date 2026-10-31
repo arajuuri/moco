@@ -14,6 +14,7 @@ Source paths cited inside the docs are relative to an opencode checkout at that 
 cargo test                       # all tests (engine tests use a scripted fake provider, no network)
 cargo test -p moco-core shell    # filter by name
 cargo build --release            # produces target/release/moco
+scripts/install.sh               # build for macOS 10.14 and install to ~/.local/bin (see docs/11; --uninstall removes it)
 moco -p "prompt"                 # one-shot; `moco` alone is the interactive chat; --continue resumes
 ```
 

@@ -558,9 +558,13 @@ fn main() {
             "--prompt" | "-p" => prompt = Some(value("--prompt")),
             "--tui" => want_tui = Some(true),
             "--plain" => want_tui = Some(false),
+            "--version" | "-V" => {
+                println!("moco {}", env!("CARGO_PKG_VERSION"));
+                return;
+            }
             "--help" | "-h" => {
                 println!(
-                    "usage: moco [--continue | --session ID] [--model PROVIDER/MODEL] [--agent ID] [--effort LEVEL] [--dir PATH] [-p PROMPT] [--plain]\n       moco sessions [--all] [--archived] | rename ID TITLE | archive ID | unarchive ID\n       moco models [FILTER] [--refresh]\n       moco auth PROVIDER"
+                    "usage: moco [--continue | --session ID] [--model PROVIDER/MODEL] [--agent ID] [--effort LEVEL] [--dir PATH] [-p PROMPT] [--plain] [--version]\n       moco sessions [--all] [--archived] | rename ID TITLE | archive ID | unarchive ID\n       moco models [FILTER] [--refresh]\n       moco auth PROVIDER"
                 );
                 return;
             }
