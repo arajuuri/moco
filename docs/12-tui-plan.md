@@ -2,6 +2,13 @@
 
 Status: planned. The feasibility check (`spike-tui/`) is done; nothing of the TUI itself is built yet. Screen concepts come from `09-ui.md`; this file decides how moco builds them.
 
+## Where we stopped
+
+- Phase 3 is committed through slice G (MCP over Streamable HTTP with OAuth, `553deef`); the plan and spike are `14ef6ee`. Working tree clean. 300 unit + 2 protocol tests pass on Linux and on the Mojave machine.
+- Next step: slice 1 (skeleton) below. Not started; the user had not yet said "go".
+- Open items: the manual Terminal.app/iTerm2 look-and-feel pass is still to do; OpenAI Responses, Gemini and MCP HTTP/OAuth remain verified only against local fakes.
+- Mac scratch: `~/moco-target` and `~/spike-tui-target` build dirs (fine to keep); temp driver files were removed.
+
 ## Feasibility result (spike-tui)
 
 ratatui 0.30 + crossterm build on the Mojave machine with `MACOSX_DEPLOYMENT_TARGET=10.14` (`minos 10.14`, links only `libSystem` and `libiconv`). Run in a pty over SSH with `TERM=xterm-256color`, driven by a script: alternate screen enter/leave, key events, arrows/Backspace/Delete, bracketed paste as one event, SIGWINCH resize with redraw, clean exit. Not checked: how it looks in Terminal.app or iTerm2 (colors, mouse, wide characters). Terminal.app has no kitty keyboard protocol, so Shift-Enter cannot be told from Enter: newline in the composer is Alt-Enter (and Ctrl-J).
