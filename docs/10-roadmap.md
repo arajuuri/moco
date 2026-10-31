@@ -26,6 +26,16 @@ Toolchain decision: **Rust core** (option B in `01`). Rust 1.99.1 stable builds 
 - UI: minimal chat (terminal or window), permission prompt, interrupt.
 - **Check**: ask "add a function to X and run the tests"; it reads, edits, runs shell with an approval prompt; kill the app mid-run and restart: session intact.
 
+### Phase 1 results (workspace `crates/moco-core` + `crates/moco`; verified on macOS 10.14.6)
+Status: complete. 84 unit tests pass on Linux and on the Mojave machine; the release binary has `minos 10.14` and links only `libSystem` and `libiconv`.
+- **Check, live API** (Anthropic Messages, `claude-sonnet-5-5`): asked to add `double(x: i32)` with a unit test and run `cargo test` in a scratch crate. It read `src/lib.rs`, edited it twice, ran `cargo test` through the shell tool and reported 2 passed. The resulting code was correct.
+- **Check, crash recovery:** SIGKILL during a `sleep 40` shell call; `moco --continue` printed "resuming interrupted run", turned the dangling tool call into an `Tool execution interrupted` error result and the model continued from the intact history.
+- **Check, permission prompt:** reading `.env` asked; rejecting without feedback stopped the run.
+- **Implemented**: SQLite store with migrations, inbox (steer/queue, idempotent admission), execution claim with a bounded resume counter, saved permissions; Anthropic provider (SSE parser, HTTP and in-stream error classification, retry policy from `03`); step loop with tools running concurrently on scoped threads; `read`, `write`, `edit` (exact, typographic and trailing-whitespace matching, CRLF/BOM kept), `glob`, `grep` (native, `.gitignore` aware, because `rg` is absent), `shell` (process-group kill on timeout or interrupt, tail truncation, v1 command scanner); `build` and `plan` agents with the base prompt; line-based terminal chat.
+- **Deviations from the spec**: retries only when no tool ran in the failed attempt, and the partial output is discarded (re-running would repeat side effects); the Plan reminder is appended at request time instead of being stored as a synthetic message; reasoning deltas are shown to the UI but not stored; blocking I/O on threads instead of an async runtime; the Plan agent denies all `edit` instead of allowing a plan directory.
+- **Not done / caveats**: the default ruleset (`* allow` except `.env`) means `shell` and `edit` never prompt until config exists (Phase 2), so the roadmap's "approval prompt" was exercised on `.env` reads only; the shell arity table is partial; no background shell, image or PDF reads, `AGENTS.md` loading, compaction, snapshots, title generation or config files; a SIGKILLed moco leaves its shell child running; the permission prompt serializes concurrent asks but "reject" does not yet cancel other already-pending asks beyond the declined flag.
+- **Dev setup lesson**: the repo folder is shared between the Linux box and the Mac over sshfs, so each machine must build into a `CARGO_TARGET_DIR` outside the repo (see `CLAUDE.md`).
+
 ## Phase 2: daily-driver
 - Inbox with steer/queue, resume after crash (`02`).
 - Compaction auto/manual/overflow recovery (`03`).
