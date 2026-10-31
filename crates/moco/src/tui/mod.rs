@@ -3,6 +3,8 @@
 mod app;
 mod builtin;
 mod complete;
+mod diff;
+mod md;
 mod term;
 
 pub use complete::Completer;
@@ -99,15 +101,15 @@ impl TuiUi {
         let ev = match e {
             UiEvent::Nested { agent, inner } => return self.convert(depth + 1, agent, inner),
             UiEvent::TextDelta(t) => Ev::Text(t.to_string()),
-            UiEvent::ReasoningDelta(_) => return,
+            UiEvent::ReasoningDelta(t) => Ev::Reasoning(t.to_string()),
             UiEvent::Delivered => {
                 if depth == 0 {
                     self.send(AppEvent::Delivered);
                 }
                 return;
             }
-            UiEvent::ToolStarted { name, input } => Ev::Tool { name: name.to_string(), summary: crate::summary(name, input) },
-            UiEvent::ToolFinished { name, ok, text } => Ev::ToolDone { name: name.to_string(), ok: *ok, msg: text.lines().next().unwrap_or("").to_string() },
+            UiEvent::ToolStarted { name, input } => Ev::Tool { name: name.to_string(), summary: crate::summary(name, input), detail: diff::tool_detail(name, input) },
+            UiEvent::ToolFinished { name, ok, text } => Ev::ToolDone { name: name.to_string(), ok: *ok, msg: text.lines().next().unwrap_or("").to_string(), output: diff::output_head(text, 12) },
             UiEvent::Retry { attempt, wait, error } => Ev::Retry { attempt: *attempt, secs: wait.as_secs(), error: error.to_string() },
             UiEvent::StepUsage { usage, cost, session_cost, context_tokens, context_limit } => {
                 Ev::Usage { usage: *usage, cost: *cost, session_cost: *session_cost, context: *context_tokens, limit: *context_limit }

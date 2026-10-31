@@ -713,6 +713,7 @@ dependencies = [
  "moco-core",
  "ratatui",
  "serde_json",
+ "similar",
  "unicode-width",
 ]
 

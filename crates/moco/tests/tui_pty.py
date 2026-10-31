@@ -119,8 +119,19 @@ if scenario == "steer":
     # the steer went in after the first step (tool call + result), before the final answer; the queued one after it
     if kinds[:2] != ["user", "assistant"] or kinds.index("user", 1) > 3:
         fail("unexpected message order %r" % kinds)
-    send(b"\x04")
-    check_restored(wait_exit())
+    # Ctrl-D is ignored while a turn is still finishing (usage, title), so repeat it until moco leaves.
+    end = time.time() + 15
+    status = None
+    while status is None and time.time() < end:
+        send(b"\x04")
+        pump(0.5)
+        done, st = os.waitpid(pid, os.WNOHANG)
+        if done:
+            pump(0.2)
+            status = st
+    if status is None:
+        fail("moco did not exit")
+    check_restored(status)
 elif scenario == "chat":
     send(b"Read a.txt and tell me what it says.\r")
     wait_for(r"Permissionneeded:read")

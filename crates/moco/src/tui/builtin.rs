@@ -239,14 +239,10 @@ pub fn run(host: &Host, app: &mut App, sid: &str, agent: &str, name: &str, args:
         "diff" => match engine.session_diff(sid) {
             Ok(DiffResult::Files(d)) if d.is_empty() => app.push_info("no changes since the session started"),
             Ok(DiffResult::Files(d)) => {
-                let (a, r): (usize, usize) = d.iter().fold((0, 0), |(a, r), f| (a + f.additions, r + f.deletions));
-                app.push_info(format!("{} file(s) changed, +{a} -{r}", d.len()));
-                for f in &d {
-                    if f.binary {
-                        app.push_info(format!("Binary file {} changed", f.path));
-                    }
-                    app.rows.push(Row::Diff(f.patch.clone()));
-                }
+                app.viewer = Some(super::app::Viewer {
+                    files: d.into_iter().map(|f| super::app::ViewFile { path: f.path, adds: f.additions, dels: f.deletions, binary: f.binary, patch: f.patch }).collect(),
+                    scroll: 0,
+                });
             }
             Ok(DiffResult::NoSnapshots) => app.push_info("no snapshots yet: nothing has run in this session"),
             Ok(DiffResult::Failed(e)) => err(app, format!("diff failed: {e}")),
@@ -384,7 +380,8 @@ pub fn history_rows(messages: &[Message], hidden_from: Option<&str>) -> Vec<Row>
                                 Some("error") => ToolState::Failed(p["state"]["error"].as_str().unwrap_or("error").to_string()),
                                 _ => ToolState::Failed("interrupted".into()),
                             };
-                            rows.push(Row::Tool { depth: 0, agent: String::new(), summary: crate::summary(&name, &p["input"]), name, state });
+                            let output = super::diff::output_head(p["state"]["output"].as_str().unwrap_or(""), 12);
+                            rows.push(Row::Tool { depth: 0, agent: String::new(), summary: crate::summary(&name, &p["input"]), detail: super::diff::tool_detail(&name, &p["input"]), output, name, state });
                         }
                         _ => {}
                     }

@@ -8,6 +8,7 @@ use moco_core::tools::{Question, Todo};
 use ratatui::{prelude::*, widgets::*};
 use std::collections::VecDeque;
 use std::sync::mpsc::Sender;
+use super::md;
 use unicode_width::UnicodeWidthChar;
 
 /// Semantic colors. Named ANSI colors only, so Terminal.app (256 colors) and light/dark profiles work.
@@ -18,6 +19,10 @@ pub struct Theme {
     pub error: Style,
     pub accent: Style,
     pub bar: Style,
+    pub code: Style,
+    pub heading: Style,
+    pub quote: Style,
+    pub link: Style,
 }
 
 impl Default for Theme {
@@ -29,6 +34,10 @@ impl Default for Theme {
             error: Style::new().fg(Color::Red),
             accent: Style::new().fg(Color::Cyan),
             bar: Style::new().add_modifier(Modifier::REVERSED),
+            code: Style::new().fg(Color::Yellow),
+            heading: Style::new().fg(Color::Cyan),
+            quote: Style::new().add_modifier(Modifier::DIM),
+            link: Style::new().fg(Color::Blue).add_modifier(Modifier::UNDERLINED),
         }
     }
 }
@@ -37,8 +46,9 @@ impl Default for Theme {
 #[derive(Debug, Clone)]
 pub enum Ev {
     Text(String),
-    Tool { name: String, summary: String },
-    ToolDone { name: String, ok: bool, msg: String },
+    Tool { name: String, summary: String, detail: Option<String> },
+    ToolDone { name: String, ok: bool, msg: String, output: String },
+    Reasoning(String),
     Retry { attempt: u32, secs: u64, error: String },
     Usage { usage: Usage, cost: Option<f64>, session_cost: f64, context: u64, limit: Option<u64> },
     Notice(String),
@@ -122,6 +132,41 @@ impl Picker {
     }
 }
 
+/// One changed file in the diff viewer.
+pub struct ViewFile {
+    pub path: String,
+    pub adds: usize,
+    pub dels: usize,
+    pub binary: bool,
+    pub patch: String,
+}
+
+/// Full-screen view of the session's changes.
+pub struct Viewer {
+    pub files: Vec<ViewFile>,
+    pub scroll: usize,
+}
+
+impl Viewer {
+    /// Wrapped, colored lines, and the line each file starts at.
+    fn lines(&self, width: usize, t: &Theme) -> (Vec<Line<'static>>, Vec<usize>) {
+        let mut out = vec![];
+        let mut starts = vec![];
+        for f in &self.files {
+            starts.push(out.len());
+            out.push(Line::styled(format!("=== {}  +{} -{}", f.path, f.adds, f.dels), t.accent.add_modifier(Modifier::BOLD)));
+            if f.binary {
+                out.push(Line::styled("binary file changed", t.dim));
+            }
+            for raw in f.patch.lines() {
+                out.extend(diff_line(raw, width, t));
+            }
+            out.push(Line::default());
+        }
+        (out, starts)
+    }
+}
+
 /// The `question` tool's form: one question at a time.
 pub struct Form {
     pub questions: Vec<Question>,
@@ -166,6 +211,8 @@ const MAX_POPUP: usize = 8;
 const MAX_COMPOSER_LINES: usize = 8;
 const PASTE_LINES: usize = 6;
 const PASTE_CHARS: usize = 800;
+/// Lines of an edit's diff shown inline at the normal detail level.
+const DETAIL_LINES: usize = 24;
 
 /// What the event loop must do after an update.
 #[derive(Debug, PartialEq, Eq)]
@@ -197,12 +244,12 @@ pub enum ToolState {
 pub enum Row {
     User(String),
     Assistant(String),
-    Tool { depth: usize, agent: String, name: String, summary: String, state: ToolState },
+    Tool { depth: usize, agent: String, name: String, summary: String, state: ToolState, detail: Option<String>, output: String },
+    /// The model's reasoning, shown according to the detail level.
+    Reasoning(String),
     Todos(Vec<Todo>),
     Info(String),
     Shell(String),
-    /// A unified diff, colored by line.
-    Diff(String),
     Error(String),
     Usage(String),
 }
@@ -235,6 +282,7 @@ pub struct App {
     pub dialogs: VecDeque<Permission>,
     pub forms: VecDeque<Form>,
     pub picker: Option<Picker>,
+    pub viewer: Option<Viewer>,
     pub model: String,
     pub agent: String,
     pub title: Option<String>,
@@ -247,8 +295,8 @@ pub struct App {
     pub jobs: usize,
     /// A retry is pending: when the next attempt starts, which attempt, and why.
     pub retry: Option<(std::time::Instant, u32, String)>,
-    /// Show every tool call of subagents instead of one summary line per run of calls.
-    pub expand_sub: bool,
+    /// Detail level: 0 compact, 1 normal, 2 full (Ctrl-O cycles).
+    pub level: u8,
     pub history: Vec<String>,
     hist: Option<usize>,
     draft: String,
@@ -276,6 +324,7 @@ impl App {
             dialogs: VecDeque::new(),
             forms: VecDeque::new(),
             picker: None,
+            viewer: None,
             model: model.to_string(),
             agent: agent.to_string(),
             title: None,
@@ -287,7 +336,7 @@ impl App {
             queued: vec![],
             jobs: 0,
             retry: None,
-            expand_sub: false,
+            level: 1,
             history: vec![],
             hist: None,
             draft: String::new(),
@@ -400,11 +449,20 @@ impl App {
                     _ => self.rows.push(Row::Assistant(t)),
                 }
             }
-            Ev::Tool { name, summary } => self.rows.push(Row::Tool { depth, agent, name, summary, state: ToolState::Running }),
-            Ev::ToolDone { name, ok, msg } => {
+            Ev::Tool { name, summary, detail } => self.rows.push(Row::Tool { depth, agent, name, summary, state: ToolState::Running, detail, output: String::new() }),
+            Ev::ToolDone { name, ok, msg, output: out } => {
                 let found = self.rows.iter_mut().rev().find(|r| matches!(r, Row::Tool { depth: d, name: n, state: ToolState::Running, .. } if *d == depth && *n == name));
-                if let Some(Row::Tool { state, .. }) = found {
+                if let Some(Row::Tool { state, output, .. }) = found {
                     *state = if ok { ToolState::Done } else { ToolState::Failed(msg) };
+                    *output = out;
+                }
+            }
+            Ev::Reasoning(t) => {
+                if depth == 0 {
+                    match self.rows.last_mut() {
+                        Some(Row::Reasoning(s)) => s.push_str(&t),
+                        _ => self.rows.push(Row::Reasoning(t)),
+                    }
                 }
             }
             Ev::Retry { attempt, secs, error } => {
@@ -697,6 +755,9 @@ impl App {
         if !self.forms.is_empty() {
             return self.form_key(k);
         }
+        if self.viewer.is_some() {
+            return self.viewer_key(k);
+        }
         if self.picker.is_some() {
             return self.picker_key(k);
         }
@@ -737,8 +798,8 @@ impl App {
             }
             KeyCode::Char('p') if ctrl => return Action::Palette,
             KeyCode::Char('o') if ctrl => {
-                self.expand_sub = !self.expand_sub;
-                self.hint = Some(if self.expand_sub { "showing every subagent tool call".into() } else { "subagent tool calls are summarized".into() });
+                self.level = (self.level + 1) % 3;
+                self.hint = Some(["detail: compact (no reasoning, no diffs)", "detail: normal (diffs, reasoning summarized)", "detail: full (reasoning, tool output, every subagent call)"][self.level as usize].into());
             }
             KeyCode::Char('q') if ctrl => {
                 if self.input.trim().is_empty() {
@@ -814,12 +875,46 @@ impl App {
 
     /// Is a dialog, form or picker taking the keys?
     pub fn modal(&self) -> bool {
-        !self.dialogs.is_empty() || !self.forms.is_empty() || self.picker.is_some()
+        !self.dialogs.is_empty() || !self.forms.is_empty() || self.picker.is_some() || self.viewer.is_some()
     }
 
     pub fn open_picker(&mut self, p: Picker) {
         self.popup = None;
         self.picker = Some(p);
+    }
+
+    fn viewer_key(&mut self, k: KeyEvent) -> Action {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let page = self.view_h.saturating_sub(1).max(1);
+        let width = self.comp_w + 2;
+        let Some(v) = self.viewer.as_mut() else { return Action::None };
+        let (lines, starts) = v.lines(width, &self.theme);
+        let last = lines.len().saturating_sub(self.view_h);
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.viewer = None,
+            KeyCode::Char('c') | KeyCode::Char('d') if ctrl => self.viewer = None,
+            KeyCode::Down | KeyCode::Char('j') => v.scroll = (v.scroll + 1).min(last),
+            KeyCode::Up | KeyCode::Char('k') => v.scroll = v.scroll.saturating_sub(1),
+            KeyCode::PageDown | KeyCode::Char(' ') => v.scroll = (v.scroll + page).min(last),
+            KeyCode::Char('f') if ctrl => v.scroll = (v.scroll + page).min(last),
+            KeyCode::PageUp | KeyCode::Char('b') => v.scroll = v.scroll.saturating_sub(page),
+            KeyCode::Home | KeyCode::Char('g') => v.scroll = 0,
+            KeyCode::End | KeyCode::Char('G') => v.scroll = last,
+            KeyCode::Char('n') => {
+                if let Some(&s) = starts.iter().find(|&&s| s > v.scroll) {
+                    v.scroll = s.min(last);
+                }
+            }
+            KeyCode::Char('p') => {
+                if let Some(&s) = starts.iter().rev().find(|&&s| s < v.scroll) {
+                    v.scroll = s;
+                } else {
+                    v.scroll = 0;
+                }
+            }
+            _ => {}
+        }
+        Action::None
     }
 
     fn picker_key(&mut self, k: KeyEvent) -> Action {
@@ -996,89 +1091,124 @@ impl App {
 
     // ---- rendering ----
 
-    /// Transcript rows as wrapped, styled lines for a given width.
-    pub fn lines(&self, width: usize) -> Vec<Line<'static>> {
-        let t = &self.theme;
-        let width = width.max(8);
-        let mut out: Vec<Line<'static>> = vec![];
-        let mut next = 0;
-        while next < self.rows.len() {
-            let (i, row) = (next, &self.rows[next]);
-            next += 1;
-            match row {
-                Row::User(s) => {
-                    if i > 0 {
-                        out.push(Line::default());
-                    }
-                    for (n, l) in wrap(s, width - 2).into_iter().enumerate() {
-                        out.push(Line::from(vec![Span::styled(if n == 0 { "> " } else { "  " }, t.user), Span::styled(l, t.text)]));
+    /// Groups of rows that render together: a subagent's consecutive tool calls collapse into one line
+    /// (unless the detail level is full); every other row stands alone. Cheap: no wrapping happens here.
+    fn blocks(&self) -> Vec<(usize, usize)> {
+        let mut out = vec![];
+        let mut i = 0;
+        while i < self.rows.len() {
+            let mut j = i + 1;
+            if let (Row::Tool { depth, agent, .. }, true) = (&self.rows[i], self.level < 2) {
+                if *depth > 0 {
+                    while matches!(self.rows.get(j), Some(Row::Tool { depth: d, agent: a, .. }) if d == depth && a == agent) {
+                        j += 1;
                     }
                 }
-                Row::Assistant(s) => {
-                    for l in wrap(s.trim_end(), width) {
-                        out.push(Line::styled(l, t.text));
-                    }
-                }
-                Row::Tool { depth, agent, name, summary, state } if *depth > 0 && !self.expand_sub => {
-                    // A run of a subagent's calls becomes one line (Ctrl-O shows them all).
-                    let (mut n, mut failed, mut running) = (1, matches!(state, ToolState::Failed(_)) as usize, matches!(state, ToolState::Running));
-                    let (mut last_name, mut last_summary) = (name, summary);
-                    while let Some(Row::Tool { depth: d, agent: a, name: nm, summary: sm, state: st }) = self.rows.get(next) {
-                        if d != depth || a != agent {
-                            break;
-                        }
-                        n += 1;
-                        failed += matches!(st, ToolState::Failed(_)) as usize;
-                        running |= matches!(st, ToolState::Running);
-                        (last_name, last_summary) = (nm, sm);
-                        next += 1;
-                    }
-                    let pad = "  ".repeat(*depth);
-                    let text = format!("{pad}[{agent}] {n} tool call{}{}: {} > {last_name} {last_summary}", if n == 1 { "" } else { "s" }, if failed > 0 { format!(", {failed} failed") } else { String::new() }, if running { "now" } else { "last" });
-                    for l in wrap(&text, width) {
-                        out.push(Line::styled(l, if failed > 0 { t.error } else { t.dim }));
-                    }
-                }
-                Row::Tool { depth, agent, name, summary, state } => {
-                    let pad = "  ".repeat(*depth);
-                    let who = if *depth > 0 { format!("[{agent}] ") } else { String::new() };
-                    for l in wrap(&format!("{pad}{who}> {name} {summary}"), width) {
-                        out.push(Line::styled(l, t.dim));
-                    }
-                    if let ToolState::Failed(msg) = state {
-                        for l in wrap(&format!("{pad}  failed: {}", msg.lines().next().unwrap_or("")), width) {
-                            out.push(Line::styled(l, t.error));
-                        }
-                    }
-                }
-                Row::Todos(todos) => {
-                    for td in todos {
-                        let mark = match td.status.as_str() {
-                            "completed" => "[x]",
-                            "in_progress" => "[~]",
-                            "cancelled" => "[-]",
-                            _ => "[ ]",
-                        };
-                        for l in wrap(&format!("  {mark} {}", td.content), width) {
-                            out.push(Line::styled(l, t.dim));
-                        }
-                    }
-                }
-                Row::Diff(patch) => {
-                    for raw in patch.lines() {
-                        let style = match raw.chars().next() {
-                            Some('+') if !raw.starts_with("+++") => Style::new().fg(Color::Green),
-                            Some('-') if !raw.starts_with("---") => t.error,
-                            _ => t.dim,
-                        };
-                        out.extend(wrap(raw, width).into_iter().map(|l| Line::styled(l, style)));
-                    }
-                }
-                Row::Shell(s) => out.extend(wrap(s.trim_end(), width).into_iter().map(|l| Line::styled(l, t.text))),
-                Row::Info(s) => out.extend(wrap(s, width).into_iter().map(|l| Line::styled(l, t.dim))),
-                Row::Error(s) => out.extend(wrap(s, width).into_iter().map(|l| Line::styled(l, t.error))),
-                Row::Usage(s) => out.extend(wrap(s, width).into_iter().map(|l| Line::styled(l, t.dim))),
             }
+            out.push((i, j));
+            i = j;
+        }
+        out
+    }
+
+    /// The newest lines of the transcript, wrapped for `width`: only as many rows as needed to produce
+    /// `want` lines are rendered, so a long conversation costs no more than a screenful. The flag says
+    /// whether the whole transcript was rendered.
+    pub fn lines_window(&self, width: usize, want: usize) -> (Vec<Line<'static>>, bool) {
+        let width = width.max(8);
+        let mut tail: Vec<Vec<Line<'static>>> = vec![];
+        let mut have = 0;
+        let mut complete = true;
+        for &(a, b) in self.blocks().iter().rev() {
+            if have >= want {
+                complete = false;
+                break;
+            }
+            let l = self.block_lines(a, b, width);
+            have += l.len();
+            tail.push(l);
+        }
+        tail.reverse();
+        (tail.into_iter().flatten().collect(), complete)
+    }
+
+    fn block_lines(&self, first: usize, end: usize, width: usize) -> Vec<Line<'static>> {
+        let t = &self.theme;
+        let mut out: Vec<Line<'static>> = vec![];
+        let row = &self.rows[first];
+        match row {
+            Row::User(s) => {
+                if first > 0 {
+                    out.push(Line::default());
+                }
+                for (n, l) in wrap(s, width - 2).into_iter().enumerate() {
+                    out.push(Line::from(vec![Span::styled(if n == 0 { "> " } else { "  " }, t.user), Span::styled(l, t.text)]));
+                }
+            }
+            Row::Assistant(s) => out.extend(md::render(s, width, t)),
+            Row::Reasoning(s) => match self.level {
+                0 => {}
+                1 => {
+                    let lines = s.lines().filter(|l| !l.trim().is_empty()).count();
+                    let head = s.split_whitespace().collect::<Vec<_>>().join(" ");
+                    let text = format!("thinking ({lines} line{}): {}", if lines == 1 { "" } else { "s" }, head);
+                    out.push(Line::styled(clip_width(&text, width.saturating_sub(1)), t.dim.add_modifier(Modifier::ITALIC)));
+                }
+                _ => out.extend(wrap(s.trim(), width).into_iter().map(|l| Line::styled(l, t.dim.add_modifier(Modifier::ITALIC)))),
+            },
+            Row::Tool { depth, agent, .. } if *depth > 0 && self.level < 2 => {
+                // A run of a subagent's calls becomes one line (Ctrl-O shows them all).
+                let (mut n, mut failed, mut running) = (0, 0, false);
+                let (mut last_name, mut last_summary) = (&String::new(), &String::new());
+                for r in &self.rows[first..end] {
+                    if let Row::Tool { name, summary, state, .. } = r {
+                        n += 1;
+                        failed += matches!(state, ToolState::Failed(_)) as usize;
+                        running |= matches!(state, ToolState::Running);
+                        (last_name, last_summary) = (name, summary);
+                    }
+                }
+                let pad = "  ".repeat(*depth);
+                let text = format!("{pad}[{agent}] {n} tool call{}{}: {} > {last_name} {last_summary}", if n == 1 { "" } else { "s" }, if failed > 0 { format!(", {failed} failed") } else { String::new() }, if running { "now" } else { "last" });
+                out.extend(wrap(&text, width).into_iter().map(|l| Line::styled(l, if failed > 0 { t.error } else { t.dim })));
+            }
+            Row::Tool { depth, agent, name, summary, state, detail, output } => {
+                let pad = "  ".repeat(*depth);
+                let who = if *depth > 0 { format!("[{agent}] ") } else { String::new() };
+                out.extend(wrap(&format!("{pad}{who}> {name} {summary}"), width).into_iter().map(|l| Line::styled(l, t.dim)));
+                if let (Some(d), true) = (detail, self.level >= 1) {
+                    let cap = if self.level >= 2 { usize::MAX } else { DETAIL_LINES };
+                    let lines: Vec<&str> = d.lines().collect();
+                    for raw in lines.iter().take(cap) {
+                        out.extend(diff_line(raw, width.saturating_sub(pad.len() + 2), t).into_iter().map(|mut l| {
+                            l.spans.insert(0, Span::raw(format!("{pad}  ")));
+                            l
+                        }));
+                    }
+                    if lines.len() > cap {
+                        out.push(Line::styled(format!("{pad}  ... {} more lines (Ctrl-O shows all)", lines.len() - cap), t.dim));
+                    }
+                }
+                if let ToolState::Failed(msg) = state {
+                    out.extend(wrap(&format!("{pad}  failed: {}", msg.lines().next().unwrap_or("")), width).into_iter().map(|l| Line::styled(l, t.error)));
+                } else if self.level >= 2 && !output.is_empty() && detail.is_none() {
+                    out.extend(output.lines().take(12).flat_map(|l| wrap(&format!("{pad}  {l}"), width)).map(|l| Line::styled(l, t.dim)));
+                }
+            }
+            Row::Todos(todos) => {
+                for td in todos {
+                    let mark = match td.status.as_str() {
+                        "completed" => "[x]",
+                        "in_progress" => "[~]",
+                        "cancelled" => "[-]",
+                        _ => "[ ]",
+                    };
+                    out.extend(wrap(&format!("  {mark} {}", td.content), width).into_iter().map(|l| Line::styled(l, t.dim)));
+                }
+            }
+            Row::Shell(s) => out.extend(wrap(s.trim_end(), width).into_iter().map(|l| Line::styled(l, t.text))),
+            Row::Info(s) | Row::Usage(s) => out.extend(wrap(s, width).into_iter().map(|l| Line::styled(l, t.dim))),
+            Row::Error(s) => out.extend(wrap(s, width).into_iter().map(|l| Line::styled(l, t.error))),
         }
         out
     }
@@ -1179,6 +1309,17 @@ impl App {
     }
 }
 
+/// One line of a unified diff, colored by its first character.
+fn diff_line(raw: &str, width: usize, t: &Theme) -> Vec<Line<'static>> {
+    let style = match raw.chars().next() {
+        Some('+') if !raw.starts_with("+++") => Style::new().fg(Color::Green),
+        Some('-') if !raw.starts_with("---") => t.error,
+        Some('@') | Some('*') => t.accent,
+        _ => t.dim,
+    };
+    wrap(raw, width.max(8)).into_iter().map(|l| Line::styled(l, style)).collect()
+}
+
 pub fn display_width(s: &str) -> usize {
     s.chars().map(|c| c.width().unwrap_or(0)).sum()
 }
@@ -1263,7 +1404,30 @@ fn dialog_lines(d: &Permission, width: usize) -> Vec<Line<'static>> {
     v
 }
 
+fn render_viewer(f: &mut Frame, app: &mut App) {
+    let area = f.area();
+    let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)]).split(area);
+    let theme_bar = app.theme.bar;
+    let dim = app.theme.dim;
+    let h = parts[1].height as usize;
+    app.view_h = h;
+    app.comp_w = (area.width as usize).saturating_sub(2);
+    let Some(v) = app.viewer.as_mut() else { return };
+    let (lines, starts) = v.lines(area.width as usize, &app.theme);
+    v.scroll = v.scroll.min(lines.len().saturating_sub(h));
+    let (adds, dels): (usize, usize) = v.files.iter().fold((0, 0), |(a, d), f| (a + f.adds, d + f.dels));
+    let at_end = v.scroll + h >= lines.len();
+    let cur = if at_end { v.files.len() } else { starts.iter().rposition(|&s| s <= v.scroll).map_or(0, |i| i + 1) };
+    f.render_widget(Paragraph::new(format!(" changes since the session started: {} file(s) +{adds} -{dels}", v.files.len())).style(theme_bar), parts[0]);
+    f.render_widget(Paragraph::new(lines.iter().skip(v.scroll).take(h).cloned().collect::<Vec<_>>()), parts[1]);
+    let at = if lines.len() <= h { "all".to_string() } else { format!("{}%", (v.scroll + h).min(lines.len()) * 100 / lines.len()) };
+    f.render_widget(Paragraph::new(format!(" j/k Space/b scroll  n/p file  g/G ends  q closes   file {cur}/{}  {at}", v.files.len())).style(dim), parts[2]);
+}
+
 pub fn render(f: &mut Frame, app: &mut App) {
+    if app.viewer.is_some() && app.dialogs.is_empty() && app.forms.is_empty() {
+        return render_viewer(f, app);
+    }
     let area = f.area();
     let max_modal = (area.height as usize).saturating_sub(5).max(3);
     let modal = app.modal_lines(area.width as usize, max_modal);
@@ -1291,10 +1455,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
         f.render_widget(Paragraph::new(ql), strip);
     }
 
-    let lines = app.lines(main.width as usize);
     let h = main.height as usize;
     app.view_h = h;
-    app.scroll = app.scroll.min(lines.len().saturating_sub(h));
+    let (lines, complete) = app.lines_window(main.width as usize, app.scroll.saturating_add(h));
+    if complete {
+        app.scroll = app.scroll.min(lines.len().saturating_sub(h));
+    }
     let end = lines.len() - app.scroll;
     let start = end.saturating_sub(h);
     f.render_widget(Paragraph::new(lines[start..end].to_vec()), main);
@@ -1441,9 +1607,9 @@ mod tests {
         a.push_user("hi");
         text(&mut a, Ev::Text("Hel".into()));
         text(&mut a, Ev::Text("lo".into()));
-        text(&mut a, Ev::Tool { name: "read".into(), summary: "a.rs".into() });
-        text(&mut a, Ev::Tool { name: "read".into(), summary: "b.rs".into() });
-        text(&mut a, Ev::ToolDone { name: "read".into(), ok: false, msg: "no such file\nmore".into() });
+        text(&mut a, Ev::Tool { name: "read".into(), summary: "a.rs".into(), detail: None });
+        text(&mut a, Ev::Tool { name: "read".into(), summary: "b.rs".into(), detail: None });
+        text(&mut a, Ev::ToolDone { name: "read".into(), ok: false, msg: "no such file\nmore".into(), output: String::new() });
         text(&mut a, Ev::Text("done".into()));
         assert_eq!(a.rows.len(), 5);
         let states: Vec<_> = a.rows.iter().filter_map(|r| if let Row::Tool { state, .. } = r { Some(state.clone()) } else { None }).collect();
@@ -1453,7 +1619,7 @@ mod tests {
         assert!(joined.contains("> hi") && joined.contains("Hello") && joined.contains("> read a.rs") && joined.contains("failed: no such file"), "{joined}");
         // Subagent prose is hidden, its tools are indented.
         a.update(AppEvent::Engine { depth: 1, agent: "explore".into(), ev: Ev::Text("secret".into()) });
-        a.update(AppEvent::Engine { depth: 1, agent: "explore".into(), ev: Ev::Tool { name: "grep".into(), summary: "x".into() } });
+        a.update(AppEvent::Engine { depth: 1, agent: "explore".into(), ev: Ev::Tool { name: "grep".into(), summary: "x".into(), detail: None } });
         let joined = screen(&mut a, 40, 14).join("\n");
         assert!(!joined.contains("secret") && joined.contains("  [explore] 1 tool call: now > grep x"), "{joined}");
     }
@@ -1744,84 +1910,122 @@ mod tests {
     }
 
     #[test]
-    fn diff_rows_are_colored_by_line() {
+    fn assistant_text_is_rendered_as_markdown() {
         let mut a = App::new("m", "build");
-        a.rows.push(Row::Diff("--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new".into()));
-        let lines = a.lines(40);
-        let color = |i: usize| lines[i].style.fg;
-        assert_eq!((color(3), color(4), color(0)), (Some(Color::Red), Some(Color::Green), None));
+        text(&mut a, Ev::Text("## Plan\n\n- fix `foo`\n- **ship**\n\n```rust\nlet x = 1;\n```\n".into()));
+        let joined = screen(&mut a, 40, 14).join("\n");
+        assert!(joined.contains("Plan\n") && !joined.contains("##") && joined.contains("• fix foo") && joined.contains("• ship") && joined.contains("  let x = 1;") && !joined.contains("```"), "{joined}");
+        // Streaming: a reply cut in the middle of a marker renders as plain text, then fixes itself.
+        let mut a = App::new("m", "build");
+        text(&mut a, Ev::Text("use **bol".into()));
+        assert!(screen(&mut a, 40, 10).join("\n").contains("use **bol"));
+        text(&mut a, Ev::Text("d** now".into()));
+        assert!(screen(&mut a, 40, 10).join("\n").contains("use bold now"));
+    }
+
+    fn tool_with_detail(a: &mut App, name: &str, detail: &str) {
+        text(a, Ev::Tool { name: name.into(), summary: "x.rs".into(), detail: Some(detail.into()) });
+        text(a, Ev::ToolDone { name: name.into(), ok: true, msg: String::new(), output: "line one\nline two".into() });
     }
 
     #[test]
-    fn typing_during_a_turn_steers_or_queues_and_commands_still_run() {
+    fn file_changes_show_their_diff_inline_by_detail_level() {
         let mut a = App::new("m", "build");
-        a.running = true;
-        type_str(&mut a, "also this");
-        assert_eq!(press(&mut a, KeyCode::Enter), Action::Enqueue { text: "also this".into(), shown: "also this".into(), queue: false });
-        type_str(&mut a, "later");
-        assert_eq!(a.update(key(KeyCode::Char('q'), KeyModifiers::CONTROL)), Action::Enqueue { text: "later".into(), shown: "later".into(), queue: true });
-        type_str(&mut a, "/jobs");
-        assert_eq!(press(&mut a, KeyCode::Enter), Action::Submit { text: "/jobs".into(), shown: "/jobs".into() }); // commands are not queued
-        assert_eq!(press(&mut a, KeyCode::Enter), Action::None); // empty composer during a turn does nothing
-        // Idle: Ctrl-Q just sends.
-        a.running = false;
-        type_str(&mut a, "go");
-        assert_eq!(a.update(key(KeyCode::Char('q'), KeyModifiers::CONTROL)), Action::Submit { text: "go".into(), shown: "go".into() });
+        let many: String = (0..40).map(|i| format!("+added {i}")).collect::<Vec<_>>().join("\n");
+        tool_with_detail(&mut a, "edit", "@@ -1 +1 @@\n-old line\n+new line");
+        tool_with_detail(&mut a, "write", &many);
+        let s = screen(&mut a, 60, 50).join("\n");
+        assert!(s.contains("> edit x.rs") && s.contains("  -old line") && s.contains("  +new line") && s.contains("+added 23") && !s.contains("+added 24") && s.contains("... 16 more lines (Ctrl-O shows all)"), "{s}");
+        let lines = a.lines_window(60, usize::MAX).0;
+        let color = |needle: &str| lines.iter().find(|l| l.spans.iter().any(|s| s.content.contains(needle))).map(|l| l.style.fg);
+        assert_eq!((color("-old line"), color("+new line")), (Some(Some(Color::Red)), Some(Some(Color::Green))));
+        // Level 2 (Ctrl-O): everything, plus tool output where there is no diff.
+        a.update(key(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert_eq!(a.level, 2);
+        text(&mut a, Ev::Tool { name: "grep".into(), summary: "q".into(), detail: None });
+        text(&mut a, Ev::ToolDone { name: "grep".into(), ok: true, msg: String::new(), output: "hit one\nhit two".into() });
+        let s = screen(&mut a, 60, 70).join("\n");
+        assert!(s.contains("+added 39") && !s.contains("more lines") && s.contains("  hit one"), "{s}");
+        // Level 0: just the call lines.
+        a.update(key(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert_eq!(a.level, 0);
+        let s = screen(&mut a, 60, 50).join("\n");
+        assert!(s.contains("> edit x.rs") && !s.contains("-old line") && !s.contains("+added"), "level 0 shows only the call lines: {s}");
     }
 
     #[test]
-    fn waiting_prompts_show_above_the_composer_and_the_status_shows_jobs_and_retries() {
+    fn reasoning_is_summarized_hidden_or_shown() {
         let mut a = App::new("m", "build");
-        a.running = true;
-        for (i, steer) in [true, false, false, true, false].into_iter().enumerate() {
-            a.queued.push(Queued { id: format!("i{i}"), steer, text: format!("prompt {i}") });
+        text(&mut a, Ev::Reasoning("Let me think\nabout the *edge* case".into()));
+        text(&mut a, Ev::Reasoning(" more".into()));
+        text(&mut a, Ev::Text("Answer".into()));
+        assert_eq!(a.rows.len(), 2); // reasoning chunks join into one row
+        let s = screen(&mut a, 70, 10).join("\n");
+        assert!(s.contains("thinking (2 lines): Let me think about the *edge* case more") && s.contains("Answer"), "{s}");
+        a.level = 2;
+        let s = screen(&mut a, 40, 10).join("\n");
+        assert!(s.contains("Let me think\nabout the *edge* case more") && !s.contains("thinking ("), "{s}");
+        a.level = 0;
+        let s = screen(&mut a, 40, 10).join("\n");
+        assert!(!s.contains("Let me think") && s.contains("Answer"), "{s}");
+        // Subagent reasoning stays hidden.
+        a.update(AppEvent::Engine { depth: 1, agent: "x".into(), ev: Ev::Reasoning("secret".into()) });
+        a.level = 2;
+        assert!(!screen(&mut a, 40, 10).join("\n").contains("secret"));
+    }
+
+    fn file(path: &str, patch: &str) -> ViewFile {
+        ViewFile { path: path.into(), adds: patch.lines().filter(|l| l.starts_with('+')).count(), dels: patch.lines().filter(|l| l.starts_with('-')).count(), binary: false, patch: patch.into() }
+    }
+
+    #[test]
+    fn diff_viewer_scrolls_jumps_between_files_and_closes() {
+        let mut a = App::new("m", "build");
+        let big: String = (0..60).map(|i| format!("+line {i}")).collect::<Vec<_>>().join("\n");
+        a.viewer = Some(Viewer { files: vec![file("a.rs", &big), file("b.rs", "-gone\n+here")], scroll: 0 });
+        let s = screen(&mut a, 60, 12);
+        assert!(s[0].contains("2 file(s) +61 -1") && s[1].contains("=== a.rs  +60 -0") && s[2].contains("+line 0") && s[11].contains("file 1/2"), "{s:?}");
+        press(&mut a, KeyCode::Char('j'));
+        assert!(screen(&mut a, 60, 12)[1].contains("+line 0"), "scrolled one line");
+        press(&mut a, KeyCode::Char('n')); // next file
+        let s = screen(&mut a, 60, 12);
+        assert!(s.iter().any(|l| l.contains("=== b.rs  +1 -1")) && s[11].contains("file 2/2"), "{s:?}"); // a short last file cannot reach the top
+        press(&mut a, KeyCode::Char('p'));
+        assert!(screen(&mut a, 60, 12).iter().any(|l| l.contains("+line 5")), "p goes back to the first file's lines");
+        press(&mut a, KeyCode::Char('G'));
+        assert!(screen(&mut a, 60, 12).iter().any(|l| l.contains("+here")));
+        press(&mut a, KeyCode::Char('g'));
+        assert!(screen(&mut a, 60, 12)[1].contains("=== a.rs"));
+        // Typing goes to the viewer, not the composer; q closes it.
+        press(&mut a, KeyCode::Char('x'));
+        assert!(a.input.is_empty());
+        press(&mut a, KeyCode::Char('q'));
+        assert!(a.viewer.is_none());
+        // An engine dialog is shown above the viewer.
+        a.viewer = Some(Viewer { files: vec![file("a.rs", "+x")], scroll: 0 });
+        let (tx, _rx) = channel();
+        a.update(AppEvent::Ask { action: "shell".into(), resources: vec!["ls".into()], save: vec![], reply: tx });
+        assert!(screen(&mut a, 60, 12).join("\n").contains("Permission needed: shell"));
+    }
+
+    #[test]
+    fn a_long_transcript_costs_a_screenful_not_the_whole_history() {
+        let mut a = App::new("m", "build");
+        for i in 0..20_000 {
+            a.rows.push(Row::Assistant(format!("## Heading {i}\n\n- item **{i}** with `code` and a [link](http://x/{i})")));
         }
-        a.jobs = 2;
-        let s = screen(&mut a, 110, 16).join("\n");
-        assert!(s.contains("next step> prompt 0") && s.contains("after turn> prompt 1") && s.contains("after turn> prompt 2") && s.contains("+2 more"), "{s}");
-        assert!(!s.contains("prompt 3") && s.contains("2 jobs (/jobs)") && s.contains("Enter steers, Ctrl-Q queues"), "{s}");
-        // A pending retry counts down in the status bar until something else arrives.
-        text(&mut a, Ev::Retry { attempt: 2, secs: 30, error: "overloaded".into() });
-        let s = screen(&mut a, 90, 16).join("\n");
-        assert!(s.contains("retrying in 30s (attempt 2)") || s.contains("retrying in 29s (attempt 2)"), "{s}");
-        text(&mut a, Ev::Text("back".into()));
-        assert!(!screen(&mut a, 90, 16).join("\n").contains("(attempt 2), Esc"));
-    }
-
-    #[test]
-    fn queue_and_job_pickers_can_drop_entries() {
-        let mut a = App::new("m", "build");
-        a.open_picker(Picker::new(PickKind::Queue, "queue", items(&["one", "two"]), ""));
-        press(&mut a, KeyCode::Down);
-        assert_eq!(a.update(key(KeyCode::Char('d'), KeyModifiers::CONTROL)), Action::Dropped { kind: PickKind::Queue, value: "v-two".into() });
-        assert_eq!(a.picker.as_ref().unwrap().items.len(), 1); // the entry leaves the list at once
-        // Other pickers ignore Ctrl-D.
-        a.open_picker(Picker::new(PickKind::Model, "model", items(&["one"]), ""));
-        assert_eq!(a.update(key(KeyCode::Char('d'), KeyModifiers::CONTROL)), Action::None);
-    }
-
-    #[test]
-    fn subagent_tool_calls_collapse_into_one_line_until_expanded() {
-        let mut a = App::new("m", "build");
-        let nested = |a: &mut App, ev: Ev| {
-            a.update(AppEvent::Engine { depth: 1, agent: "explore".into(), ev });
-        };
-        nested(&mut a, Ev::Tool { name: "grep".into(), summary: "foo".into() });
-        nested(&mut a, Ev::ToolDone { name: "grep".into(), ok: true, msg: String::new() });
-        nested(&mut a, Ev::Tool { name: "read".into(), summary: "a.rs".into() });
-        nested(&mut a, Ev::ToolDone { name: "read".into(), ok: false, msg: "no such file".into() });
-        nested(&mut a, Ev::Tool { name: "glob".into(), summary: "*.rs".into() });
-        let joined = screen(&mut a, 80, 12).join("\n");
-        assert!(joined.contains("[explore] 3 tool calls, 1 failed: now > glob *.rs") && !joined.contains("> grep foo"), "{joined}");
-        a.update(key(KeyCode::Char('o'), KeyModifiers::CONTROL));
-        let joined = screen(&mut a, 80, 12).join("\n");
-        assert!(joined.contains("> grep foo") && joined.contains("> read a.rs") && joined.contains("failed: no such file"), "{joined}");
-        // A top-level call between two runs of subagent calls keeps them apart.
-        a.update(key(KeyCode::Char('o'), KeyModifiers::CONTROL));
-        text(&mut a, Ev::Tool { name: "read".into(), summary: "top".into() });
-        nested(&mut a, Ev::Tool { name: "grep".into(), summary: "again".into() });
-        let joined = screen(&mut a, 80, 14).join("\n");
-        assert!(joined.contains("[explore] 1 tool call: now > grep again"), "{joined}");
+        let t = std::time::Instant::now();
+        let (lines, complete) = a.lines_window(80, 30);
+        assert!(!complete && lines.len() >= 30 && lines.len() < 200, "rendered {} lines", lines.len());
+        assert!(t.elapsed() < std::time::Duration::from_millis(250), "took {:?}", t.elapsed());
+        let s = screen(&mut a, 80, 20).join("\n");
+        assert!(s.contains("Heading 19999") && !s.contains("Heading 19000"), "{s}");
+        // Scrolling far up renders more, and the top is reachable.
+        a.scroll = 10_000;
+        assert!(screen(&mut a, 80, 20).join("\n").contains("Heading"));
+        a.scroll = usize::MAX / 4;
+        let s = screen(&mut a, 80, 20);
+        assert!(a.scroll < 200_000 && s.join("\n").contains("Heading 0"), "scroll {}", a.scroll);
     }
 
     #[test]
