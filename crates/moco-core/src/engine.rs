@@ -2405,7 +2405,7 @@ mod tests {
             config: config::McpServerConfig { command: vec!["python3".into(), concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_mcp.py").into()], ..Default::default() },
             cwd: dir.to_path_buf(),
         };
-        let m = crate::mcp::Manager::start(vec![spec], &config::McpTimeouts::default());
+        let m = crate::mcp::Manager::start(vec![spec], &config::McpTimeouts::default(), &std::env::temp_dir());
         assert!(m.wait_ready(Duration::from_secs(20)));
         Some(m)
     }
@@ -2592,13 +2592,17 @@ mod tests {
         assert_eq!(f.run(&ui), RunOutcome::Idle);
         let started = result_text(&f.fake.requests.lock().unwrap()[1]);
         assert!(started.starts_with("Subagent started in the background (sessionID: ses_"), "{started}");
-        wait_until("the subagent", || f.engine.store().pending_inbox(&f.session.id).unwrap() > 0);
+        // The report reaches the parent either inside the turn that started the subagent (if it finishes quickly, which
+        // a scripted one does) or with the next run; both are right, so wait for the job and run again only if needed.
+        wait_until("the subagent to finish", || f.engine.running_jobs() == 0);
         assert!(ui.asked.lock().unwrap().is_empty(), "nobody was asked: the subagent had no one to ask");
         // It was refused with a reason the model could act on.
         let routed = f.fake.routed_requests.lock().unwrap().clone();
         let refusal = result_text(&routed[1]);
         assert!(refusal.contains("nobody is present to give it"), "{refusal}");
-        f.run(&TestUi::default());
+        if f.engine.store().pending_inbox(&f.session.id).unwrap() > 0 {
+            f.run(&TestUi::default());
+        }
         let t = all_text(&f.fake.requests.lock().unwrap()[2]);
         assert!(t.contains("Background subagent finished (sessionID: ses_") && t.contains("task: background task") && t.contains("finished, but could not run the command"), "{t}");
         assert_eq!(f.engine.background_jobs(None)[0].status, "finished");

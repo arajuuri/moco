@@ -59,7 +59,7 @@ Status: complete. 197 unit tests pass on Linux and on the Mojave machine; the re
 
 ## Phase 3: extensibility
 - Skills, custom commands, `@` mentions [done, see `08` implementation notes] and attachments (images/PDF) [done, see `04` implementation notes].
-- MCP stdio [done, see `08` implementation notes], then Streamable HTTP + OAuth.
+- MCP stdio [done], Streamable HTTP + OAuth [done, experimental; see `08` implementation notes].
 - Background shell [done, with background subagents and `!command`; see `04` and `03` implementation notes], formatter hooks [done, see `08` implementation notes], OpenAI Responses and Gemini protocols [done but experimental: verified only against local test servers, see `07` implementation notes].
 - Notifications, themes, keybinding config.
 

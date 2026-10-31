@@ -16,6 +16,8 @@ pub const OFFERED: &str = "2025-06-18";
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RpcError {
+    /// The server wants credentials (HTTP 401); carries its `WWW-Authenticate` challenge.
+    Unauthorized(String),
     Timeout,
     Cancelled,
     /// The server process ended or its pipe broke; carries the tail of its stderr for diagnosis.
@@ -26,6 +28,7 @@ pub enum RpcError {
 impl std::fmt::Display for RpcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            RpcError::Unauthorized(_) => write!(f, "authorization required"),
             RpcError::Timeout => write!(f, "timed out"),
             RpcError::Cancelled => write!(f, "cancelled"),
             RpcError::Closed(m) if m.is_empty() => write!(f, "the server exited"),
@@ -37,6 +40,45 @@ impl std::fmt::Display for RpcError {
 
 type Pending = Arc<Mutex<HashMap<u64, Sender<Result<Value, RpcError>>>>>;
 pub type NotifyFn = Arc<dyn Fn(&str, &Value) + Send + Sync>;
+
+/// A connection to one MCP server, whatever it runs over (a child process's stdio, or HTTP).
+pub trait McpConn: Send + Sync {
+    /// Send a request and wait for its answer, up to `timeout`; abandoned (and the server told) when `cancel` is set.
+    fn request(&self, method: &str, params: Value, timeout: Duration, cancel: Option<&AtomicBool>) -> Result<Value, RpcError>;
+    fn notify(&self, method: &str, params: Value);
+    fn is_alive(&self) -> bool;
+    /// The tail of the server's stderr (stdio only), for explaining failures.
+    fn stderr_tail(&self) -> String;
+    /// The server's `initialize` answer.
+    fn info(&self) -> Value;
+    fn shutdown(&self);
+}
+
+impl McpConn for Client {
+    fn request(&self, method: &str, params: Value, timeout: Duration, cancel: Option<&AtomicBool>) -> Result<Value, RpcError> {
+        Client::request(self, method, params, timeout, cancel)
+    }
+    fn notify(&self, method: &str, params: Value) {
+        Client::notify(self, method, params)
+    }
+    fn is_alive(&self) -> bool {
+        Client::is_alive(self)
+    }
+    fn stderr_tail(&self) -> String {
+        Client::stderr_tail(self)
+    }
+    fn info(&self) -> Value {
+        self.info.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+    fn shutdown(&self) {
+        Client::shutdown(self)
+    }
+}
+
+/// Is `version` a protocol revision this client speaks?
+pub fn supported(version: &str) -> bool {
+    SUPPORTED.contains(&version)
+}
 
 struct Inner {
     stdin: Mutex<Option<ChildStdin>>,
@@ -221,7 +263,7 @@ impl Client {
                 other => format!("initialize failed: {other}"),
             })?;
         let version = res["protocolVersion"].as_str().unwrap_or("");
-        if !SUPPORTED.contains(&version) {
+        if !supported(version) {
             return Err(format!("the server speaks protocol revision '{version}', which this client does not support (supported: {})", SUPPORTED.join(", ")));
         }
         self.notify("notifications/initialized", json!({}));

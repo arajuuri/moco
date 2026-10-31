@@ -43,6 +43,7 @@ Check a Mojave build with `otool -l moco | grep minos` (must say 10.14). On Linu
 | `/rename <title>`, `/fork [N]`, `/archive [n\|id]`, `/unarchive <n\|id>` | Manage sessions; `/fork N` branches off before your Nth most recent prompt |
 | `/skills`, `/commands` | List the skills and custom slash commands that were found (MCP prompts included) |
 | `/mcp`, `/mcp reconnect <name>` | Show the MCP servers and their state, or restart one |
+| `/mcp auth <name>`, `/mcp logout <name>` | Sign in to a remote MCP server (OAuth), or forget its stored sign-in |
 | `/jobs`, `/jobs output <id>`, `/jobs kill <id>` | Background commands and subagents: list, read output so far, stop |
 | `!<command>` | Run a shell command yourself, right now; the assistant is told what you ran |
 | (empty line) | Let the assistant react to a background result that arrived while you were idle |
@@ -78,7 +79,9 @@ MCP servers add tools (and prompts and resources) from other programs. Declare t
 ```
 - Their tools are named `<server>_<tool>` and are checked like any other tool: add a rule such as `{ "action": "files_*", "resource": "*", "effect": "ask" }` to be asked first. Prompts are slash commands `/<server>:<prompt> args`; resources can be mentioned with `@server:name`.
 - **Servers declared in a project's own config file ask for your approval** before starting (a terminal is required; "always" is remembered for that project and that exact definition; `MOCO_TRUST_PROJECT_CONFIG=1` approves them without asking). Servers in your user config (`~/Library/Application Support/moco/config/`) start without asking.
-- `/mcp` shows what is running; a server that fails to start prints its reason and stderr at startup. Remote (HTTP) servers are not supported yet.
+- `/mcp` shows what is running; a server that fails to start prints its reason and stderr at startup.
+- **Remote servers** (MCP Streamable HTTP): `"docs": { "url": "https://example.com/mcp", "headers": { "Authorization": "Bearer {env:TOKEN}" } }`. A server that answers 401 shows `needs authorization`; run `/mcp auth <name>` to sign in. moco prints an address to open in a browser (and tries `open`/`xdg-open`) and listens on a loopback port for the redirect. Over SSH, open the address on your own machine and paste the address the browser ended up on at the prompt. Tokens are stored in `mcp-auth.json` in the app directory (mode 600, never in the Keychain) and refreshed automatically; `/mcp logout <name>` removes them. `"oauth": { "client_id", "client_secret", "scope", "callback_port", "redirect_uri", "auth_server_metadata_url" }` pre-configures a client, `"oauth": false` disables sign-in.
+- Remote HTTP and OAuth support is experimental: it has been verified against local fake servers and a live model on Mojave, not against real hosted MCP services.
 
 ## Formatters
 

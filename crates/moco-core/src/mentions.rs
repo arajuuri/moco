@@ -348,7 +348,7 @@ mod tests {
             config: crate::config::McpServerConfig { command: vec!["python3".into(), concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_mcp.py").into()], ..Default::default() },
             cwd: work.clone(),
         };
-        let m = crate::mcp::Manager::start(vec![spec], &Default::default());
+        let m = crate::mcp::Manager::start(vec![spec], &Default::default(), &std::env::temp_dir());
         assert!(m.wait_ready(std::time::Duration::from_secs(20)));
         let ctx = Ctx { mcp: Some(&m), ..fx.ctx(&work, &[], MediaCaps::default()) };
         let (v, notes) = expand("what is in @fake:notes and again @file:///notes.txt, ignoring @fake:missing", &ctx);

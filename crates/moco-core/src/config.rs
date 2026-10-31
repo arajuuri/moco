@@ -81,6 +81,41 @@ pub enum FormatterSetting {
     Formatters(BTreeMap<String, FormatterConfig>),
 }
 
+/// `mcp.servers.<name>.oauth` for a remote server: how to sign in. All fields are optional; a server that supports
+/// dynamic client registration needs none of them.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct OAuthConfig {
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub scope: Option<String>,
+    /// Port of the local callback listener (default: any free port).
+    pub callback_port: Option<u16>,
+    /// Redirect URI to register and use instead of `http://127.0.0.1:<port>/callback`.
+    pub redirect_uri: Option<String>,
+    /// Where to fetch the authorization server metadata, when it cannot be discovered.
+    pub auth_server_metadata_url: Option<String>,
+}
+
+/// `oauth` is `false` (never try OAuth for this server) or an object.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum OAuthSetting {
+    Flag(bool),
+    Config(OAuthConfig),
+}
+
+impl OAuthSetting {
+    /// `None` when OAuth is switched off.
+    pub fn resolve(setting: &Option<OAuthSetting>) -> Option<OAuthConfig> {
+        match setting {
+            Some(OAuthSetting::Flag(false)) => None,
+            Some(OAuthSetting::Config(c)) => Some(c.clone()),
+            _ => Some(OAuthConfig::default()),
+        }
+    }
+}
+
 /// `mcp.servers.<name>`: a Model Context Protocol server. `local` servers are child processes speaking over stdio.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default)]
@@ -97,7 +132,7 @@ pub struct McpServerConfig {
     pub timeout: Option<u64>,
     pub url: Option<String>,
     pub headers: BTreeMap<String, String>,
-    pub oauth: Option<Value>,
+    pub oauth: Option<OAuthSetting>,
 }
 
 impl McpServerConfig {
@@ -508,6 +543,20 @@ mod tests {
         assert_eq!(merged["formatter"]["b"]["command"], json!(["b2"]));
         assert_eq!(merged["formatter"]["a"]["command"], json!(["a"]));
         assert_eq!(merge(json!({"formatter": {"a": {}}}), json!({"formatter": false}), "")["formatter"], json!(false));
+    }
+
+    #[test]
+    fn mcp_remote_server_settings() {
+        let cfg: Config = serde_json::from_value(json!({"mcp": {"servers": {
+            "plain": {"url": "https://x/mcp"},
+            "token": {"type": "remote", "url": "https://x/mcp", "headers": {"Authorization": "Bearer t"}, "oauth": false},
+            "oauth": {"url": "https://y/mcp", "oauth": {"client_id": "cid", "scope": "read", "callback_port": 8123}}}}})).unwrap();
+        let s = &cfg.mcp.servers;
+        assert!(s["plain"].is_remote() && s["token"].is_remote() && s["oauth"].is_remote());
+        assert_eq!(OAuthSetting::resolve(&s["plain"].oauth), Some(OAuthConfig::default()), "OAuth is tried unless switched off");
+        assert_eq!(OAuthSetting::resolve(&s["token"].oauth), None);
+        let o = OAuthSetting::resolve(&s["oauth"].oauth).unwrap();
+        assert_eq!((o.client_id.as_deref(), o.scope.as_deref(), o.callback_port), (Some("cid"), Some("read"), Some(8123)));
     }
 
     #[test]

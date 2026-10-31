@@ -1,7 +1,9 @@
 //! Runs the configured MCP servers and exposes what they offer: tools (as `Tool`s named `<server>_<tool>`), prompts
 //! (as slash commands) and resources (an `mcp-resource` tool and `@` mentions).
-use super::client::{Client, NotifyFn, RpcError};
-use crate::config::{McpServerConfig, McpTimeouts};
+use super::client::{Client, McpConn, NotifyFn, RpcError};
+use super::http::{ConnectError, HttpClient, HttpOptions};
+use super::oauth;
+use crate::config::{McpServerConfig, McpTimeouts, OAuthSetting};
 use crate::tools::{MediaCaps, Tool, ToolCtx, ToolError, ToolOutput};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -78,7 +80,7 @@ struct Catalog {
 struct Server {
     spec: ServerSpec,
     status: Status,
-    client: Option<Arc<Client>>,
+    client: Option<Arc<dyn McpConn>>,
     catalog: Catalog,
 }
 
@@ -92,6 +94,8 @@ struct Timeouts {
 pub struct Manager {
     servers: Mutex<Vec<Server>>,
     timeouts: Timeouts,
+    /// Where OAuth tokens for remote servers are kept.
+    app_dir: PathBuf,
     me: Mutex<Weak<Manager>>,
 }
 
@@ -112,7 +116,7 @@ pub fn tool_name(server: &str, tool: &str) -> String {
 
 impl Manager {
     /// Start every server in the background and return at once; use `wait_ready` to wait for them.
-    pub fn start(specs: Vec<ServerSpec>, timeouts: &McpTimeouts) -> Arc<Manager> {
+    pub fn start(specs: Vec<ServerSpec>, timeouts: &McpTimeouts, app_dir: &std::path::Path) -> Arc<Manager> {
         let t = Timeouts {
             startup: Duration::from_millis(timeouts.startup.unwrap_or(30_000)),
             catalog: Duration::from_millis(timeouts.catalog.unwrap_or(30_000)),
@@ -125,7 +129,7 @@ impl Manager {
                 Server { spec, status, client: None, catalog: Catalog::default() }
             })
             .collect();
-        let m = Arc::new(Manager { servers: Mutex::new(servers), timeouts: t, me: Mutex::new(Weak::new()) });
+        let m = Arc::new(Manager { servers: Mutex::new(servers), timeouts: t, app_dir: app_dir.to_path_buf(), me: Mutex::new(Weak::new()) });
         *m.me.lock().unwrap() = Arc::downgrade(&m);
         let names: Vec<String> = m.servers.lock().unwrap().iter().filter(|s| s.status == Status::Pending).map(|s| s.spec.name.clone()).collect();
         for name in names {
@@ -151,17 +155,6 @@ impl Manager {
 
     fn connect(self: &Arc<Self>, name: &str) {
         let Some(spec) = self.lock().iter().find(|s| s.spec.name == name).map(|s| s.spec.clone()) else { return };
-        if spec.config.is_remote() {
-            self.set_status(name, Status::Failed("remote MCP servers are not supported yet".into()));
-            return;
-        }
-        let cwd = match &spec.config.cwd {
-            Some(c) => {
-                let p = PathBuf::from(c);
-                if p.is_absolute() { p } else { spec.cwd.join(p) }
-            }
-            None => spec.cwd.clone(),
-        };
         let weak = Arc::downgrade(self);
         let server = name.to_string();
         let notify: NotifyFn = Arc::new(move |method, _| {
@@ -174,15 +167,33 @@ impl Manager {
             }
         });
         let started = Instant::now();
-        let client = match Client::spawn(&spec.config.command, &cwd, &spec.config.environment, notify) {
-            Ok(c) => c,
-            Err(e) => return self.set_status(name, Status::Failed(e)),
+        let client: Arc<dyn McpConn> = if spec.config.is_remote() {
+            let Some(url) = spec.config.url.clone() else { return self.set_status(name, Status::Failed("a remote server needs a `url`".into())) };
+            let opts = HttpOptions { url, headers: spec.config.headers.clone(), oauth: OAuthSetting::resolve(&spec.config.oauth).is_some(), app_dir: self.app_dir.clone(), notify };
+            match HttpClient::connect(opts, self.timeouts.startup) {
+                Ok(c) => c,
+                Err(ConnectError::NeedsAuth(m)) => return self.set_status(name, Status::NeedsAuth(m.replace("<name>", name))),
+                Err(ConnectError::Failed(m)) => return self.set_status(name, Status::Failed(m)),
+            }
+        } else {
+            let cwd = match &spec.config.cwd {
+                Some(c) => {
+                    let p = PathBuf::from(c);
+                    if p.is_absolute() { p } else { spec.cwd.join(p) }
+                }
+                None => spec.cwd.clone(),
+            };
+            let client = match Client::spawn(&spec.config.command, &cwd, &spec.config.environment, notify) {
+                Ok(c) => c,
+                Err(e) => return self.set_status(name, Status::Failed(e)),
+            };
+            let left = self.timeouts.startup.saturating_sub(started.elapsed());
+            if let Err(e) = client.initialize(left.max(Duration::from_millis(200))) {
+                self.set_status(name, Status::Failed(e));
+                return; // dropping the client stops the process
+            }
+            client
         };
-        let left = self.timeouts.startup.saturating_sub(started.elapsed());
-        if let Err(e) = client.initialize(left.max(Duration::from_millis(200))) {
-            self.set_status(name, Status::Failed(e));
-            return; // dropping the client stops the process
-        }
         if let Some(s) = self.lock().iter_mut().find(|s| s.spec.name == name) {
             s.client = Some(client);
         }
@@ -197,6 +208,28 @@ impl Manager {
         }
     }
 
+    /// Sign in to a remote server with OAuth, then reconnect it. Blocks while the user completes the browser step.
+    pub fn authorize(self: &Arc<Self>, name: &str, io: &oauth::LoginIo) -> Result<(), String> {
+        let spec = self.lock().iter().find(|s| s.spec.name == name).map(|s| s.spec.clone()).ok_or_else(|| format!("no MCP server '{name}'"))?;
+        if !spec.config.is_remote() {
+            return Err(format!("'{name}' is a local server; only remote servers sign in"));
+        }
+        let cfg = OAuthSetting::resolve(&spec.config.oauth).ok_or_else(|| format!("OAuth is switched off for '{name}' (`oauth: false`); use `headers` for a static token"))?;
+        let url = spec.config.url.clone().ok_or("the server has no url")?;
+        oauth::login(&self.app_dir, &url, &spec.config.headers, &cfg, Duration::from_secs(300), io)?;
+        self.reconnect(name);
+        self.wait_ready(self.timeouts.startup + Duration::from_secs(2));
+        Ok(())
+    }
+
+    /// Forget the stored tokens of a remote server and disconnect it.
+    pub fn logout(self: &Arc<Self>, name: &str) -> Result<bool, String> {
+        let url = self.lock().iter().find(|s| s.spec.name == name).and_then(|s| s.spec.config.url.clone()).ok_or_else(|| format!("no remote MCP server '{name}'"))?;
+        let removed = oauth::remove(&self.app_dir, &url);
+        self.reconnect(name);
+        Ok(removed)
+    }
+
     /// Re-read one server's tools, prompts and resources (after it announced a change).
     pub fn refresh(&self, name: &str) {
         if let Ok(c) = self.read_catalog(name) {
@@ -206,14 +239,14 @@ impl Manager {
         }
     }
 
-    fn client_of(&self, name: &str) -> Option<Arc<Client>> {
+    fn client_of(&self, name: &str) -> Option<Arc<dyn McpConn>> {
         self.lock().iter().find(|s| s.spec.name == name).and_then(|s| s.client.clone())
     }
 
     /// `tools/list`, `prompts/list` and `resources/list` for what the server declared support for, following pagination.
     fn read_catalog(&self, name: &str) -> Result<Catalog, String> {
         let client = self.client_of(name).ok_or("not connected")?;
-        let caps = client.info.lock().unwrap_or_else(|e| e.into_inner())["capabilities"].clone();
+        let caps = client.info()["capabilities"].clone();
         let list = |method: &str, key: &str| -> Result<Vec<Value>, String> {
             let (mut out, mut cursor) = (vec![], None::<String>);
             for _ in 0..50 {
@@ -513,7 +546,7 @@ struct McpTool {
     remote_name: String,
     description: String,
     schema: Value,
-    client: Arc<Client>,
+    client: Arc<dyn McpConn>,
     timeout: Duration,
 }
 
@@ -576,6 +609,7 @@ impl Tool for McpTool {
             Ok(res) => map_call_result(&res, ctx.media),
             Err(RpcError::Cancelled) => Err(ToolError::Interrupted),
             Err(RpcError::Timeout) => Err(ToolError::fail(format!("MCP tool {} did not answer within {}", self.full_name, fmt_dur(self.timeout)))),
+            Err(RpcError::Unauthorized(_)) => Err(ToolError::fail(format!("The MCP server '{}' needs you to sign in again. The user can do that with /mcp auth {}.", self.server, self.server))),
             Err(RpcError::Closed(m)) => Err(ToolError::fail(format!("The MCP server '{}' stopped{}. The user can restart it with /mcp reconnect {}.", self.server, if m.is_empty() { String::new() } else { format!(" ({m})") }, self.server))),
             Err(RpcError::Server { message, .. }) => Err(ToolError::fail(message)),
         }
@@ -653,7 +687,7 @@ mod tests {
     }
 
     fn start(specs: Vec<ServerSpec>, timeouts: McpTimeouts) -> Arc<Manager> {
-        let m = Manager::start(specs, &timeouts);
+        let m = Manager::start(specs, &timeouts, &std::env::temp_dir());
         assert!(m.wait_ready(Duration::from_secs(20)), "servers did not settle: {:?}", m.status().iter().map(|s| describe(s)).collect::<Vec<_>>());
         m
     }
@@ -730,14 +764,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let broken = ServerSpec { name: "broken".into(), config: McpServerConfig { command: vec!["/no/such/program".into()], ..Default::default() }, cwd: dir.clone() };
         let off = ServerSpec { name: "off".into(), config: McpServerConfig { command: vec!["x".into()], disabled: true, ..Default::default() }, cwd: dir.clone() };
-        let remote = ServerSpec { name: "cloud".into(), config: McpServerConfig { kind: Some("remote".into()), url: Some("https://example.com/mcp".into()), ..Default::default() }, cwd: dir.clone() };
+        let remote = ServerSpec { name: "cloud".into(), config: McpServerConfig { kind: Some("remote".into()), url: None, ..Default::default() }, cwd: dir.clone() };
         let m = start(vec![spec("fake", &[("MCP_TEST_VAR", "hello")], &dir), broken, off, remote], McpTimeouts::default());
 
         let status: Vec<(String, String)> = m.status().iter().map(|s| (s.name.clone(), describe(s))).collect();
         assert_eq!(status[0], ("fake".into(), "connected: 9 tool(s), 1 prompt(s), 1 resource(s)".into()), "pagination found the 9th tool");
         assert!(status[1].1.starts_with("failed: cannot start '/no/such/program'"), "{status:?}");
         assert_eq!(status[2].1, "disabled");
-        assert_eq!(status[3].1, "failed: remote MCP servers are not supported yet");
+        assert_eq!(status[3].1, "failed: a remote server needs a `url`");
 
         let names: Vec<String> = m.tools().iter().map(|t| t.name().to_string()).collect();
         assert_eq!(names, ["fake_echo", "fake_fail", "fake_image", "fake_slow", "fake_add_tool", "fake_crash", "fake_structured", "fake_env", "fake_page_two_tool_", "mcp-resource"]);

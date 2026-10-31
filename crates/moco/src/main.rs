@@ -1,6 +1,6 @@
 //! moco: line-based terminal chat.
 use moco_core::catalog::{Catalog, ProviderInfo};
-use moco_core::mcp::{self, trust, Manager, ServerSpec};
+use moco_core::mcp::{self, oauth::LoginIo, trust, Manager, ServerSpec};
 use moco_core::tools::SubagentRequest;
 use moco_core::{commands, compaction, mentions, skills};
 use moco_core::engine::{CompactResult, DiffResult, Engine, UndoReport, UndoResult, EngineConfig, PermissionPrompt, Reply, RunOutcome, Ui, UiEvent};
@@ -636,7 +636,7 @@ fn main() {
     for w in &mcp_warnings {
         eprintln!("warning: {w}");
     }
-    let manager: Option<std::sync::Arc<Manager>> = (!mcp_specs.is_empty()).then(|| Manager::start(mcp_specs, &cfg.mcp.timeout));
+    let manager: Option<std::sync::Arc<Manager>> = (!mcp_specs.is_empty()).then(|| Manager::start(mcp_specs, &cfg.mcp.timeout, &app_dir));
     if let Some(m) = &manager {
         // Tools are fixed once a conversation starts, so wait for the servers instead of letting them appear mid-way.
         let wait = std::time::Duration::from_millis(cfg.mcp.timeout.startup.unwrap_or(30_000) + 2_000);
@@ -812,7 +812,31 @@ fn main() {
                     continue;
                 };
                 let arg = l.trim_start_matches("/mcp").trim();
-                if let Some(name) = arg.strip_prefix("reconnect") {
+                if let Some(name) = arg.strip_prefix("auth") {
+                    let name = name.trim();
+                    CANCEL.store(false, Ordering::Relaxed);
+                    let show = |url: &str| println!("\nSign in to '{name}' by opening this address in a browser:\n\n  {url}\n");
+                    let open = |url: &str| {
+                        let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+                        let _ = std::process::Command::new(opener).arg(url).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn();
+                    };
+                    let paste = || {
+                        let line = term.read_line("If your browser is on another machine, paste the address it ended up on here (it starts with http://127.0.0.1). Otherwise press Enter and finish in the browser: ")?;
+                        (!line.trim().is_empty()).then(|| line.trim().to_string())
+                    };
+                    let io = LoginIo { show: &show, open: &open, paste: &paste, cancel: &CANCEL };
+                    match m.authorize(name, &io) {
+                        Ok(()) => println!("{DIM}signed in to '{name}'{RESET}"),
+                        Err(e) => println!("{RED}sign-in failed: {e}{RESET}"),
+                    }
+                } else if let Some(name) = arg.strip_prefix("logout") {
+                    match m.logout(name.trim()) {
+                        Ok(true) => println!("{DIM}forgot the stored sign-in for '{}'{RESET}", name.trim()),
+                        Ok(false) => println!("{DIM}no stored sign-in for '{}'{RESET}", name.trim()),
+                        Err(e) => println!("{e}"),
+                    }
+                    m.wait_ready(std::time::Duration::from_secs(5));
+                } else if let Some(name) = arg.strip_prefix("reconnect") {
                     let name = name.trim();
                     if !m.reconnect(name) {
                         println!("no enabled MCP server '{name}'");
@@ -823,7 +847,7 @@ fn main() {
                 for i in m.status() {
                     println!("{DIM}  {:<14} {}   [{}]{RESET}", i.name, mcp::manager::describe(&i), clip(&i.command, 50));
                 }
-                println!("{DIM}  tools from MCP servers are named <server>_<tool>; /mcp reconnect <name> restarts one{RESET}");
+                println!("{DIM}  tools from MCP servers are named <server>_<tool>; /mcp reconnect <name> restarts one; /mcp auth <name> signs in to a remote one{RESET}");
             }
             "/commands" => {
                 if let Some(m) = &manager {
