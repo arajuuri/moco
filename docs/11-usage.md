@@ -41,15 +41,23 @@ Check a Mojave build with `otool -l moco | grep minos` (must say 10.14). On Linu
 | `/diff` | Changes in the working tree since the session started |
 | `/sessions [all\|archived]`, `/resume <n\|id>` | List and continue sessions (numbers refer to the last list) |
 | `/rename <title>`, `/fork [N]`, `/archive [n\|id]`, `/unarchive <n\|id>` | Manage sessions; `/fork N` branches off before your Nth most recent prompt |
+| `/skills`, `/commands` | List the skills and custom slash commands that were found |
+| `/<name> [args]` | Run a custom command (built in: `/init`, `/review`) |
 | `/new`, `/help`, `/exit` | |
 
 `Ctrl-C` interrupts a running turn (running commands are killed); `Ctrl-D` at the prompt quits.
 
 **Permission prompts** show the action and what it touches: `y` allow once, `a` allow always (saved for this project with a pattern such as `git push *`), `n` reject and stop, or type feedback to reject and tell the model why. By default everything is allowed except reading `.env` files; make `shell` or `edit` ask with a rule (below). The `question` tool shows a numbered form; Enter dismisses it.
 
+## Skills, commands and mentions
+
+- **Skills** are folders with a `SKILL.md` (frontmatter `name` and `description`, then instructions) in `.moco/skills/`, `.claude/skills/` or `.agents/skills/` of the project or any parent directory, or in `~/Library/Application Support/moco/config/skills/` and `~/.claude/skills/`. The model sees the list and loads a matching skill itself with the `skill` tool; you can also load one with `@skill-id`.
+- **Custom commands** are markdown files in `commands/` next to those folders (or `commands` in the config). The file name is the command, the body is the prompt; `$ARGUMENTS` is replaced by what you type after the name. Optional frontmatter: `description`, `agent`, `model` (for that prompt only) and `subagent: true` (run in a child session and report back).
+- **Mentions**: `@src/main.rs` attaches that file, `@docs/` a directory listing, `@release` a skill, `@explore` asks the model to delegate to that subagent. What was attached is shown as a dim note.
+
 ## Tools the model has
 
-`read`, `write`, `edit`, `patch`, `glob`, `grep`, `shell`, `webfetch`, `todowrite`, `question`, `subagent` (agents `general` and `explore`). Paths outside the project ask for an `external_directory` permission first. Long output is cut to 2000 lines or 50 KiB and the full text is saved under `data/tool-output/`.
+`read`, `write`, `edit`, `patch`, `glob`, `grep`, `shell`, `webfetch`, `todowrite`, `question`, `subagent` (agents `general` and `explore`), and `skill` when skills exist. Paths outside the project ask for an `external_directory` permission first. Long output is cut to 2000 lines or 50 KiB and the full text is saved under `data/tool-output/`.
 
 ## Configuration
 
@@ -71,7 +79,9 @@ Files named `moco.json` or `moco.jsonc` (comments and trailing commas allowed), 
   "providers": { "ollama": { "base_url": "http://localhost:11434/v1",
                  "models": { "qwen3-coder": { "limit": { "context": 32768, "output": 8192 } } } } },
   "compaction": { "auto": true, "buffer": "15%", "keep": 20000 },
-  "snapshots": true
+  "snapshots": true,
+  "skills": ["~/shared-skills"],                         // extra skill directories
+  "commands": { "ship": { "description": "Tag and push", "template": "Tag the release and push it. $ARGUMENTS", "agent": "build" } }
 }
 ```
 Actions are `read`, `edit` (write, edit and patch), `glob`, `grep`, `shell`, `webfetch`, `question`, `subagent`, `external_directory`. Details: `08-config-and-extensions.md`, `07-providers.md`.

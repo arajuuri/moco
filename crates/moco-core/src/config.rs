@@ -61,9 +61,24 @@ pub struct CompactionConfig {
     pub keep: Option<u64>,
 }
 
+/// `commands.<name>`: a prompt template reachable as `/name`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct CommandConfig {
+    pub template: String,
+    pub description: Option<String>,
+    pub agent: Option<String>,
+    pub model: Option<String>,
+    /// Run in a child session (a subagent) instead of the current conversation.
+    pub subagent: bool,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Extra skill locations: a directory of skills, or a single skill directory.
+    pub skills: Vec<String>,
+    pub commands: BTreeMap<String, CommandConfig>,
     pub compaction: CompactionConfig,
     /// `false` turns off the per-step working-tree snapshots (and with them `/undo` and `/diff`). Default on.
     pub snapshots: Option<bool>,

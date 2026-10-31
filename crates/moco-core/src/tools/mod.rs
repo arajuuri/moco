@@ -8,6 +8,7 @@ pub mod question;
 pub mod read;
 pub mod shell;
 pub mod shellparse;
+pub mod skill;
 pub mod subagent;
 pub mod todowrite;
 pub mod webfetch;
@@ -201,8 +202,8 @@ pub trait Tool: Send + Sync {
 }
 
 /// Every built-in tool. `subagents` lists `(id, description)` of the agents the subagent tool may start.
-pub fn all(subagents: Vec<(String, String)>) -> Vec<Box<dyn Tool>> {
-    vec![
+pub fn all(subagents: Vec<(String, String)>, skills: Vec<crate::skills::Skill>) -> Vec<Box<dyn Tool>> {
+    let mut tools: Vec<Box<dyn Tool>> = vec![
         Box::new(read::Read),
         Box::new(write::Write),
         Box::new(edit::Edit),
@@ -214,7 +215,12 @@ pub fn all(subagents: Vec<(String, String)>) -> Vec<Box<dyn Tool>> {
         Box::new(todowrite::TodoWrite),
         Box::new(question::AskQuestion),
         Box::new(subagent::Subagent { agents: subagents }),
-    ]
+    ];
+    // Only offered when there is something to load: an empty skill tool is noise in every request.
+    if !skills.is_empty() {
+        tools.push(Box::new(skill::SkillTool { skills }));
+    }
+    tools
 }
 
 // ---- input helpers -------------------------------------------------------------------------

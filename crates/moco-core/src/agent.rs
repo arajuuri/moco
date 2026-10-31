@@ -169,6 +169,8 @@ pub struct EnvInfo<'a> {
     pub date: &'a str,
     /// Rendered `AGENTS.md` content (see `instructions::render`), may be empty.
     pub instructions: &'a str,
+    /// Rendered skill list (`skills::render_list`); only included when the agent has the `skill` tool.
+    pub skills: &'a str,
 }
 
 /// Base prompt adapted from upstream `runner/prompt/system.txt` (MIT, see LICENSE-opencode).
@@ -212,6 +214,10 @@ pub fn system_prompt(agent: &Agent, tools: &[&dyn Tool], env: &EnvInfo) -> Strin
     if !env.instructions.trim().is_empty() {
         s.push_str("\n# Project instructions\nThese come from the user's AGENTS.md files; follow them. Later entries are more specific and win over earlier ones.\n\n");
         s.push_str(env.instructions);
+    }
+    if has("skill") && !env.skills.trim().is_empty() {
+        s.push_str("\n# Skills\n");
+        s.push_str(env.skills);
     }
     s.push_str(&format!("\n# Environment\n- Working directory: {}\n- Platform: {}\n- Date: {}\n", env.cwd, env.platform, env.date));
     s
@@ -262,7 +268,7 @@ mod tests {
 
     #[test]
     fn plan_hides_write_tools_but_build_does_not() {
-        let tools = crate::tools::all(vec![]);
+        let tools = crate::tools::all(vec![], vec![]);
         let names = |a: &Agent| tools.iter().filter(|t| advertised(a, t.as_ref())).map(|t| t.name()).collect::<Vec<_>>();
         let all = ["read", "write", "edit", "patch", "glob", "grep", "shell", "webfetch", "todowrite", "question", "subagent"];
         assert_eq!(names(&find(&builtin(), "build").unwrap()), all);
@@ -273,9 +279,9 @@ mod tests {
 
     #[test]
     fn prompt_guidance_follows_enabled_tools() {
-        let tools = crate::tools::all(vec![]);
+        let tools = crate::tools::all(vec![], vec![]);
         let refs: Vec<&dyn Tool> = tools.iter().map(|t| t.as_ref()).collect();
-        let env = EnvInfo { cwd: "/w", platform: "macos", date: "2026-10-31", instructions: "" };
+        let env = EnvInfo { cwd: "/w", platform: "macos", date: "2026-10-31", instructions: "", skills: "" };
         let full = system_prompt(&find(&builtin(), "build").unwrap(), &refs, &env);
         assert!(full.contains("Use the edit tool for targeted changes") && full.contains("Working directory: /w"));
         let no_edit = system_prompt(&find(&builtin(), "build").unwrap(), &refs[4..], &env);

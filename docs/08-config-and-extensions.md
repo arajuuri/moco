@@ -28,7 +28,7 @@ Implemented in `crates/moco-core/src/config.rs` and `instructions.rs`.
 ] }
 ```
 - Instructions: `<app dir>/config/AGENTS.md`, then `AGENTS.md` in each directory from the project root (nearest `.git`) down to the working directory, falling back to `CLAUDE.md` in a directory that has no `AGENTS.md` (a moco extension). Files are re-read from disk on every step instead of being sent as deltas, which keeps them live but costs prompt-cache hits when they change. `read` adds `AGENTS.md` files in directories between the file and the working directory, remembered per session (`instruction_state` table).
-- Not done: remote config, managed/system config, live reload, `{file:}` path rules beyond "relative to the config file", URL instructions, `agents` markdown files, skills, custom commands, MCP.
+- Not done: remote config, managed/system config, live reload, `{file:}` path rules beyond "relative to the config file", URL instructions, `agents` markdown files, MCP (Phase 3, later slice).
 
 ## Top-level keys (`Config.Info`)
 
@@ -90,3 +90,13 @@ After write/edit/patch upstream runs a configured formatter for the file extensi
 
 ## Project/worktree
 Project = git root detection. `worktree` creates `git worktree`s for isolated sessions (`core/src/worktree/*`). Optional.
+
+## moco implementation notes (Phase 3, skills / commands / mentions slice)
+
+Code: `markdown.rs`, `skills.rs`, `commands.rs`, `mentions.rs`, `tools/skill.rs`.
+- **Frontmatter** (`markdown.rs`): flat `key: value` pairs only. A value is everything after the first colon (so `description: Use when: ...` is fine), quotes are removed, `>` and `|` start an indented block, other indented lines continue the previous value, lines that are not `key: value` are ignored. No nesting, lists or anchors; a malformed header never fails a skill or command load.
+- **Roots**: `~/.claude`, `~/.agents`, `<app dir>/config`, then for every directory from `/` to the working directory its `.claude`, `.agents` and `.moco`, lowest priority first (`.claude` and `.agents` are read so skills and command files written for other tools work). Skills live in `<root>/skills/<id>/SKILL.md`, commands in `<root>/commands/*.md` or `<root>/command/*.md`. Config adds `skills` (directories of skills, or one skill directory) and `commands`.
+- **Skills**: the directory name is the id; `description` is required (a skill without one is skipped), `name` defaults to the id. A later root overrides an earlier skill with the same id. The sorted list is rendered into the system prompt as `<available_skills>` (stable order, so the prompt cache survives) and the `skill` tool loads one: `<skill_content>` with the body, the base directory, a note that relative paths resolve there, and up to 10 sibling files. The tool and the prompt section exist only when skills exist, and only for agents whose rules allow `skill` (the read-only `explore` agent gets neither). Skills are discovered once at startup. Remote skill indexes are not implemented.
+- **Commands**: `/name args` expands the template (`$ARGUMENTS` replaced, otherwise the arguments are appended after a blank line) and sends it as a normal prompt. Frontmatter or config `agent` and `model` apply to that prompt only (restored afterwards); `subagent: true` runs it in a child session, prints the result and records it in the conversation as a synthetic message. Built-in `/init` and `/review` use templates written for moco; file and config commands override them by name. The chat's own commands (`/model`, `/undo`, ...) cannot be overridden. `moco -p "/name args"` works for non-subagent commands.
+- **Mentions**: `@token` at the start of a word. A path (relative, absolute or `~/`) that exists attaches the file (up to 2000 lines / 50 KiB, files over 2 MiB and binary files are skipped with a note) or a directory listing (200 entries); otherwise a skill id loads that skill; otherwise a subagent name adds a reminder to delegate to it with the `subagent` tool. A file beats a skill or agent of the same name. Everything is read when the prompt is sent and stored with the message (`mentions`), so history replays as sent even if the files change. Not implemented: MCP resources, images and PDFs (next slice), fuzzy completion.
+

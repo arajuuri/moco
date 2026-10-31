@@ -29,6 +29,10 @@ pub fn to_chat(messages: &[Message]) -> Vec<ChatMessage> {
                 if let Some(t) = m.data["text"].as_str().filter(|t| !t.is_empty()) {
                     push_user(&mut out, Block::Text(t.into()));
                 }
+                // Files, skills and agent hints the user attached with @ (resolved when the prompt was sent).
+                for extra in crate::mentions::render(&m.data["mentions"]) {
+                    push_user(&mut out, Block::Text(extra));
+                }
             }
             "assistant" => {
                 let mut blocks = vec![];
@@ -102,6 +106,17 @@ mod tests {
             ]
         );
         assert_eq!(c[3].content, [Block::Text("done".into())]);
+    }
+
+    #[test]
+    fn mentions_follow_the_typed_text_in_the_same_message() {
+        let m = vec![msg("user", json!({"text":"fix @a.txt","mentions":{"files":[{"path":"a.txt","kind":"file","content":"hello","truncated":false}],"skills":[],"agents":[]}}))];
+        let c = to_chat(&m);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].content, [Block::Text("fix @a.txt".into()), Block::Text("<file path=\"a.txt\">\nhello\n</file>".into())]);
+        // A mention with no typed text still produces a message.
+        let only = to_chat(&[msg("user", json!({"text":"","mentions":{"files":[{"path":"b","kind":"file","content":"x"}]}}))]);
+        assert_eq!(only[0].content.len(), 1);
     }
 
     #[test]

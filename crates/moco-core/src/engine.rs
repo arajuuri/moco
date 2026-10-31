@@ -5,7 +5,7 @@
 //! produced tool calls. History is reloaded from the store on every step.
 use crate::agent::{self, Agent};
 use crate::snapshot::{FileDiff, Snapshots};
-use crate::{catalog, compaction, config, instructions, title};
+use crate::{catalog, compaction, config, instructions, skills, title};
 use crate::chat;
 use crate::permission::{self, Effect, Rule};
 use crate::provider::{retry, Block, ChatMessage, Event, FinishReason, Provider, ProviderError, Request, Role, ToolDef, Usage};
@@ -106,6 +106,8 @@ pub struct EngineConfig {
     pub snapshot_max_files: usize,
     /// Model for titles and other small jobs (`provider/model`); the session's model when unset.
     pub small_model: Option<String>,
+    /// Discovered skills (see `skills::discover`).
+    pub skills: Vec<skills::Skill>,
     /// Waits for retry backoff; must return early when `cancel` is set.
     pub sleep: Box<dyn Fn(Duration, &AtomicBool) + Send + Sync>,
     pub jitter: Box<dyn Fn() -> f64 + Send + Sync>,
@@ -124,6 +126,7 @@ impl EngineConfig {
             snapshots: true,
             snapshot_max_files: 50_000,
             small_model: None,
+            skills: vec![],
             sleep: Box::new(|d, cancel| {
                 let end = std::time::Instant::now() + d;
                 while std::time::Instant::now() < end && !cancel.load(Ordering::Relaxed) {
@@ -235,12 +238,12 @@ struct AttemptResult {
 impl Engine {
     /// Single provider answering every model ref.
     pub fn new(store: Store, provider: Box<dyn Provider>, cfg: EngineConfig) -> Self {
-        Engine { store: Mutex::new(store), providers: HashMap::new(), fallback: Some(provider), tools: tools::all(subagent_list(&cfg)), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()), title_tried: Mutex::new(HashSet::new()) }
+        Engine { store: Mutex::new(store), providers: HashMap::new(), fallback: Some(provider), tools: tools::all(subagent_list(&cfg), cfg.skills.clone()), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()), title_tried: Mutex::new(HashSet::new()) }
     }
 
     /// One client per provider id; a model ref's provider part picks the client.
     pub fn with_providers(store: Store, providers: HashMap<String, Box<dyn Provider>>, cfg: EngineConfig) -> Self {
-        Engine { store: Mutex::new(store), providers, fallback: None, tools: tools::all(subagent_list(&cfg)), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()), title_tried: Mutex::new(HashSet::new()) }
+        Engine { store: Mutex::new(store), providers, fallback: None, tools: tools::all(subagent_list(&cfg), cfg.skills.clone()), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()), title_tried: Mutex::new(HashSet::new()) }
     }
 
     pub fn catalog(&self) -> &catalog::Catalog {
@@ -273,7 +276,25 @@ impl Engine {
 
     /// Durably admit a user prompt (steered by default: delivered at the next step boundary).
     pub fn submit(&self, session_id: &str, text: &str, mode: Mode) -> Result<String, StoreError> {
-        self.store().enqueue(session_id, None, mode, "user", &json!({ "text": text }))
+        self.submit_with(session_id, text, None, mode)
+    }
+
+    /// Like `submit`, with the expanded `@` mentions (`mentions::expand`) stored alongside the typed text.
+    pub fn submit_with(&self, session_id: &str, text: &str, mentions: Option<Value>, mode: Mode) -> Result<String, StoreError> {
+        let mut data = json!({ "text": text });
+        if let Some(m) = mentions.filter(|m| !m.is_null()) {
+            data["mentions"] = m;
+        }
+        self.store().enqueue(session_id, None, mode, "user", &data)
+    }
+
+    pub fn skills(&self) -> &[skills::Skill] {
+        &self.cfg.skills
+    }
+
+    /// Names of the agents the subagent tool can start.
+    pub fn subagent_names(&self) -> Vec<String> {
+        self.cfg.agents.iter().filter(|a| a.subagent()).map(|a| a.id.clone()).collect()
     }
 
     /// Run until idle. `resume` continues a run that was interrupted by a crash (the claim is still held).
@@ -374,10 +395,11 @@ impl Engine {
                 return Ok(Err(StepOutcome::Stop(RunOutcome::Failed(msg))));
             }
         };
+        let skill_list = skills::render_list(&self.cfg.skills);
         let mut system = agent::system_prompt(
             &agent,
             &advertised,
-            &agent::EnvInfo { cwd: &session.directory, platform: std::env::consts::OS, date: &agent::date_from_unix(now), instructions: &ins },
+            &agent::EnvInfo { cwd: &session.directory, platform: std::env::consts::OS, date: &agent::date_from_unix(now), instructions: &ins, skills: &skill_list },
         );
         if agent.id == "plan" {
             // In the system prompt (not appended to the last message) so every request keeps the same prefix.
@@ -601,6 +623,61 @@ impl Engine {
             Some(users[users.len() - turns_back].clone())
         };
         Ok(Some(st.fork_session(sid, before.as_deref())?))
+    }
+
+    /// Run `req` in a child session of `parent` and return the subagent's final text. Used by the `subagent` tool and
+    /// by custom commands marked `subagent`.
+    pub fn run_subagent(&self, parent: &Session, req: SubagentRequest, ui: &dyn Ui, cancel: &AtomicBool) -> Result<SubagentResult, ToolError> {
+        let eng = self;
+        let store_err = |e: StoreError| ToolError::fail(e.to_string());
+        let agent = agent::find(&eng.cfg.agents, &req.agent).filter(|a| a.subagent()).ok_or_else(|| ToolError::fail(format!("Unknown agent '{}'", req.agent)))?;
+        let child = {
+            let st = eng.store();
+            if st.depth(&parent.id).map_err(store_err)? + 1 > MAX_SUBAGENT_DEPTH {
+                return Err(ToolError::fail("subagent depth limit reached; do this work yourself"));
+            }
+            let child = match &req.session_id {
+                Some(id) => st
+                    .session(id)
+                    .map_err(store_err)?
+                    .filter(|c| c.parent_id.as_deref() == Some(parent.id.as_str()))
+                    .ok_or_else(|| ToolError::fail(format!("sessionID {id} is not a subagent session of this conversation")))?,
+                None => {
+                    let c = st.create_child_session(parent, &agent.id).map_err(store_err)?;
+                    st.set_title(&c.id, &req.description).map_err(store_err)?;
+                    c
+                }
+            };
+            // A model chosen for this conversation carries over unless the call names one.
+            match req.model.as_ref().or(parent.model.as_ref()) {
+                Some(m) => st.set_model(&child.id, Some(m)).map_err(store_err)?,
+                None => {}
+            }
+            child
+        };
+        eng.submit(&child.id, &req.prompt, Mode::Steer).map_err(store_err)?;
+        let child_ui = ChildUi { parent: ui, agent: &agent.id };
+        ui.event(&UiEvent::Status(&format!("subagent {}: {}", agent.id, req.description)));
+        match eng.run(&child.id, &child_ui, cancel, false).map_err(store_err)? {
+            RunOutcome::Idle => {}
+            RunOutcome::Interrupted => return Err(ToolError::Interrupted),
+            RunOutcome::Declined => return Err(ToolError::Declined),
+            RunOutcome::Failed(m) => return Err(ToolError::fail(format!("Subagent failed: {m}"))),
+            RunOutcome::Busy => return Err(ToolError::fail("that subagent session is already running")),
+        }
+        let output = eng
+            .store()
+            .messages(&child.id)
+            .map_err(store_err)?
+            .iter()
+            .rev()
+            .filter(|m| m.kind == "assistant")
+            .find_map(|m| {
+                let text: Vec<&str> = m.data["parts"].as_array()?.iter().filter(|p| p["type"] == "text").filter_map(|p| p["text"].as_str()).collect();
+                (!text.is_empty()).then(|| text.join("\n\n"))
+            })
+            .unwrap_or_else(|| "(the subagent returned no text)".to_string());
+        Ok(SubagentResult { session_id: child.id, output })
     }
 
     /// Capture the working tree before a step. Best effort: a failure disables snapshots for the session with one notice.
@@ -972,56 +1049,7 @@ impl Host for EngineHost<'_> {
     }
 
     fn subagent(&self, req: SubagentRequest) -> Result<SubagentResult, ToolError> {
-        let eng = self.engine;
-        let store_err = |e: StoreError| ToolError::fail(e.to_string());
-        let agent = agent::find(&eng.cfg.agents, &req.agent).filter(|a| a.subagent()).ok_or_else(|| ToolError::fail(format!("Unknown agent '{}'", req.agent)))?;
-        let child = {
-            let st = eng.store();
-            if st.depth(&self.session.id).map_err(store_err)? + 1 > MAX_SUBAGENT_DEPTH {
-                return Err(ToolError::fail("subagent depth limit reached; do this work yourself"));
-            }
-            let child = match &req.session_id {
-                Some(id) => st
-                    .session(id)
-                    .map_err(store_err)?
-                    .filter(|c| c.parent_id.as_deref() == Some(self.session.id.as_str()))
-                    .ok_or_else(|| ToolError::fail(format!("sessionID {id} is not a subagent session of this conversation")))?,
-                None => {
-                    let c = st.create_child_session(self.session, &agent.id).map_err(store_err)?;
-                    st.set_title(&c.id, &req.description).map_err(store_err)?;
-                    c
-                }
-            };
-            // A model chosen for this conversation carries over unless the call names one.
-            match req.model.as_ref().or(self.session.model.as_ref()) {
-                Some(m) => st.set_model(&child.id, Some(m)).map_err(store_err)?,
-                None => {}
-            }
-            child
-        };
-        eng.submit(&child.id, &req.prompt, Mode::Steer).map_err(store_err)?;
-        let child_ui = ChildUi { parent: self.ui, agent: &agent.id };
-        self.ui.event(&UiEvent::Status(&format!("subagent {}: {}", agent.id, req.description)));
-        match eng.run(&child.id, &child_ui, self.cancel, false).map_err(store_err)? {
-            RunOutcome::Idle => {}
-            RunOutcome::Interrupted => return Err(ToolError::Interrupted),
-            RunOutcome::Declined => return Err(ToolError::Declined),
-            RunOutcome::Failed(m) => return Err(ToolError::fail(format!("Subagent failed: {m}"))),
-            RunOutcome::Busy => return Err(ToolError::fail("that subagent session is already running")),
-        }
-        let output = eng
-            .store()
-            .messages(&child.id)
-            .map_err(store_err)?
-            .iter()
-            .rev()
-            .filter(|m| m.kind == "assistant")
-            .find_map(|m| {
-                let text: Vec<&str> = m.data["parts"].as_array()?.iter().filter(|p| p["type"] == "text").filter_map(|p| p["text"].as_str()).collect();
-                (!text.is_empty()).then(|| text.join("\n\n"))
-            })
-            .unwrap_or_else(|| "(the subagent returned no text)".to_string());
-        Ok(SubagentResult { session_id: child.id, output })
+        self.engine.run_subagent(self.session, req, self.ui, self.cancel)
     }
 }
 
@@ -2110,5 +2138,85 @@ mod tests {
         let last = f.fake.requests.lock().unwrap().last().unwrap().clone();
         assert!(all_text(&last).contains("second") && all_text(&last).contains("different third") && !all_text(&last).contains("third\n"));
         assert_eq!(users(&f.session.id), ["first", "second", "third"], "the original is untouched");
+    }
+
+    fn demo_skill(f: &Fixture) -> skills::Skill {
+        let dir = f.dir.join("skills/release");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("notes.md"), "n").unwrap();
+        skills::Skill { id: "release".into(), name: "release".into(), description: "Cut a release: bump, tag, publish".into(), dir, body: "1. Bump the version.\n2. Tag it.".into() }
+    }
+
+    #[test]
+    fn skills_are_listed_in_the_prompt_and_loadable_with_the_tool() {
+        // The fixture must exist before the skill (its dir lives in the fixture), so build the engine twice-free: use a tweak with a temp path.
+        let dir = std::env::temp_dir().join(crate::id::new_id("moco-sk-eng"));
+        let sk_dir = dir.join("release");
+        std::fs::create_dir_all(&sk_dir).unwrap();
+        let skill = skills::Skill { id: "release".into(), name: "release".into(), description: "Cut a release: bump, tag, publish".into(), dir: sk_dir, body: "1. Bump the version.\n2. Tag it.".into() };
+        let f = fixture_cfg(vec![tool_call("t1", "skill", json!({"id":"release"})), text("following it")], |c| c.skills = vec![skill]);
+        f.say("make a release");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        let reqs = f.fake.requests.lock().unwrap();
+        assert!(reqs[0].tools.iter().any(|t| t.name == "skill"));
+        assert!(reqs[0].system.contains("<available_skills>") && reqs[0].system.contains("<id>release</id>") && reqs[0].system.contains("Cut a release: bump, tag, publish"), "{}", reqs[0].system);
+        assert!(result_text(&reqs[1]).contains("# Skill: release") && result_text(&reqs[1]).contains("2. Tag it."));
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = demo_skill;
+    }
+
+    #[test]
+    fn without_skills_there_is_no_tool_and_no_prompt_section() {
+        let f = fixture(vec![text("ok")]);
+        f.say("hi");
+        f.run(&TestUi::default());
+        let reqs = f.fake.requests.lock().unwrap();
+        assert!(!reqs[0].tools.iter().any(|t| t.name == "skill") && !reqs[0].system.contains("available_skills") && !reqs[0].system.contains("# Skills"));
+    }
+
+    #[test]
+    fn explore_does_not_get_skills() {
+        let sk = skills::Skill { id: "s".into(), name: "s".into(), description: "d".into(), dir: std::env::temp_dir(), body: "b".into() };
+        let f = fixture_cfg(vec![sub("t1", "explore", "look"), text("found"), text("done")], |c| c.skills = vec![sk]);
+        f.say("go");
+        f.run(&TestUi::default());
+        let reqs = f.fake.requests.lock().unwrap();
+        assert!(reqs[0].system.contains("available_skills"), "the main agent sees the list");
+        assert!(!reqs[1].system.contains("available_skills") && !reqs[1].tools.iter().any(|t| t.name == "skill"), "read-only explore has no skill tool, so no list");
+    }
+
+    #[test]
+    fn mentions_are_stored_with_the_prompt_and_reach_the_model() {
+        let f = fixture(vec![text("seen"), text("again")]);
+        f.file("notes.txt", "remember the milk\n");
+        let skills_none: Vec<skills::Skill> = vec![];
+        let ctx = crate::mentions::Ctx { cwd: &f.dir.join("work"), skills: &skills_none, subagents: &["explore".to_string()] };
+        let (m, notes) = crate::mentions::expand("what does @notes.txt say? ask @explore too", &ctx);
+        assert_eq!(notes.len(), 2);
+        f.engine.submit_with(&f.session.id, "what does @notes.txt say? ask @explore too", Some(m), Mode::Steer).unwrap();
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        // The file is stored as it was when sent: later edits do not change history.
+        std::fs::write(f.dir.join("work/notes.txt"), "changed").unwrap();
+        f.say("and now?");
+        f.run(&TestUi::default());
+        let reqs = f.fake.requests.lock().unwrap();
+        let first = all_text(&reqs[1]);
+        assert!(first.contains("<file path=\"notes.txt\">\nremember the milk\n</file>") && first.contains("(agent: \"explore\")"), "{first}");
+        assert!(!first.contains("changed"), "history keeps the content from submit time");
+        assert_eq!(reqs[0].messages.len(), 1, "typed text and attachments are one user message");
+        // The title is made from what the user typed, not the attachment.
+        assert_eq!(f.engine.store().title_source(&f.session.id).unwrap().unwrap().0, "what does @notes.txt say? ask @explore too");
+    }
+
+    #[test]
+    fn a_subagent_can_be_run_directly_for_a_command() {
+        let f = fixture(vec![text("review done")]);
+        let parent = f.engine.store().session(&f.session.id).unwrap().unwrap();
+        let r = f
+            .engine
+            .run_subagent(&parent, SubagentRequest { agent: "general".into(), description: "review".into(), prompt: "review the diff".into(), model: None, session_id: None }, &TestUi::default(), &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(r.output, "review done");
+        assert_eq!(f.engine.store().session(&r.session_id).unwrap().unwrap().parent_id.as_deref(), Some(f.session.id.as_str()));
     }
 }

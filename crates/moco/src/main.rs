@@ -1,6 +1,7 @@
 //! moco: line-based terminal chat.
 use moco_core::catalog::{Catalog, ProviderInfo};
-use moco_core::compaction;
+use moco_core::tools::SubagentRequest;
+use moco_core::{commands, compaction, mentions, skills};
 use moco_core::engine::{CompactResult, DiffResult, Engine, UndoReport, UndoResult, EngineConfig, PermissionPrompt, Reply, RunOutcome, Ui, UiEvent};
 use moco_core::provider::registry;
 use moco_core::provider::Usage;
@@ -561,6 +562,10 @@ fn main() {
     engine_cfg.catalog = catalog;
     engine_cfg.compaction = compaction::Settings::from_config(&cfg.compaction);
     engine_cfg.snapshots = cfg.snapshots.unwrap_or(true);
+    let found_skills = skills::discover(&app_dir, &cwd, &cfg.skills);
+    let found_commands = commands::discover(&app_dir, &cwd, &cfg.commands);
+    engine_cfg.skills = found_skills.clone();
+    engine_cfg.small_model = cfg.small_model.clone();
     let n_sources = loaded.sources.len();
     let engine = Engine::with_providers(store, providers, engine_cfg);
     // Drop snapshot data that no session active in the last 30 days refers to.
@@ -585,12 +590,32 @@ fn main() {
         outcome.ok()
     };
 
+    // Expand @mentions of files, directories, skills and agents, tell the user what was attached, then queue the prompt.
+    let send = |sid: &str, text: &str| -> bool {
+        let subagents = engine.subagent_names();
+        let (m, notes) = mentions::expand(text, &mentions::Ctx { cwd: &cwd, skills: &found_skills, subagents: &subagents });
+        for n in notes {
+            println!("{DIM}{n}{RESET}");
+        }
+        engine.submit_with(sid, text, Some(m), Mode::Steer).is_ok()
+    };
+
     if recovered.contains(&session.id) {
         println!("{DIM}resuming interrupted run{RESET}");
         run(&session.id, true);
     }
     if let Some(p) = prompt {
-        engine.submit(&session.id, &p, Mode::Steer).unwrap_or_else(|e| die(&e.to_string()));
+        // `-p "/review the last commit"` works like typing the command.
+        let text = match p.strip_prefix('/').and_then(|r| {
+            let (name, args) = r.split_once(char::is_whitespace).unwrap_or((r, ""));
+            found_commands.iter().find(|c| c.name == name && !c.subagent).map(|c| commands::expand(c, args))
+        }) {
+            Some(t) => t,
+            None => p,
+        };
+        if !send(&session.id, &text) {
+            die("could not queue the prompt");
+        }
         let ok = matches!(run(&session.id, false), Some(RunOutcome::Idle));
         std::process::exit(if ok { 0 } else { 1 });
     }
@@ -608,8 +633,21 @@ fn main() {
         match line {
             "" => continue,
             "/exit" | "/quit" => break,
+            "/skills" => {
+                if found_skills.is_empty() {
+                    println!("{DIM}no skills found (put SKILL.md folders in .moco/skills, .claude/skills or the config skills dir){RESET}");
+                }
+                for k in &found_skills {
+                    println!("{DIM}  {:<20} {}{RESET}", k.id, clip(&k.description, 90));
+                }
+            }
+            "/commands" => {
+                for c in &found_commands {
+                    println!("{DIM}  /{:<18} {}{}{RESET}", c.name, clip(&c.description, 80), if c.source == "built-in" { String::new() } else { format!("  [{}]", if c.source == "config" { "config".to_string() } else { tilde(&c.source) }) });
+                }
+            }
             "/help" => println!(
-                "/model [FILTER|PROVIDER/MODEL]  show, search or switch the model\n/agent <id>                     switch agent\n/compact                        summarize older messages to free up context\n/sessions [all|archived]       list sessions (/resume <n|id> to continue one)\n/rename <title>                 name this session\n/fork [N]                       copy this conversation into a new session\n/archive [n|id]                 hide a session from the list (/unarchive to restore)\n/undo, /redo                    undo the last turn's file changes and messages, or bring them back\n/diff                           changes in the working tree since this session started\n/new                            start a new session\n/exit                           quit (Ctrl-C interrupts a running turn)"
+                "/model [FILTER|PROVIDER/MODEL]  show, search or switch the model\n/agent <id>                     switch agent\n/compact                        summarize older messages to free up context\n/sessions [all|archived]       list sessions (/resume <n|id> to continue one)\n/rename <title>                 name this session\n/fork [N]                       copy this conversation into a new session\n/archive [n|id]                 hide a session from the list (/unarchive to restore)\n/undo, /redo                    undo the last turn's file changes and messages, or bring them back\n/diff                           changes in the working tree since this session started\n/new                            start a new session\n/skills, /commands              list skills and custom slash commands (@name mentions a skill, agent or file)\n/exit                           quit (Ctrl-C interrupts a running turn)"
             ),
             l if l == "/sessions" || l.starts_with("/sessions ") => {
                 let which = l.trim_start_matches("/sessions").trim();
@@ -769,9 +807,69 @@ fn main() {
                     None => println!("unknown agent; available: {}", engine.agents().iter().filter(|a| a.selectable()).map(|a| a.id.as_str()).collect::<Vec<_>>().join(", ")),
                 }
             }
-            l if l.starts_with('/') => println!("unknown command (try /help)"),
+            l if l.starts_with('/') => {
+                let (name, args) = l[1..].split_once(char::is_whitespace).unwrap_or((&l[1..], ""));
+                let Some(cmd) = found_commands.iter().find(|c| c.name == name) else {
+                    println!("unknown command /{name} (try /help, /commands)");
+                    continue;
+                };
+                let prompt = commands::expand(cmd, args);
+                if cmd.subagent {
+                    // Runs in a child session; the result is shown here and recorded in this conversation.
+                    let parent = engine.store.lock().unwrap().session(&session.id).ok().flatten();
+                    let Some(parent) = parent else { continue };
+                    let subagents = engine.subagent_names();
+                    let (m, notes) = mentions::expand(&prompt, &mentions::Ctx { cwd: &cwd, skills: &found_skills, subagents: &subagents });
+                    for n in notes {
+                        println!("{DIM}{n}{RESET}");
+                    }
+                    let full = std::iter::once(prompt.clone()).chain(mentions::render(&m)).collect::<Vec<_>>().join("\n\n");
+                    let req = SubagentRequest { agent: cmd.agent.clone().unwrap_or_else(|| "general".into()), description: cmd.name.clone(), prompt: full, model: cmd.model.clone(), session_id: None };
+                    CANCEL.store(false, Ordering::Relaxed);
+                    match engine.run_subagent(&parent, req, &term, &CANCEL) {
+                        Ok(r) => {
+                            println!("{}", r.output);
+                            let st = engine.store.lock().unwrap();
+                            st.add_message(&session.id, "synthetic", &serde_json::json!({"text": format!("Result of /{} {}:\n\n{}", cmd.name, args.trim(), r.output)})).ok();
+                        }
+                        Err(e) => eprintln!("{RED}/{} failed: {}{RESET}", cmd.name, e.message()),
+                    }
+                    // Subagent events carry the child's totals; show this conversation's (children roll up into it).
+                    if let Ok((total, _)) = engine.store.lock().unwrap().usage_totals(&session.id) {
+                        term.run.lock().unwrap().session_cost = total;
+                    }
+                    term.print_usage();
+                } else {
+                    // `agent` and `model` in the command apply to this one prompt only.
+                    let (saved_agent, saved_model) = {
+                        let st = engine.store.lock().unwrap();
+                        let cur = st.session(&session.id).ok().flatten();
+                        if let Some(a) = &cmd.agent {
+                            if engine.agents().iter().any(|x| x.id == *a) {
+                                st.set_agent(&session.id, a).ok();
+                            } else {
+                                println!("unknown agent '{a}' in /{name}; using the current one");
+                            }
+                        }
+                        if let Some(m) = &cmd.model {
+                            st.set_model(&session.id, Some(m)).ok();
+                        }
+                        (cur.as_ref().map(|c| c.agent.clone()), cur.and_then(|c| c.model))
+                    };
+                    if send(&session.id, &prompt) {
+                        run(&session.id, false);
+                    }
+                    let st = engine.store.lock().unwrap();
+                    if let Some(a) = saved_agent {
+                        st.set_agent(&session.id, &a).ok();
+                    }
+                    if cmd.model.is_some() {
+                        st.set_model(&session.id, saved_model.as_deref()).ok();
+                    }
+                }
+            }
             _ => {
-                if engine.submit(&session.id, line, Mode::Steer).is_ok() {
+                if send(&session.id, line) {
                     run(&session.id, false);
                 }
             }
