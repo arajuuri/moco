@@ -452,7 +452,7 @@ pub fn history_rows(messages: &[Message], hidden_from: Option<&str>) -> Vec<Row>
                                 _ => ToolState::Failed("interrupted".into()),
                             };
                             let output = super::diff::output_head(p["state"]["output"].as_str().unwrap_or(""), 12);
-                            rows.push(Row::Tool { depth: 0, agent: String::new(), summary: crate::summary(&name, &p["input"]), detail: super::diff::tool_detail(&name, &p["input"]), output, name, state, auto: None });
+                            rows.push(Row::Tool { id: p["callID"].as_str().unwrap_or("").to_string(), depth: 0, agent: String::new(), summary: crate::summary(&name, &p["input"]), detail: super::diff::tool_detail(&name, &p["input"]), output, name, state, auto: None });
                         }
                         _ => {}
                     }

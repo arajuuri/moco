@@ -42,18 +42,18 @@ fn conversation(theme: Theme) -> App {
     a.push_user("The parser test `handles_nested_quotes` fails. Can you find out why and fix it?");
     ev(&mut a, 0, "", Ev::Reasoning("The test name suggests the tokenizer mishandles escaped quotes inside a quoted string. Let me look at the test first, then the tokenizer.".into()));
     ev(&mut a, 0, "", Ev::Text("I'll start by running the test and reading the tokenizer.".into()));
-    ev(&mut a, 0, "", Ev::Tool { name: "shell".into(), summary: "cargo test handles_nested_quotes".into(), detail: None });
+    ev(&mut a, 0, "", Ev::Tool { id: String::new(), name: "shell".into(), summary: "cargo test handles_nested_quotes".into(), detail: None });
     ev(&mut a, 0, "", Ev::ToolDone { name: "shell".into(), ok: true, msg: String::new(), output: "test handles_nested_quotes ... FAILED\n\nleft: [Str(\"a\\\"b\")]\nright: [Str(\"a\"), Str(\"b\")]".into() });
-    ev(&mut a, 0, "", Ev::Tool { name: "grep".into(), summary: "fn tokenize".into(), detail: None });
+    ev(&mut a, 0, "", Ev::Tool { id: String::new(), name: "grep".into(), summary: "fn tokenize".into(), detail: None });
     ev(&mut a, 0, "", Ev::ToolDone { name: "grep".into(), ok: true, msg: String::new(), output: String::new() });
-    ev(&mut a, 0, "", Ev::Tool { name: "read".into(), summary: "src/parser.rs".into(), detail: None });
+    ev(&mut a, 0, "", Ev::Tool { id: String::new(), name: "read".into(), summary: "src/parser.rs".into(), detail: None });
     ev(&mut a, 0, "", Ev::ToolDone { name: "read".into(), ok: true, msg: String::new(), output: String::new() });
     ev(&mut a, 0, "", Ev::Text("## What is wrong\n\nThe tokenizer ends a string at the **first** `\"`, even when it is escaped:\n\n- `\\\"` inside a string should be kept as part of the string\n- the closing quote is only the first *unescaped* one\n\n```rust\nif c == '\"' {\n    in_string = !in_string;\n}\n```\n\nI'll make the check aware of the backslash.".into()));
-    ev(&mut a, 0, "", Ev::Tool { name: "edit".into(), summary: "src/parser.rs".into(), detail: Some("@@ -41,5 +41,7 @@\n     for c in chars {\n-        if c == '\"' {\n-            in_string = !in_string;\n+        if c == '\\\\' && in_string {\n+            escaped = !escaped;\n+        } else if c == '\"' && !escaped {\n+            in_string = !in_string;\n         }\n     }".into()) });
+    ev(&mut a, 0, "", Ev::Tool { id: String::new(), name: "edit".into(), summary: "src/parser.rs".into(), detail: Some("@@ -41,5 +41,7 @@\n     for c in chars {\n-        if c == '\"' {\n-            in_string = !in_string;\n+        if c == '\\\\' && in_string {\n+            escaped = !escaped;\n+        } else if c == '\"' && !escaped {\n+            in_string = !in_string;\n         }\n     }".into()) });
     ev(&mut a, 0, "", Ev::ToolDone { name: "edit".into(), ok: true, msg: String::new(), output: String::new() });
-    ev(&mut a, 1, "explore", Ev::Tool { name: "grep".into(), summary: "escaped".into(), detail: None });
+    ev(&mut a, 1, "explore", Ev::Tool { id: String::new(), name: "grep".into(), summary: "escaped".into(), detail: None });
     ev(&mut a, 1, "explore", Ev::ToolDone { name: "grep".into(), ok: true, msg: String::new(), output: String::new() });
-    ev(&mut a, 0, "", Ev::Tool { name: "shell".into(), summary: "cargo test".into(), detail: None });
+    ev(&mut a, 0, "", Ev::Tool { id: String::new(), name: "shell".into(), summary: "cargo test".into(), detail: None });
     ev(&mut a, 0, "", Ev::ToolDone { name: "shell".into(), ok: false, msg: "exit code 101: 1 test failed".into(), output: String::new() });
     ev(&mut a, 0, "", Ev::Todos(vec![
         Todo { content: "Reproduce the failure".into(), status: "completed".into() },
@@ -66,7 +66,7 @@ fn conversation(theme: Theme) -> App {
     a.push_user("Great. Please also add a regression test.");
     ev(&mut a, 0, "", Ev::Text("Adding a test that feeds `\"a\\\"b\"` through the tokenizer.".into()));
     a.running = true;
-    ev(&mut a, 0, "", Ev::Tool { name: "read".into(), summary: "tests/parser.rs".into(), detail: None });
+    ev(&mut a, 0, "", Ev::Tool { id: String::new(), name: "read".into(), summary: "tests/parser.rs".into(), detail: None });
     a.queued.push(Queued { id: "q1".into(), steer: true, text: "also run clippy afterwards".into() });
     a.mcp = vec![("files".into(), "connected: 3 tool(s)".into()), ("web".into(), "needs authorization".into())];
     a.jobs = 1;

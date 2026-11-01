@@ -114,14 +114,14 @@ impl TuiUi {
                 }
                 return;
             }
-            UiEvent::ToolStarted { name, input } => Ev::Tool { name: name.to_string(), summary: crate::summary(name, input), detail: diff::tool_detail(name, input) },
+            UiEvent::ToolStarted { id, name, input } => Ev::Tool { id: id.to_string(), name: name.to_string(), summary: crate::summary(name, input), detail: diff::tool_detail(name, input) },
             UiEvent::ToolFinished { name, ok, text } => Ev::ToolDone { name: name.to_string(), ok: *ok, msg: text.lines().next().unwrap_or("").to_string(), output: diff::output_head(text, 12) },
             UiEvent::Retry { attempt, wait, error } => Ev::Retry { attempt: *attempt, secs: wait.as_secs(), error: error.to_string() },
             UiEvent::StepUsage { usage, cost, session_cost, context_tokens, context_limit } => {
                 Ev::Usage { usage: *usage, cost: *cost, session_cost: *session_cost, context: *context_tokens, limit: *context_limit }
             }
             UiEvent::ClassifierUsage { cost, session_cost, classifier_cost } => Ev::ClassifierUsage { cost: *cost, session_cost: *session_cost, classifier_cost: *classifier_cost },
-            UiEvent::AutoAllowed { command, risk, reason } => Ev::AutoAllowed { command: command.to_string(), risk: risk.to_string(), reason: reason.to_string() },
+            UiEvent::AutoAllowed { call_id, command, risk, reason } => Ev::AutoAllowed { call_id: call_id.to_string(), command: command.to_string(), risk: risk.to_string(), reason: reason.to_string() },
             UiEvent::Notice(n) => Ev::Notice(n.to_string()),
             UiEvent::Status(s) => Ev::Status(s.to_string()),
             UiEvent::Todos(t) => Ev::Todos(t.to_vec()),

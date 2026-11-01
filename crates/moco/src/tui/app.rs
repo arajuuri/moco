@@ -20,13 +20,13 @@ pub use super::theme::Theme;
 #[derive(Debug, Clone)]
 pub enum Ev {
     Text(String),
-    Tool { name: String, summary: String, detail: Option<String> },
+    Tool { id: String, name: String, summary: String, detail: Option<String> },
     ToolDone { name: String, ok: bool, msg: String, output: String },
     Reasoning(String),
     Retry { attempt: u32, secs: u64, error: String },
     Usage { usage: Usage, cost: Option<f64>, session_cost: f64, context: u64, limit: Option<u64> },
     /// The classifier let this shell command through without asking.
-    AutoAllowed { command: String, risk: String, reason: String },
+    AutoAllowed { call_id: String, command: String, risk: String, reason: String },
     /// A permission-classifier call: its cost, the session total (which includes it) and the classifier's share of it.
     ClassifierUsage { cost: f64, session_cost: f64, classifier_cost: f64 },
     Notice(String),
@@ -204,6 +204,8 @@ const PASTE_LINES: usize = 6;
 const PASTE_CHARS: usize = 800;
 /// Lines of an edit's diff shown inline at the normal detail level.
 const DETAIL_LINES: usize = 24;
+/// Columns a shell row keeps for its command when an "auto:" marker shares the line.
+const MIN_COMMAND_WIDTH: usize = 12;
 const SIDEBAR_W: u16 = 32;
 
 /// What the event loop must do after an update.
@@ -240,7 +242,7 @@ pub enum ToolState {
 pub enum Row {
     User(String),
     Assistant(String),
-    Tool { depth: usize, agent: String, name: String, summary: String, state: ToolState, detail: Option<String>, output: String, auto: Option<String> },
+    Tool { id: String, depth: usize, agent: String, name: String, summary: String, state: ToolState, detail: Option<String>, output: String, auto: Option<String> },
     /// The model's reasoning, shown according to the detail level.
     Reasoning(String),
     /// The welcome card at the top of a session.
@@ -518,15 +520,16 @@ impl App {
                     _ => self.rows.push(Row::Assistant(t)),
                 }
             }
-            Ev::Tool { name, summary, detail } => self.rows.push(Row::Tool { depth, agent, name, summary, state: ToolState::Running, detail, output: String::new(), auto: None }),
-            Ev::AutoAllowed { command, risk, reason } => {
-                // The marker goes on the shell row this command belongs to: the newest one still running that
-                // shows the same text and has no marker yet.
-                let found = self.rows.iter_mut().rev().find(|r| matches!(r, Row::Tool { depth: d, name, summary, state: ToolState::Running, auto: None, .. } if *d == depth && name == "shell" && command.starts_with(summary.trim_end_matches('.'))));
+            Ev::Tool { id, name, summary, detail } => self.rows.push(Row::Tool { id, depth, agent, name, summary, state: ToolState::Running, detail, output: String::new(), auto: None }),
+            Ev::AutoAllowed { call_id, command, risk, reason } => {
+                // The marker goes on the tool row of the call it belongs to, found by the call's id. Without a row to
+                // attach to (an unknown id, or the row is gone) it shows as a line of its own, with the command, so
+                // it is never put on a different command's row.
+                let found = if call_id.is_empty() { None } else { self.rows.iter_mut().rev().find(|r| matches!(r, Row::Tool { id, depth: d, auto: None, .. } if *d == depth && *id == call_id)) };
                 let label = if reason.is_empty() { risk } else { format!("{risk}: {reason}") };
                 match found {
                     Some(Row::Tool { auto, .. }) => *auto = Some(label),
-                    _ if depth == 0 => self.push_info(format!("auto: {label}")),
+                    _ if depth == 0 => self.push_info(format!("auto: {label}: {command}")),
                     _ => {}
                 }
             }
@@ -1413,7 +1416,7 @@ impl App {
                 let text = clip_width(&text, room);
                 out.push(Line::from(vec![Span::raw(format!("{M}{pad}")), Span::styled(format!("{} ", if running { g.active } else { g.done }), if failed > 0 { t.error } else { t.accent }), Span::styled(text, if failed > 0 { t.error } else { dim })]));
             }
-            Row::Tool { depth, agent, name, summary, state, detail, output, auto } => {
+            Row::Tool { depth, agent, name, summary, state, detail, output, auto, .. } => {
                 let pad = "  ".repeat(*depth);
                 let glyph = match state {
                     ToolState::Running => Span::styled(if (self.tick / 3) % 2 == 0 { g.run } else { g.idle }, t.accent),
@@ -1424,8 +1427,8 @@ impl App {
                 let head = format!("{who}{name:<6} ");
                 let mark = auto.as_ref().map(|a| format!("  {} auto: {a}", g.sep));
                 let room = width.saturating_sub(M.len() + pad.len() + 2 + display_width(&head));
-                // The marker is shown whole when it fits; the command is what gives way.
-                let mark_room = mark.as_ref().map_or(0, |m| display_width(m).min(room / 2));
+                // The marker is shown whole when it fits; the command is what gives way, down to a few columns.
+                let mark_room = mark.as_ref().map_or(0, |m| display_width(m).min(room.saturating_sub(MIN_COMMAND_WIDTH)));
                 let room = room.saturating_sub(mark_room);
                 let sum = if display_width(summary) > room { format!("{}{}", clip_width(summary, room.saturating_sub(1)), g.ellipsis) } else { summary.clone() };
                 let mut spans = vec![Span::raw(format!("{M}{pad}")), glyph, Span::raw(" "), Span::styled(head, t.accent), Span::styled(sum, dim)];
@@ -2222,8 +2225,8 @@ mod tests {
         a.push_user("hi");
         text(&mut a, Ev::Text("Hel".into()));
         text(&mut a, Ev::Text("lo".into()));
-        text(&mut a, Ev::Tool { name: "read".into(), summary: "a.rs".into(), detail: None });
-        text(&mut a, Ev::Tool { name: "read".into(), summary: "b.rs".into(), detail: None });
+        text(&mut a, Ev::Tool { id: String::new(), name: "read".into(), summary: "a.rs".into(), detail: None });
+        text(&mut a, Ev::Tool { id: String::new(), name: "read".into(), summary: "b.rs".into(), detail: None });
         text(&mut a, Ev::ToolDone { name: "read".into(), ok: false, msg: "no such file\nmore".into(), output: String::new() });
         text(&mut a, Ev::Text("done".into()));
         assert_eq!(a.rows.len(), 5);
@@ -2234,7 +2237,7 @@ mod tests {
         assert!(joined.contains("hi") && joined.contains("Hello") && joined.contains("read   a.rs") && joined.contains("failed: no such file"), "{joined}");
         // Subagent prose is hidden, its tools are indented.
         a.update(AppEvent::Engine { depth: 1, agent: "explore".into(), ev: Ev::Text("secret".into()) });
-        a.update(AppEvent::Engine { depth: 1, agent: "explore".into(), ev: Ev::Tool { name: "grep".into(), summary: "x".into(), detail: None } });
+        a.update(AppEvent::Engine { depth: 1, agent: "explore".into(), ev: Ev::Tool { id: String::new(), name: "grep".into(), summary: "x".into(), detail: None } });
         let joined = screen(&mut a, 60, 14).join("\n");
         assert!(!joined.contains("secret") && joined.contains("explore · 1 tool call · now: grep x"), "{joined}");
     }
@@ -2584,33 +2587,78 @@ mod tests {
         assert!(screen(&mut a, 40, 10).join("\n").contains("use bold now"));
     }
 
+    fn shell_row(id: &str, summary: &str) -> Ev {
+        Ev::Tool { id: id.into(), name: "shell".into(), summary: summary.into(), detail: None }
+    }
+
+    fn auto(id: &str, command: &str, risk: &str, reason: &str) -> Ev {
+        Ev::AutoAllowed { call_id: id.into(), command: command.into(), risk: risk.into(), reason: reason.into() }
+    }
+
     #[test]
-    fn an_auto_allowed_command_marks_its_own_tool_row() {
+    fn an_auto_allowed_command_marks_the_row_of_its_own_call() {
         let mut a = App::new("m", "build");
-        text(&mut a, Ev::Tool { name: "shell".into(), summary: "cargo test -p moco-core".into(), detail: None });
-        text(&mut a, Ev::Tool { name: "shell".into(), summary: "ls -la".into(), detail: None });
-        text(&mut a, Ev::AutoAllowed { command: "ls -la".into(), risk: "read-only".into(), reason: "lists files".into() });
+        text(&mut a, shell_row("call_1", "cargo test -p moco-core"));
+        text(&mut a, shell_row("call_2", "ls -la"));
+        text(&mut a, auto("call_2", "ls -la", "read-only", "lists files"));
         let s = screen(&mut a, 80, 12).join("\n");
         let row = |needle: &str| s.lines().find(|l| l.contains(needle)).unwrap_or("").to_string();
         assert!(row("ls -la").contains("auto: read-only: lists files"), "{s}");
         assert!(!row("cargo test").contains("auto:"), "the other row is not marked: {s}");
-        // A second marker for the same command goes to the next unmarked row, never twice to one.
-        text(&mut a, Ev::AutoAllowed { command: "cargo test -p moco-core".into(), risk: "project-write".into(), reason: String::new() });
-        let s = screen(&mut a, 80, 12).join("\n");
+        // The same id twice marks the row once; the second one is shown as a line of its own.
+        text(&mut a, auto("call_2", "ls -la", "read-only", ""));
+        let s = screen(&mut a, 80, 14).join("\n");
+        assert_eq!(s.matches("auto:").count(), 2, "one marker on the row and one fallback line: {s}");
+        // The other call is marked when its own event arrives.
+        text(&mut a, auto("call_1", "cargo test -p moco-core", "project-write", ""));
+        let s = screen(&mut a, 80, 14).join("\n");
         assert!(s.lines().find(|l| l.contains("cargo test")).unwrap().contains("auto: project-write"), "{s}");
-        // With nothing to attach to (the row is gone or finished), it still shows up as a line of its own.
-        text(&mut a, Ev::AutoAllowed { command: "pwd".into(), risk: "read-only".into(), reason: String::new() });
-        assert!(screen(&mut a, 80, 14).join("\n").contains("auto: read-only"), "fallback line");
-        // A narrow screen clips the command, not the marker.
+    }
+
+    #[test]
+    fn parallel_calls_with_look_alike_commands_are_not_mixed_up() {
+        // `ls` is a prefix of `ls -la /etc`, and an empty summary is a prefix of everything: neither may steal a marker.
+        let mut a = App::new("m", "build");
+        text(&mut a, shell_row("call_1", "ls -la /etc"));
+        text(&mut a, shell_row("call_2", "ls"));
+        text(&mut a, shell_row("call_3", ""));
+        text(&mut a, auto("call_1", "ls -la /etc", "read-only", ""));
+        let s = screen(&mut a, 80, 12).join("\n");
+        assert!(s.lines().find(|l| l.contains("ls -la /etc")).unwrap().contains("auto: read-only"), "{s}");
+        assert_eq!(s.matches("auto:").count(), 1, "only the call the verdict is for is marked: {s}");
+        // A summary the row clipped with an ellipsis is still matched, because the id does the matching.
         let mut b = App::new("m", "build");
-        text(&mut b, Ev::Tool { name: "shell".into(), summary: "a-very-long-command-name --with --many --flags --that --go --on".into(), detail: None });
-        text(&mut b, Ev::AutoAllowed { command: "a-very-long-command-name --with --many --flags --that --go --on".into(), risk: "read-only".into(), reason: String::new() });
+        text(&mut b, shell_row("call_9", "a-very-long-command…"));
+        text(&mut b, auto("call_9", "a-very-long-command --with --many --flags", "read-only", ""));
+        assert!(screen(&mut b, 80, 6).join("\n").contains("auto: read-only"));
+    }
+
+    #[test]
+    fn an_auto_allowed_command_without_a_row_shows_up_as_a_line_naming_the_command() {
+        let mut a = App::new("m", "build");
+        text(&mut a, auto("call_gone", "pwd", "read-only", ""));
+        let s = screen(&mut a, 80, 6).join("\n");
+        assert!(s.contains("auto: read-only: pwd"), "fallback line: {s}");
+        // An event without an id never attaches to a running row.
+        let mut b = App::new("m", "build");
+        text(&mut b, shell_row("", "pwd"));
+        text(&mut b, auto("", "pwd", "read-only", ""));
+        let s = screen(&mut b, 80, 6).join("\n");
+        assert!(s.contains("auto: read-only: pwd"), "{s}");
+    }
+
+    #[test]
+    fn a_narrow_screen_clips_the_command_not_the_marker() {
+        let mut b = App::new("m", "build");
+        let cmd = "a-very-long-command-name --with --many --flags --that --go --on";
+        text(&mut b, shell_row("call_1", cmd));
+        text(&mut b, auto("call_1", cmd, "read-only", ""));
         let s = screen(&mut b, 44, 6).join("\n");
         assert!(s.contains("auto: read-only"), "{s}");
     }
 
     fn tool_with_detail(a: &mut App, name: &str, detail: &str) {
-        text(a, Ev::Tool { name: name.into(), summary: "x.rs".into(), detail: Some(detail.into()) });
+        text(a, Ev::Tool { id: String::new(), name: name.into(), summary: "x.rs".into(), detail: Some(detail.into()) });
         text(a, Ev::ToolDone { name: name.into(), ok: true, msg: String::new(), output: "line one\nline two".into() });
     }
 
@@ -2631,7 +2679,7 @@ mod tests {
         // Level 2 (Ctrl-O): everything, plus tool output where there is no diff.
         a.update(key(KeyCode::Char('o'), KeyModifiers::CONTROL));
         assert_eq!(a.level, 2);
-        text(&mut a, Ev::Tool { name: "grep".into(), summary: "q".into(), detail: None });
+        text(&mut a, Ev::Tool { id: String::new(), name: "grep".into(), summary: "q".into(), detail: None });
         text(&mut a, Ev::ToolDone { name: "grep".into(), ok: true, msg: String::new(), output: "hit one\nhit two".into() });
         let s = screen(&mut a, 60, 70).join("\n");
         assert!(s.contains("+added 39") && !s.contains("more lines") && s.contains("  hit one"), "{s}");
@@ -2877,7 +2925,7 @@ mod tests {
         a.push_user("hello");
         text(&mut a, Ev::Reasoning("hmm".into()));
         text(&mut a, Ev::Text("# Title\n\n- item\n> quote\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```\ncode\n```".into()));
-        text(&mut a, Ev::Tool { name: "edit".into(), summary: "x".into(), detail: Some("@@ -1 +1 @@\n-a\n+b".into()) });
+        text(&mut a, Ev::Tool { id: String::new(), name: "edit".into(), summary: "x".into(), detail: Some("@@ -1 +1 @@\n-a\n+b".into()) });
         text(&mut a, Ev::ToolDone { name: "edit".into(), ok: true, msg: String::new(), output: String::new() });
         text(&mut a, Ev::Todos(vec![Todo { content: "t".into(), status: "completed".into() }]));
         text(&mut a, Ev::Usage { usage: Usage { input: 1, output: 1, cache_read: 0, cache_write: 0 }, cost: Some(0.1), session_cost: 0.1, context: 10, limit: Some(100) });

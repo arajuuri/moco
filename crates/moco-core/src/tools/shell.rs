@@ -207,12 +207,12 @@ Do not use interactive commands.\n\n{BACKGROUND_INSTRUCTION}"
         resources.dedup();
         save.dedup();
         let unsandbox_save = save.clone();
-        ctx.permitter.check(&PermReq { action: "shell".into(), resources: resources.clone(), save, force_ask: parsed.opaque, command: Some(command.to_string()) })?;
+        ctx.permitter.check(&PermReq { action: "shell".into(), resources: resources.clone(), save, force_ask: parsed.opaque, command: Some(command.to_string()), call_id: ctx.call_id.into() })?;
 
         // Leaving the sandbox is its own permission, so a blanket `shell` allow does not cover it.
         let unsandboxed = opt_bool(input, "unsandboxed").unwrap_or(false) && crate::sandbox::active();
         if unsandboxed {
-            ctx.permitter.check(&PermReq { action: "shell.unsandboxed".into(), resources, save: unsandbox_save, force_ask: parsed.opaque, command: None })?;
+            ctx.permitter.check(&PermReq { action: "shell.unsandboxed".into(), resources, save: unsandbox_save, force_ask: parsed.opaque, command: None, call_id: ctx.call_id.into() })?;
         }
 
         if background {

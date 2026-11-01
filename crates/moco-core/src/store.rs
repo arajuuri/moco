@@ -150,6 +150,9 @@ fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
+/// How long a recorded automatic allow is kept: as long as the log files (seven days).
+const AUTO_ALLOW_KEEP_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(dir) = path.parent() {
@@ -174,7 +177,15 @@ impl Store {
             tx.execute("insert into migrations(version, applied_at) values (?1, ?2)", params![version, now_ms()])?;
             tx.commit()?;
         }
-        Ok(Store { conn })
+        let store = Store { conn };
+        store.prune_auto_allows(AUTO_ALLOW_KEEP_MS);
+        Ok(store)
+    }
+
+    /// Forget automatic allows older than `keep_ms`. They only feed the `/permissions` listing, and the same cutoff as
+    /// the log files keeps what a command line once held from piling up. A failure is logged, never fatal.
+    fn prune_auto_allows(&self, keep_ms: i64) {
+        crate::log::LogErr::log_err(self.conn.execute("delete from auto_allow where at < ?1", [now_ms() - keep_ms]), "store", "pruning old automatic allows");
     }
 
     /// Project id is derived from the directory, so reopening the same directory finds the same project.
@@ -305,10 +316,10 @@ impl Store {
         Ok(())
     }
 
-    /// The part of the session's cost (children included) that went to the permission classifier.
-    /// Remember a command the classifier allowed without asking.
+    /// Remember a command the classifier allowed without asking. The command is stored redacted (`log::redact`): a
+    /// token or password on the command line must not outlive the command in the database.
     pub fn record_auto_allow(&self, session_id: &str, command: &str, risk: &str, reason: &str, model: &str) -> Result<()> {
-        let command: String = command.chars().take(2000).collect();
+        let command: String = crate::log::redact(command).chars().take(2000).collect();
         self.conn.execute("insert into auto_allow(session_id, at, command, risk, reason, model) values (?1,?2,?3,?4,?5,?6)", params![session_id, now_ms(), command, risk, reason, model])?;
         Ok(())
     }
@@ -323,6 +334,7 @@ impl Store {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
+    /// The part of the session's cost (children included) that went to the permission classifier.
     pub fn classifier_cost(&self, session_id: &str) -> Result<f64> {
         Ok(self.conn.query_row("select classifier_cost from session where id=?1", [session_id], |r| r.get(0))?)
     }
@@ -955,6 +967,32 @@ mod tests {
         s.save_permission("prj_other", "edit", "*").unwrap();
         let rules = s.saved_permissions(&ses.project_id).unwrap();
         assert_eq!(rules, [Rule::new("shell", "git push *", Effect::Allow)]);
+    }
+
+    #[test]
+    fn automatic_allows_are_stored_without_credentials_and_forgotten_after_a_week() {
+        let dir = std::env::temp_dir().join(new_id("moco-store"));
+        let path = dir.join("moco.db");
+        let ses = {
+            let s = Store::open(&path).unwrap();
+            let ses = s.create_session("/p", "build").unwrap();
+            s.record_auto_allow(&ses.id, "export GITHUB_TOKEN=ghp_abcdef123456 && gh api user", "network", "", "m/a").unwrap();
+            s.record_auto_allow(&ses.id, "mysql -u root -phunter2 -e 'select 1'", "read-only", "", "m/a").unwrap();
+            let stored: Vec<String> = s.auto_allows(&ses.id).unwrap().into_iter().map(|a| a.command).collect();
+            assert!(stored.iter().all(|c| !c.contains("ghp_abcdef123456") && !c.contains("hunter2")), "{stored:?}");
+            assert_eq!(stored[0], "export GITHUB_TOKEN=[redacted] && gh api user");
+            // Age one of them past the cutoff, the other to just inside it.
+            let old = now_ms() - AUTO_ALLOW_KEEP_MS - 1000;
+            let recent = now_ms() - AUTO_ALLOW_KEEP_MS + 60_000;
+            s.conn.execute("update auto_allow set at=?1 where command like 'export%'", [old]).unwrap();
+            s.conn.execute("update auto_allow set at=?1 where command like 'mysql%'", [recent]).unwrap();
+            ses
+        };
+        let s = Store::open(&path).unwrap();
+        let left: Vec<String> = s.auto_allows(&ses.id).unwrap().into_iter().map(|a| a.command).collect();
+        assert_eq!(left.len(), 1, "the week-old row is pruned when the store opens: {left:?}");
+        assert!(left[0].starts_with("mysql"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

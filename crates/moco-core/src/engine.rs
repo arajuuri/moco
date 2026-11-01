@@ -14,6 +14,7 @@ use crate::store::{Mode, Session, Store, StoreError};
 use crate::tools::{self, project_root_of, Host, MediaCaps, PermReq, Permitter, Question, SubagentRequest, SubagentResult, Todo, Tool, ToolCtx, ToolError, ToolOutput};
 use serde_json::{json, Value};
 mod classify;
+pub use classify::Evaluation;
 mod jobs;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -39,7 +40,7 @@ pub struct PermissionPrompt<'a> {
 pub enum UiEvent<'a> {
     TextDelta(&'a str),
     ReasoningDelta(&'a str),
-    ToolStarted { name: &'a str, input: &'a Value },
+    ToolStarted { id: &'a str, name: &'a str, input: &'a Value },
     ToolFinished { name: &'a str, ok: bool, text: &'a str },
     Retry { attempt: u32, wait: Duration, error: &'a str },
     /// After each step: this step's tokens and cost, session total, and how full the context is.
@@ -47,9 +48,10 @@ pub enum UiEvent<'a> {
     /// The permission classifier was called (`classifier.rs`): what the call cost, the session total (which includes
     /// it) and the part of that total spent on classifying.
     ClassifierUsage { cost: f64, session_cost: f64, classifier_cost: f64 },
-    /// The classifier let a shell command through without asking. `command` is one line, `risk` is what the model
-    /// judged it to be (or `allowed earlier` for a repeat), `reason` may be empty.
-    AutoAllowed { command: &'a str, risk: &'a str, reason: &'a str },
+    /// The classifier let a shell command through without asking. `call_id` is the tool call it belongs to (the id of
+    /// the matching `ToolStarted`), `command` is one line, `risk` is what the model judged it to be (or
+    /// `allowed earlier` for a repeat), `reason` may be empty.
+    AutoAllowed { call_id: &'a str, command: &'a str, risk: &'a str, reason: &'a str },
     Notice(&'a str),
     /// Progress that is not an error (compaction started or finished).
     Status(&'a str),
@@ -476,7 +478,11 @@ impl Engine {
     pub fn permissions_report(&self, sid: &str) -> Result<Vec<String>, StoreError> {
         let (session, auto) = {
             let st = self.store();
-            (st.session(sid)?.expect("session exists"), st.auto_allows(sid)?)
+            match st.session(sid)? {
+                Some(session) => (session, st.auto_allows(sid)?),
+                // Deleted or archived from another process, or a stale id after /resume: say so, don't take the UI down.
+                None => return Ok(vec![format!("session {sid} was not found (it may have been deleted from another moco process)")]),
+            }
         };
         let saved = self.store().saved_permissions(&session.project_id)?;
         let mode = self.permission_mode_of(&session);
@@ -1261,7 +1267,7 @@ impl Engine {
                 Event::ToolCall { id, name, input } => {
                     text_idx = None;
                     dispatched = true;
-                    ui.event(&UiEvent::ToolStarted { name: &name, input: &input });
+                    ui.event(&UiEvent::ToolStarted { id: &id, name: &name, input: &input });
                     parts.push(chat::tool_part(&id, &name, &input));
                     let idx = parts.len() - 1;
                     self.store().set_message_parts(msg_id, &parts).log_err("store", "saving a tool call");
@@ -1275,7 +1281,7 @@ impl Engine {
                                 None => Err(ToolError::fail(format!("Unknown tool: {name}"))),
                                 Some(t) => {
                                     let host = EngineHost { engine: self, session, ui, cancel };
-                                    t.run(&input, &ToolCtx { formatters: &self.cfg.formatters, media: caps, session_id: &session.id, host: &host, cwd, project_root: root, spill_dir: spill, permitter, cancel })
+                                    t.run(&input, &ToolCtx { formatters: &self.cfg.formatters, media: caps, session_id: &session.id, host: &host, cwd, project_root: root, spill_dir: spill, permitter, cancel, call_id: &id })
                                 }
                             };
                             log_tool(&name, &outcome, started.elapsed());
@@ -1435,7 +1441,7 @@ impl EnginePermitter<'_> {
         match c.engine.classify_command(c.session, command, &parsed, c.settings, self.ui, c.cancel) {
             classifier::Verdict::Allow { risk, reason } => {
                 // Its own event, not a Notice: an allowed command is not an error, and the TUI marks the tool row with it.
-                self.ui.event(&UiEvent::AutoAllowed { command: &classifier::sanitize(command, 100), risk: &risk, reason: &reason });
+                self.ui.event(&UiEvent::AutoAllowed { call_id: &req.call_id, command: &classifier::sanitize(command, 100), risk: &risk, reason: &reason });
                 true
             }
             classifier::Verdict::Ask { reason } => {
@@ -1530,7 +1536,7 @@ mod tests {
             UiEvent::Retry { attempt, wait, .. } => format!("retry:{attempt}:{}", wait.as_secs()),
             UiEvent::StepUsage { .. } => "usage".into(),
             UiEvent::ClassifierUsage { .. } => "classifier-usage".into(),
-            UiEvent::AutoAllowed { command, risk, reason } => format!("auto:{risk}:{command}:{reason}"),
+            UiEvent::AutoAllowed { command, risk, reason, .. } => format!("auto:{risk}:{command}:{reason}"),
             UiEvent::Notice(n) => format!("notice:{n}"),
             UiEvent::Status(n) => format!("status:{n}"),
             UiEvent::Todos(t) => format!("todos:{}", t.len()),
@@ -2323,7 +2329,7 @@ mod tests {
     }
 
     fn notices(ui: &TestUi) -> Vec<String> {
-        ui.log().into_iter().filter(|l| l.starts_with("notice:") || l.starts_with("status:")).collect()
+        ui.log().into_iter().filter(|l| l.starts_with("notice:") || l.starts_with("status:") || l.starts_with("auto:")).collect()
     }
 
     #[test]
@@ -2520,7 +2526,7 @@ mod tests {
             assert!(lines[0].contains(part), "{part} missing from {}", lines[0]);
         }
         assert!(lines[1].contains("decision=allow cached=true") && lines[1].contains("command=echo hi"), "{}", lines[1]);
-        assert!(!classifier_log(sid, "DEBUG").is_empty(), "the raw reply is kept at debug");
+        assert!(!classifier_log(sid, "DEBUG").is_empty(), "the raw reply is kept at debug: {:?}", crate::log::capture::global_lines(&format!("session={sid}")));
 
         // What `/permissions` shows: the mode, the model, the command (once, not per repeat) and the saved rules.
         let report = f.engine.permissions_report(sid).unwrap();
@@ -2568,6 +2574,37 @@ mod tests {
         assert!(classifier_log(&f.session.id, "INFO").is_empty());
         let skipped = classifier_log(&f.session.id, "DEBUG");
         assert!(skipped.len() == 1 && skipped[0].contains("skipped (opaque or never-classify list)") && skipped[0].contains("sudo ls"), "{skipped:?}");
+    }
+
+    #[test]
+    fn an_interrupt_while_classifying_is_not_reported_as_a_timeout_or_logged_as_a_decision() {
+        crate::log::capture::ensure_global("debug");
+        let settings = classifier::Settings { timeout: Duration::from_secs(20), ..Default::default() };
+        let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "echo hi"})), text("done")], auto_careful_with(Some(settings), vec![]));
+        f.fake.delay_classifier(Duration::from_secs(30));
+        f.fake.script_verdicts(vec![verdict("allow", "read-only")]);
+        f.say("go");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let ui = TestUi::replying(vec![Reply::Once]);
+        let (c2, started) = (cancel.clone(), std::time::Instant::now());
+        let esc = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            c2.store(true, Ordering::Relaxed);
+        });
+        let _ = f.engine.run(&f.session.id, &ui, &cancel, false);
+        esc.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10), "the interrupt ends the wait at once, not at the 20 s limit");
+        assert!(!notices(&ui).iter().any(|n| n.contains("did not answer in time") || n.contains("classifier: asking you")), "{:?}", notices(&ui));
+        assert!(classifier_log(&f.session.id, "INFO").is_empty(), "no decision was made, so none is logged: {:?}", classifier_log(&f.session.id, "INFO"));
+        assert!(classifier_log(&f.session.id, "DEBUG").iter().any(|l| l.contains("interrupted") && l.contains("no decision made")));
+    }
+
+    #[test]
+    fn permissions_for_a_session_that_does_not_exist_is_a_message_not_a_panic() {
+        let f = fixture(vec![]);
+        let report = f.engine.permissions_report("ses_missing").unwrap();
+        assert_eq!(report.len(), 1);
+        assert!(report[0].contains("ses_missing") && report[0].contains("not found"), "{report:?}");
     }
 
     #[test]

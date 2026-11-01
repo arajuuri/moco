@@ -129,7 +129,7 @@ impl Terminal {
         let pad = "  ".repeat(depth);
         match e {
             UiEvent::Nested { agent, inner } => self.nested(depth + 1, agent, inner),
-            UiEvent::ToolStarted { name, input } => {
+            UiEvent::ToolStarted { name, input, .. } => {
                 self.newline_if_needed();
                 println!("{DIM}{pad}[{agent}] > {name} {}{RESET}", summary(name, input));
             }
@@ -229,7 +229,7 @@ impl Ui for Terminal {
                 r.session_cost = *session_cost;
                 return;
             }
-            UiEvent::ToolStarted { name, input } => {
+            UiEvent::ToolStarted { name, input, .. } => {
                 self.newline_if_needed();
                 println!("{DIM}> {name} {}{RESET}", summary(name, input));
             }
@@ -250,10 +250,10 @@ impl Ui for Terminal {
                 self.newline_if_needed();
                 println!("{DIM}{n}{RESET}");
             }
-            UiEvent::AutoAllowed { command, risk, reason } => {
+            UiEvent::AutoAllowed { command, risk, reason, .. } => {
+                // With parallel tool calls the line does not follow its own call, so it names the command.
                 self.newline_if_needed();
-                println!("{DIM}  auto: {risk}{}{RESET}", if reason.is_empty() { String::new() } else { format!(" ({reason})") });
-                let _ = command; // the line belongs to the tool call printed just above
+                println!("{DIM}  auto: {risk}{}: {command}{RESET}", if reason.is_empty() { String::new() } else { format!(" ({reason})") });
             }
         }
         let _ = std::io::stdout().flush();
@@ -477,12 +477,33 @@ fn provider_line(p: &ProviderInfo, app_dir: &std::path::Path) -> String {
     format!("{:<16} {:>4} models  {state}{experimental}", p.id, p.models.len())
 }
 
+/// `moco --eval-classifier FILE`: runs every command in FILE (JSON lines with a `command` field, or plain lines)
+/// through the classifier and prints one JSON line per command with the layer that decided and its verdict. The
+/// comparison with what was expected is `scripts/eval-classifier.py`. Uses the configured model and records a session
+/// in the store, so point `MOCO_HOME` at a scratch directory.
+fn eval_classifier_cases(engine: &Engine, file: &str, cwd: &str) {
+    let text = std::fs::read_to_string(file).unwrap_or_else(|e| die(&format!("{file}: {e}")));
+    let session = engine.store.lock().unwrap().create_session(cwd, "build").unwrap_or_else(|e| die(&format!("database: {e}")));
+    let cancel = AtomicBool::new(false);
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        let command = match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(v) => v["command"].as_str().map(str::to_string).unwrap_or_else(|| die(&format!("a case has no `command`: {line}"))),
+            Err(_) => line.to_string(),
+        };
+        let ev = engine.evaluate_command(&session, &command, &cancel);
+        let (decision, risk, reason) = match ev.verdict {
+            moco_core::classifier::Verdict::Allow { risk, reason } => ("allow", risk, reason),
+            moco_core::classifier::Verdict::Ask { reason } => ("ask", String::new(), reason),
+        };
+        println!("{}", serde_json::json!({"command": command, "stage": ev.stage, "decision": decision, "risk": risk, "reason": reason}));
+    }
+}
+
 fn main() {
     // Let `moco models | head` end quietly instead of panicking on a closed pipe.
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let mut raw: Vec<String> = std::env::args().skip(1).collect();
     let app_dir = auth::app_dir();
-    moco_core::log::init(&app_dir);
 
     // Subcommands that need no session.
     match raw.first().map(String::as_str) {
@@ -553,7 +574,7 @@ fn main() {
                 None => {}
             }
             if follow {
-                let mut f = moco_core::log::Follow::new(&app_dir, true);
+                let mut f = moco_core::log::Follow::new(&app_dir);
                 loop {
                     let new = f.poll();
                     if !new.is_empty() {
@@ -596,6 +617,7 @@ fn main() {
     let mut model = std::env::var("MOCO_MODEL").ok();
     let mut agent_id: Option<String> = None;
     let mut permission_mode_arg: Option<String> = None;
+    let mut eval_classifier: Option<String> = None;
     let mut args = raw.drain(..);
     while let Some(a) = args.next() {
         let mut value = |flag: &str| args.next().unwrap_or_else(|| die(&format!("{flag} needs a value")));
@@ -608,6 +630,8 @@ fn main() {
             "--dir" => dir = Some(value("--dir")),
             "--session" | "-s" => session_arg = Some(value("--session")),
             "--prompt" | "-p" => prompt = Some(value("--prompt")),
+            // Not in --help: a development tool for `scripts/eval-classifier.py`.
+            "--eval-classifier" => eval_classifier = Some(value("--eval-classifier")),
             "--tui" => want_tui = Some(true),
             "--plain" => want_tui = Some(false),
             "--version" | "-V" => {
@@ -623,6 +647,9 @@ fn main() {
             other => die(&format!("unknown argument {other}")),
         }
     }
+    // Only a run that starts a session logs. `--help`, `--version`, `logs`, `models`, `auth` and `sessions` never touch
+    // the log directory, so `moco logs` cannot create the file it is about to show.
+    moco_core::log::init(&app_dir);
     if let Some(w) = auth::permissions_warning(&app_dir) {
         eprintln!("warning: {w}");
     }
@@ -751,6 +778,9 @@ fn main() {
     engine_cfg.websearch = moco_core::tools::websearch::Settings::from_config(&cfg.websearch, app_dir.clone());
     let n_sources = loaded.sources.len();
     let engine = Engine::with_providers(store, providers, engine_cfg).share();
+    if let Some(cases) = eval_classifier {
+        return eval_classifier_cases(&engine, &cases, &cwd_str);
+    }
     engine.set_notifier(std::sync::Arc::new(|line| {
         if AT_PROMPT.load(Ordering::Relaxed) {
             // Redraw the prompt line underneath the notice.

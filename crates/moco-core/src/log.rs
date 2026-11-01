@@ -11,7 +11,6 @@
 //!   bearer tokens never reach the file, not even at `trace`.
 //!
 //! Until `init` runs nothing is written and `enabled` is a single atomic load, so library users and tests pay nothing.
-use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -73,15 +72,24 @@ impl Filter {
     /// one target. Fails with a message naming the bad part.
     pub fn parse(spec: &str) -> Result<Filter, String> {
         let mut f = Filter::default();
+        let mut explicit: Vec<String> = vec![];
         for part in spec.split(',').map(str::trim).filter(|p| !p.is_empty()) {
             match part.split_once('=') {
                 Some((target, level)) => {
                     let level = Level::parse(level).ok_or_else(|| format!("unknown log level '{}' in '{part}'", level.trim()))?;
                     let target = target.trim().to_string();
                     f.targets.retain(|(t, _)| *t != target);
-                    f.targets.push((target, level));
+                    f.targets.push((target.clone(), level));
+                    explicit.push(target);
                 }
                 None => f.default = Level::parse(part).ok_or_else(|| format!("unknown log level '{part}' (use error, warn, info, debug, trace or off)"))?,
+            }
+        }
+        // An audit target is at least `info`, but a more verbose global level applies to it too: `MOCO_LOG=debug`
+        // must show the classifier's debug lines. Only an explicit `target=level` overrides this.
+        for (t, l) in f.targets.iter_mut() {
+            if AUDIT_TARGETS.contains(&t.as_str()) && !explicit.contains(t) {
+                *l = f.default.max(Level::Info);
             }
         }
         Ok(f)
@@ -133,6 +141,12 @@ struct Patterns {
     bearer: regex::Regex,
     prefixed_key: regex::Regex,
     url_param: regex::Regex,
+    // Shell command lines (the permission classifier logs and stores them).
+    secret_assignment: regex::Regex,
+    user_flag: regex::Regex,
+    secret_flag: regex::Regex,
+    mysql_password: regex::Regex,
+    url_credentials: regex::Regex,
 }
 
 fn patterns() -> &'static Patterns {
@@ -146,6 +160,17 @@ fn patterns() -> &'static Patterns {
         bearer: regex::Regex::new(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}").unwrap(),
         prefixed_key: regex::Regex::new(r"\b(sk|pk|rk|xai|gsk|key)-[A-Za-z0-9_-]{16,}").unwrap(),
         url_param: regex::Regex::new(r"(?i)([?&](?:key|api_key|apikey|access_token|token)=)[^&\s\x22']+").unwrap(),
+        // `GITHUB_TOKEN=ghp_x`, `export DB_PASSWORD='a b'`, `AWS_SECRET_ACCESS_KEY=...`: an assignment whose name says it is
+        // a secret. The value is a quoted string or runs to the next space, `;`, `&` or `|`.
+        secret_assignment: regex::Regex::new(r#"(?i)\b((?:[A-Za-z0-9_]*(?:token|secret|passw(?:or)?d|pwd|credential|authorization|_auth\b|api_?key|private_?key|access_?key)[A-Za-z0-9_]*)|(?:[A-Za-z0-9]+_)*key(?:_[A-Za-z0-9]+)*)=("[^"]*"|'[^']*'|[^\s;&|]+)"#).unwrap(),
+        // `curl -u user:pass`, `--user=user:pass`. Only a value with a colon: `git push -u origin` is not a credential.
+        user_flag: regex::Regex::new(r#"(?i)(\s(?:-u|--user|--proxy-user)(?:\s+|=))("[^"]*:[^"]*"|'[^']*:[^']*'|[^\s"';&|]*:[^\s"';&|]*)"#).unwrap(),
+        // `--password hunter2`, `--token=abc`, `--api-key abc`.
+        secret_flag: regex::Regex::new(r#"(?i)(--(?:password|passwd|pass|token|secret|api-key|apikey|access-token|auth-token|client-secret)(?:=|\s+))("[^"]*"|'[^']*'|[^\s;&|]+)"#).unwrap(),
+        // `mysql -u root -phunter2`: the password is glued to the flag. Only for the mysql family, where `-p` means that.
+        mysql_password: regex::Regex::new(r"(?i)(\bmysql\w*\b[^\n;|&]*?\s)-p\S+").unwrap(),
+        // `postgres://user:pass@host/db`, `redis://:pass@host`
+        url_credentials: regex::Regex::new(r"(?i)\b([a-z][a-z0-9+.-]*://[^\s:/@]*:)[^\s@/]+@").unwrap(),
     })
 }
 
@@ -162,7 +187,12 @@ pub fn redact(text: &str) -> String {
     let out = p.cookie.replace_all(&out, "$1$2[redacted]");
     let out = p.bearer.replace_all(&out, "Bearer [redacted]");
     let out = p.prefixed_key.replace_all(&out, "[redacted]");
-    p.url_param.replace_all(&out, "${1}[redacted]").into_owned()
+    let out = p.url_param.replace_all(&out, "${1}[redacted]");
+    let out = p.secret_assignment.replace_all(&out, "$1=[redacted]");
+    let out = p.user_flag.replace_all(&out, "$1[redacted]");
+    let out = p.secret_flag.replace_all(&out, "$1[redacted]");
+    let out = p.mysql_password.replace_all(&out, "${1}-p[redacted]");
+    p.url_credentials.replace_all(&out, "${1}[redacted]@").into_owned()
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -258,7 +288,6 @@ pub struct Sink {
     header: String,
     day: String,
     file: Option<std::fs::File>,
-    size: u64,
     capped: bool,
     /// Opening failed: stay quiet instead of retrying for every line.
     failed: bool,
@@ -266,7 +295,7 @@ pub struct Sink {
 
 impl Sink {
     pub fn new(dir: PathBuf, header: String) -> Sink {
-        Sink { dir, header, day: String::new(), file: None, size: 0, capped: false, failed: false }
+        Sink { dir, header, day: String::new(), file: None, capped: false, failed: false }
     }
 
     fn open(&mut self, day: &str, now: i64) {
@@ -278,7 +307,6 @@ impl Sink {
         let opened = std::fs::create_dir_all(&self.dir).and_then(|_| std::fs::OpenOptions::new().append(true).create(true).mode(0o600).open(self.dir.join(file_name(day))));
         match opened {
             Ok(f) => {
-                self.size = f.metadata().map(|m| m.len()).unwrap_or(0);
                 self.file = Some(f);
                 self.prune(now);
                 let line = format!("{} INFO  log: {}\n", stamp(now), one_line(&self.header));
@@ -303,10 +331,14 @@ impl Sink {
     fn append(&mut self, line: &str) {
         if let Some(f) = &mut self.file {
             // One write call per line, so lines of two moco processes never interleave mid-line.
-            if f.write_all(line.as_bytes()).is_ok() {
-                self.size += line.len() as u64;
-            }
+            let _ = f.write_all(line.as_bytes());
         }
+    }
+
+    /// The file's size right now, other moco processes' lines included. Asked before every write, so the cap is shared
+    /// by everything that writes the day file (a stale count would let each process add up to the whole cap).
+    fn size_now(&self) -> u64 {
+        self.file.as_ref().and_then(|f| f.metadata().ok()).map_or(0, |m| m.len())
     }
 
     /// Append one record stamped `now` (ms since the epoch).
@@ -319,7 +351,7 @@ impl Sink {
             return;
         }
         let line = format!("{} {} {target}: {}\n", stamp(now), level.label(), one_line(msg));
-        if self.size + line.len() as u64 > MAX_FILE_BYTES {
+        if self.size_now() + line.len() as u64 > MAX_FILE_BYTES {
             if !self.capped {
                 self.capped = true;
                 let note = format!("{} WARN  log: this file reached {} MiB; dropping lines until the next day\n", stamp(now), MAX_FILE_BYTES / 1024 / 1024);
@@ -455,10 +487,28 @@ pub fn tail(text: &str, lines: usize) -> String {
     all[all.len().saturating_sub(lines)..].join(" | ")
 }
 
-/// The last `n` lines of a log file (files are capped at 16 MiB, so reading one whole is fine).
+/// The last `n` lines of a log file. Reads backwards from the end in chunks, so a big file costs only what the tail needs.
 pub fn read_tail(path: &Path, n: usize) -> std::io::Result<String> {
-    let text = String::from_utf8_lossy(&std::fs::read(path)?).into_owned();
-    let lines: Vec<&str> = text.lines().collect();
+    use std::io::{Read, Seek, SeekFrom};
+    const CHUNK: u64 = 64 * 1024;
+    let mut f = std::fs::File::open(path)?;
+    let (mut start, mut buf, mut newlines) = (f.metadata()?.len(), Vec::<u8>::new(), 0usize);
+    // One newline more than asked for, so that the first line kept is whole.
+    while start > 0 && newlines <= n {
+        let step = start.min(CHUNK);
+        start -= step;
+        f.seek(SeekFrom::Start(start))?;
+        let mut chunk = vec![0u8; step as usize];
+        f.read_exact(&mut chunk)?;
+        newlines += chunk.iter().filter(|b| **b == b'\n').count();
+        chunk.extend_from_slice(&buf);
+        buf = chunk;
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines: Vec<&str> = text.lines().collect();
+    if start > 0 && !lines.is_empty() {
+        lines.remove(0); // cut off mid-line by the chunk boundary
+    }
     Ok(lines[lines.len().saturating_sub(n)..].iter().map(|l| format!("{l}\n")).collect())
 }
 
@@ -467,13 +517,12 @@ pub struct Follow {
     app_dir: PathBuf,
     path: Option<PathBuf>,
     pos: u64,
-    start_at_end: bool,
 }
 
 impl Follow {
-    /// With `start_at_end` the lines already in the newest file are skipped.
-    pub fn new(app_dir: &Path, start_at_end: bool) -> Follow {
-        Follow { app_dir: app_dir.to_path_buf(), path: None, pos: 0, start_at_end }
+    /// The lines already in the newest file are skipped; files that appear later are read from their start.
+    pub fn new(app_dir: &Path) -> Follow {
+        Follow { app_dir: app_dir.to_path_buf(), path: None, pos: 0 }
     }
 
     pub fn poll(&mut self) -> String {
@@ -481,7 +530,7 @@ impl Follow {
         let Some(newest) = latest_file(&self.app_dir) else { return String::new() };
         if self.path.as_ref() != Some(&newest) {
             let first = self.path.is_none();
-            self.pos = if first && self.start_at_end { std::fs::metadata(&newest).map(|m| m.len()).unwrap_or(0) } else { 0 };
+            self.pos = if first { std::fs::metadata(&newest).map(|m| m.len()).unwrap_or(0) } else { 0 };
             self.path = Some(newest.clone());
         }
         let Ok(mut f) = std::fs::File::open(&newest) else { return String::new() };
@@ -496,16 +545,6 @@ impl Follow {
         let Some(end) = buf.iter().rposition(|b| *b == b'\n') else { return String::new() };
         self.pos += end as u64 + 1;
         String::from_utf8_lossy(&buf[..=end]).into_owned()
-    }
-}
-
-/// A set of strings for "log this only once" decisions.
-#[derive(Default)]
-pub struct Once(Mutex<BTreeSet<String>>);
-
-impl Once {
-    pub fn first(&self, key: &str) -> bool {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).insert(key.to_string())
     }
 }
 
@@ -584,6 +623,49 @@ mod tests {
     }
 
     #[test]
+    fn shell_commands_lose_their_credentials_but_not_their_meaning() {
+        for (before, secret) in [
+            ("export GITHUB_TOKEN=ghp_abcdef123456 && gh api user", "ghp_abcdef123456"),
+            ("PASSWORD=hunter2 ./deploy", "hunter2"),
+            ("BASIC_AUTH=user:pw123 ./go", "pw123"),
+            ("KEY=abcdef ./go", "abcdef"),
+            ("SSH_KEY=abcdef ./go", "abcdef"),
+            ("DB_PASSWORD='a b c' ./run", "a b c"),
+            ("AWS_SECRET_ACCESS_KEY=abc/def+ghi aws s3 ls", "abc/def+ghi"),
+            ("API_KEY=\"quoted value\" make", "quoted value"),
+            ("curl -u admin:s3cret https://x.example/api", "s3cret"),
+            ("curl --user=admin:s3cret https://x.example/api", "s3cret"),
+            ("mysql -u root -phunter2 -e 'select 1'", "hunter2"),
+            ("cli login --password hunter2", "hunter2"),
+            ("cli login --token=abc123xyz", "abc123xyz"),
+            ("psql postgres://app:pw0rd@db.example/app", "pw0rd"),
+            ("redis-cli -u redis://:pw0rd@cache:6379 ping", "pw0rd"),
+        ] {
+            let after = redact(before);
+            assert!(!after.contains(secret), "{secret} survived in: {after}");
+            assert!(after.contains("[redacted]"), "{after}");
+        }
+        // What stays readable: the command, its other arguments and the name of the variable.
+        assert_eq!(redact("PASSWORD=hunter2 ./deploy --env prod"), "PASSWORD=[redacted] ./deploy --env prod");
+        assert!(redact("curl -u admin:s3cret https://x.example/api").starts_with("curl -u [redacted] https://x.example"));
+        assert!(redact("psql postgres://app:pw0rd@db.example/app").contains("postgres://app:[redacted]@db.example/app"));
+        // Ordinary commands are untouched.
+        for plain in ["git push -u origin main", "cargo test -p moco-core", "ls -la /etc", "KEYBOARD=us make", "MONKEY=1 ./go", "mysql -u root -p -e 'select 1'", "git log --author=me", "GIT_AUTHOR_NAME=me git commit", "docker run -u 1000 img", "echo $HOME", "https://example.com/a:b@c"] {
+            assert_eq!(redact(plain), plain, "{plain} was changed");
+        }
+    }
+
+    #[test]
+    fn classifier_lines_logged_at_the_default_level_carry_no_credentials() {
+        let ((), lines) = capture::with("warn", || {
+            crate::log_info!("classifier", "session=ses_x decision=allow command=PASSWORD=hunter2 ./deploy && curl -u admin:s3cret https://x.example");
+        });
+        assert_eq!(lines.len(), 1, "the classifier target is on at info even when the default is warn: {lines:?}");
+        assert!(!lines[0].contains("hunter2") && !lines[0].contains("s3cret"), "{}", lines[0]);
+        assert!(lines[0].contains("PASSWORD=[redacted]") && lines[0].contains("./deploy"), "{}", lines[0]);
+    }
+
+    #[test]
     fn filters_parse_levels_and_targets() {
         let f = Filter::parse("debug,mcp=trace").unwrap();
         assert!(f.allows(Level::Debug, "engine") && !f.allows(Level::Trace, "engine"));
@@ -592,6 +674,12 @@ mod tests {
         assert!(d.allows(Level::Warn, "engine") && !d.allows(Level::Info, "engine"), "warn by default");
         assert!(d.allows(Level::Info, "classifier") && !d.allows(Level::Debug, "classifier"), "verdicts are on record by default");
         assert!(!Filter::parse("info,classifier=off").unwrap().allows(Level::Error, "classifier"));
+        let dbg = Filter::parse("debug").unwrap();
+        assert!(dbg.allows(Level::Debug, "classifier") && !dbg.allows(Level::Trace, "classifier"), "a verbose global level reaches the audit target");
+        let warn = Filter::parse("warn").unwrap();
+        assert!(warn.allows(Level::Info, "classifier") && !warn.allows(Level::Debug, "classifier"), "the audit floor stays at info");
+        let quiet = Filter::parse("trace,classifier=warn").unwrap();
+        assert!(quiet.allows(Level::Warn, "classifier") && !quiet.allows(Level::Info, "classifier"), "an explicit setting wins");
         assert!(!Filter::parse("off").unwrap().allows(Level::Error, "engine"));
         assert!(Filter::parse("loud").unwrap_err().contains("loud"));
         assert!(Filter::parse("warn,mcp=loud").is_err());
@@ -675,6 +763,44 @@ https://h/p?key=AIzaSECRET&alt=sse and sk-proj-abcdefghijklmnopqrstu"#);
     }
 
     #[test]
+    fn processes_share_the_size_cap_of_a_day_file() {
+        let dir = tmp("log-shared-cap");
+        let big = "z".repeat(MAX_RECORD - 100);
+        let (mut a, mut b) = (Sink::new(dir.clone(), "a".into()), Sink::new(dir.clone(), "b".into()));
+        // Process A fills most of the file. Process B opens it afterwards and has never seen those lines.
+        for _ in 0..(MAX_FILE_BYTES as usize / MAX_RECORD * 3 / 4) {
+            a.write(1_000_000, Level::Warn, "t", &big);
+        }
+        for _ in 0..(MAX_FILE_BYTES as usize / MAX_RECORD) {
+            b.write(1_000_000, Level::Warn, "t", &big);
+        }
+        for _ in 0..20 {
+            a.write(1_000_000, Level::Warn, "t", &big);
+        }
+        let size = std::fs::metadata(dir.join(file_name("1970-01-01"))).unwrap().len();
+        assert!(size <= MAX_FILE_BYTES + 400, "two writers together stay within the cap: {size}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_tail_of_a_big_file_is_read_from_the_end_and_cut_on_line_boundaries() {
+        let dir = tmp("log-tail");
+        let path = dir.join("big.log");
+        // 60k lines of varying length: far more than one 64 KiB chunk, so chunk edges fall inside lines.
+        let body: String = (0..60_000).map(|i| format!("line {i} {}\n", "x".repeat(i % 37))).collect();
+        std::fs::write(&path, &body).unwrap();
+        let expect = |n: usize| -> String { body.lines().rev().take(n).collect::<Vec<_>>().into_iter().rev().map(|l| format!("{l}\n")).collect() };
+        for n in [1, 2, 3, 1000, 5000, 59_999, 60_000, 70_000] {
+            assert_eq!(read_tail(&path, n).unwrap(), expect(n), "n={n}");
+        }
+        std::fs::write(&path, "no newline at the end").unwrap();
+        assert_eq!(read_tail(&path, 3).unwrap(), "no newline at the end\n");
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(read_tail(&path, 3).unwrap(), "");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn tail_and_follow_read_whole_lines_and_cross_midnight() {
         let app = tmp("log-follow");
         let dir = log_dir(&app);
@@ -686,7 +812,7 @@ https://h/p?key=AIzaSECRET&alt=sse and sk-proj-abcdefghijklmnopqrstu"#);
         assert!(path.ends_with("moco-2024-10-04.log"));
         let tail = read_tail(&path, 2).unwrap();
         assert!(tail.contains("line 3") && tail.contains("line 4") && !tail.contains("line 2"), "{tail}");
-        let mut from_end = Follow::new(&app, true);
+        let mut from_end = Follow::new(&app);
         assert_eq!(from_end.poll(), "", "existing lines are skipped");
         sink.write(86_400_000 * 20_000 + 9, Level::Warn, "t", "fresh");
         assert!(from_end.poll().contains("fresh"));
@@ -699,7 +825,6 @@ https://h/p?key=AIzaSECRET&alt=sse and sk-proj-abcdefghijklmnopqrstu"#);
         sink.write(86_400_000 * 20_001, Level::Warn, "t", "next day");
         let moved = from_end.poll();
         assert!(moved.contains("INFO  log: h") && moved.contains("next day"), "the new file is read from its start: {moved}");
-        assert_eq!(Follow::new(&app, false).poll().lines().count(), 2, "from the start: header and next day");
         let _ = std::fs::remove_dir_all(app);
     }
 
