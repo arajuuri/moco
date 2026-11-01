@@ -257,6 +257,10 @@ pub struct Permission {
     pub reply: Sender<Reply>,
     /// Some while the user is typing feedback for a rejection.
     pub feedback: Option<String>,
+    /// First visible line of the (wrapped) request text; the arrow and page keys move it.
+    pub scroll: usize,
+    /// Set by the renderer: (largest useful scroll, lines visible), so the keys know their limits.
+    pub view: std::cell::Cell<(usize, usize)>,
 }
 
 #[derive(Default)]
@@ -425,7 +429,7 @@ impl App {
             AppEvent::Engine { depth, agent, ev } => self.engine(depth, agent, ev),
             AppEvent::Ask { action, resources, save, reply } => {
                 self.attention = Some(format!("{action} needs permission"));
-                self.dialogs.push_back(Permission { action, resources, save, reply, feedback: None });
+                self.dialogs.push_back(Permission { action, resources, save, reply, feedback: None, scroll: 0, view: Default::default() });
                 self.scroll = 0;
             }
             AppEvent::Background(line) => self.push_info(format!("[{line}]")),
@@ -1220,6 +1224,24 @@ impl App {
             return Action::Interrupt;
         }
         let Some(d) = self.dialogs.front_mut() else { return Action::None };
+        // The request text can be taller than the box: these keys scroll it, also while typing feedback.
+        let (max_scroll, page) = d.view.get();
+        let typing = d.feedback.is_some();
+        let scrolled = match k.code {
+            KeyCode::Up => Some(d.scroll.saturating_sub(1)),
+            KeyCode::Down => Some((d.scroll + 1).min(max_scroll)),
+            KeyCode::PageUp => Some(d.scroll.saturating_sub(page.max(1))),
+            KeyCode::PageDown => Some((d.scroll + page.max(1)).min(max_scroll)),
+            KeyCode::Home => Some(0),
+            KeyCode::End => Some(max_scroll),
+            KeyCode::Char('k') if !typing => Some(d.scroll.saturating_sub(1)),
+            KeyCode::Char('j') if !typing => Some((d.scroll + 1).min(max_scroll)),
+            _ => None,
+        };
+        if let Some(s) = scrolled {
+            d.scroll = s;
+            return Action::None;
+        }
         if let Some(f) = d.feedback.as_mut() {
             match k.code {
                 KeyCode::Enter => {
@@ -1490,44 +1512,74 @@ impl App {
         let inner_w = width.saturating_sub(4);
         let key = |k: &str| Span::styled(format!("[{k}]"), t.accent.add_modifier(Modifier::BOLD));
         if let Some(d) = self.dialogs.front() {
-            let mut v = vec![];
+            let mut body: Vec<Line<'static>> = vec![];
             let card = t.code.patch(t.panel);
-            for r in d.resources.iter().take(4) {
+            // The whole request, wrapped: this is what the user is agreeing to, so nothing is cut off.
+            for r in d.resources.iter() {
                 let prefix = if d.action == "shell" { "$ " } else { "" };
-                let text = format!(" {prefix}{}", clip_width(r.lines().next().unwrap_or(""), inner_w.saturating_sub(3)));
-                v.push(fill(vec![Span::styled(text, card)], inner_w, t.panel));
+                let indent = " ".repeat(prefix.len());
+                let text_w = inner_w.saturating_sub(1 + prefix.len()).max(1);
+                for (n, l) in wrap(r.trim_end(), text_w).into_iter().enumerate() {
+                    let p = if n == 0 { prefix } else { indent.as_str() };
+                    body.push(fill(vec![Span::styled(format!(" {p}{l}"), card)], inner_w, t.panel));
+                }
             }
-            if d.resources.len() > 4 {
-                v.push(Line::styled(format!("{} {} more", g.ellipsis, d.resources.len() - 4), t.dim));
-            }
+            let mut foot: Vec<Line<'static>> = vec![];
+            let mut cursor_col = None;
+            let mut title = Line::from(vec![Span::styled(format!(" {} permission needed: {} ", g.run, d.action), t.warn.add_modifier(Modifier::BOLD))]);
             match &d.feedback {
                 Some(f) => {
-                    v.push(Line::from(vec![Span::styled("tell the assistant why (Enter sends, Esc goes back): ", t.dim), Span::raw(f.clone())]));
-                    let col = display_width("tell the assistant why (Enter sends, Esc goes back): ") + display_width(f);
-                    let row = v.len() as u16 - 1;
-                    let title = Line::from(vec![Span::styled(format!(" {} {} ", g.fail, d.action), t.warn.add_modifier(Modifier::BOLD))]);
-                    return Some((title, v, Some((col as u16, row)), t.warn));
+                    foot.push(Line::from(vec![Span::styled("tell the assistant why (Enter sends, Esc goes back): ", t.dim), Span::raw(f.clone())]));
+                    cursor_col = Some((display_width("tell the assistant why (Enter sends, Esc goes back): ") + display_width(f)) as u16);
+                    title = Line::from(vec![Span::styled(format!(" {} {} ", g.fail, d.action), t.warn.add_modifier(Modifier::BOLD))]);
                 }
                 None => {
+                    // Patterns saved by "always" are part of what is being agreed to. Show them whole:
+                    // inline when they fit the key line, otherwise as lines of their own.
+                    let saved = d.save.join(", ");
+                    let inline_w = inner_w.saturating_sub(48).max(12);
                     let mut first = vec![key("y"), Span::raw(" allow once   "), key("a"), Span::raw(" always")];
                     if !d.save.is_empty() {
-                        first.push(Span::styled(format!(" ({})", clip_width(&d.save.join(", "), inner_w.saturating_sub(48).max(12))), t.dim));
+                        if display_width(&saved) <= inline_w {
+                            first.push(Span::styled(format!(" ({saved})"), t.dim));
+                        } else {
+                            body.push(Line::default());
+                            for l in wrap(&format!("[a] always allows: {saved}"), inner_w.max(1)) {
+                                body.push(Line::styled(l, t.dim));
+                            }
+                        }
                     }
                     let second = vec![key("n"), Span::raw(" reject   "), key("f"), Span::raw(" reject with feedback")];
-                    v.push(Line::default());
+                    foot.push(Line::default());
                     let w = |s: &[Span]| s.iter().map(|x| display_width(&x.content)).sum::<usize>();
                     if w(&first) + 3 + w(&second) <= inner_w {
                         first.push(Span::raw("   "));
                         first.extend(second);
-                        v.push(Line::from(first));
+                        foot.push(Line::from(first));
                     } else {
-                        v.push(Line::from(first));
-                        v.push(Line::from(second));
+                        foot.push(Line::from(first));
+                        foot.push(Line::from(second));
                     }
                 }
             }
-            let title = Line::from(vec![Span::styled(format!(" {} permission needed: {} ", g.run, d.action), t.warn.add_modifier(Modifier::BOLD))]);
-            return Some((title, v, None, t.warn));
+            // Fit the body into what is left of the box; when it does not fit, a status line says so.
+            let mut room = max_h.saturating_sub(foot.len()).max(1);
+            let overflow = body.len() > room;
+            if overflow {
+                room = room.saturating_sub(1).max(1);
+            }
+            let max_scroll = body.len().saturating_sub(room);
+            let scroll = d.scroll.min(max_scroll);
+            d.view.set((max_scroll, room));
+            let mut v: Vec<Line<'static>> = body.into_iter().skip(scroll).take(room).collect();
+            if overflow {
+                let total = max_scroll + room;
+                let more = if scroll < max_scroll { format!("{} ", g.ellipsis) } else { String::new() };
+                v.push(Line::styled(format!("{more}lines {}-{} of {total} {} Up/Down, PgUp/PgDn scroll", scroll + 1, scroll + room, g.sep), t.dim));
+            }
+            let cursor = cursor_col.map(|c| (c, (v.len() + foot.len()) as u16 - 1));
+            v.extend(foot);
+            return Some((title, v, cursor, t.warn));
         }
         if let Some(f) = self.forms.front() {
             let q = f.q();
@@ -2182,6 +2234,30 @@ mod tests {
         assert_eq!(screen(&mut a, 30, 10)[5], "  line 29");
         a.update(key(KeyCode::Home, KeyModifiers::CONTROL));
         assert_eq!(screen(&mut a, 30, 10)[0], "  line 0"); // clamped to the top
+    }
+
+    #[test]
+    fn permission_dialog_shows_the_whole_request_and_scrolls() {
+        let mut a = App::new("m", "build");
+        a.running = true;
+        let (tx, rx) = channel();
+        let cmd: String = (1..=30).map(|i| format!("echo line{i}")).collect::<Vec<_>>().join("\n");
+        let long = format!("cat {}", "verylongargument ".repeat(8).trim_end());
+        a.update(AppEvent::Ask { action: "shell".into(), resources: vec![cmd, long], save: vec![], reply: tx });
+        let first = screen(&mut a, 60, 20).join("\n");
+        assert!(first.contains("echo line1") && !first.contains("echo line30"), "{first}");
+        assert!(first.contains("lines 1-") && first.contains("[y] allow once"), "{first}");
+        // Wrapped text is not cut at the right edge: the last word of the long command is on screen after scrolling.
+        press(&mut a, KeyCode::End);
+        let last = screen(&mut a, 60, 20).join("\n");
+        assert!(last.contains("echo line30") && last.contains("verylongargument"), "{last}");
+        assert!(!last.contains("echo line1\n") && last.contains("[y] allow once"), "{last}");
+        press(&mut a, KeyCode::PageUp);
+        assert!(a.dialogs[0].scroll < a.dialogs[0].view.get().0);
+        // Scrolling does not answer the dialog, and the answer keys still work.
+        assert!(rx.try_recv().is_err());
+        type_str(&mut a, "y");
+        assert_eq!(rx.try_recv().unwrap(), Reply::Once);
     }
 
     #[test]
