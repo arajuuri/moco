@@ -683,9 +683,6 @@ fn main() {
     engine_cfg.skills = found_skills.clone();
     engine_cfg.small_model = cfg.small_model.clone();
     engine_cfg.classifier = loaded.classifier.settings();
-    if engine_cfg.classifier.is_some() {
-        eprintln!("permission classifier: on");
-    }
     let (mcp_specs, mcp_warnings) = mcp_specs(&cfg, &loaded.mcp_origins, &app_dir, &cwd);
     for w in &mcp_warnings {
         eprintln!("warning: {w}");

@@ -214,7 +214,8 @@ pub struct Config {
     /// `"manual"` (default: ask before anything that changes state or leaves the project) or `"auto"`.
     pub permission_mode: Option<String>,
     /// `"careful"` (ask for shell commands except read-only ones, for web fetches and outside-project edits) or
-    /// `"trusted"` (default: no extra rules). Sits between the mode's rules and `permissions`.
+    /// `"trusted"` (no extra rules). Unset means `careful` in auto mode and nothing in manual mode, which already
+    /// asks for everything. Sits between the mode's rules and `permissions`.
     #[serde(alias = "permissionPreset")]
     pub permission_preset: Option<String>,
     /// Seatbelt sandbox for `shell` (macOS): `{"enabled": true, "writable": ["~/.cargo"], "network": true}`.
@@ -278,8 +279,10 @@ pub struct TuiConfig {
 }
 
 /// `permission_classifier`: let a cheap model approve routine shell commands that would otherwise ask
-/// (see `classifier.rs`). Read only from the user's own config, never from a project's.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+/// (see `classifier.rs`). Read only from the user's own config, never from a project's. On by default; it only
+/// ever acts in auto mode and only on commands that would ask because of a default rule, so `"enabled": false`
+/// is the way out.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ClassifierConfig {
     pub enabled: bool,
@@ -291,8 +294,14 @@ pub struct ClassifierConfig {
     pub background: Option<bool>,
 }
 
+impl Default for ClassifierConfig {
+    fn default() -> Self {
+        ClassifierConfig { enabled: true, model: None, timeout: None, background: None }
+    }
+}
+
 impl ClassifierConfig {
-    /// `None` unless enabled.
+    /// `None` when switched off.
     pub fn settings(&self) -> Option<crate::classifier::Settings> {
         let d = crate::classifier::Settings::default();
         self.enabled.then(|| crate::classifier::Settings {
@@ -522,11 +531,21 @@ pub fn permission_mode(cfg: &Config) -> Result<crate::permission::PermissionMode
     }
 }
 
-/// The preset rules the config selects (none when unset).
+/// The preset rules the config selects, whatever the mode (none when unset). Also validates the name.
 pub fn preset_rules(cfg: &Config) -> Result<Vec<Rule>, String> {
     match &cfg.permission_preset {
         None => Ok(vec![]),
         Some(s) => crate::permission::preset_rules(s).ok_or_else(|| format!("permission_preset must be \"careful\" or \"trusted\", not \"{s}\"")),
+    }
+}
+
+/// The preset in force in `mode`: the configured one, or when none is configured `careful` in auto mode (manual
+/// mode already asks for everything, and the preset's allow rules would loosen it). `"trusted"` opts out.
+pub fn preset_name(cfg: &Config, mode: crate::permission::PermissionMode) -> Option<&str> {
+    match (&cfg.permission_preset, mode) {
+        (Some(s), _) => Some(s),
+        (None, crate::permission::PermissionMode::Auto) => Some("careful"),
+        (None, _) => None,
     }
 }
 
@@ -563,7 +582,7 @@ pub fn resolve_agents_in(cfg: &Config, mode: crate::permission::PermissionMode) 
     }
     agents.retain(|a| !cfg.agents.get(&a.id).is_some_and(|c| c.disabled));
     // The preset goes right after the mode rules, so an agent's own rules (plan's edit deny, explore's read-only set) still win.
-    let preset = preset_rules(cfg).unwrap_or_default();
+    let preset = preset_name(cfg, mode).and_then(crate::permission::preset_rules).unwrap_or_default();
     let at = crate::permission::mode_rules(mode).len();
     for a in &mut agents {
         let at = at.min(a.permissions.len());
@@ -635,7 +654,7 @@ mod tests {
         std::fs::create_dir_all(&proj).unwrap();
         std::fs::write(proj.join("moco.json"), r#"{"permission_classifier":{"enabled":true,"model":"evil/m"}}"#).unwrap();
         let l = load(&app, &proj);
-        assert_eq!(l.classifier.settings(), None, "a project cannot switch it on");
+        assert_eq!(l.classifier.model, None, "a project cannot choose its model");
         assert!(l.warnings.iter().any(|w| w.contains("permission_classifier") && w.contains("ignored")), "{:?}", l.warnings);
 
         std::fs::write(app.join("config/moco.jsonc"), r#"{"permission_classifier":{"enabled":true,"model":"anthropic/haiku","timeout":2500,"background":false}}"#).unwrap();
@@ -646,7 +665,11 @@ mod tests {
         std::fs::write(app.join("config/moco.jsonc"), r#"{"permission_classifier":{"enabled":true}}"#).unwrap();
         let s = load(&app, &proj).classifier.settings().unwrap();
         assert_eq!((s.model, s.timeout, s.background), (None, std::time::Duration::from_secs(5), true));
-        assert_eq!(ClassifierConfig::default().settings(), None, "off unless enabled");
+        assert!(ClassifierConfig::default().settings().is_some(), "on unless switched off");
+        std::fs::write(app.join("config/moco.jsonc"), r#"{"permission_classifier":{"enabled":false}}"#).unwrap();
+        assert_eq!(load(&app, &proj).classifier.settings(), None, "the user can switch it off");
+        std::fs::write(app.join("config/moco.jsonc"), r#"{"permission_classifier":{"model":"anthropic/haiku"}}"#).unwrap();
+        assert!(load(&app, &proj).classifier.settings().is_some(), "setting only a model leaves it on");
     }
 
     #[test]
@@ -711,6 +734,24 @@ mod tests {
         let bad: Config = serde_json::from_value(json!({"permission_preset": "wild"})).unwrap();
         assert!(preset_rules(&bad).unwrap_err().contains("wild"));
         assert!(preset_rules(&Config::default()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn auto_mode_is_careful_unless_a_preset_is_chosen() {
+        use crate::permission::{evaluate, Effect::*, PermissionMode::*};
+        let shell = |cfg: &Config, mode, cmd: &str| {
+            let agents = resolve_agents_in(cfg, mode);
+            evaluate("shell", cmd, &agents.iter().find(|a| a.id == "build").unwrap().permissions)
+        };
+        let none = Config::default();
+        assert_eq!(preset_name(&none, Auto), Some("careful"));
+        assert_eq!(preset_name(&none, Manual), None, "manual mode already asks for everything");
+        assert_eq!((shell(&none, Auto, "curl x"), shell(&none, Auto, "ls"), shell(&none, Auto, "git push")), (Ask, Allow, Ask));
+        assert_eq!(shell(&none, Manual, "ls"), Ask, "manual mode is not loosened by the default");
+        let trusted: Config = serde_json::from_value(json!({"permission_preset": "trusted"})).unwrap();
+        assert_eq!((shell(&trusted, Auto, "curl x"), shell(&trusted, Auto, "git push")), (Allow, Allow), "trusted opts out");
+        let careful: Config = serde_json::from_value(json!({"permission_preset": "careful"})).unwrap();
+        assert_eq!(preset_name(&careful, Manual), Some("careful"), "an explicit choice applies to both modes");
     }
 
     #[test]
