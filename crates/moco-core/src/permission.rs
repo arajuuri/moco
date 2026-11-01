@@ -102,7 +102,35 @@ pub fn default_rules() -> Vec<Rule> {
         Rule::new("read", "*.env.example", Effect::Allow),
         // A search sends your words to a third party: ask first (then "always" remembers it for the project).
         Rule::new("websearch", "*", Effect::Ask),
+        // Running outside the shell sandbox is never covered by the blanket allow.
+        Rule::new("shell.unsandboxed", "*", Effect::Ask),
     ]
+}
+
+/// Rules of a `permission_preset`, placed after the mode rules and before the user's own `permissions`.
+/// `trusted` adds nothing; `careful` asks for shell commands (except read-only and build ones), web fetches and
+/// edits outside the project, and always asks for `git push`, `rm -rf` and `sudo`.
+pub fn preset_rules(name: &str) -> Option<Vec<Rule>> {
+    match name {
+        "trusted" => Some(vec![]),
+        "careful" => {
+            let mut rules = vec![Rule::new("shell", "*", Effect::Ask)];
+            for c in ["ls *", "cat *", "head *", "tail *", "wc *", "rg *", "grep *", "git status *", "git diff *", "git log *", "git show *", "cargo check *", "cargo test *", "cargo build *"] {
+                rules.push(Rule::new("shell", c, Effect::Allow));
+            }
+            for c in ["git push *", "rm -rf *", "rm -fr *", "sudo *"] {
+                rules.push(Rule::new("shell", c, Effect::Ask));
+            }
+            rules.extend([
+                Rule::new("webfetch", "*", Effect::Ask),
+                Rule::new("edit", "*", Effect::Allow),
+                Rule::new("external_directory", "*", Effect::Ask),
+                Rule::new("shell.unsandboxed", "*", Effect::Ask),
+            ]);
+            Some(rules)
+        }
+        _ => None,
+    }
 }
 
 /// `configured` = agent rules followed by session rules. `saved` = user "always" rules (all allow).
@@ -135,6 +163,13 @@ mod tests {
         let rules = [Rule::new("*", "*", Deny), Rule::new("read", "*", Allow)];
         assert_eq!(evaluate("read", "a.txt", &rules), Allow);
         assert_eq!(evaluate("edit", "a.txt", &rules), Deny);
+    }
+
+    #[test]
+    fn unsandboxed_shell_asks_even_in_auto_mode() {
+        let auto = mode_rules(PermissionMode::Auto);
+        assert_eq!(evaluate("shell", "ls", &auto), Effect::Allow);
+        assert_eq!(evaluate("shell.unsandboxed", "ls", &auto), Effect::Ask);
     }
 
     #[test]

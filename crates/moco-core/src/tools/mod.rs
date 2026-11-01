@@ -197,7 +197,8 @@ pub trait Host: Sync {
     fn ask(&self, questions: &[Question]) -> Result<Vec<Vec<String>>, ToolError>;
     fn subagent(&self, req: SubagentRequest) -> Result<SubagentResult, ToolError>;
     /// Start a command that keeps running after the tool call returns; returns its job id and output file.
-    fn start_background_shell(&self, command: &str, workdir: &Path, timeout: Option<std::time::Duration>) -> Result<(String, PathBuf), ToolError>;
+    /// `unsandboxed` skips the shell sandbox (already approved by the caller).
+    fn start_background_shell(&self, command: &str, workdir: &Path, timeout: Option<std::time::Duration>, unsandboxed: bool) -> Result<(String, PathBuf), ToolError>;
     /// Start a subagent without waiting for it; returns its session id.
     fn start_background_subagent(&self, req: SubagentRequest) -> Result<String, ToolError>;
     fn jobs(&self) -> Vec<JobInfo>;
@@ -387,7 +388,7 @@ pub(crate) mod testutil {
             self.subagents.lock().unwrap().push(req.clone());
             Ok(SubagentResult { session_id: "ses_child".into(), output: format!("done: {}", req.prompt) })
         }
-        fn start_background_shell(&self, command: &str, workdir: &Path, timeout: Option<std::time::Duration>) -> Result<(String, PathBuf), ToolError> {
+        fn start_background_shell(&self, command: &str, workdir: &Path, timeout: Option<std::time::Duration>, _unsandboxed: bool) -> Result<(String, PathBuf), ToolError> {
             self.shells.lock().unwrap().push((command.to_string(), workdir.to_path_buf(), timeout));
             Ok(("shl_test".into(), PathBuf::from("/tmp/shl_test.txt")))
         }

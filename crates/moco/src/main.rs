@@ -601,6 +601,14 @@ fn main() {
         Some(m) => m,
         None => config::permission_mode(&cfg).unwrap_or_else(|e| die(&e)),
     };
+    config::preset_rules(&cfg).unwrap_or_else(|e| die(&e));
+    if let Some(p) = &cfg.permission_preset {
+        eprintln!("permission preset: {p}");
+    }
+    moco_core::sandbox::configure(&cfg.sandbox);
+    if let Some(w) = moco_core::sandbox::unavailable_notice(&cfg.sandbox) {
+        eprintln!("warning: {w}");
+    }
     let mode_agents: std::collections::BTreeMap<_, _> = [permission::PermissionMode::Manual, permission::PermissionMode::Auto].into_iter().map(|m| (m, config::resolve_agents_in(&cfg, m))).collect();
     let agents = mode_agents[&default_mode].clone();
     let agent_explicit = agent_id.is_some();

@@ -213,6 +213,12 @@ pub struct Config {
     pub shell: Option<String>,
     /// `"manual"` (default: ask before anything that changes state or leaves the project) or `"auto"`.
     pub permission_mode: Option<String>,
+    /// `"careful"` (ask for shell commands except read-only ones, for web fetches and outside-project edits) or
+    /// `"trusted"` (default: no extra rules). Sits between the mode's rules and `permissions`.
+    #[serde(alias = "permissionPreset")]
+    pub permission_preset: Option<String>,
+    /// Seatbelt sandbox for `shell` (macOS): `{"enabled": true, "writable": ["~/.cargo"], "network": true}`.
+    pub sandbox: crate::sandbox::SandboxConfig,
     pub permissions: Vec<Rule>,
     pub agents: BTreeMap<String, AgentConfig>,
     /// Extra instruction files (paths, `~/` allowed; relative paths resolve against the working directory).
@@ -472,6 +478,14 @@ pub fn permission_mode(cfg: &Config) -> Result<crate::permission::PermissionMode
     }
 }
 
+/// The preset rules the config selects (none when unset).
+pub fn preset_rules(cfg: &Config) -> Result<Vec<Rule>, String> {
+    match &cfg.permission_preset {
+        None => Ok(vec![]),
+        Some(s) => crate::permission::preset_rules(s).ok_or_else(|| format!("permission_preset must be \"careful\" or \"trusted\", not \"{s}\"")),
+    }
+}
+
 /// Built-in agents with config overrides applied, plus agents defined only in config, in the default permission mode.
 pub fn resolve_agents(cfg: &Config) -> Vec<Agent> {
     resolve_agents_in(cfg, crate::permission::PermissionMode::default())
@@ -504,7 +518,12 @@ pub fn resolve_agents_in(cfg: &Config, mode: crate::permission::PermissionMode) 
         }
     }
     agents.retain(|a| !cfg.agents.get(&a.id).is_some_and(|c| c.disabled));
+    // The preset goes right after the mode rules, so an agent's own rules (plan's edit deny, explore's read-only set) still win.
+    let preset = preset_rules(cfg).unwrap_or_default();
+    let at = crate::permission::mode_rules(mode).len();
     for a in &mut agents {
+        let at = at.min(a.permissions.len());
+        a.permissions.splice(at..at, preset.iter().cloned());
         a.permissions.extend(cfg.permissions.iter().cloned());
         if let Some(ac) = cfg.agents.get(&a.id) {
             a.permissions.extend(ac.permissions.iter().cloned());
@@ -597,6 +616,35 @@ mod tests {
         assert!(l.warnings[0].contains("moco.json"));
         assert_eq!(l.config.model.as_deref(), Some("ok/m"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn careful_preset_asks_and_allows_as_intended() {
+        use crate::permission::{evaluate, Effect::*, PermissionMode};
+        let cfg: Config = serde_json::from_value(json!({"permissionPreset": "careful", "permissions": [{"action": "shell", "resource": "make *", "effect": "allow"}]})).unwrap();
+        for mode in [PermissionMode::Auto, PermissionMode::Manual] {
+            let agents = resolve_agents_in(&cfg, mode);
+            let build = &agents.iter().find(|a| a.id == "build").unwrap().permissions;
+            assert_eq!(evaluate("shell", "ls -la", build), Allow);
+            assert_eq!(evaluate("shell", "git status", build), Allow);
+            assert_eq!(evaluate("shell", "cargo test -p x", build), Allow);
+            assert_eq!(evaluate("shell", "curl x", build), Ask);
+            assert_eq!(evaluate("shell", "git push origin main", build), Ask);
+            assert_eq!(evaluate("shell", "rm -rf /tmp/x", build), Ask);
+            assert_eq!(evaluate("shell", "sudo ls", build), Ask);
+            assert_eq!(evaluate("webfetch", "https://x", build), Ask);
+            assert_eq!(evaluate("edit", "src/a.rs", build), Allow);
+            assert_eq!(evaluate("external_directory", "/etc/*", build), Ask);
+            assert_eq!(evaluate("shell.unsandboxed", "ls", build), Ask);
+            assert_eq!(evaluate("shell", "make all", build), Allow, "the user's rules win over the preset");
+            let explore = &agents.iter().find(|a| a.id == "explore").unwrap().permissions;
+            assert_eq!(evaluate("shell", "ls", explore), Deny, "the preset does not weaken explore");
+            let plan = &agents.iter().find(|a| a.id == "plan").unwrap().permissions;
+            assert_eq!(evaluate("edit", "a.rs", plan), Deny);
+        }
+        let bad: Config = serde_json::from_value(json!({"permission_preset": "wild"})).unwrap();
+        assert!(preset_rules(&bad).unwrap_err().contains("wild"));
+        assert!(preset_rules(&Config::default()).unwrap().is_empty());
     }
 
     #[test]

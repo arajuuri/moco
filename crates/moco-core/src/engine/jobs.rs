@@ -203,15 +203,21 @@ impl Engine {
     }
 
     /// Run `command` in the background. The job survives the tool call; its end is reported to `session`.
-    pub(super) fn start_shell_job(self: &Arc<Self>, session: &Session, command: &str, workdir: &Path, timeout: Option<Duration>) -> Result<(String, PathBuf), ToolError> {
+    pub(super) fn start_shell_job(self: &Arc<Self>, session: &Session, command: &str, workdir: &Path, timeout: Option<Duration>, unsandboxed: bool) -> Result<(String, PathBuf), ToolError> {
         let id = crate::id::new_id("shl");
         let out = self.spill_dir().join(format!("{id}.txt"));
-        let mut child = shell::spawn(command, workdir, &out)?;
+        // Background commands inherit the sandbox like foreground ones.
+        let root = (!unsandboxed).then(|| crate::tools::project_root_of(Path::new(&session.directory)));
+        let sandboxed = root.is_some() && crate::sandbox::active();
+        let mut child = shell::spawn(command, workdir, &out, root.as_deref())?;
         let stop = Arc::new(AtomicBool::new(false));
         self.register(Job { id: id.clone(), kind: Kind::Shell, session_id: session.id.clone(), title: command.to_string(), started: Instant::now(), state: State::Running, out: Some(out.clone()), stop: stop.clone() });
         let (eng, sid, cmd, job_id, out_path) = (self.clone(), session.id.clone(), command.to_string(), id.clone(), out.clone());
         std::thread::spawn(move || {
-            let f = shell::wait(&mut child, &out_path, timeout, &|| stop.load(Ordering::Relaxed), true);
+            let mut f = shell::wait(&mut child, &out_path, timeout, &|| stop.load(Ordering::Relaxed), true);
+            if sandboxed {
+                crate::sandbox::annotate(&mut f.text, f.exit);
+            }
             eng.finish_shell_job(&job_id, &sid, &cmd, &f);
         });
         Ok((id, out))
@@ -263,7 +269,7 @@ impl Engine {
     /// the exchange in the conversation so the model knows what happened. Returns the text to show.
     pub fn run_user_command(&self, sid: &str, command: &str, cancel: &AtomicBool) -> Result<String, String> {
         let session = self.store().session(sid).map_err(|e| e.to_string())?.ok_or("no such session")?;
-        let f = shell::run_foreground(command, Path::new(&session.directory), &self.spill_dir(), 120_000, cancel).map_err(|e| e.message())?;
+        let f = shell::run_foreground(command, Path::new(&session.directory), &self.spill_dir(), 120_000, cancel, None).map_err(|e| e.message())?;
         if f.killed {
             return Err("interrupted".into());
         }
