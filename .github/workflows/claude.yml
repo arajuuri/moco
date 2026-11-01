@@ -27,7 +27,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -39,4 +39,4 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           claude_args: |
-            --allowedTools "Bash(cargo:*),Bash(rustc:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*)"
+            --allowedTools "Bash(cargo:*),Bash(rustc:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git fetch:*),Bash(git checkout:*),Bash(git branch:*),Bash(git pull:*)"
