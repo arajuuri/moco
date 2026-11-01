@@ -364,6 +364,25 @@ impl Engine {
     }
 
     /// Reasoning levels a model offers: the built-in ones for its protocol, then the ones defined in config.
+    /// How to ask `model` for a short plain-text answer (a title, a verdict): the reasoning effort to request and the
+    /// output budget. Thinking tokens count against `max_tokens`, and some models (Haiku 5.5 and the Fable and Opus 5
+    /// families) cannot switch thinking off, so a budget sized for the answer alone comes back empty or cut off in the
+    /// middle of the answer. Where thinking can be switched off it is; where it cannot, the lowest effort is asked for and
+    /// the budget gets room to think.
+    pub(crate) fn short_answer_shape(&self, provider_id: &str, model_id: &str, answer_tokens: u32) -> (Option<String>, u32) {
+        let levels = self.effort_levels(provider_id, model_id);
+        let has = |name: &str| levels.iter().any(|l| l == name);
+        if has("none") {
+            (Some("none".into()), answer_tokens)
+        } else if has("minimal") {
+            (Some("minimal".into()), answer_tokens + THINKING_HEADROOM)
+        } else if has("low") {
+            (Some("low".into()), answer_tokens + THINKING_HEADROOM)
+        } else {
+            (None, answer_tokens)
+        }
+    }
+
     pub fn effort_levels(&self, provider_id: &str, model_id: &str) -> Vec<String> {
         let cat = &self.cfg.catalog;
         let model = cat.model(provider_id, model_id);
@@ -837,12 +856,14 @@ impl Engine {
         let model_ref = self.small_model_ref(session);
         let (provider_id, model_id) = config::split_model(&model_ref);
         let Some(provider) = self.providers.get(provider_id).map(|p| p.as_ref()).or(self.fallback.as_deref()) else { return };
+        let (effort, max_tokens) = self.short_answer_shape(provider_id, model_id, 60);
         let req = Request {
             model: model_id.to_string(),
             system: title::SYSTEM.into(),
             messages: vec![ChatMessage { role: Role::User, content: vec![Block::Text(text.to_string())] }],
             tools: vec![],
-            max_tokens: 60,
+            max_tokens,
+            effort,
             overlay: self.base_overlay(provider_id, model_id),
             ..Default::default()
         };
@@ -1407,6 +1428,9 @@ impl Host for EngineHost<'_> {
         self.engine.kill_job(id).map_err(ToolError::fail)
     }
 }
+
+/// Output tokens a model that thinks whatever the request says may spend before a short answer (`short_answer_shape`).
+const THINKING_HEADROOM: u32 = 2_000;
 
 /// Rule evaluation + user prompting for tool permission requests.
 struct EnginePermitter<'a> {
@@ -2677,6 +2701,64 @@ mod tests {
         f.say("go");
         f.run(&TestUi::default());
         assert_eq!(f.fake.classifier_requests.lock().unwrap()[0].model, "claude-small");
+    }
+
+    /// Thinking tokens count against `max_tokens`. Haiku 5.5 thinks whatever the request says: with a budget sized for the
+    /// answer alone, the classifier's reply came back empty or cut off in the middle (found by running the evaluation).
+    #[test]
+    fn short_answers_leave_room_for_models_that_cannot_stop_thinking() {
+        let f = fixture(vec![]);
+        let shape = |m: &str, n: u32| f.engine.short_answer_shape("anthropic", m, n);
+        // Cannot be switched off: the lowest effort, and room to think before the answer.
+        assert_eq!(shape("claude-haiku-5-5", 200), (Some("low".into()), 200 + THINKING_HEADROOM));
+        assert_eq!(shape("claude-opus-5-5", 60), (Some("low".into()), 60 + THINKING_HEADROOM));
+        // Can be switched off (or only runs between tool calls): switched off, and the budget stays small.
+        assert_eq!(shape("claude-opus-4-7", 200), (Some("none".into()), 200));
+        assert_eq!(shape("claude-sonnet-5-5", 200), (Some("none".into()), 200));
+        // A model the engine knows nothing about is asked as before.
+        assert_eq!(shape("claude-judge", 200), (None, 200));
+        assert_eq!(f.engine.short_answer_shape("nowhere", "any", 60), (None, 60));
+    }
+
+    #[test]
+    fn the_classifier_and_the_title_use_that_shape() {
+        let settings = classifier::Settings { model: Some("anthropic/claude-haiku-5-5".into()), ..Default::default() };
+        let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "echo hi"})), text("done")], |c| {
+            auto_careful_with(Some(settings), vec![])(c);
+            c.small_model = Some("anthropic/claude-haiku-5-5".into());
+        });
+        f.fake.script_verdicts(vec![verdict("allow", "read-only")]);
+        f.fake.script_titles(vec![text("A title")]);
+        f.say("go");
+        f.run(&TestUi::default());
+        let c = f.fake.classifier_requests.lock().unwrap()[0].clone();
+        assert_eq!((c.effort.as_deref(), c.max_tokens), (Some("low"), 200 + THINKING_HEADROOM));
+        let t = titles(&f)[0].clone();
+        assert_eq!((t.effort.as_deref(), t.max_tokens), (Some("low"), 60 + THINKING_HEADROOM));
+        // The conversation's own requests are not touched.
+        assert_eq!(f.fake.requests.lock().unwrap()[0].effort, None);
+    }
+
+    #[test]
+    fn a_reply_cut_off_at_the_token_limit_says_so() {
+        for partial in ["{\"verdict\": \"al", ""] {
+            let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "echo hi"})), text("done")], auto_careful_with(Some(Default::default()), vec![]));
+            let mut events = if partial.is_empty() { vec![] } else { vec![Event::TextDelta(partial.into())] };
+            events.push(Event::Finish { reason: FinishReason::MaxTokens, usage: Usage::default() });
+            f.fake.script_verdicts(vec![Scripted::Events(events)]);
+            f.say("go");
+            let ui = TestUi::replying(vec![Reply::Once]);
+            assert_eq!(f.run(&ui), RunOutcome::Idle);
+            assert!(notices(&ui).iter().any(|n| n.contains("the classifier's reply was cut off at its token limit")), "{partial:?}: {:?}", notices(&ui));
+            assert_eq!(ui.asked.lock().unwrap().len(), 1, "the user is asked");
+        }
+        // A garbled reply that was not cut off keeps its own message.
+        let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "echo hi"})), text("done")], auto_careful_with(Some(Default::default()), vec![]));
+        f.fake.script_verdicts(vec![text("I think this is fine")]);
+        f.say("go");
+        let ui = TestUi::replying(vec![Reply::Once]);
+        f.run(&ui);
+        assert!(notices(&ui).iter().any(|n| n.contains("no usable answer")), "{:?}", notices(&ui));
     }
 
     /// A UI nobody is behind, like a background subagent's.
