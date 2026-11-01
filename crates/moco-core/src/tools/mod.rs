@@ -341,6 +341,37 @@ pub fn all(subagents: Vec<(String, String)>, skills: Vec<crate::skills::Skill>, 
 
 // ---- input helpers -------------------------------------------------------------------------
 
+/// Claude's own coding tools call these arguments `file_path`, `old_string`, `new_string` and `replace_all`, and models
+/// trained on them sometimes use those names here. They are accepted as aliases of ours: each is renamed when our name
+/// is not already present, wherever the call is first seen (the engine), so the UI, the stored history and the tool all
+/// see one spelling. The schema we advertise does not change, so requests stay byte-stable for prompt caching.
+pub fn normalize_input(tool: &str, mut input: Value) -> Value {
+    fn rename(v: &mut Value, aliases: &[(&str, &str)]) {
+        let Some(obj) = v.as_object_mut() else { return };
+        for (alias, ours) in aliases {
+            if !obj.contains_key(*ours) {
+                if let Some(val) = obj.remove(*alias) {
+                    obj.insert((*ours).to_string(), val);
+                }
+            }
+        }
+    }
+    const REPLACEMENT: [(&str, &str); 3] = [("old_string", "oldString"), ("new_string", "newString"), ("replace_all", "replaceAll")];
+    match tool {
+        "read" | "write" => rename(&mut input, &[("file_path", "path")]),
+        "edit" => {
+            rename(&mut input, &[("file_path", "path"), REPLACEMENT[0], REPLACEMENT[1], REPLACEMENT[2]]);
+            if let Some(list) = input.get_mut("edits").and_then(Value::as_array_mut) {
+                for item in list {
+                    rename(item, &REPLACEMENT);
+                }
+            }
+        }
+        _ => {}
+    }
+    input
+}
+
 pub(crate) fn str_arg<'a>(input: &'a Value, key: &str) -> Result<&'a str, ToolError> {
     input.get(key).and_then(Value::as_str).ok_or_else(|| ToolError::fail(format!("`{key}` is required and must be a string")))
 }
@@ -353,6 +384,38 @@ pub(crate) fn opt_u64(input: &Value, key: &str) -> Option<u64> {
 }
 pub(crate) fn opt_bool(input: &Value, key: &str) -> Option<bool> {
     input.get(key).and_then(Value::as_bool)
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::*;
+
+    #[test]
+    fn claude_code_argument_names_become_ours() {
+        let got = normalize_input("edit", json!({"file_path":"a.rs","old_string":"x","new_string":"y","replace_all":true}));
+        assert_eq!(got, json!({"path":"a.rs","oldString":"x","newString":"y","replaceAll":true}));
+        assert_eq!(normalize_input("write", json!({"file_path":"a","content":"c"})), json!({"path":"a","content":"c"}));
+        assert_eq!(normalize_input("read", json!({"file_path":"a","offset":3,"limit":5})), json!({"path":"a","offset":3,"limit":5}));
+        // Inside `edits`, too.
+        let got = normalize_input("edit", json!({"file_path":"a","edits":[{"old_string":"x","new_string":"y"},{"oldString":"p","new_string":"q","replace_all":false}]}));
+        assert_eq!(got, json!({"path":"a","edits":[{"oldString":"x","newString":"y"},{"oldString":"p","newString":"q","replaceAll":false}]}));
+    }
+
+    #[test]
+    fn our_names_win_and_other_tools_and_shapes_are_left_alone() {
+        // Both spellings: ours is kept, the alias stays where it was.
+        let got = normalize_input("edit", json!({"path":"ours","file_path":"theirs","oldString":"x","newString":"y"}));
+        assert_eq!(got["path"], "ours");
+        assert_eq!(got["file_path"], "theirs");
+        // Tools with their own meaning for the names are not touched.
+        let same = json!({"file_path":"a","old_string":"b"});
+        assert_eq!(normalize_input("shell", same.clone()), same);
+        assert_eq!(normalize_input("grep", json!({"pattern":"x","path":"."})), json!({"pattern":"x","path":"."}));
+        // Not an object, or a bad `edits`: passed through for the tool to reject.
+        assert_eq!(normalize_input("edit", json!("text")), json!("text"));
+        assert_eq!(normalize_input("edit", json!({"edits":"x","file_path":"a"})), json!({"edits":"x","path":"a"}));
+        assert_eq!(normalize_input("edit", json!({"edits":[1,"two"],"file_path":"a"})), json!({"edits":[1,"two"],"path":"a"}));
+    }
 }
 
 #[cfg(test)]
