@@ -1319,12 +1319,13 @@ impl EnginePermitter<'_> {
         match c.engine.classify_command(c.session, command, &parsed, c.settings, self.ui, c.cancel) {
             classifier::Verdict::Allow { risk, reason } => {
                 let shown = classifier::sanitize(command, 100);
-                self.ui.event(&UiEvent::Notice(&if reason.is_empty() { format!("auto: {risk}: {shown}") } else { format!("auto: {risk}: {shown} ({reason})") }));
+                // Status, not Notice: an allowed command is not an error and must not be drawn like one.
+                self.ui.event(&UiEvent::Status(&if reason.is_empty() { format!("auto: {risk}: {shown}") } else { format!("auto: {risk}: {shown} ({reason})") }));
                 true
             }
             classifier::Verdict::Ask { reason } => {
                 if !reason.is_empty() {
-                    self.ui.event(&UiEvent::Notice(&format!("classifier: asking you because {reason}")));
+                    self.ui.event(&UiEvent::Status(&format!("classifier: asking you because {reason}")));
                 }
                 false
             }
@@ -2206,7 +2207,7 @@ mod tests {
     }
 
     fn notices(ui: &TestUi) -> Vec<String> {
-        ui.log().into_iter().filter(|l| l.starts_with("notice:")).collect()
+        ui.log().into_iter().filter(|l| l.starts_with("notice:") || l.starts_with("status:")).collect()
     }
 
     #[test]
@@ -2230,8 +2231,8 @@ mod tests {
         assert_eq!(f.run(&ui), RunOutcome::Idle);
         assert_eq!(f.fake.classifier_requests.lock().unwrap().len(), 1, "the second identical command is not classified again");
         let n = notices(&ui);
-        assert_eq!(n[0], "notice:auto: read-only: echo hi (because)");
-        assert_eq!(n[1], "notice:auto: allowed earlier: echo hi");
+        assert_eq!(n[0], "status:auto: read-only: echo hi (because)");
+        assert_eq!(n[1], "status:auto: allowed earlier: echo hi");
         let req = f.fake.classifier_requests.lock().unwrap()[0].clone();
         assert_eq!(req.system, classifier::SYSTEM);
         assert!(req.tools.is_empty() && req.messages.len() == 1, "no conversation history goes to the classifier");
@@ -2321,7 +2322,7 @@ mod tests {
             let ui = TestUi::replying(vec![Reply::Once]);
             assert_eq!(f.run(&ui), RunOutcome::Idle, "{why}");
             assert_eq!(ui.asked.lock().unwrap().len(), 1, "{why}");
-            assert!(notices(&ui).contains(&format!("notice:classifier: asking you because {why}")), "{why}: {:?}", notices(&ui));
+            assert!(notices(&ui).contains(&format!("status:classifier: asking you because {why}")), "{why}: {:?}", notices(&ui));
         }
         // A refusal is remembered nowhere: the same command is classified (and asked) again.
         let f = fixture_cfg(shell_twice("make"), auto_careful_with(Some(Default::default()), vec![]));
