@@ -17,6 +17,11 @@ pub struct FakeProvider {
     titles: Mutex<std::collections::VecDeque<Scripted>>,
     pub title_requests: Mutex<Vec<Request>>,
     pub routed_requests: Mutex<Vec<Request>>,
+    /// The command classifier (recognized by its system prompt) is kept apart the same way.
+    verdicts: Mutex<std::collections::VecDeque<Scripted>>,
+    pub classifier_requests: Mutex<Vec<Request>>,
+    /// Makes classifier calls slow (until cancelled), to test the timeout.
+    classifier_delay: Mutex<Option<std::time::Duration>>,
     /// Requests whose first user message contains a marker get their own script (for work on other threads, such as
     /// background subagents, whose request order against the main conversation is otherwise a race).
     routes: Mutex<Vec<(String, std::collections::VecDeque<Scripted>)>>,
@@ -24,7 +29,7 @@ pub struct FakeProvider {
 
 impl FakeProvider {
     pub fn new(script: Vec<Scripted>) -> Self {
-        FakeProvider { script: Mutex::new(script.into()), requests: Mutex::new(vec![]), titles: Mutex::new(Default::default()), title_requests: Mutex::new(vec![]), routes: Mutex::new(vec![]), routed_requests: Mutex::new(vec![]) }
+        FakeProvider { script: Mutex::new(script.into()), requests: Mutex::new(vec![]), titles: Mutex::new(Default::default()), title_requests: Mutex::new(vec![]), routes: Mutex::new(vec![]), routed_requests: Mutex::new(vec![]), verdicts: Mutex::new(Default::default()), classifier_requests: Mutex::new(vec![]), classifier_delay: Mutex::new(None) }
     }
     /// Queue more responses (for multi-turn tests where later script entries depend on earlier results).
     pub fn extend(&self, more: Vec<Scripted>) {
@@ -39,6 +44,13 @@ impl FakeProvider {
     pub fn script_titles(&self, more: Vec<Scripted>) {
         self.titles.lock().unwrap().extend(more);
     }
+    /// Queue replies for the command classifier; an empty queue answers with nothing.
+    pub fn script_verdicts(&self, more: Vec<Scripted>) {
+        self.verdicts.lock().unwrap().extend(more);
+    }
+    pub fn delay_classifier(&self, d: std::time::Duration) {
+        *self.classifier_delay.lock().unwrap() = Some(d);
+    }
     pub fn calls(&self) -> usize {
         self.requests.lock().unwrap().len()
     }
@@ -47,6 +59,27 @@ impl FakeProvider {
 impl Provider for FakeProvider {
     fn stream(&self, req: &Request, cancel: &AtomicBool, on_event: &mut dyn FnMut(Event)) -> Result<(), ProviderError> {
         let is_title = req.system == crate::title::SYSTEM;
+        if req.system == crate::classifier::SYSTEM {
+            self.classifier_requests.lock().unwrap().push(req.clone());
+            let delay = *self.classifier_delay.lock().unwrap();
+            if let Some(d) = delay {
+                let end = std::time::Instant::now() + d;
+                while std::time::Instant::now() < end {
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Err(ProviderError::Interrupted);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            let next = self.verdicts.lock().unwrap().pop_front();
+            let (events, err) = match next {
+                Some(Scripted::Events(e)) => (e, None),
+                Some(Scripted::Fail(e, err)) => (e, Some(err)),
+                None => return Ok(()),
+            };
+            events.into_iter().for_each(&mut *on_event);
+            return err.map_or(Ok(()), Err);
+        }
         let first_user = req
             .messages
             .first()

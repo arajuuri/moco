@@ -37,7 +37,7 @@ pub fn build(catalog: &Catalog, app_dir: &Path) -> HashMap<String, Box<dyn Provi
             Some(Protocol::Gemini) => Box::new(Gemini::new(key, p.base_url().unwrap_or_default(), p.headers.clone())),
             None => continue,
         };
-        out.insert(id.clone(), client);
+        out.insert(id.clone(), Box::new(super::Logged::new(id, client)));
     }
     out
 }

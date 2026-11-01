@@ -17,6 +17,7 @@ pub struct Anthropic {
 
 impl Anthropic {
     pub fn new(api_key: String, base_url: Option<String>) -> Self {
+        crate::log::add_secret(&api_key);
         Anthropic {
             prompt_cache: true,
             api_key,
@@ -266,18 +267,19 @@ fn transport(e: ureq::Transport) -> ProviderError {
 
 impl Provider for Anthropic {
     fn stream(&self, req: &Request, cancel: &AtomicBool, on_event: &mut dyn FnMut(Event)) -> Result<(), ProviderError> {
-        let resp = self
-            .agent
-            .post(&format!("{}/v1/messages", self.base_url))
-            .set("x-api-key", &self.api_key)
-            .set("anthropic-version", "2023-06-01")
-            .set("content-type", "application/json");
-        let resp = req.overlay.headers.iter().fold(resp, |r, (k, v)| r.set(k, v)).send_string(&build_body(req, self.prompt_cache).to_string());
+        let url = format!("{}/v1/messages", self.base_url);
+        let resp = self.agent.post(&url).set("x-api-key", &self.api_key).set("anthropic-version", "2023-06-01").set("content-type", "application/json");
+        let body = build_body(req, self.prompt_cache).to_string();
+        let mut shown = vec![("x-api-key", self.api_key.as_str()), ("anthropic-version", "2023-06-01")];
+        shown.extend(req.overlay.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        super::trace_http(PROVIDER, &url, &shown, &body);
+        let resp = req.overlay.headers.iter().fold(resp, |r, (k, v)| r.set(k, v)).send_string(&body);
         let resp = match resp {
             Ok(r) => r,
             Err(ureq::Error::Status(code, r)) => {
                 let ra = r.header("retry-after").and_then(|s| s.trim().parse::<u64>().ok());
                 let body = r.into_string().unwrap_or_default();
+                super::log_http_error(PROVIDER, code, ra, &body);
                 return Err(classify_http(code, &body, ra));
             }
             Err(ureq::Error::Transport(t)) => return Err(transport(t)),

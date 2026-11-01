@@ -5,13 +5,16 @@
 //! produced tool calls. History is reloaded from the store on every step.
 use crate::agent::{self, Agent};
 use crate::snapshot::{FileDiff, Snapshots};
-use crate::{blobs, catalog, compaction, config, instructions, skills, title};
+use crate::{blobs, catalog, classifier, compaction, config, instructions, skills, title};
 use crate::chat;
+use crate::log::LogErr;
 use crate::permission::{self, Effect, PermissionMode, Rule};
 use crate::provider::{retry, Block, ChatMessage, Event, FinishReason, Provider, ProviderError, Request, Role, ToolDef, Usage};
 use crate::store::{Mode, Session, Store, StoreError};
 use crate::tools::{self, project_root_of, Host, MediaCaps, PermReq, Permitter, Question, SubagentRequest, SubagentResult, Todo, Tool, ToolCtx, ToolError, ToolOutput};
 use serde_json::{json, Value};
+mod classify;
+pub use classify::Evaluation;
 mod jobs;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -37,11 +40,18 @@ pub struct PermissionPrompt<'a> {
 pub enum UiEvent<'a> {
     TextDelta(&'a str),
     ReasoningDelta(&'a str),
-    ToolStarted { name: &'a str, input: &'a Value },
+    ToolStarted { id: &'a str, name: &'a str, input: &'a Value },
     ToolFinished { name: &'a str, ok: bool, text: &'a str },
     Retry { attempt: u32, wait: Duration, error: &'a str },
     /// After each step: this step's tokens and cost, session total, and how full the context is.
     StepUsage { usage: Usage, cost: Option<f64>, session_cost: f64, context_tokens: u64, context_limit: Option<u64> },
+    /// The permission classifier was called (`classifier.rs`): what the call cost, the session total (which includes
+    /// it) and the part of that total spent on classifying.
+    ClassifierUsage { cost: f64, session_cost: f64, classifier_cost: f64 },
+    /// The classifier let a shell command through without asking. `call_id` is the tool call it belongs to (the id of
+    /// the matching `ToolStarted`), `command` is one line, `risk` is what the model judged it to be (or
+    /// `allowed earlier` for a repeat), `reason` may be empty.
+    AutoAllowed { call_id: &'a str, command: &'a str, risk: &'a str, reason: &'a str },
     Notice(&'a str),
     /// Progress that is not an error (compaction started or finished).
     Status(&'a str),
@@ -64,6 +74,11 @@ pub trait Ui: Sync {
     fn ask_questions(&self, _questions: &[Question]) -> Option<Vec<Vec<String>>> {
         None
     }
+    /// Nobody can answer a prompt (a background subagent). The command classifier then runs only if its
+    /// `background` setting allows it.
+    fn unattended(&self) -> bool {
+        false
+    }
 }
 
 /// Wraps the parent's UI for a subagent session: events are tagged, prompts go to the same user.
@@ -81,6 +96,9 @@ impl Ui for ChildUi<'_> {
     }
     fn ask_questions(&self, q: &[Question]) -> Option<Vec<Vec<String>>> {
         self.parent.ask_questions(q)
+    }
+    fn unattended(&self) -> bool {
+        self.parent.unattended()
     }
 }
 
@@ -124,6 +142,8 @@ pub struct EngineConfig {
     pub snapshot_max_files: usize,
     /// Model for titles and other small jobs (`provider/model`); the session's model when unset.
     pub small_model: Option<String>,
+    /// Automatic classification of shell commands that would otherwise ask (off unless set; see `classifier.rs`).
+    pub classifier: Option<classifier::Settings>,
     /// Discovered skills (see `skills::discover`).
     pub skills: Vec<skills::Skill>,
     /// MCP servers whose tools join the built-in ones. Their tool list is read again for every request.
@@ -154,6 +174,7 @@ impl EngineConfig {
             snapshots: true,
             snapshot_max_files: 50_000,
             small_model: None,
+            classifier: None,
             skills: vec![],
             mcp: None,
             formatters: Default::default(),
@@ -186,6 +207,10 @@ pub struct Engine {
     snapshot_off: Mutex<HashSet<String>>,
     /// Sessions a title was already attempted for in this process.
     title_tried: Mutex<HashSet<String>>,
+    /// Commands the classifier allowed in this process (per session and directory); only allows are remembered.
+    classified: Mutex<HashSet<String>>,
+    /// Classifier models already reported as having no price (once each per process).
+    unpriced_noted: Mutex<HashSet<String>>,
     /// Weak handle to this engine once it is shared (`share`): detached background threads need an owner.
     me: Mutex<std::sync::Weak<Engine>>,
     jobs: jobs::Jobs,
@@ -241,6 +266,27 @@ struct Prepared<'a> {
     tools: Vec<Arc<dyn Tool>>,
 }
 
+fn describe_undo(r: &Result<UndoResult, StoreError>) -> String {
+    match r {
+        Ok(UndoResult::Done(rep)) => format!("done: {} message(s) hidden, files restored={} (restored {}, deleted {})", rep.hidden_messages, rep.files_restored, rep.restored.len(), rep.deleted.len()),
+        Ok(other) => format!("{other:?}"),
+        Err(e) => format!("store error: {e}"),
+    }
+}
+
+/// One line per finished tool call: name, outcome, duration and the size of what the model gets back.
+fn log_tool(name: &str, outcome: &Result<ToolOutput, ToolError>, elapsed: Duration) {
+    let (status, size) = match outcome {
+        Ok(o) => ("ok", o.text.len()),
+        Err(ToolError::Failure(m)) => ("error", m.len()),
+        Err(ToolError::Declined) => ("declined", 0),
+        Err(ToolError::Corrected(m)) => ("corrected", m.len()),
+        Err(ToolError::Blocked(m)) => ("blocked", m.len()),
+        Err(ToolError::Interrupted) => ("interrupted", 0),
+    };
+    crate::log_debug!("tool", "{name} {status} ms={} output_bytes={size}", elapsed.as_millis());
+}
+
 fn subagent_list(cfg: &EngineConfig) -> Vec<(String, String)> {
     cfg.agents.iter().filter(|a| a.subagent()).map(|a| (a.id.clone(), a.description.clone())).collect()
 }
@@ -278,12 +324,12 @@ struct AttemptResult {
 impl Engine {
     /// Single provider answering every model ref.
     pub fn new(store: Store, provider: Box<dyn Provider>, cfg: EngineConfig) -> Self {
-        Engine { store: Mutex::new(store), providers: HashMap::new(), fallback: Some(provider), tools: tools::all(subagent_list(&cfg), cfg.skills.clone(), cfg.websearch.clone()).into_iter().map(Arc::from).collect(), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()), title_tried: Mutex::new(HashSet::new()), me: Mutex::new(std::sync::Weak::new()), jobs: jobs::Jobs::default(), notifier: Mutex::new(None) }
+        Engine { store: Mutex::new(store), providers: HashMap::new(), fallback: Some(provider), tools: tools::all(subagent_list(&cfg), cfg.skills.clone(), cfg.websearch.clone()).into_iter().map(Arc::from).collect(), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()), title_tried: Mutex::new(HashSet::new()), classified: Mutex::new(HashSet::new()), unpriced_noted: Mutex::new(HashSet::new()), me: Mutex::new(std::sync::Weak::new()), jobs: jobs::Jobs::default(), notifier: Mutex::new(None) }
     }
 
     /// One client per provider id; a model ref's provider part picks the client.
     pub fn with_providers(store: Store, providers: HashMap<String, Box<dyn Provider>>, cfg: EngineConfig) -> Self {
-        Engine { store: Mutex::new(store), providers, fallback: None, tools: tools::all(subagent_list(&cfg), cfg.skills.clone(), cfg.websearch.clone()).into_iter().map(Arc::from).collect(), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()), title_tried: Mutex::new(HashSet::new()), me: Mutex::new(std::sync::Weak::new()), jobs: jobs::Jobs::default(), notifier: Mutex::new(None) }
+        Engine { store: Mutex::new(store), providers, fallback: None, tools: tools::all(subagent_list(&cfg), cfg.skills.clone(), cfg.websearch.clone()).into_iter().map(Arc::from).collect(), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()), title_tried: Mutex::new(HashSet::new()), classified: Mutex::new(HashSet::new()), unpriced_noted: Mutex::new(HashSet::new()), me: Mutex::new(std::sync::Weak::new()), jobs: jobs::Jobs::default(), notifier: Mutex::new(None) }
     }
 
     pub fn catalog(&self) -> &catalog::Catalog {
@@ -427,6 +473,43 @@ impl Engine {
         self.media_caps(p, m)
     }
 
+    /// Lines for `/permissions`: what the classifier allowed without asking in this session (and its subagents), and
+    /// the "always allow" rules saved for the project.
+    pub fn permissions_report(&self, sid: &str) -> Result<Vec<String>, StoreError> {
+        let (session, auto) = {
+            let st = self.store();
+            match st.session(sid)? {
+                Some(session) => (session, st.auto_allows(sid)?),
+                // Deleted or archived from another process, or a stale id after /resume: say so, don't take the UI down.
+                None => return Ok(vec![format!("session {sid} was not found (it may have been deleted from another moco process)")]),
+            }
+        };
+        let saved = self.store().saved_permissions(&session.project_id)?;
+        let mode = self.permission_mode_of(&session);
+        let mut out = vec![format!(
+            "permission mode: {}; the command classifier is {}",
+            mode.name(),
+            match (&self.cfg.classifier, mode) {
+                (None, _) => "off (permission_classifier.enabled is false)".to_string(),
+                (Some(_), PermissionMode::Manual) => "idle (it only works in auto mode)".to_string(),
+                (Some(s), _) => format!("on ({})", s.model.clone().unwrap_or_else(|| self.small_model_ref(&session))),
+            }
+        )];
+        out.push(format!("allowed automatically in this session: {}", auto.len()));
+        for a in auto.iter().rev().take(50).rev() {
+            let when = crate::log::stamp(a.at).replace('T', " ");
+            out.push(format!("  {} {:<14} {}{}", &when[..19], a.risk, classifier::sanitize(&a.command, 100), if a.reason.is_empty() { String::new() } else { format!("  ({})", a.reason) }));
+        }
+        if auto.len() > 50 {
+            out.push(format!("  ... {} older not shown", auto.len() - 50));
+        }
+        out.push(format!("saved \"always allow\" rules for this project: {}", saved.len()));
+        for r in &saved {
+            out.push(format!("  {:<20} {}", r.action, r.resource));
+        }
+        Ok(out)
+    }
+
     pub fn app_dir(&self) -> &std::path::Path {
         &self.cfg.app_dir
     }
@@ -461,12 +544,20 @@ impl Engine {
     /// Run until idle. `resume` continues a run that was interrupted by a crash (the claim is still held).
     pub fn run(&self, session_id: &str, ui: &dyn Ui, cancel: &AtomicBool, resume: bool) -> Result<RunOutcome, StoreError> {
         if !resume && !self.store().claim(session_id)? {
+            crate::log_info!("engine", "run session={session_id} not started: another run holds the claim");
             return Ok(RunOutcome::Busy);
         }
+        crate::log_info!("engine", "run start session={session_id} resume={resume}");
+        let run_started = std::time::Instant::now();
         // Sending a new prompt after /undo makes the undo permanent.
-        if let Err(e) = self.commit_pending(session_id) {
-            self.store().release(session_id)?;
-            return Err(e);
+        match self.commit_pending(session_id) {
+            Ok(0) => {}
+            Ok(n) => crate::log_info!("engine", "session={session_id} undo made permanent: {n} message(s) deleted"),
+            Err(e) => {
+                crate::log_error!("engine", "session={session_id} could not commit the pending undo: {e}");
+                self.store().release(session_id)?;
+                return Err(e);
+            }
         }
         self.auto_failed.lock().unwrap().remove(session_id);
         // An untitled session gets a title from a small model call that runs alongside the first turn.
@@ -478,6 +569,12 @@ impl Engine {
             self.drain(session_id, ui, cancel, resume)
         });
         self.store().release(session_id)?;
+        let ms = run_started.elapsed().as_millis();
+        match &outcome {
+            Ok(RunOutcome::Failed(why)) => crate::log_warn!("engine", "run end session={session_id} outcome=failed ms={ms}: {why}"),
+            Ok(o) => crate::log_info!("engine", "run end session={session_id} outcome={o:?} ms={ms}"),
+            Err(e) => crate::log_error!("engine", "run end session={session_id} store error ms={ms}: {e}"),
+        }
         outcome
     }
 
@@ -614,6 +711,7 @@ impl Engine {
         let Prepared { session, agent, req, provider, provider_id, model_id, tools: step_tools, .. } = p;
         let (provider_id, model_id) = (provider_id.as_str(), model_id.as_str());
         let caps = self.media_caps(provider_id, model_id);
+        crate::log_debug!("engine", "step session={sid} step={step} agent={} model={provider_id}/{model_id} messages={} tools={}", agent.id, req.messages.len(), req.tools.len());
 
         let snapshot = self.take_snapshot(&session, ui);
         let mut first = json!({ "parts": [] });
@@ -629,6 +727,8 @@ impl Engine {
             ui,
             declined: &declined,
             ask_lock: &self.prompt_lock,
+            // Manual mode is fully manual: the classifier only ever works in auto mode.
+            classify: self.cfg.classifier.as_ref().filter(|_| self.permission_mode_of(&session) == PermissionMode::Auto).filter(|s| s.background || !ui.unattended()).map(|settings| classify::ClassifyCtx { engine: self, session: &session, settings, cancel }),
         };
 
         let mut retries = 0u32;
@@ -639,6 +739,7 @@ impl Engine {
                     // Safe to retry: no tool has run, and the partial output is discarded.
                     retries += 1;
                     if let Some(wait) = retry::delay(retries, e, (self.cfg.jitter)()) {
+                        crate::log_warn!("engine", "retry session={sid} step={step} attempt={retries} wait_ms={}: {}", wait.as_millis(), e.message());
                         ui.event(&UiEvent::Retry { attempt: retries, wait, error: &e.message() });
                         self.store().set_message_parts(&msg_id, &[])?;
                         (self.cfg.sleep)(wait, cancel);
@@ -647,6 +748,7 @@ impl Engine {
                         }
                         continue;
                     }
+                    crate::log_warn!("engine", "giving up session={sid} step={step} after {} retries: {}", retries - 1, e.message());
                     break r;
                 }
                 _ => break r,
@@ -656,6 +758,7 @@ impl Engine {
         // The provider rejected the prompt as too long before producing anything: compact once and retry the step.
         if let (Err(ProviderError::ContextOverflow(_)), false, false) = (&result.stream, result.dispatched, overflowed) {
             if !cancel.load(Ordering::Relaxed) {
+                crate::log_warn!("engine", "context overflow session={sid} step={step}: compacting and retrying once");
                 self.store().delete_message(&msg_id)?;
                 match self.compact_inner(sid, "overflow", ui, cancel)? {
                     CompactResult::Compacted { .. } => return self.run_step_inner(sid, step, ui, cancel, true),
@@ -686,10 +789,11 @@ impl Engine {
             let context_tokens = usage.input + usage.cache_read + usage.cache_write + usage.output;
             let session_cost = {
                 let st = self.store();
-                let _ = st.add_usage(sid, cost.unwrap_or(0.0), usage);
+                st.add_usage(sid, cost.unwrap_or(0.0), usage).log_err("store", "recording token usage");
                 st.usage_totals(sid).map(|t| t.0).unwrap_or(0.0)
             };
             data["cost"] = json!(cost);
+            crate::log_debug!("engine", "usage session={sid} step={step} model={provider_id}/{model_id} input={} output={} cache_read={} cache_write={} cost={} session_cost={session_cost:.4}", usage.input, usage.output, usage.cache_read, usage.cache_write, cost.map_or("unpriced".to_string(), |c| format!("{c:.4}")));
             ui.event(&UiEvent::StepUsage { usage: *usage, cost, session_cost, context_tokens, context_limit: model.map(|m| m.limit.context).filter(|l| *l > 0) });
         }
         let outcome = match &result.stream {
@@ -711,6 +815,7 @@ impl Engine {
             }
         };
         self.store().update_message(&msg_id, &data)?;
+        crate::log_debug!("engine", "step end session={sid} step={step} tool_calls={tool_calls} next={}", match &outcome { StepOutcome::Continue => "continue".to_string(), StepOutcome::Done => "done".to_string(), StepOutcome::Stop(o) => format!("stop:{o:?}") });
         Ok(outcome)
     }
 
@@ -729,14 +834,7 @@ impl Engine {
     /// Best effort: any failure just leaves the session untitled. Only errors where the request provably never ran
     /// (connection refused, DNS) are retried, up to 3 times, since this is a one-shot generation.
     fn generate_title(&self, session: &Session, text: &str, ui: &dyn Ui, cancel: &AtomicBool) {
-        let agent = agent::find(self.agents_of(session), &session.agent).or_else(|| self.agents_of(session).first().cloned());
-        let model_ref = self
-            .cfg
-            .small_model
-            .clone()
-            .or(session.model.clone())
-            .or(agent.and_then(|a| a.model))
-            .unwrap_or_else(|| self.cfg.model.clone());
+        let model_ref = self.small_model_ref(session);
         let (provider_id, model_id) = config::split_model(&model_ref);
         let Some(provider) = self.providers.get(provider_id).map(|p| p.as_ref()).or(self.fallback.as_deref()) else { return };
         let req = Request {
@@ -768,7 +866,7 @@ impl Engine {
         let st = self.store();
         if st.set_title_if_empty(&session.id, &title).unwrap_or(false) {
             let cost = self.cfg.catalog.model(provider_id, model_id).and_then(|m| catalog::cost(m, &usage)).unwrap_or(0.0);
-            let _ = st.add_usage(&session.id, cost, &usage);
+            st.add_usage(&session.id, cost, &usage).log_err("store", "recording title usage");
             drop(st);
             ui.event(&UiEvent::Titled(&title));
         }
@@ -867,9 +965,18 @@ impl Engine {
             let st = self.store();
             st.last_snapshot(&session.id).ok().flatten().or_else(|| session.parent_id.as_ref().and_then(|p| st.last_snapshot(p).ok().flatten()))
         };
-        match self.snaps(session).capture(std::path::Path::new(&session.directory), prev.as_deref()) {
-            Ok(id) => Some(id),
+        let started = std::time::Instant::now();
+        let snaps = self.snaps(session);
+        match snaps.capture(std::path::Path::new(&session.directory), prev.as_deref()) {
+            Ok(id) => {
+                if crate::log::enabled(crate::log::Level::Debug, "snapshot") {
+                    let files = snaps.manifest(&id).map(|m| m.files.len().to_string()).unwrap_or_else(|_| "?".into());
+                    crate::log_debug!("snapshot", "captured session={} files={files} ms={}", session.id, started.elapsed().as_millis());
+                }
+                Some(id)
+            }
             Err(e) => {
+                crate::log_warn!("snapshot", "capture failed session={} after {} ms, snapshots are off for this session: {e}", session.id, started.elapsed().as_millis());
                 self.snapshot_off.lock().unwrap().insert(session.id.clone());
                 ui.event(&UiEvent::Notice(&format!("snapshots are off for this session (undo and diff unavailable): {e}")));
                 None
@@ -903,6 +1010,7 @@ impl Engine {
         }
         let r = self.undo_inner(sid);
         self.store().release(sid)?;
+        crate::log_info!("engine", "undo session={sid}: {}", describe_undo(&r));
         r
     }
 
@@ -960,6 +1068,7 @@ impl Engine {
             Ok(UndoResult::Done(report))
         })();
         self.store().release(sid)?;
+        crate::log_info!("engine", "redo session={sid}: {}", describe_undo(&r));
         r
     }
 
@@ -1019,6 +1128,8 @@ impl Engine {
         let update = compaction::has_checkpoint(&eff);
         let before: u64 = eff.iter().map(compaction::estimate).sum();
         let limit = self.cfg.catalog.model(&provider_id, &model_id).map(|m| m.limit.context).filter(|l| *l > 0);
+        crate::log_info!("engine", "compaction start session={sid} trigger={trigger} replacing={k} messages, about {before} tokens, model={provider_id}/{model_id}");
+        let compaction_started = std::time::Instant::now();
         ui.event(&UiEvent::Status(&format!("compacting {k} message(s) ({trigger})...")));
 
         let mut portion: Vec<crate::store::Message> = eff[..k].to_vec();
@@ -1073,10 +1184,12 @@ impl Engine {
             }
         }
         if let Some(e) = failure {
+            crate::log_warn!("engine", "compaction failed session={sid} trigger={trigger}: {e}");
             return Ok(CompactResult::Failed(e));
         }
         let summary = reply.trim().to_string();
         if summary.is_empty() {
+            crate::log_warn!("engine", "compaction failed session={sid} trigger={trigger}: the model returned an empty summary");
             return Ok(CompactResult::Failed("the model returned an empty summary".into()));
         }
         let after: u64 = compaction::estimate_text(&summary) + eff[k..].iter().map(compaction::estimate).sum::<u64>();
@@ -1086,6 +1199,7 @@ impl Engine {
             let cost = self.cfg.catalog.model(&provider_id, &model_id).and_then(|m| catalog::cost(m, &usage_total)).unwrap_or(0.0);
             st.add_usage(sid, cost, &usage_total)?;
         }
+        crate::log_info!("engine", "compaction done session={sid} trigger={trigger} tokens {before} -> {after} ms={}", compaction_started.elapsed().as_millis());
         ui.event(&UiEvent::Status(&format!("compacted: about {} -> {} tokens", human_tokens(before), human_tokens(after))));
         Ok(CompactResult::Compacted { before, after })
     }
@@ -1106,6 +1220,7 @@ impl Engine {
                     attempt += 1;
                     match retry::delay(attempt, &e, (self.cfg.jitter)()) {
                         Some(wait) if !cancel.load(Ordering::Relaxed) => {
+                            crate::log_warn!("engine", "retry summary request attempt={attempt} wait_ms={}: {}", wait.as_millis(), e.message());
                             ui.event(&UiEvent::Retry { attempt, wait, error: &e.message() });
                             (self.cfg.sleep)(wait, cancel);
                             if cancel.load(Ordering::Relaxed) {
@@ -1152,20 +1267,25 @@ impl Engine {
                 Event::ToolCall { id, name, input } => {
                     text_idx = None;
                     dispatched = true;
-                    ui.event(&UiEvent::ToolStarted { name: &name, input: &input });
+                    ui.event(&UiEvent::ToolStarted { id: &id, name: &name, input: &input });
                     parts.push(chat::tool_part(&id, &name, &input));
                     let idx = parts.len() - 1;
-                    let _ = self.store().set_message_parts(msg_id, &parts);
+                    self.store().set_message_parts(msg_id, &parts).log_err("store", "saving a tool call");
                     let tool = step_tools.iter().find(|t| t.name() == name).map(|t| t.as_ref());
                     let (cwd, root, spill) = (cwd.clone(), root.clone(), spill.clone());
                     handles.push((
                         idx,
-                        s.spawn(move || match tool {
-                            None => Err(ToolError::fail(format!("Unknown tool: {name}"))),
-                            Some(t) => {
-                                let host = EngineHost { engine: self, session, ui, cancel };
-                                t.run(&input, &ToolCtx { formatters: &self.cfg.formatters, media: caps, session_id: &session.id, host: &host, cwd, project_root: root, spill_dir: spill, permitter, cancel })
-                            }
+                        s.spawn(move || {
+                            let started = std::time::Instant::now();
+                            let outcome = match tool {
+                                None => Err(ToolError::fail(format!("Unknown tool: {name}"))),
+                                Some(t) => {
+                                    let host = EngineHost { engine: self, session, ui, cancel };
+                                    t.run(&input, &ToolCtx { formatters: &self.cfg.formatters, media: caps, session_id: &session.id, host: &host, cwd, project_root: root, spill_dir: spill, permitter, cancel, call_id: &id })
+                                }
+                            };
+                            log_tool(&name, &outcome, started.elapsed());
+                            outcome
                         }),
                     ));
                 }
@@ -1180,7 +1300,7 @@ impl Engine {
                     if let Some(p) = out.metadata["path"].as_str() {
                         let st = self.store();
                         for ins in instructions::discover_between(std::path::Path::new(p), &cwd) {
-                            let _ = st.add_instruction(&session.id, &ins.to_string_lossy());
+                            st.add_instruction(&session.id, &ins.to_string_lossy()).log_err("store", "remembering an instruction file");
                         }
                     }
                 }
@@ -1200,10 +1320,24 @@ impl Engine {
                 for a in out.take_media() {
                     match blobs::put(&self.cfg.app_dir, &a.bytes) {
                         Ok(hash) => media.push(json!({"mediaType": a.media_type, "blob": hash, "size": a.bytes.len(), "name": a.name})),
-                        Err(e) => out.text.push_str(&format!("\n[could not store the attachment {}: {e}]", a.name)),
+                        Err(e) => {
+                            crate::log_warn!("tool", "{name}: could not store the attachment {}: {e}", a.name);
+                            out.text.push_str(&format!("\n[could not store the attachment {}: {e}]", a.name))
+                        }
                     }
                 }
-                let text = crate::truncate::truncate(&out.text, spill).map(|t| t.text).unwrap_or(out.text);
+                let text = match crate::truncate::truncate(&out.text, spill) {
+                    Ok(t) => {
+                        if let Some(p) = &t.output_path {
+                            crate::log_debug!("tool", "{name} output truncated; the full text is in {}", p.display());
+                        }
+                        t.text
+                    }
+                    Err(e) => {
+                        crate::log_warn!("tool", "{name}: could not save the long output to {}: {e}", spill.display());
+                        out.text
+                    }
+                };
                 let text = if text.is_empty() { "(no output)".to_string() } else { text };
                 ui.event(&UiEvent::ToolFinished { name, ok: true, text: &text });
                 let mut state = json!({"status":"completed","output":text,"metadata":out.metadata});
@@ -1281,9 +1415,44 @@ struct EnginePermitter<'a> {
     /// Set when the user declines without feedback: every other pending/future request of the batch fails too.
     declined: &'a AtomicBool,
     ask_lock: &'a Mutex<()>,
+    /// Present when the command classifier is on for this step.
+    classify: Option<classify::ClassifyCtx<'a>>,
 }
 
 impl EnginePermitter<'_> {
+    /// The classifier may answer for a shell command that would only ask because of a default rule. It never
+    /// overrides a rule the user or the careful preset's always-ask list wrote, and never sees opaque or dangerous
+    /// commands. `true` = run it without asking.
+    fn auto_allowed(&self, req: &PermReq) -> bool {
+        let (Some(c), Some(command)) = (&self.classify, &req.command) else { return false };
+        if req.action != "shell" || req.force_ask {
+            return false;
+        }
+        let parsed = tools::shellparse::parse(command);
+        if classifier::never_classify(&parsed) {
+            crate::log_debug!("classifier", "session={} skipped (opaque or never-classify list): {}", c.session.id, classifier::sanitize(command, 200));
+            return false;
+        }
+        let saved = self.store.lock().unwrap_or_else(|e| e.into_inner()).saved_permissions(&self.project_id).unwrap_or_default();
+        if !permission::only_default_asks(&req.action, &req.resources, &self.rules, &saved) {
+            crate::log_debug!("classifier", "session={} skipped (an explicit rule decides): {}", c.session.id, classifier::sanitize(command, 200));
+            return false;
+        }
+        match c.engine.classify_command(c.session, command, &parsed, c.settings, self.ui, c.cancel) {
+            classifier::Verdict::Allow { risk, reason } => {
+                // Its own event, not a Notice: an allowed command is not an error, and the TUI marks the tool row with it.
+                self.ui.event(&UiEvent::AutoAllowed { call_id: &req.call_id, command: &classifier::sanitize(command, 100), risk: &risk, reason: &reason });
+                true
+            }
+            classifier::Verdict::Ask { reason } => {
+                if !reason.is_empty() {
+                    self.ui.event(&UiEvent::Status(&format!("classifier: asking you because {reason}")));
+                }
+                false
+            }
+        }
+    }
+
     fn effect(&self, req: &PermReq) -> Effect {
         let saved = self.store.lock().unwrap_or_else(|e| e.into_inner()).saved_permissions(&self.project_id).unwrap_or_default();
         let e = permission::decide(&req.action, &req.resources, &self.rules, &saved);
@@ -1300,6 +1469,9 @@ impl Permitter for EnginePermitter<'_> {
             Effect::Allow => Ok(()),
             Effect::Deny => Err(ToolError::Blocked(format!("Permission denied: {} {}", req.action, req.resources.join(", ")))),
             Effect::Ask => {
+                if self.auto_allowed(req) {
+                    return Ok(());
+                }
                 let _one_prompt_at_a_time = self.ask_lock.lock().unwrap_or_else(|e| e.into_inner());
                 if self.declined.load(Ordering::Relaxed) {
                     return Err(ToolError::Declined);
@@ -1313,7 +1485,7 @@ impl Permitter for EnginePermitter<'_> {
                     Reply::Always => {
                         let st = self.store.lock().unwrap_or_else(|e| e.into_inner());
                         for pat in &req.save {
-                            let _ = st.save_permission(&self.project_id, &req.action, pat);
+                            st.save_permission(&self.project_id, &req.action, pat).log_err("store", "saving an always-allow rule");
                         }
                         Ok(())
                     }
@@ -1363,6 +1535,8 @@ mod tests {
             UiEvent::ToolFinished { name, ok, .. } => format!("done:{name}:{ok}"),
             UiEvent::Retry { attempt, wait, .. } => format!("retry:{attempt}:{}", wait.as_secs()),
             UiEvent::StepUsage { .. } => "usage".into(),
+            UiEvent::ClassifierUsage { .. } => "classifier-usage".into(),
+            UiEvent::AutoAllowed { command, risk, reason, .. } => format!("auto:{risk}:{command}:{reason}"),
             UiEvent::Notice(n) => format!("notice:{n}"),
             UiEvent::Status(n) => format!("status:{n}"),
             UiEvent::Todos(t) => format!("todos:{}", t.len()),
@@ -2124,6 +2298,362 @@ mod tests {
         f.engine.store().set_permission_mode(&f.session.id, Some("manual")).unwrap();
         f.say("again");
         assert_eq!(f.run(&TestUi::replying(vec![Reply::Reject(None)])), RunOutcome::Declined);
+    }
+
+    // --- command classifier (classifier.rs) ---
+
+    fn verdict(v: &str, risk: &str) -> Scripted {
+        text(&format!(r#"{{"verdict":"{v}","risk":"{risk}","reason":"because"}}"#))
+    }
+
+    /// Auto mode with the careful preset: the one place a default (soft) ask exists for the classifier to relax.
+    fn auto_careful_with(settings: Option<classifier::Settings>, more: Vec<Rule>) -> impl FnOnce(&mut EngineConfig) {
+        move |c| {
+            let mut auto = agent::builtin_for(PermissionMode::Auto);
+            for a in &mut auto {
+                a.permissions.extend(permission::preset_rules("careful").unwrap());
+                a.permissions.extend(more.iter().cloned());
+            }
+            c.permission_mode = PermissionMode::Auto;
+            c.agents_by_mode = BTreeMap::from([(PermissionMode::Manual, agent::builtin_for(PermissionMode::Manual)), (PermissionMode::Auto, auto)]);
+            // A model with a catalog price, so cost is real (and the no-price notice stays out of the way).
+            c.small_model = Some(PRICED.into());
+            c.classifier = settings;
+        }
+    }
+
+    const PRICED: &str = "anthropic/claude-haiku-5-5";
+
+    fn shell_twice(cmd: &str) -> Vec<Scripted> {
+        vec![tool_call("t1", "shell", json!({"command": cmd})), tool_call("t2", "shell", json!({"command": cmd})), text("done")]
+    }
+
+    fn notices(ui: &TestUi) -> Vec<String> {
+        ui.log().into_iter().filter(|l| l.starts_with("notice:") || l.starts_with("status:") || l.starts_with("auto:")).collect()
+    }
+
+    #[test]
+    fn manual_mode_is_fully_manual_and_never_calls_the_classifier() {
+        let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "echo hi"})), text("done")], auto_careful_with(Some(Default::default()), vec![]));
+        f.engine.store().set_permission_mode(&f.session.id, Some("manual")).unwrap();
+        f.fake.script_verdicts(vec![verdict("allow", "read-only")]);
+        f.say("go");
+        let ui = TestUi::replying(vec![Reply::Once]); // the one prompt is answered; a second would panic
+        assert_eq!(f.run(&ui), RunOutcome::Idle);
+        assert!(f.fake.classifier_requests.lock().unwrap().is_empty(), "manual mode asks the user, nothing is classified");
+        assert!(ui.replies.lock().unwrap().is_empty(), "the prompt was shown");
+    }
+
+    #[test]
+    fn the_classifier_allows_a_routine_command_once_and_remembers_it() {
+        let f = fixture_cfg(shell_twice("echo hi"), auto_careful_with(Some(Default::default()), vec![]));
+        f.fake.script_verdicts(vec![verdict("allow", "read-only")]);
+        f.say("go");
+        let ui = TestUi::default(); // a prompt would panic
+        assert_eq!(f.run(&ui), RunOutcome::Idle);
+        assert_eq!(f.fake.classifier_requests.lock().unwrap().len(), 1, "the second identical command is not classified again");
+        let n = notices(&ui);
+        assert_eq!(n[0], "auto:read-only:echo hi:because");
+        assert_eq!(n[1], "auto:allowed earlier:echo hi:");
+        let req = f.fake.classifier_requests.lock().unwrap()[0].clone();
+        assert_eq!(req.system, classifier::SYSTEM);
+        assert!(req.tools.is_empty() && req.messages.len() == 1, "no conversation history goes to the classifier");
+        let input: Value = serde_json::from_str(&all_text(&req)).unwrap();
+        assert_eq!(input["command"], "echo hi");
+        assert!(input["cwd"].as_str().unwrap().ends_with("/work"));
+        // Three main steps and one classifier call, all on the session's bill.
+        assert_eq!(f.engine.store().usage_totals(&f.session.id).unwrap().1.input, 40);
+    }
+
+    #[test]
+    fn classifier_spend_is_priced_reported_at_once_and_counted_in_the_session() {
+        let f = fixture_cfg(shell_twice("echo hi"), |c| {
+            auto_careful_with(Some(Default::default()), vec![])(c);
+            c.model = PRICED.into(); // the three main steps cost money too
+        });
+        f.fake.script_verdicts(vec![verdict("allow", "read-only")]);
+        f.say("go");
+        let seen = Mutex::new(vec![]);
+        struct Spy<'a>(&'a TestUi, &'a Mutex<Vec<(f64, f64, f64)>>);
+        impl Ui for Spy<'_> {
+            fn event(&self, e: &UiEvent) {
+                if let UiEvent::ClassifierUsage { cost, session_cost, classifier_cost } = e {
+                    self.1.lock().unwrap().push((*cost, *session_cost, *classifier_cost));
+                }
+                self.0.event(e)
+            }
+            fn ask(&self, p: &PermissionPrompt) -> Reply {
+                self.0.ask(p)
+            }
+        }
+        let inner = TestUi::default();
+        assert_eq!(f.engine.run(&f.session.id, &Spy(&inner, &seen), &AtomicBool::new(false), false).unwrap(), RunOutcome::Idle);
+        // 10 input and 5 output tokens at $0.10 / $0.50 per million, for the one call that was made.
+        let call = (10.0 * 0.1 + 5.0 * 0.5) / 1e6;
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "the cached second command costs nothing and reports nothing");
+        assert!((seen[0].0 - call).abs() < 1e-12 && (seen[0].2 - call).abs() < 1e-12, "{seen:?}");
+        assert!((seen[0].1 - call).abs() < 1e-12, "when the call is made, no step has finished yet: {seen:?}");
+        let st = f.engine.store();
+        let (total, _) = st.usage_totals(&f.session.id).unwrap();
+        assert!((total - 4.0 * call).abs() < 1e-12, "three steps and one classifier call, all in the total: {total}");
+        assert!((st.classifier_cost(&f.session.id).unwrap() - call).abs() < 1e-12, "the classifier's share is shown on its own");
+        assert!(!inner.log().iter().any(|l| l.contains("no price")));
+    }
+
+    #[test]
+    fn a_classifier_model_without_a_price_is_said_so_once() {
+        let f = fixture_cfg(shell_twice("echo hi"), |c| {
+            auto_careful_with(Some(classifier::Settings { model: Some("anthropic/claude-unpriced".into()), ..Default::default() }), vec![])(c);
+        });
+        f.fake.script_verdicts(vec![verdict("ask", "unknown"), verdict("ask", "unknown")]);
+        f.say("go");
+        let ui = TestUi::replying(vec![Reply::Once, Reply::Once]);
+        f.run(&ui);
+        assert_eq!(f.fake.classifier_requests.lock().unwrap().len(), 2);
+        let said: Vec<String> = ui.log().into_iter().filter(|l| l.contains("no price")).collect();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("anthropic/claude-unpriced") && said[0].contains("$0.00"));
+        assert_eq!(f.engine.store().classifier_cost(&f.session.id).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn a_subagents_classifier_spend_rolls_up_to_its_parent() {
+        let st = Store::open_memory().unwrap();
+        let parent = st.create_session("/tmp/p", "build").unwrap();
+        let child = st.create_child_session(&parent, "general").unwrap();
+        let u = Usage { input: 1, ..Default::default() };
+        st.add_usage(&child.id, 0.5, &u).unwrap();
+        st.add_classifier_usage(&child.id, 0.25, &u).unwrap();
+        assert_eq!((st.classifier_cost(&child.id).unwrap(), st.classifier_cost(&parent.id).unwrap()), (0.25, 0.25));
+        assert_eq!(st.usage_totals(&parent.id).unwrap().0, 0.75);
+    }
+
+    #[test]
+    fn anything_but_a_safe_allow_asks_the_user() {
+        for (reply, why) in [
+            (Some(verdict("allow", "network")), "network: because"),
+            (Some(verdict("ask", "unknown")), "because"),
+            (Some(verdict("deny", "destructive")), "the classifier advises against this: because"),
+            (Some(text("I think it is fine")), "the classifier gave no usable answer"),
+            (None, "the classifier gave no usable answer"),
+        ] {
+            let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "make"})), text("done")], auto_careful_with(Some(Default::default()), vec![]));
+            f.fake.script_verdicts(reply.into_iter().collect());
+            f.say("go");
+            let ui = TestUi::replying(vec![Reply::Once]);
+            assert_eq!(f.run(&ui), RunOutcome::Idle, "{why}");
+            assert_eq!(ui.asked.lock().unwrap().len(), 1, "{why}");
+            assert!(notices(&ui).contains(&format!("status:classifier: asking you because {why}")), "{why}: {:?}", notices(&ui));
+        }
+        // A refusal is remembered nowhere: the same command is classified (and asked) again.
+        let f = fixture_cfg(shell_twice("make"), auto_careful_with(Some(Default::default()), vec![]));
+        f.fake.script_verdicts(vec![verdict("ask", "unknown"), verdict("ask", "unknown")]);
+        f.say("go");
+        let ui = TestUi::replying(vec![Reply::Once, Reply::Once]);
+        f.run(&ui);
+        assert_eq!(f.fake.classifier_requests.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn dangerous_opaque_and_explicitly_ruled_commands_never_reach_the_classifier() {
+        for (cmd, rules) in [
+            ("git push origin main", vec![]),
+            ("rm -rf build", vec![]),
+            ("sudo make install", vec![]),
+            ("echo $(whoami)", vec![]),
+            ("make test", vec![Rule::new("shell", "make *", Effect::Ask)]),
+            ("make test", vec![Rule::new("shell", "*", Effect::Ask)]),
+        ] {
+            let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": cmd})), text("done")], auto_careful_with(Some(Default::default()), rules));
+            f.fake.script_verdicts(vec![verdict("allow", "read-only")]);
+            f.say("go");
+            let ui = TestUi::replying(vec![Reply::Reject(None)]);
+            assert_eq!(f.run(&ui), RunOutcome::Declined, "{cmd}");
+            assert_eq!(ui.asked.lock().unwrap().len(), 1, "{cmd}");
+            assert!(f.fake.classifier_requests.lock().unwrap().is_empty(), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn a_rule_based_deny_stays_a_deny_and_the_classifier_is_off_by_default() {
+        let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "make"})), text("done")], auto_careful_with(Some(Default::default()), vec![Rule::new("shell", "make", Effect::Deny)]));
+        f.fake.script_verdicts(vec![verdict("allow", "read-only")]);
+        f.say("go");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        assert!(matches!(&last_user_blocks(&f.fake.requests.lock().unwrap()[1])[0], Block::ToolResult { is_error: true, content, .. } if content.starts_with("Permission denied: shell")));
+        assert!(f.fake.classifier_requests.lock().unwrap().is_empty());
+
+        let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "echo hi"})), text("done")], auto_careful_with(None, vec![]));
+        f.say("go");
+        let ui = TestUi::replying(vec![Reply::Once]);
+        f.run(&ui);
+        assert_eq!(ui.asked.lock().unwrap().len(), 1);
+        assert!(f.fake.classifier_requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_slow_classifier_times_out_into_a_prompt() {
+        let settings = classifier::Settings { timeout: Duration::from_millis(150), ..Default::default() };
+        let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "echo hi"})), text("done")], auto_careful_with(Some(settings), vec![]));
+        f.fake.delay_classifier(Duration::from_secs(30));
+        f.fake.script_verdicts(vec![verdict("allow", "read-only")]);
+        f.say("go");
+        let ui = TestUi::replying(vec![Reply::Once]);
+        let start = std::time::Instant::now();
+        assert_eq!(f.run(&ui), RunOutcome::Idle);
+        assert!(start.elapsed() < Duration::from_secs(10));
+        assert_eq!(ui.asked.lock().unwrap().len(), 1);
+        assert!(notices(&ui).iter().any(|n| n.contains("did not answer in time")));
+    }
+
+    /// The classifier lines logged for one session, oldest first (the `session=` field is unique per test).
+    fn classifier_log(sid: &str, level: &str) -> Vec<String> {
+        crate::log::capture::global_lines(&format!("session={sid}")).into_iter().filter(|l| l.starts_with(&format!("{level} classifier:"))).collect()
+    }
+
+    #[test]
+    fn every_classifier_decision_is_logged_and_listed_by_permissions() {
+        crate::log::capture::ensure_global("debug");
+        let f = fixture_cfg(shell_twice("echo hi"), auto_careful_with(Some(Default::default()), vec![]));
+        f.fake.script_verdicts(vec![verdict("allow", "read-only")]);
+        f.say("go");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        let sid = &f.session.id;
+        let lines = classifier_log(sid, "INFO");
+        assert_eq!(lines.len(), 2, "one line per decision, the repeat included: {lines:?}");
+        for part in ["decision=allow", "model_verdict=allow", "risk=read-only", "model=anthropic/claude-haiku-5-5", " ms=", "tokens_in=", "tokens_out=", "cost=", "reason=because", "command=echo hi"] {
+            assert!(lines[0].contains(part), "{part} missing from {}", lines[0]);
+        }
+        assert!(lines[1].contains("decision=allow cached=true") && lines[1].contains("command=echo hi"), "{}", lines[1]);
+        assert!(!classifier_log(sid, "DEBUG").is_empty(), "the raw reply is kept at debug: {:?}", crate::log::capture::global_lines(&format!("session={sid}")));
+
+        // What `/permissions` shows: the mode, the model, the command (once, not per repeat) and the saved rules.
+        let report = f.engine.permissions_report(sid).unwrap();
+        assert!(report[0].contains("permission mode: auto") && report[0].contains("on (anthropic/claude-haiku-5-5)"), "{report:?}");
+        assert_eq!(report[1], "allowed automatically in this session: 1");
+        assert!(report[2].contains("read-only") && report[2].contains("echo hi") && report[2].contains("(because)"), "{report:?}");
+        assert_eq!(report[3], "saved \"always allow\" rules for this project: 0");
+        f.engine.store().save_permission(&f.session.project_id, "shell", "cargo test *").unwrap();
+        assert!(f.engine.permissions_report(sid).unwrap().iter().any(|l| l.contains("shell") && l.contains("cargo test *")));
+
+        // The other states are described honestly.
+        f.engine.store().set_permission_mode(sid, Some("manual")).unwrap();
+        assert!(f.engine.permissions_report(sid).unwrap()[0].contains("idle (it only works in auto mode)"));
+        let off = fixture_cfg(vec![text("hi")], auto_careful_with(None, vec![]));
+        assert!(off.engine.permissions_report(&off.session.id).unwrap()[0].contains("off (permission_classifier.enabled is false)"));
+    }
+
+    #[test]
+    fn declines_timeouts_and_skips_are_logged_with_their_cause() {
+        crate::log::capture::ensure_global("debug");
+        // The model advises against it: logged with the model's own words, and the user is asked.
+        let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "make"})), text("done")], auto_careful_with(Some(Default::default()), vec![]));
+        f.fake.script_verdicts(vec![verdict("deny", "destructive")]);
+        f.say("go");
+        assert_eq!(f.run(&TestUi::replying(vec![Reply::Once])), RunOutcome::Idle);
+        let lines = classifier_log(&f.session.id, "INFO");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("decision=ask model_verdict=deny risk=destructive") && lines[0].contains("command=make"), "{}", lines[0]);
+        assert_eq!(f.engine.store().auto_allows(&f.session.id).unwrap().len(), 0, "only allows are listed");
+
+        // No answer in time: the cause is in the log.
+        let settings = classifier::Settings { timeout: Duration::from_millis(150), ..Default::default() };
+        let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "echo hi"})), text("done")], auto_careful_with(Some(settings), vec![]));
+        f.fake.delay_classifier(Duration::from_secs(30));
+        f.fake.script_verdicts(vec![verdict("allow", "read-only")]);
+        f.say("go");
+        assert_eq!(f.run(&TestUi::replying(vec![Reply::Once])), RunOutcome::Idle);
+        let lines = classifier_log(&f.session.id, "INFO");
+        assert!(lines.len() == 1 && lines[0].contains("decision=ask") && lines[0].contains("no answer within 150 ms"), "{lines:?}");
+
+        // Commands that are never sent to the model leave a debug line saying why, and no verdict.
+        let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "sudo ls"})), text("done")], auto_careful_with(Some(Default::default()), vec![]));
+        f.say("go");
+        assert_eq!(f.run(&TestUi::replying(vec![Reply::Once])), RunOutcome::Idle);
+        assert!(classifier_log(&f.session.id, "INFO").is_empty());
+        let skipped = classifier_log(&f.session.id, "DEBUG");
+        assert!(skipped.len() == 1 && skipped[0].contains("skipped (opaque or never-classify list)") && skipped[0].contains("sudo ls"), "{skipped:?}");
+    }
+
+    #[test]
+    fn an_interrupt_while_classifying_is_not_reported_as_a_timeout_or_logged_as_a_decision() {
+        crate::log::capture::ensure_global("debug");
+        let settings = classifier::Settings { timeout: Duration::from_secs(20), ..Default::default() };
+        let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "echo hi"})), text("done")], auto_careful_with(Some(settings), vec![]));
+        f.fake.delay_classifier(Duration::from_secs(30));
+        f.fake.script_verdicts(vec![verdict("allow", "read-only")]);
+        f.say("go");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let ui = TestUi::replying(vec![Reply::Once]);
+        let (c2, started) = (cancel.clone(), std::time::Instant::now());
+        let esc = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            c2.store(true, Ordering::Relaxed);
+        });
+        let _ = f.engine.run(&f.session.id, &ui, &cancel, false);
+        esc.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10), "the interrupt ends the wait at once, not at the 20 s limit");
+        assert!(!notices(&ui).iter().any(|n| n.contains("did not answer in time") || n.contains("classifier: asking you")), "{:?}", notices(&ui));
+        assert!(classifier_log(&f.session.id, "INFO").is_empty(), "no decision was made, so none is logged: {:?}", classifier_log(&f.session.id, "INFO"));
+        assert!(classifier_log(&f.session.id, "DEBUG").iter().any(|l| l.contains("interrupted") && l.contains("no decision made")));
+    }
+
+    #[test]
+    fn permissions_for_a_session_that_does_not_exist_is_a_message_not_a_panic() {
+        let f = fixture(vec![]);
+        let report = f.engine.permissions_report("ses_missing").unwrap();
+        assert_eq!(report.len(), 1);
+        assert!(report[0].contains("ses_missing") && report[0].contains("not found"), "{report:?}");
+    }
+
+    #[test]
+    fn the_classifier_model_comes_from_its_setting_then_the_small_model() {
+        let settings = classifier::Settings { model: Some("anthropic/claude-judge".into()), ..Default::default() };
+        let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "echo hi"})), text("done")], |c| {
+            auto_careful_with(Some(settings), vec![])(c);
+            c.small_model = Some("anthropic/claude-small".into());
+        });
+        f.fake.script_verdicts(vec![verdict("allow", "read-only")]);
+        f.say("go");
+        f.run(&TestUi::default());
+        assert_eq!(f.fake.classifier_requests.lock().unwrap()[0].model, "claude-judge");
+
+        let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "echo hi"})), text("done")], |c| {
+            auto_careful_with(Some(Default::default()), vec![])(c);
+            c.small_model = Some("anthropic/claude-small".into());
+        });
+        f.fake.script_verdicts(vec![verdict("allow", "read-only")]);
+        f.say("go");
+        f.run(&TestUi::default());
+        assert_eq!(f.fake.classifier_requests.lock().unwrap()[0].model, "claude-small");
+    }
+
+    /// A UI nobody is behind, like a background subagent's.
+    struct Away;
+    impl Ui for Away {
+        fn event(&self, _: &UiEvent) {}
+        fn ask(&self, _: &PermissionPrompt) -> Reply {
+            Reply::Reject(Some("nobody here".into()))
+        }
+        fn unattended(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn unattended_runs_use_the_classifier_only_when_background_is_on() {
+        for (background, runs_unprompted) in [(true, true), (false, false)] {
+            let settings = classifier::Settings { background, ..Default::default() };
+            let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "echo hi"})), text("done")], auto_careful_with(Some(settings), vec![]));
+            f.fake.script_verdicts(vec![verdict("allow", "read-only")]);
+            f.say("go");
+            assert_eq!(f.engine.run(&f.session.id, &Away, &AtomicBool::new(false), false).unwrap(), RunOutcome::Idle);
+            let reqs = f.fake.requests.lock().unwrap();
+            let result = &last_user_blocks(&reqs[1])[0];
+            assert_eq!(matches!(result, Block::ToolResult { is_error: false, .. }), runs_unprompted, "background={background}");
+            assert_eq!(f.fake.classifier_requests.lock().unwrap().len(), usize::from(background));
+        }
     }
 
     #[test]

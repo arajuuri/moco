@@ -41,6 +41,54 @@ impl std::fmt::Display for RpcError {
 type Pending = Arc<Mutex<HashMap<u64, Sender<Result<Value, RpcError>>>>>;
 pub type NotifyFn = Arc<dyn Fn(&str, &Value) + Send + Sync>;
 
+/// Wraps a connection to log what crosses it: every request with its duration (a failure, with the server's stderr
+/// tail, at `warn`), and notifications at `trace`. Tool arguments and results are never logged, only the tool's name.
+pub struct LoggedConn {
+    name: String,
+    inner: Arc<dyn McpConn>,
+}
+
+impl LoggedConn {
+    pub fn wrap(name: &str, inner: Arc<dyn McpConn>) -> Arc<dyn McpConn> {
+        Arc::new(LoggedConn { name: name.to_string(), inner })
+    }
+}
+
+impl McpConn for LoggedConn {
+    fn request(&self, method: &str, params: Value, timeout: Duration, cancel: Option<&AtomicBool>) -> Result<Value, RpcError> {
+        let what = if method == "tools/call" { format!("{method} {}", params["name"].as_str().unwrap_or("?")) } else { method.to_string() };
+        let started = Instant::now();
+        let r = self.inner.request(method, params, timeout, cancel);
+        let ms = started.elapsed().as_millis();
+        match &r {
+            Ok(_) => crate::log_debug!("mcp", "server={} {what} ok ms={ms}", self.name),
+            Err(RpcError::Cancelled) => crate::log_debug!("mcp", "server={} {what} cancelled ms={ms}", self.name),
+            Err(e) => {
+                let tail = crate::log::tail(&self.inner.stderr_tail(), 5);
+                crate::log_warn!("mcp", "server={} {what} failed after {ms} ms (timeout {} ms): {e}{}", self.name, timeout.as_millis(), tail_suffix(&tail));
+            }
+        }
+        r
+    }
+    fn notify(&self, method: &str, params: Value) {
+        crate::log_trace!("mcp", "server={} notify {method}", self.name);
+        self.inner.notify(method, params)
+    }
+    fn is_alive(&self) -> bool {
+        self.inner.is_alive()
+    }
+    fn stderr_tail(&self) -> String {
+        self.inner.stderr_tail()
+    }
+    fn info(&self) -> Value {
+        self.inner.info()
+    }
+    fn shutdown(&self) {
+        crate::log_debug!("mcp", "server={} shutdown", self.name);
+        self.inner.shutdown()
+    }
+}
+
 /// A connection to one MCP server, whatever it runs over (a child process's stdio, or HTTP).
 pub trait McpConn: Send + Sync {
     /// Send a request and wait for its answer, up to `timeout`; abandoned (and the server told) when `cancel` is set.
@@ -246,7 +294,9 @@ impl Client {
     }
 
     pub fn notify(&self, method: &str, params: Value) {
-        let _ = self.inner.write(&json!({"jsonrpc":"2.0","method":method,"params":params}));
+        if let Err(e) = self.inner.write(&json!({"jsonrpc":"2.0","method":method,"params":params})) {
+            crate::log_debug!("mcp", "could not send notification {method}: {e}");
+        }
     }
 
     /// The handshake: `initialize`, check the protocol revision, `notifications/initialized`.

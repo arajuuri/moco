@@ -51,6 +51,16 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (4, "alter table session add column fork_session_id text; alter table session add column fork_boundary text;"),
     (5, "alter table session add column variant text;"),
     (6, "alter table session add column permission_mode text;"),
+    // The part of `cost` that went to the permission classifier (it is also counted in `cost`).
+    (7, "alter table session add column classifier_cost real not null default 0;"),
+    // Shell commands the permission classifier allowed without asking (the `/permissions` listing; issue #28).
+    (
+        8,
+        "create table auto_allow(
+        id integer primary key autoincrement, session_id text not null references session(id) on delete cascade,
+        at integer not null, command text not null, risk text not null, reason text not null, model text not null);
+     create index auto_allow_session on auto_allow(session_id);",
+    ),
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -68,6 +78,18 @@ pub struct Session {
     pub permission_mode: Option<String>,
     /// Set for subagent sessions.
     pub parent_id: Option<String>,
+}
+
+/// A shell command the permission classifier let through without asking.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AutoAllow {
+    pub session_id: String,
+    /// Milliseconds since the epoch.
+    pub at: i64,
+    pub command: String,
+    pub risk: String,
+    pub reason: String,
+    pub model: String,
 }
 
 /// One row of the session list.
@@ -128,10 +150,13 @@ fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
+/// How long a recorded automatic allow is kept: as long as the log files (seven days).
+const AUTO_ALLOW_KEEP_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+            crate::log::LogErr::log_err(std::fs::create_dir_all(dir), "store", "creating the data directory");
         }
         let conn = Connection::open(path)?;
         conn.query_row("pragma journal_mode=wal", [], |_| Ok(()))?;
@@ -152,7 +177,15 @@ impl Store {
             tx.execute("insert into migrations(version, applied_at) values (?1, ?2)", params![version, now_ms()])?;
             tx.commit()?;
         }
-        Ok(Store { conn })
+        let store = Store { conn };
+        store.prune_auto_allows(AUTO_ALLOW_KEEP_MS);
+        Ok(store)
+    }
+
+    /// Forget automatic allows older than `keep_ms`. They only feed the `/permissions` listing, and the same cutoff as
+    /// the log files keeps what a command line once held from piling up. A failure is logged, never fatal.
+    fn prune_auto_allows(&self, keep_ms: i64) {
+        crate::log::LogErr::log_err(self.conn.execute("delete from auto_allow where at < ?1", [now_ms() - keep_ms]), "store", "pruning old automatic allows");
     }
 
     /// Project id is derived from the directory, so reopening the same directory finds the same project.
@@ -252,6 +285,16 @@ impl Store {
     /// Add one step's usage to the session totals (`cost` in USD; `tokens` is a JSON object of running sums).
     /// Subagent spend also counts toward every ancestor session, so a parent's total covers its whole tree.
     pub fn add_usage(&self, session_id: &str, cost: f64, usage: &crate::provider::Usage) -> Result<()> {
+        self.add_usage_of(session_id, cost, usage, false)
+    }
+
+    /// As `add_usage`, for a permission classifier call: also counted in `classifier_cost`, so it can be shown on
+    /// its own while the session total still covers everything.
+    pub fn add_classifier_usage(&self, session_id: &str, cost: f64, usage: &crate::provider::Usage) -> Result<()> {
+        self.add_usage_of(session_id, cost, usage, true)
+    }
+
+    fn add_usage_of(&self, session_id: &str, cost: f64, usage: &crate::provider::Usage, classifier: bool) -> Result<()> {
         let mut cur = Some(session_id.to_string());
         let mut hops = 0;
         while let Some(id) = cur {
@@ -260,7 +303,10 @@ impl Store {
             for (k, v) in [("input", usage.input), ("output", usage.output), ("cacheRead", usage.cache_read), ("cacheWrite", usage.cache_write)] {
                 t[k] = serde_json::json!(t[k].as_u64().unwrap_or(0) + v);
             }
-            self.conn.execute("update session set cost=cost+?2, tokens=?3, time_updated=?4 where id=?1", params![id, cost, t.to_string(), now_ms()])?;
+            self.conn.execute(
+                "update session set cost=cost+?2, tokens=?3, time_updated=?4, classifier_cost=classifier_cost+?5 where id=?1",
+                params![id, cost, t.to_string(), now_ms(), if classifier { cost } else { 0.0 }],
+            )?;
             cur = self.conn.query_row("select parent_id from session where id=?1", [&id], |r| r.get::<_, Option<String>>(0)).optional()?.flatten();
             hops += 1;
             if hops > 32 {
@@ -268,6 +314,29 @@ impl Store {
             }
         }
         Ok(())
+    }
+
+    /// Remember a command the classifier allowed without asking. The command is stored redacted (`log::redact`): a
+    /// token or password on the command line must not outlive the command in the database.
+    pub fn record_auto_allow(&self, session_id: &str, command: &str, risk: &str, reason: &str, model: &str) -> Result<()> {
+        let command: String = crate::log::redact(command).chars().take(2000).collect();
+        self.conn.execute("insert into auto_allow(session_id, at, command, risk, reason, model) values (?1,?2,?3,?4,?5,?6)", params![session_id, now_ms(), command, risk, reason, model])?;
+        Ok(())
+    }
+
+    /// What the classifier allowed in this session and in the subagent sessions below it, oldest first.
+    pub fn auto_allows(&self, session_id: &str) -> Result<Vec<AutoAllow>> {
+        let mut stmt = self.conn.prepare(
+            "with recursive tree(id) as (select ?1 union all select s.id from session s join tree on s.parent_id = tree.id)
+             select a.session_id, a.at, a.command, a.risk, a.reason, a.model from auto_allow a where a.session_id in (select id from tree) order by a.id",
+        )?;
+        let rows = stmt.query_map([session_id], |r| Ok(AutoAllow { session_id: r.get(0)?, at: r.get(1)?, command: r.get(2)?, risk: r.get(3)?, reason: r.get(4)?, model: r.get(5)? }))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// The part of the session's cost (children included) that went to the permission classifier.
+    pub fn classifier_cost(&self, session_id: &str) -> Result<f64> {
+        Ok(self.conn.query_row("select classifier_cost from session where id=?1", [session_id], |r| r.get(0))?)
     }
 
     /// (cost in USD, token sums) for the session.
@@ -589,28 +658,35 @@ impl Store {
 
     pub fn saved_permissions(&self, project_id: &str) -> Result<Vec<Rule>> {
         let mut stmt = self.conn.prepare("select action, resource from permission_saved where project_id=?1 order by rowid")?;
-        let rows = stmt.query_map([project_id], |r| Ok(Rule { action: r.get(0)?, resource: r.get(1)?, effect: Effect::Allow }))?;
+        let rows = stmt.query_map([project_id], |r| Ok(Rule { action: r.get(0)?, resource: r.get(1)?, effect: Effect::Allow, soft: false }))?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
     /// Write-ahead execution claim. Returns false if the session is already claimed.
     pub fn claim(&self, session_id: &str) -> Result<bool> {
-        Ok(self.conn.execute("update session set claim_at=?2 where id=?1 and claim_at is null", params![session_id, now_ms()])? > 0)
+        let got = self.conn.execute("update session set claim_at=?2 where id=?1 and claim_at is null", params![session_id, now_ms()])? > 0;
+        crate::log_debug!("store", "claim session={session_id} {}", if got { "taken" } else { "refused: already claimed" });
+        Ok(got)
     }
 
     pub fn release(&self, session_id: &str) -> Result<()> {
         self.conn.execute("update session set claim_at=null, resume_attempts=0 where id=?1", [session_id])?;
+        crate::log_debug!("store", "release session={session_id}");
         Ok(())
     }
 
     /// On startup: sessions left claimed by a crash. Bumps the attempt counter; sessions over `max_attempts`
     /// are released instead of resumed. Returns the ids to resume.
     pub fn recover_claims(&self, max_attempts: i64) -> Result<Vec<String>> {
-        self.conn.execute("update session set claim_at=null where claim_at is not null and resume_attempts>=?1", [max_attempts])?;
+        let dropped = self.conn.execute("update session set claim_at=null where claim_at is not null and resume_attempts>=?1", [max_attempts])?;
+        if dropped > 0 {
+            crate::log_warn!("store", "recover: {dropped} session(s) crashed {max_attempts} times in a row and will not be resumed again");
+        }
         let mut stmt = self.conn.prepare("select id from session where claim_at is not null and parent_id is null")?;
         let ids: Vec<String> = stmt.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
         for id in &ids {
             self.conn.execute("update session set resume_attempts=resume_attempts+1 where id=?1", [id])?;
+            crate::log_warn!("store", "recover: session={id} was left claimed by a crash; resuming it");
         }
         Ok(ids)
     }
@@ -891,6 +967,49 @@ mod tests {
         s.save_permission("prj_other", "edit", "*").unwrap();
         let rules = s.saved_permissions(&ses.project_id).unwrap();
         assert_eq!(rules, [Rule::new("shell", "git push *", Effect::Allow)]);
+    }
+
+    #[test]
+    fn automatic_allows_are_stored_without_credentials_and_forgotten_after_a_week() {
+        let dir = std::env::temp_dir().join(new_id("moco-store"));
+        let path = dir.join("moco.db");
+        let ses = {
+            let s = Store::open(&path).unwrap();
+            let ses = s.create_session("/p", "build").unwrap();
+            s.record_auto_allow(&ses.id, "export GITHUB_TOKEN=ghp_abcdef123456 && gh api user", "network", "", "m/a").unwrap();
+            s.record_auto_allow(&ses.id, "mysql -u root -phunter2 -e 'select 1'", "read-only", "", "m/a").unwrap();
+            let stored: Vec<String> = s.auto_allows(&ses.id).unwrap().into_iter().map(|a| a.command).collect();
+            assert!(stored.iter().all(|c| !c.contains("ghp_abcdef123456") && !c.contains("hunter2")), "{stored:?}");
+            assert_eq!(stored[0], "export GITHUB_TOKEN=[redacted] && gh api user");
+            // Age one of them past the cutoff, the other to just inside it.
+            let old = now_ms() - AUTO_ALLOW_KEEP_MS - 1000;
+            let recent = now_ms() - AUTO_ALLOW_KEEP_MS + 60_000;
+            s.conn.execute("update auto_allow set at=?1 where command like 'export%'", [old]).unwrap();
+            s.conn.execute("update auto_allow set at=?1 where command like 'mysql%'", [recent]).unwrap();
+            ses
+        };
+        let s = Store::open(&path).unwrap();
+        let left: Vec<String> = s.auto_allows(&ses.id).unwrap().into_iter().map(|a| a.command).collect();
+        assert_eq!(left.len(), 1, "the week-old row is pruned when the store opens: {left:?}");
+        assert!(left[0].starts_with("mysql"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auto_allows_are_listed_oldest_first_with_the_subagents_below() {
+        let s = Store::open_memory().unwrap();
+        let top = s.create_session("/p", "build").unwrap();
+        let other = s.create_session("/p", "build").unwrap();
+        let child = s.create_child_session(&top, "general").unwrap();
+        s.record_auto_allow(&top.id, "ls", "read-only", "", "m/a").unwrap();
+        s.record_auto_allow(&child.id, "cargo test", "project-write", "tests", "m/a").unwrap();
+        s.record_auto_allow(&other.id, "pwd", "read-only", "", "m/a").unwrap();
+        let got: Vec<(String, String)> = s.auto_allows(&top.id).unwrap().into_iter().map(|a| (a.command, a.risk)).collect();
+        assert_eq!(got, [("ls".to_string(), "read-only".to_string()), ("cargo test".to_string(), "project-write".to_string())]);
+        assert_eq!(s.auto_allows(&child.id).unwrap().len(), 1, "a subagent sees its own");
+        assert_eq!(s.auto_allows(&other.id).unwrap()[0].command, "pwd");
+        s.record_auto_allow(&top.id, &"x".repeat(5000), "read-only", "", "m").unwrap();
+        assert_eq!(s.auto_allows(&top.id).unwrap().last().unwrap().command.len(), 2000, "very long commands are cut");
     }
 
     #[test]

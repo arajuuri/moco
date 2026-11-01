@@ -150,9 +150,17 @@ pub(crate) fn run_foreground(command: &str, workdir: &Path, spill_dir: &Path, ti
     let out_path = spill_dir.join(format!("{}.txt", crate::id::new_id("shell")));
     let mut child = spawn(command, workdir, &out_path, sandbox_root)?;
     let timeout = (timeout_ms > 0).then(|| Duration::from_millis(timeout_ms));
+    let started = std::time::Instant::now();
     let mut f = wait(&mut child, &out_path, timeout, &|| cancel.load(std::sync::atomic::Ordering::Relaxed), false);
-    if sandbox_root.is_some() && crate::sandbox::active() {
+    let sandboxed = sandbox_root.is_some() && crate::sandbox::active();
+    if sandboxed {
         crate::sandbox::annotate(&mut f.text, f.exit);
+    }
+    let what = format!("exit={:?} signal={:?} timed_out={} killed={} truncated={} sandboxed={sandboxed} ms={} command={}", f.exit, f.signal, f.timed_out, f.killed, f.truncated, started.elapsed().as_millis(), crate::classifier::sanitize(command, 200));
+    if f.timed_out {
+        crate::log_warn!("shell", "{what}");
+    } else {
+        crate::log_debug!("shell", "{what}");
     }
     Ok(f)
 }
@@ -199,12 +207,12 @@ Do not use interactive commands.\n\n{BACKGROUND_INSTRUCTION}"
         resources.dedup();
         save.dedup();
         let unsandbox_save = save.clone();
-        ctx.permitter.check(&PermReq { action: "shell".into(), resources: resources.clone(), save, force_ask: parsed.opaque })?;
+        ctx.permitter.check(&PermReq { action: "shell".into(), resources: resources.clone(), save, force_ask: parsed.opaque, command: Some(command.to_string()), call_id: ctx.call_id.into() })?;
 
         // Leaving the sandbox is its own permission, so a blanket `shell` allow does not cover it.
         let unsandboxed = opt_bool(input, "unsandboxed").unwrap_or(false) && crate::sandbox::active();
         if unsandboxed {
-            ctx.permitter.check(&PermReq { action: "shell.unsandboxed".into(), resources, save: unsandbox_save, force_ask: parsed.opaque })?;
+            ctx.permitter.check(&PermReq { action: "shell.unsandboxed".into(), resources, save: unsandbox_save, force_ask: parsed.opaque, command: None, call_id: ctx.call_id.into() })?;
         }
 
         if background {

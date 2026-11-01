@@ -57,6 +57,9 @@ struct Unattended;
 
 impl Ui for Unattended {
     fn event(&self, _: &UiEvent) {}
+    fn unattended(&self) -> bool {
+        true
+    }
     fn ask(&self, _: &PermissionPrompt) -> Reply {
         Reply::Reject(Some("This needs approval, but you are a subagent running in the background and nobody is present to give it. Do not retry it; do what is possible without it and say what needs approval.".into()))
     }
@@ -111,7 +114,7 @@ impl Engine {
 
     /// Queue `text` for the session as a message the model will see.
     fn tell_session(&self, sid: &str, text: &str, description: &str) {
-        let _ = self.store().enqueue(sid, None, Mode::Steer, "synthetic", &json!({"text": text, "description": description}));
+        self.store().enqueue(sid, None, Mode::Steer, "synthetic", &json!({"text": text, "description": description})).log_err("store", "queueing a background job's result");
     }
 
     pub fn background_jobs(&self, session: Option<&str>) -> Vec<JobInfo> {
@@ -169,10 +172,14 @@ impl Engine {
         if !running {
             return Ok(format!("{id} is not running ({})", self.background_jobs(None).iter().find(|j| j.id == id).map(|j| j.status.clone()).unwrap_or_default()));
         }
+        crate::log_info!("jobs", "kill requested job={id}");
         stop.store(true, Ordering::Relaxed);
         let end = Instant::now() + Duration::from_secs(3);
         while Instant::now() < end && self.jobs_lock().iter().any(|j| j.id == id && j.state == State::Running) {
             std::thread::sleep(Duration::from_millis(20));
+        }
+        if self.jobs_lock().iter().any(|j| j.id == id && j.state == State::Running) {
+            crate::log_warn!("jobs", "job={id} was still running 3 s after the kill request");
         }
         Ok(format!("Stopped {id}."))
     }
@@ -210,6 +217,7 @@ impl Engine {
         let root = (!unsandboxed).then(|| crate::tools::project_root_of(Path::new(&session.directory)));
         let sandboxed = root.is_some() && crate::sandbox::active();
         let mut child = shell::spawn(command, workdir, &out, root.as_deref())?;
+        crate::log_info!("jobs", "start shell job={id} session={} sandboxed={sandboxed} timeout_ms={} command={}", session.id, timeout.map_or("none".to_string(), |t| t.as_millis().to_string()), classifier::sanitize(command, 200));
         let stop = Arc::new(AtomicBool::new(false));
         self.register(Job { id: id.clone(), kind: Kind::Shell, session_id: session.id.clone(), title: command.to_string(), started: Instant::now(), state: State::Running, out: Some(out.clone()), stop: stop.clone() });
         let (eng, sid, cmd, job_id, out_path) = (self.clone(), session.id.clone(), command.to_string(), id.clone(), out.clone());
@@ -232,6 +240,8 @@ impl Engine {
             State::Exited { code: f.exit, signal: f.signal }
         };
         let what = describe(&state);
+        let ran_ms = self.jobs_lock().iter().find(|j| j.id == id).map_or(0, |j| j.started.elapsed().as_millis());
+        crate::log_info!("jobs", "finish shell job={id} session={sid} {what} ms={ran_ms}");
         self.set_state(id, state.clone());
         let output = if f.text.trim().is_empty() { "(no output)".to_string() } else { f.text.clone() };
         // Whoever stopped it knows; everything else is news for the model.
@@ -248,6 +258,7 @@ impl Engine {
     /// Run the prepared child session on a thread of its own, unattended; report its result to `parent`.
     pub(super) fn start_subagent_job(self: &Arc<Self>, parent: &Session, child: &Session, description: &str) {
         let stop = Arc::new(AtomicBool::new(false));
+        crate::log_info!("jobs", "start subagent job={} session={} agent={} task={}", child.id, parent.id, child.agent, classifier::sanitize(description, 120));
         self.register(Job { id: child.id.clone(), kind: Kind::Subagent, session_id: parent.id.clone(), title: description.to_string(), started: Instant::now(), state: State::Running, out: None, stop: stop.clone() });
         let (eng, parent_id, child, description) = (self.clone(), parent.id.clone(), child.clone(), description.to_string());
         std::thread::spawn(move || {
@@ -257,6 +268,7 @@ impl Engine {
                 Err(ToolError::Interrupted) => (State::Stopped, String::new()),
                 Err(e) => (State::Failed(e.message()), format!("Background subagent failed (sessionID: {}, task: {description}): {}", child.id, e.message())),
             };
+            crate::log_info!("jobs", "finish subagent job={} session={parent_id} {}", child.id, describe(&state));
             eng.set_state(&child.id, state.clone());
             if state != State::Stopped {
                 eng.tell_session(&parent_id, &text, &format!("background subagent {} {}", child.id, describe(&state)));
@@ -274,7 +286,7 @@ impl Engine {
             return Err("interrupted".into());
         }
         let shown = if f.text.trim().is_empty() { "(no output)".to_string() } else { f.text };
-        let _ = self.store().add_message(sid, "synthetic", &json!({"text": format!("The user ran this command themselves:\n$ {command}\n\n{shown}"), "description": "user shell command"}));
+        self.store().add_message(sid, "synthetic", &json!({"text": format!("The user ran this command themselves:\n$ {command}\n\n{shown}"), "description": "user shell command"})).log_err("store", "recording the user's own command");
         Ok(shown)
     }
 }

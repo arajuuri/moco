@@ -69,7 +69,8 @@ pub fn remove(app_dir: &Path, server_url: &str) -> bool {
     if all.remove(server_url).is_none() {
         return false;
     }
-    let _ = std::fs::write(path(app_dir), serde_json::to_string_pretty(&Value::Object(all)).unwrap_or_default());
+    crate::log::LogErr::log_err(std::fs::write(path(app_dir), serde_json::to_string_pretty(&Value::Object(all)).unwrap_or_default()), "mcp", "forgetting stored OAuth tokens");
+    crate::log_info!("mcp", "oauth: stored tokens for {server_url} removed");
     true
 }
 
@@ -276,9 +277,16 @@ fn refresh_locked(app_dir: &Path, server_url: &str) -> Result<String, String> {
     if let Some(sec) = &secret {
         form.push(("client_secret", sec));
     }
-    let v = token_request(&s.token_endpoint, &form)?;
+    let v = match token_request(&s.token_endpoint, &form) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log_warn!("mcp", "oauth: refreshing the token for {server_url} failed: {e}");
+            return Err(e);
+        }
+    };
     apply_tokens(&mut s, &v)?;
     save(app_dir, server_url, &s).map_err(|e| e.to_string())?;
+    crate::log_info!("mcp", "oauth: token for {server_url} refreshed (expires in {} s)", s.expires_at.map_or("?".to_string(), |e| e.saturating_sub(now()).to_string()));
     Ok(s.access_token.clone().unwrap_or_default())
 }
 
@@ -405,8 +413,10 @@ pub fn probe(server_url: &str, headers: &std::collections::BTreeMap<String, Stri
 
 /// The whole sign-in: discover, register (or reuse), authorize in the browser, exchange the code, store the tokens.
 pub fn login(app_dir: &Path, server_url: &str, headers: &std::collections::BTreeMap<String, String>, cfg: &OAuthConfig, timeout: Duration, io: &LoginIo) -> Result<(), String> {
+    crate::log_info!("mcp", "oauth: sign-in to {server_url} started");
     let www = probe(server_url, headers);
-    let meta = discover(server_url, www.as_deref(), cfg)?;
+    let meta = discover(server_url, www.as_deref(), cfg).inspect_err(|e| crate::log_warn!("mcp", "oauth: discovery for {server_url} failed: {e}"))?;
+    crate::log_info!("mcp", "oauth: authorization endpoint {}, token endpoint {}, registration {}", meta.authorization_endpoint, meta.token_endpoint, if meta.registration_endpoint.is_some() { "available" } else { "not offered" });
     // A client registered earlier is only good with the redirect URI it was registered for, so that port is bound again.
     // If it is taken (or the client was preconfigured) the usual route applies: a fresh registration.
     let previous = load(app_dir, server_url).filter(|s| s.token_endpoint == meta.token_endpoint);
@@ -427,7 +437,8 @@ pub fn login(app_dir: &Path, server_url: &str, headers: &std::collections::BTree
             match &cfg.client_id {
                 Some(id) => (l, uri, id.clone(), cfg.client_secret.clone(), None),
                 None => {
-                    let (id, secret) = register(&meta, &uri)?;
+                    let (id, secret) = register(&meta, &uri).inspect_err(|e| crate::log_warn!("mcp", "oauth: {e}"))?;
+                    crate::log_info!("mcp", "oauth: registered a new client ({id})");
                     (l, uri.clone(), id, secret, Some(uri))
                 }
             }
@@ -439,21 +450,25 @@ pub fn login(app_dir: &Path, server_url: &str, headers: &std::collections::BTree
     let resource = canonical_resource(server_url);
     let scope = cfg.scope.as_deref().or(meta.scopes.as_deref());
     let url = authorization_url(&meta, &client_id, &redirect_uri, &challenge, &state, scope, &resource);
+    crate::log_info!("mcp", "oauth: waiting for the browser sign-in (the authorization URL is not logged)");
     (io.show)(&url);
     (io.open)(&url);
     let code = match (io.paste)() {
-        Some(text) => parse_pasted(&text, &state)?,
-        None => wait_callback(&listener, &state, timeout, io.cancel)?,
-    };
+        Some(text) => parse_pasted(&text, &state),
+        None => wait_callback(&listener, &state, timeout, io.cancel),
+    }
+    .inspect_err(|e| crate::log_warn!("mcp", "oauth: sign-in to {server_url} did not complete: {e}"))?;
 
     let mut form = vec![("grant_type", "authorization_code"), ("code", code.as_str()), ("redirect_uri", redirect_uri.as_str()), ("client_id", client_id.as_str()), ("code_verifier", verifier.as_str()), ("resource", resource.as_str())];
     if let Some(sec) = &client_secret {
         form.push(("client_secret", sec));
     }
-    let v = token_request(&meta.token_endpoint, &form)?;
+    let v = token_request(&meta.token_endpoint, &form).inspect_err(|e| crate::log_warn!("mcp", "oauth: exchanging the code failed: {e}"))?;
     let mut stored = Stored { client_id, client_secret, redirect_uri: registered_with, token_endpoint: meta.token_endpoint.clone(), ..Default::default() };
     apply_tokens(&mut stored, &v)?;
-    save(app_dir, server_url, &stored).map_err(|e| format!("could not store the tokens: {e}"))
+    save(app_dir, server_url, &stored).map_err(|e| format!("could not store the tokens: {e}"))?;
+    crate::log_info!("mcp", "oauth: signed in to {server_url}; tokens stored");
+    Ok(())
 }
 
 #[cfg(test)]

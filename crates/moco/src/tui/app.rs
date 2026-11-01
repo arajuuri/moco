@@ -20,11 +20,15 @@ pub use super::theme::Theme;
 #[derive(Debug, Clone)]
 pub enum Ev {
     Text(String),
-    Tool { name: String, summary: String, detail: Option<String> },
+    Tool { id: String, name: String, summary: String, detail: Option<String> },
     ToolDone { name: String, ok: bool, msg: String, output: String },
     Reasoning(String),
     Retry { attempt: u32, secs: u64, error: String },
     Usage { usage: Usage, cost: Option<f64>, session_cost: f64, context: u64, limit: Option<u64> },
+    /// The classifier let this shell command through without asking.
+    AutoAllowed { call_id: String, command: String, risk: String, reason: String },
+    /// A permission-classifier call: its cost, the session total (which includes it) and the classifier's share of it.
+    ClassifierUsage { cost: f64, session_cost: f64, classifier_cost: f64 },
     Notice(String),
     Status(String),
     Todos(Vec<Todo>),
@@ -200,6 +204,8 @@ const PASTE_LINES: usize = 6;
 const PASTE_CHARS: usize = 800;
 /// Lines of an edit's diff shown inline at the normal detail level.
 const DETAIL_LINES: usize = 24;
+/// Columns a shell row keeps for its command when an "auto:" marker shares the line.
+const MIN_COMMAND_WIDTH: usize = 12;
 const SIDEBAR_W: u16 = 32;
 
 /// What the event loop must do after an update.
@@ -236,7 +242,7 @@ pub enum ToolState {
 pub enum Row {
     User(String),
     Assistant(String),
-    Tool { depth: usize, agent: String, name: String, summary: String, state: ToolState, detail: Option<String>, output: String },
+    Tool { id: String, depth: usize, agent: String, name: String, summary: String, state: ToolState, detail: Option<String>, output: String, auto: Option<String> },
     /// The model's reasoning, shown according to the detail level.
     Reasoning(String),
     /// The welcome card at the top of a session.
@@ -255,6 +261,10 @@ pub struct Permission {
     pub reply: Sender<Reply>,
     /// Some while the user is typing feedback for a rejection.
     pub feedback: Option<String>,
+    /// First visible line of the (wrapped) request text; the arrow and page keys move it.
+    pub scroll: usize,
+    /// Set by the renderer: (largest useful scroll, lines visible), so the keys know their limits.
+    pub view: std::cell::Cell<(usize, usize)>,
 }
 
 #[derive(Default)]
@@ -263,6 +273,8 @@ struct RunUsage {
     cost: f64,
     priced: bool,
     steps: u32,
+    /// Spent this turn on classifying shell commands (in the session total, not in `cost`).
+    classifier: f64,
 }
 
 pub struct App {
@@ -283,6 +295,8 @@ pub struct App {
     pub permission_mode: PermissionMode,
     pub title: Option<String>,
     pub session_cost: f64,
+    /// The part of `session_cost` spent on the permission classifier.
+    pub classifier_cost: f64,
     pub context: u64,
     pub limit: Option<u64>,
     pub hint: Option<String>,
@@ -346,6 +360,7 @@ impl App {
             permission_mode: PermissionMode::default(),
             title: None,
             session_cost: 0.0,
+            classifier_cost: 0.0,
             context: 0,
             limit: None,
             hint: None,
@@ -418,7 +433,7 @@ impl App {
             AppEvent::Engine { depth, agent, ev } => self.engine(depth, agent, ev),
             AppEvent::Ask { action, resources, save, reply } => {
                 self.attention = Some(format!("{action} needs permission"));
-                self.dialogs.push_back(Permission { action, resources, save, reply, feedback: None });
+                self.dialogs.push_back(Permission { action, resources, save, reply, feedback: None, scroll: 0, view: Default::default() });
                 self.scroll = 0;
             }
             AppEvent::Background(line) => self.push_info(format!("[{line}]")),
@@ -483,7 +498,10 @@ impl App {
             return;
         }
         let sep = self.glyphs.sep;
-        let cost = if r.priced { format!("${:.4} {sep} session ${:.4}", r.cost, self.session_cost) } else { "cost n/a".to_string() };
+        let mut cost = if r.priced { format!("${:.4} {sep} session ${:.4}", r.cost, self.session_cost) } else { "cost n/a".to_string() };
+        if r.classifier > 0.0 {
+            cost.push_str(&format!(" + classifier ${:.4}", r.classifier));
+        }
         let wrote = if r.usage.cache_write > 0 { format!(" {sep} {} cache written", human(r.usage.cache_write)) } else { String::new() };
         self.rows.push(Row::Usage(format!("{} in {sep} {} out {sep} {} cached{wrote} {sep} {cost}", human(r.usage.input), human(r.usage.output), human(r.usage.cache_read))));
     }
@@ -502,7 +520,19 @@ impl App {
                     _ => self.rows.push(Row::Assistant(t)),
                 }
             }
-            Ev::Tool { name, summary, detail } => self.rows.push(Row::Tool { depth, agent, name, summary, state: ToolState::Running, detail, output: String::new() }),
+            Ev::Tool { id, name, summary, detail } => self.rows.push(Row::Tool { id, depth, agent, name, summary, state: ToolState::Running, detail, output: String::new(), auto: None }),
+            Ev::AutoAllowed { call_id, command, risk, reason } => {
+                // The marker goes on the tool row of the call it belongs to, found by the call's id. Without a row to
+                // attach to (an unknown id, or the row is gone) it shows as a line of its own, with the command, so
+                // it is never put on a different command's row.
+                let found = if call_id.is_empty() { None } else { self.rows.iter_mut().rev().find(|r| matches!(r, Row::Tool { id, depth: d, auto: None, .. } if *d == depth && *id == call_id)) };
+                let label = if reason.is_empty() { risk } else { format!("{risk}: {reason}") };
+                match found {
+                    Some(Row::Tool { auto, .. }) => *auto = Some(label),
+                    _ if depth == 0 => self.push_info(format!("auto: {label}: {command}")),
+                    _ => {}
+                }
+            }
             Ev::ToolDone { name, ok, msg, output: out } => {
                 let found = self.rows.iter_mut().rev().find(|r| matches!(r, Row::Tool { depth: d, name: n, state: ToolState::Running, .. } if *d == depth && *n == name));
                 if let Some(Row::Tool { state, output, .. }) = found {
@@ -534,6 +564,13 @@ impl App {
                     self.session_cost = session_cost;
                     self.context = context;
                     self.limit = limit;
+                }
+            }
+            Ev::ClassifierUsage { cost, session_cost, classifier_cost } => {
+                self.run.classifier += cost;
+                if depth == 0 {
+                    self.session_cost = session_cost;
+                    self.classifier_cost = classifier_cost;
                 }
             }
             Ev::Notice(n) => self.rows.push(Row::Error(if depth > 0 { format!("[{agent}] {n}") } else { n })),
@@ -1203,6 +1240,24 @@ impl App {
             return Action::Interrupt;
         }
         let Some(d) = self.dialogs.front_mut() else { return Action::None };
+        // The request text can be taller than the box: these keys scroll it, also while typing feedback.
+        let (max_scroll, page) = d.view.get();
+        let typing = d.feedback.is_some();
+        let scrolled = match k.code {
+            KeyCode::Up => Some(d.scroll.saturating_sub(1)),
+            KeyCode::Down => Some((d.scroll + 1).min(max_scroll)),
+            KeyCode::PageUp => Some(d.scroll.saturating_sub(page.max(1))),
+            KeyCode::PageDown => Some((d.scroll + page.max(1)).min(max_scroll)),
+            KeyCode::Home => Some(0),
+            KeyCode::End => Some(max_scroll),
+            KeyCode::Char('k') if !typing => Some(d.scroll.saturating_sub(1)),
+            KeyCode::Char('j') if !typing => Some((d.scroll + 1).min(max_scroll)),
+            _ => None,
+        };
+        if let Some(s) = scrolled {
+            d.scroll = s;
+            return Action::None;
+        }
         if let Some(f) = d.feedback.as_mut() {
             match k.code {
                 KeyCode::Enter => {
@@ -1361,7 +1416,7 @@ impl App {
                 let text = clip_width(&text, room);
                 out.push(Line::from(vec![Span::raw(format!("{M}{pad}")), Span::styled(format!("{} ", if running { g.active } else { g.done }), if failed > 0 { t.error } else { t.accent }), Span::styled(text, if failed > 0 { t.error } else { dim })]));
             }
-            Row::Tool { depth, agent, name, summary, state, detail, output } => {
+            Row::Tool { depth, agent, name, summary, state, detail, output, auto, .. } => {
                 let pad = "  ".repeat(*depth);
                 let glyph = match state {
                     ToolState::Running => Span::styled(if (self.tick / 3) % 2 == 0 { g.run } else { g.idle }, t.accent),
@@ -1370,9 +1425,17 @@ impl App {
                 };
                 let who = if *depth > 0 { format!("{agent} {} ", g.sep) } else { String::new() };
                 let head = format!("{who}{name:<6} ");
+                let mark = auto.as_ref().map(|a| format!("  {} auto: {a}", g.sep));
                 let room = width.saturating_sub(M.len() + pad.len() + 2 + display_width(&head));
+                // The marker is shown whole when it fits; the command is what gives way, down to a few columns.
+                let mark_room = mark.as_ref().map_or(0, |m| display_width(m).min(room.saturating_sub(MIN_COMMAND_WIDTH)));
+                let room = room.saturating_sub(mark_room);
                 let sum = if display_width(summary) > room { format!("{}{}", clip_width(summary, room.saturating_sub(1)), g.ellipsis) } else { summary.clone() };
-                out.push(Line::from(vec![Span::raw(format!("{M}{pad}")), glyph, Span::raw(" "), Span::styled(head, t.accent), Span::styled(sum, dim)]));
+                let mut spans = vec![Span::raw(format!("{M}{pad}")), glyph, Span::raw(" "), Span::styled(head, t.accent), Span::styled(sum, dim)];
+                if let Some(m) = mark {
+                    spans.push(Span::styled(clip_width(&m, mark_room), t.ok));
+                }
+                out.push(Line::from(spans));
                 let indent = format!("{M}{pad}  ");
                 if let (Some(d), true) = (detail, self.level >= 1) {
                     let cap = if self.level >= 2 { usize::MAX } else { DETAIL_LINES };
@@ -1473,44 +1536,74 @@ impl App {
         let inner_w = width.saturating_sub(4);
         let key = |k: &str| Span::styled(format!("[{k}]"), t.accent.add_modifier(Modifier::BOLD));
         if let Some(d) = self.dialogs.front() {
-            let mut v = vec![];
+            let mut body: Vec<Line<'static>> = vec![];
             let card = t.code.patch(t.panel);
-            for r in d.resources.iter().take(4) {
+            // The whole request, wrapped: this is what the user is agreeing to, so nothing is cut off.
+            for r in d.resources.iter() {
                 let prefix = if d.action == "shell" { "$ " } else { "" };
-                let text = format!(" {prefix}{}", clip_width(r.lines().next().unwrap_or(""), inner_w.saturating_sub(3)));
-                v.push(fill(vec![Span::styled(text, card)], inner_w, t.panel));
+                let indent = " ".repeat(prefix.len());
+                let text_w = inner_w.saturating_sub(1 + prefix.len()).max(1);
+                for (n, l) in wrap(r.trim_end(), text_w).into_iter().enumerate() {
+                    let p = if n == 0 { prefix } else { indent.as_str() };
+                    body.push(fill(vec![Span::styled(format!(" {p}{l}"), card)], inner_w, t.panel));
+                }
             }
-            if d.resources.len() > 4 {
-                v.push(Line::styled(format!("{} {} more", g.ellipsis, d.resources.len() - 4), t.dim));
-            }
+            let mut foot: Vec<Line<'static>> = vec![];
+            let mut cursor_col = None;
+            let mut title = Line::from(vec![Span::styled(format!(" {} permission needed: {} ", g.run, d.action), t.warn.add_modifier(Modifier::BOLD))]);
             match &d.feedback {
                 Some(f) => {
-                    v.push(Line::from(vec![Span::styled("tell the assistant why (Enter sends, Esc goes back): ", t.dim), Span::raw(f.clone())]));
-                    let col = display_width("tell the assistant why (Enter sends, Esc goes back): ") + display_width(f);
-                    let row = v.len() as u16 - 1;
-                    let title = Line::from(vec![Span::styled(format!(" {} {} ", g.fail, d.action), t.warn.add_modifier(Modifier::BOLD))]);
-                    return Some((title, v, Some((col as u16, row)), t.warn));
+                    foot.push(Line::from(vec![Span::styled("tell the assistant why (Enter sends, Esc goes back): ", t.dim), Span::raw(f.clone())]));
+                    cursor_col = Some((display_width("tell the assistant why (Enter sends, Esc goes back): ") + display_width(f)) as u16);
+                    title = Line::from(vec![Span::styled(format!(" {} {} ", g.fail, d.action), t.warn.add_modifier(Modifier::BOLD))]);
                 }
                 None => {
+                    // Patterns saved by "always" are part of what is being agreed to. Show them whole:
+                    // inline when they fit the key line, otherwise as lines of their own.
+                    let saved = d.save.join(", ");
+                    let inline_w = inner_w.saturating_sub(48).max(12);
                     let mut first = vec![key("y"), Span::raw(" allow once   "), key("a"), Span::raw(" always")];
                     if !d.save.is_empty() {
-                        first.push(Span::styled(format!(" ({})", clip_width(&d.save.join(", "), inner_w.saturating_sub(48).max(12))), t.dim));
+                        if display_width(&saved) <= inline_w {
+                            first.push(Span::styled(format!(" ({saved})"), t.dim));
+                        } else {
+                            body.push(Line::default());
+                            for l in wrap(&format!("[a] always allows: {saved}"), inner_w.max(1)) {
+                                body.push(Line::styled(l, t.dim));
+                            }
+                        }
                     }
                     let second = vec![key("n"), Span::raw(" reject   "), key("f"), Span::raw(" reject with feedback")];
-                    v.push(Line::default());
+                    foot.push(Line::default());
                     let w = |s: &[Span]| s.iter().map(|x| display_width(&x.content)).sum::<usize>();
                     if w(&first) + 3 + w(&second) <= inner_w {
                         first.push(Span::raw("   "));
                         first.extend(second);
-                        v.push(Line::from(first));
+                        foot.push(Line::from(first));
                     } else {
-                        v.push(Line::from(first));
-                        v.push(Line::from(second));
+                        foot.push(Line::from(first));
+                        foot.push(Line::from(second));
                     }
                 }
             }
-            let title = Line::from(vec![Span::styled(format!(" {} permission needed: {} ", g.run, d.action), t.warn.add_modifier(Modifier::BOLD))]);
-            return Some((title, v, None, t.warn));
+            // Fit the body into what is left of the box; when it does not fit, a status line says so.
+            let mut room = max_h.saturating_sub(foot.len()).max(1);
+            let overflow = body.len() > room;
+            if overflow {
+                room = room.saturating_sub(1).max(1);
+            }
+            let max_scroll = body.len().saturating_sub(room);
+            let scroll = d.scroll.min(max_scroll);
+            d.view.set((max_scroll, room));
+            let mut v: Vec<Line<'static>> = body.into_iter().skip(scroll).take(room).collect();
+            if overflow {
+                let total = max_scroll + room;
+                let more = if scroll < max_scroll { format!("{} ", g.ellipsis) } else { String::new() };
+                v.push(Line::styled(format!("{more}lines {}-{} of {total} {} Up/Down, PgUp/PgDn scroll", scroll + 1, scroll + room, g.sep), t.dim));
+            }
+            let cursor = cursor_col.map(|c| (c, (v.len() + foot.len()) as u16 - 1));
+            v.extend(foot);
+            return Some((title, v, cursor, t.warn));
         }
         if let Some(f) = self.forms.front() {
             let q = f.q();
@@ -1602,6 +1695,9 @@ impl App {
         }
         if self.session_cost > 0.0 {
             v.push(Line::from(vec![Span::styled(" cost    ", t.dim), Span::raw(format!("${:.4}", self.session_cost))]));
+            if self.classifier_cost > 0.0 {
+                v.push(Line::styled(format!("  incl. classifier ${:.4}", self.classifier_cost), t.dim));
+            }
         }
         if !self.todos.is_empty() {
             v.push(Line::default());
@@ -2129,8 +2225,8 @@ mod tests {
         a.push_user("hi");
         text(&mut a, Ev::Text("Hel".into()));
         text(&mut a, Ev::Text("lo".into()));
-        text(&mut a, Ev::Tool { name: "read".into(), summary: "a.rs".into(), detail: None });
-        text(&mut a, Ev::Tool { name: "read".into(), summary: "b.rs".into(), detail: None });
+        text(&mut a, Ev::Tool { id: String::new(), name: "read".into(), summary: "a.rs".into(), detail: None });
+        text(&mut a, Ev::Tool { id: String::new(), name: "read".into(), summary: "b.rs".into(), detail: None });
         text(&mut a, Ev::ToolDone { name: "read".into(), ok: false, msg: "no such file\nmore".into(), output: String::new() });
         text(&mut a, Ev::Text("done".into()));
         assert_eq!(a.rows.len(), 5);
@@ -2141,7 +2237,7 @@ mod tests {
         assert!(joined.contains("hi") && joined.contains("Hello") && joined.contains("read   a.rs") && joined.contains("failed: no such file"), "{joined}");
         // Subagent prose is hidden, its tools are indented.
         a.update(AppEvent::Engine { depth: 1, agent: "explore".into(), ev: Ev::Text("secret".into()) });
-        a.update(AppEvent::Engine { depth: 1, agent: "explore".into(), ev: Ev::Tool { name: "grep".into(), summary: "x".into(), detail: None } });
+        a.update(AppEvent::Engine { depth: 1, agent: "explore".into(), ev: Ev::Tool { id: String::new(), name: "grep".into(), summary: "x".into(), detail: None } });
         let joined = screen(&mut a, 60, 14).join("\n");
         assert!(!joined.contains("secret") && joined.contains("explore · 1 tool call · now: grep x"), "{joined}");
     }
@@ -2162,6 +2258,30 @@ mod tests {
         assert_eq!(screen(&mut a, 30, 10)[5], "  line 29");
         a.update(key(KeyCode::Home, KeyModifiers::CONTROL));
         assert_eq!(screen(&mut a, 30, 10)[0], "  line 0"); // clamped to the top
+    }
+
+    #[test]
+    fn permission_dialog_shows_the_whole_request_and_scrolls() {
+        let mut a = App::new("m", "build");
+        a.running = true;
+        let (tx, rx) = channel();
+        let cmd: String = (1..=30).map(|i| format!("echo line{i}")).collect::<Vec<_>>().join("\n");
+        let long = format!("cat {}", "verylongargument ".repeat(8).trim_end());
+        a.update(AppEvent::Ask { action: "shell".into(), resources: vec![cmd, long], save: vec![], reply: tx });
+        let first = screen(&mut a, 60, 20).join("\n");
+        assert!(first.contains("echo line1") && !first.contains("echo line30"), "{first}");
+        assert!(first.contains("lines 1-") && first.contains("[y] allow once"), "{first}");
+        // Wrapped text is not cut at the right edge: the last word of the long command is on screen after scrolling.
+        press(&mut a, KeyCode::End);
+        let last = screen(&mut a, 60, 20).join("\n");
+        assert!(last.contains("echo line30") && last.contains("verylongargument"), "{last}");
+        assert!(!last.contains("echo line1\n") && last.contains("[y] allow once"), "{last}");
+        press(&mut a, KeyCode::PageUp);
+        assert!(a.dialogs[0].scroll < a.dialogs[0].view.get().0);
+        // Scrolling does not answer the dialog, and the answer keys still work.
+        assert!(rx.try_recv().is_err());
+        type_str(&mut a, "y");
+        assert_eq!(rx.try_recv().unwrap(), Reply::Once);
     }
 
     #[test]
@@ -2467,8 +2587,78 @@ mod tests {
         assert!(screen(&mut a, 40, 10).join("\n").contains("use bold now"));
     }
 
+    fn shell_row(id: &str, summary: &str) -> Ev {
+        Ev::Tool { id: id.into(), name: "shell".into(), summary: summary.into(), detail: None }
+    }
+
+    fn auto(id: &str, command: &str, risk: &str, reason: &str) -> Ev {
+        Ev::AutoAllowed { call_id: id.into(), command: command.into(), risk: risk.into(), reason: reason.into() }
+    }
+
+    #[test]
+    fn an_auto_allowed_command_marks_the_row_of_its_own_call() {
+        let mut a = App::new("m", "build");
+        text(&mut a, shell_row("call_1", "cargo test -p moco-core"));
+        text(&mut a, shell_row("call_2", "ls -la"));
+        text(&mut a, auto("call_2", "ls -la", "read-only", "lists files"));
+        let s = screen(&mut a, 80, 12).join("\n");
+        let row = |needle: &str| s.lines().find(|l| l.contains(needle)).unwrap_or("").to_string();
+        assert!(row("ls -la").contains("auto: read-only: lists files"), "{s}");
+        assert!(!row("cargo test").contains("auto:"), "the other row is not marked: {s}");
+        // The same id twice marks the row once; the second one is shown as a line of its own.
+        text(&mut a, auto("call_2", "ls -la", "read-only", ""));
+        let s = screen(&mut a, 80, 14).join("\n");
+        assert_eq!(s.matches("auto:").count(), 2, "one marker on the row and one fallback line: {s}");
+        // The other call is marked when its own event arrives.
+        text(&mut a, auto("call_1", "cargo test -p moco-core", "project-write", ""));
+        let s = screen(&mut a, 80, 14).join("\n");
+        assert!(s.lines().find(|l| l.contains("cargo test")).unwrap().contains("auto: project-write"), "{s}");
+    }
+
+    #[test]
+    fn parallel_calls_with_look_alike_commands_are_not_mixed_up() {
+        // `ls` is a prefix of `ls -la /etc`, and an empty summary is a prefix of everything: neither may steal a marker.
+        let mut a = App::new("m", "build");
+        text(&mut a, shell_row("call_1", "ls -la /etc"));
+        text(&mut a, shell_row("call_2", "ls"));
+        text(&mut a, shell_row("call_3", ""));
+        text(&mut a, auto("call_1", "ls -la /etc", "read-only", ""));
+        let s = screen(&mut a, 80, 12).join("\n");
+        assert!(s.lines().find(|l| l.contains("ls -la /etc")).unwrap().contains("auto: read-only"), "{s}");
+        assert_eq!(s.matches("auto:").count(), 1, "only the call the verdict is for is marked: {s}");
+        // A summary the row clipped with an ellipsis is still matched, because the id does the matching.
+        let mut b = App::new("m", "build");
+        text(&mut b, shell_row("call_9", "a-very-long-command…"));
+        text(&mut b, auto("call_9", "a-very-long-command --with --many --flags", "read-only", ""));
+        assert!(screen(&mut b, 80, 6).join("\n").contains("auto: read-only"));
+    }
+
+    #[test]
+    fn an_auto_allowed_command_without_a_row_shows_up_as_a_line_naming_the_command() {
+        let mut a = App::new("m", "build");
+        text(&mut a, auto("call_gone", "pwd", "read-only", ""));
+        let s = screen(&mut a, 80, 6).join("\n");
+        assert!(s.contains("auto: read-only: pwd"), "fallback line: {s}");
+        // An event without an id never attaches to a running row.
+        let mut b = App::new("m", "build");
+        text(&mut b, shell_row("", "pwd"));
+        text(&mut b, auto("", "pwd", "read-only", ""));
+        let s = screen(&mut b, 80, 6).join("\n");
+        assert!(s.contains("auto: read-only: pwd"), "{s}");
+    }
+
+    #[test]
+    fn a_narrow_screen_clips_the_command_not_the_marker() {
+        let mut b = App::new("m", "build");
+        let cmd = "a-very-long-command-name --with --many --flags --that --go --on";
+        text(&mut b, shell_row("call_1", cmd));
+        text(&mut b, auto("call_1", cmd, "read-only", ""));
+        let s = screen(&mut b, 44, 6).join("\n");
+        assert!(s.contains("auto: read-only"), "{s}");
+    }
+
     fn tool_with_detail(a: &mut App, name: &str, detail: &str) {
-        text(a, Ev::Tool { name: name.into(), summary: "x.rs".into(), detail: Some(detail.into()) });
+        text(a, Ev::Tool { id: String::new(), name: name.into(), summary: "x.rs".into(), detail: Some(detail.into()) });
         text(a, Ev::ToolDone { name: name.into(), ok: true, msg: String::new(), output: "line one\nline two".into() });
     }
 
@@ -2489,7 +2679,7 @@ mod tests {
         // Level 2 (Ctrl-O): everything, plus tool output where there is no diff.
         a.update(key(KeyCode::Char('o'), KeyModifiers::CONTROL));
         assert_eq!(a.level, 2);
-        text(&mut a, Ev::Tool { name: "grep".into(), summary: "q".into(), detail: None });
+        text(&mut a, Ev::Tool { id: String::new(), name: "grep".into(), summary: "q".into(), detail: None });
         text(&mut a, Ev::ToolDone { name: "grep".into(), ok: true, msg: String::new(), output: "hit one\nhit two".into() });
         let s = screen(&mut a, 60, 70).join("\n");
         assert!(s.contains("+added 39") && !s.contains("more lines") && s.contains("  hit one"), "{s}");
@@ -2636,6 +2826,27 @@ mod tests {
     }
 
     #[test]
+    fn classifier_spend_updates_the_total_at_once_and_is_shown_on_its_own() {
+        let mut a = App::new("m", "build");
+        a.running = true;
+        a.session_cost = 0.0100;
+        let wide = |a: &mut App| screen(a, 120, 24).join("\n");
+        assert!(!wide(&mut a).contains("classifier"), "nothing to show before the classifier has cost anything");
+        // The run is rejected before any step reports usage; the total must still move.
+        text(&mut a, Ev::ClassifierUsage { cost: 0.0004, session_cost: 0.0104, classifier_cost: 0.0004 });
+        assert_eq!((a.session_cost, a.classifier_cost), (0.0104, 0.0004));
+        let s = wide(&mut a);
+        assert!(s.contains("cost    $0.0104") && s.contains("incl. classifier $0.0004"), "{s}");
+        // A subagent's call counts toward this turn's classifier spend but never replaces the totals.
+        a.update(AppEvent::Engine { depth: 1, agent: "general".into(), ev: Ev::ClassifierUsage { cost: 0.0002, session_cost: 9.0, classifier_cost: 9.0 } });
+        assert_eq!((a.session_cost, a.classifier_cost), (0.0104, 0.0004));
+        text(&mut a, Ev::Usage { usage: Usage { input: 10, output: 5, cache_read: 0, cache_write: 0 }, cost: Some(0.0050), session_cost: 0.0156, context: 100, limit: Some(1000) });
+        a.update(AppEvent::RunDone(Ok(RunOutcome::Idle)));
+        let joined = screen(&mut a, 120, 24).join("\n");
+        assert!(joined.contains("$0.0050 · session $0.0156 + classifier $0.0006"), "{joined}");
+    }
+
+    #[test]
     fn the_sidebar_appears_on_wide_terminals_and_shows_session_state() {
         let mut a = App::new("anthropic/sonnet", "build");
         a.title = Some("Fix the parser".into());
@@ -2714,7 +2925,7 @@ mod tests {
         a.push_user("hello");
         text(&mut a, Ev::Reasoning("hmm".into()));
         text(&mut a, Ev::Text("# Title\n\n- item\n> quote\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```\ncode\n```".into()));
-        text(&mut a, Ev::Tool { name: "edit".into(), summary: "x".into(), detail: Some("@@ -1 +1 @@\n-a\n+b".into()) });
+        text(&mut a, Ev::Tool { id: String::new(), name: "edit".into(), summary: "x".into(), detail: Some("@@ -1 +1 @@\n-a\n+b".into()) });
         text(&mut a, Ev::ToolDone { name: "edit".into(), ok: true, msg: String::new(), output: String::new() });
         text(&mut a, Ev::Todos(vec![Todo { content: "t".into(), status: "completed".into() }]));
         text(&mut a, Ev::Usage { usage: Usage { input: 1, output: 1, cache_read: 0, cache_write: 0 }, cost: Some(0.1), session_cost: 0.1, context: 10, limit: Some(100) });

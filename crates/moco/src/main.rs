@@ -43,6 +43,8 @@ struct RunUsage {
     cost: f64,
     priced: bool,
     session_cost: f64,
+    /// Spent this turn on classifying shell commands (also part of the session total, not of `cost`).
+    classifier: f64,
     context: u64,
     limit: Option<u64>,
     steps: u32,
@@ -75,7 +77,10 @@ impl Terminal {
         if r.steps == 0 {
             return;
         }
-        let cost = if r.priced { format!("${:.4} (session ${:.4})", r.cost, r.session_cost) } else { "cost n/a".to_string() };
+        let mut cost = if r.priced { format!("${:.4} (session ${:.4})", r.cost, r.session_cost) } else { "cost n/a".to_string() };
+        if r.classifier > 0.0 {
+            cost.push_str(&format!(" + classifier ${:.4}", r.classifier));
+        }
         let ctx = match r.limit {
             Some(l) if l > 0 => format!("context {}% of {}", (r.context * 100 / l).min(100), human(l)),
             _ => format!("context {}", human(r.context)),
@@ -124,7 +129,7 @@ impl Terminal {
         let pad = "  ".repeat(depth);
         match e {
             UiEvent::Nested { agent, inner } => self.nested(depth + 1, agent, inner),
-            UiEvent::ToolStarted { name, input } => {
+            UiEvent::ToolStarted { name, input, .. } => {
                 self.newline_if_needed();
                 println!("{DIM}{pad}[{agent}] > {name} {}{RESET}", summary(name, input));
             }
@@ -139,6 +144,7 @@ impl Terminal {
                 r.priced |= cost.is_some();
                 r.steps += 1;
             }
+            UiEvent::ClassifierUsage { cost, .. } => self.run.lock().unwrap().classifier += cost,
             UiEvent::Retry { attempt, wait, error } => println!("{DIM}{pad}[{agent}] retrying in {}s (attempt {attempt}): {error}{RESET}", wait.as_secs()),
             UiEvent::Notice(n) => eprintln!("{RED}{pad}[{agent}] {n}{RESET}"),
             _ => {}
@@ -217,7 +223,13 @@ impl Ui for Terminal {
                 r.steps += 1;
                 return;
             }
-            UiEvent::ToolStarted { name, input } => {
+            UiEvent::ClassifierUsage { cost, session_cost, .. } => {
+                let mut r = self.run.lock().unwrap();
+                r.classifier += cost;
+                r.session_cost = *session_cost;
+                return;
+            }
+            UiEvent::ToolStarted { name, input, .. } => {
                 self.newline_if_needed();
                 println!("{DIM}> {name} {}{RESET}", summary(name, input));
             }
@@ -237,6 +249,11 @@ impl Ui for Terminal {
             UiEvent::Status(n) => {
                 self.newline_if_needed();
                 println!("{DIM}{n}{RESET}");
+            }
+            UiEvent::AutoAllowed { command, risk, reason, .. } => {
+                // With parallel tool calls the line does not follow its own call, so it names the command.
+                self.newline_if_needed();
+                println!("{DIM}  auto: {risk}{}: {command}{RESET}", if reason.is_empty() { String::new() } else { format!(" ({reason})") });
             }
         }
         let _ = std::io::stdout().flush();
@@ -460,6 +477,28 @@ fn provider_line(p: &ProviderInfo, app_dir: &std::path::Path) -> String {
     format!("{:<16} {:>4} models  {state}{experimental}", p.id, p.models.len())
 }
 
+/// `moco --eval-classifier FILE`: runs every command in FILE (JSON lines with a `command` field, or plain lines)
+/// through the classifier and prints one JSON line per command with the layer that decided and its verdict. The
+/// comparison with what was expected is `scripts/eval-classifier.py`. Uses the configured model and records a session
+/// in the store, so point `MOCO_HOME` at a scratch directory.
+fn eval_classifier_cases(engine: &Engine, file: &str, cwd: &str) {
+    let text = std::fs::read_to_string(file).unwrap_or_else(|e| die(&format!("{file}: {e}")));
+    let session = engine.store.lock().unwrap().create_session(cwd, "build").unwrap_or_else(|e| die(&format!("database: {e}")));
+    let cancel = AtomicBool::new(false);
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        let command = match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(v) => v["command"].as_str().map(str::to_string).unwrap_or_else(|| die(&format!("a case has no `command`: {line}"))),
+            Err(_) => line.to_string(),
+        };
+        let ev = engine.evaluate_command(&session, &command, &cancel);
+        let (decision, risk, reason) = match ev.verdict {
+            moco_core::classifier::Verdict::Allow { risk, reason } => ("allow", risk, reason),
+            moco_core::classifier::Verdict::Ask { reason } => ("ask", String::new(), reason),
+        };
+        println!("{}", serde_json::json!({"command": command, "stage": ev.stage, "decision": decision, "risk": risk, "reason": reason}));
+    }
+}
+
 fn main() {
     // Let `moco models | head` end quietly instead of panicking on a closed pipe.
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
@@ -515,6 +554,38 @@ fn main() {
             }
             return;
         }
+        Some("logs") => {
+            let rest: Vec<&str> = raw.iter().skip(1).map(String::as_str).collect();
+            let follow = rest.iter().any(|a| matches!(*a, "--follow" | "-f"));
+            if rest.contains(&"--path") {
+                println!("{}", moco_core::log::log_dir(&app_dir).display());
+                return;
+            }
+            let n = rest.iter().position(|a| matches!(*a, "--lines" | "-n")).and_then(|i| rest.get(i + 1)).map(|v| v.parse::<usize>().unwrap_or_else(|_| die("--lines needs a number"))).unwrap_or(100);
+            if let Some(bad) = rest.iter().find(|a| a.starts_with('-') && !matches!(**a, "--follow" | "-f" | "--lines" | "-n" | "--path")) {
+                die(&format!("unknown option {bad}; usage: moco logs [--follow] [--lines N] [--path]"));
+            }
+            match moco_core::log::latest_file(&app_dir) {
+                Some(path) => {
+                    let text = moco_core::log::read_tail(&path, n).unwrap_or_else(|e| die(&format!("{}: {e}", path.display())));
+                    print!("{text}");
+                }
+                None if !follow => println!("{DIM}(no log yet in {}; set MOCO_LOG=info or debug to record more){RESET}", moco_core::log::log_dir(&app_dir).display()),
+                None => {}
+            }
+            if follow {
+                let mut f = moco_core::log::Follow::new(&app_dir);
+                loop {
+                    let new = f.poll();
+                    if !new.is_empty() {
+                        print!("{new}");
+                        let _ = std::io::stdout().flush();
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                }
+            }
+            return;
+        }
         Some("models") => {
             let refresh = raw.iter().any(|a| a == "--refresh");
             if refresh {
@@ -546,6 +617,7 @@ fn main() {
     let mut model = std::env::var("MOCO_MODEL").ok();
     let mut agent_id: Option<String> = None;
     let mut permission_mode_arg: Option<String> = None;
+    let mut eval_classifier: Option<String> = None;
     let mut args = raw.drain(..);
     while let Some(a) = args.next() {
         let mut value = |flag: &str| args.next().unwrap_or_else(|| die(&format!("{flag} needs a value")));
@@ -558,6 +630,8 @@ fn main() {
             "--dir" => dir = Some(value("--dir")),
             "--session" | "-s" => session_arg = Some(value("--session")),
             "--prompt" | "-p" => prompt = Some(value("--prompt")),
+            // Not in --help: a development tool for `scripts/eval-classifier.py`.
+            "--eval-classifier" => eval_classifier = Some(value("--eval-classifier")),
             "--tui" => want_tui = Some(true),
             "--plain" => want_tui = Some(false),
             "--version" | "-V" => {
@@ -566,13 +640,16 @@ fn main() {
             }
             "--help" | "-h" => {
                 println!(
-                    "usage: moco [--continue | --session ID] [--model PROVIDER/MODEL] [--agent ID] [--permission-mode manual|auto] [--effort LEVEL] [--dir PATH] [-p PROMPT] [--plain] [--version]\n       moco sessions [--all] [--archived] | rename ID TITLE | archive ID | unarchive ID\n       moco models [FILTER] [--refresh]\n       moco auth PROVIDER"
+                    "usage: moco [--continue | --session ID] [--model PROVIDER/MODEL] [--agent ID] [--permission-mode manual|auto] [--effort LEVEL] [--dir PATH] [-p PROMPT] [--plain] [--version]\n       moco sessions [--all] [--archived] | rename ID TITLE | archive ID | unarchive ID\n       moco models [FILTER] [--refresh]\n       moco auth PROVIDER\n       moco logs [--follow] [--lines N] [--path]\n\nlogging: MOCO_LOG=error|warn|info|debug|trace (default warn; `warn,mcp=trace` sets one target) or the `log` config key.\n         Files: <data dir>/data/logs/moco-YYYY-MM-DD.log (7 days kept). Nothing is ever printed to the terminal."
                 );
                 return;
             }
             other => die(&format!("unknown argument {other}")),
         }
     }
+    // Only a run that starts a session logs. `--help`, `--version`, `logs`, `models`, `auth` and `sessions` never touch
+    // the log directory, so `moco logs` cannot create the file it is about to show.
+    moco_core::log::init(&app_dir);
     if let Some(w) = auth::permissions_warning(&app_dir) {
         eprintln!("warning: {w}");
     }
@@ -592,6 +669,8 @@ fn main() {
         eprintln!("warning: config: {w}");
     }
     let cfg = loaded.config;
+    moco_core::log::configure(cfg.log.as_deref());
+    moco_core::log_info!("main", "start dir={} sources={}", cwd_str, loaded.sources.len());
     if let (Some(sh), None) = (&cfg.shell, std::env::var_os("MOCO_SHELL")) {
         std::env::set_var("MOCO_SHELL", sh);
     }
@@ -670,6 +749,7 @@ fn main() {
     let found_commands = commands::discover(&app_dir, &cwd, &cfg.commands);
     engine_cfg.skills = found_skills.clone();
     engine_cfg.small_model = cfg.small_model.clone();
+    engine_cfg.classifier = loaded.classifier.settings();
     let (mcp_specs, mcp_warnings) = mcp_specs(&cfg, &loaded.mcp_origins, &app_dir, &cwd);
     for w in &mcp_warnings {
         eprintln!("warning: {w}");
@@ -698,6 +778,9 @@ fn main() {
     engine_cfg.websearch = moco_core::tools::websearch::Settings::from_config(&cfg.websearch, app_dir.clone());
     let n_sources = loaded.sources.len();
     let engine = Engine::with_providers(store, providers, engine_cfg).share();
+    if let Some(cases) = eval_classifier {
+        return eval_classifier_cases(&engine, &cases, &cwd_str);
+    }
     engine.set_notifier(std::sync::Arc::new(|line| {
         if AT_PROMPT.load(Ordering::Relaxed) {
             // Redraw the prompt line underneath the notice.
@@ -868,6 +951,14 @@ fn main() {
                     Err(e) => eprintln!("{RED}{e}{RESET}"),
                 }
             }
+            "/permissions" => match engine.permissions_report(&session.id) {
+                Ok(lines) => {
+                    for l in lines {
+                        println!("{DIM}{l}{RESET}");
+                    }
+                }
+                Err(e) => eprintln!("{RED}{e}{RESET}"),
+            },
             l if l == "/jobs" || l.starts_with("/jobs ") => {
                 let arg = l.trim_start_matches("/jobs").trim();
                 if let Some(id) = arg.strip_prefix("output") {
@@ -945,7 +1036,7 @@ fn main() {
                 }
             }
             "/help" => println!(
-                "/model [FILTER|PROVIDER/MODEL]  show, search or switch the model\n/agent <id>                     switch agent\n/mode [manual|auto]             ask before acting (manual, the default) or run tools without asking (auto)\n/effort [level|default]          reasoning effort for models that offer levels\n/compact                        summarize older messages to free up context\n/sessions [all|archived]       list sessions (/resume <n|id> to continue one)\n/rename <title>                 name this session\n/fork [N]                       copy this conversation into a new session\n/archive [n|id]                 hide a session from the list (/unarchive to restore)\n/undo, /redo                    undo the last turn's file changes and messages, or bring them back\n/diff                           changes in the working tree since this session started\n/new                            start a new session\n/jobs                           background commands and subagents (output <id>, kill <id>)\n!<command>                      run a shell command yourself; the assistant is told\n/skills, /commands, /mcp       list skills, custom slash commands (also MCP prompts) and MCP servers (@name mentions a skill, agent or file)\n/exit                           quit (Ctrl-C interrupts a running turn)"
+                "/model [FILTER|PROVIDER/MODEL]  show, search or switch the model\n/agent <id>                     switch agent\n/mode [manual|auto]             ask before acting (manual, the default) or run tools without asking (auto)\n/effort [level|default]          reasoning effort for models that offer levels\n/compact                        summarize older messages to free up context\n/sessions [all|archived]       list sessions (/resume <n|id> to continue one)\n/rename <title>                 name this session\n/fork [N]                       copy this conversation into a new session\n/archive [n|id]                 hide a session from the list (/unarchive to restore)\n/undo, /redo                    undo the last turn's file changes and messages, or bring them back\n/diff                           changes in the working tree since this session started\n/new                            start a new session\n/jobs                           background commands and subagents (output <id>, kill <id>)\n/permissions                    what the classifier allowed automatically, and the saved always-allow rules\n!<command>                      run a shell command yourself; the assistant is told\n/skills, /commands, /mcp       list skills, custom slash commands (also MCP prompts) and MCP servers (@name mentions a skill, agent or file)\n/exit                           quit (Ctrl-C interrupts a running turn)"
             ),
             l if l == "/sessions" || l.starts_with("/sessions ") => {
                 let which = l.trim_start_matches("/sessions").trim();

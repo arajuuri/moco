@@ -33,6 +33,7 @@ By hand: `MACOSX_DEPLOYMENT_TARGET=10.14 CARGO_TARGET_DIR=<a directory outside t
 | `moco models [filter] [--refresh]` | Providers with connection state, or models with context size and price; `--refresh` downloads the full catalog |
 | `moco auth PROVIDER` | Store an API key |
 | `moco sessions [--all] [--archived]` | List sessions; `rename ID TITLE`, `archive ID`, `unarchive ID` |
+| `moco logs [--follow] [--lines N] [--path]` | Show the end of the newest log file, follow it, or print the log directory (see "Logging") |
 
 ## Inside the chat
 
@@ -177,10 +178,20 @@ Actions are `read`, `edit` (write, edit and patch), `glob`, `grep`, `shell`, `we
 
 **Project instructions**: `AGENTS.md` (or `CLAUDE.md` where there is no `AGENTS.md`) in the project root down to the working directory, `config/AGENTS.md` globally, plus `instructions` files. They are re-read every step.
 
+## Logging
+
+moco writes a diagnostic log, never to the terminal. `MOCO_LOG=error|warn|info|debug|trace` (or the `log` config key; the variable wins) sets the level, `warn` by default. `warn,mcp=trace` sets one target; the targets are `provider`, `engine`, `tool`, `shell`, `jobs`, `mcp`, `store`, `snapshot`, `classifier`, `main` and `log`. Files are `data/logs/moco-YYYY-MM-DD.log` (mode 600), one per day, seven days kept, 16 MiB at most per day file (the cap is shared by all moco processes). The first line says which moco, OS and kernel wrote it. `moco logs` shows the end of the newest file.
+
+Keys, `Authorization`-style headers, cookies, URL tokens and credentials on command lines (`TOKEN=...`, `curl -u user:pass`, `--password`, connection strings) are replaced by `[redacted]` before a line is written. Request and response bodies are logged at `trace` only.
+
+The `classifier` target is on at `info` whatever the default level is, so every automatic permission verdict is on record, with the command (redacted, shortened). Turn it off with `MOCO_LOG=warn,classifier=off`. Commands the classifier allowed are also kept in the database for `/permissions` for seven days, redacted the same way. Commands, tokens and paths that do not look like credentials are not recognized, so treat the log as sensitive.
+
+Only a run that starts a session creates a log: `--help`, `--version`, `logs`, `models`, `auth` and `sessions` leave no file behind.
+
 ## Where things are stored
 
-Everything is under `~/Library/Application Support/moco/` (`MOCO_HOME` overrides): `auth.json` (keys), `config/`, `cache/models.json` (refreshed catalog), `data/moco.db` (sessions, SQLite), `data/snapshots/` (undo data, pruned after 30 idle days), `data/tool-output/`. Nothing is sent anywhere except to the model provider you chose and the URLs the model fetches.
+Everything is under `~/Library/Application Support/moco/` (`MOCO_HOME` overrides): `auth.json` (keys), `config/`, `cache/models.json` (refreshed catalog), `data/moco.db` (sessions, SQLite), `data/snapshots/` (undo data, pruned after 30 idle days), `data/tool-output/`, `data/logs/` (diagnostic log, 7 days). Nothing is sent anywhere except to the model provider you chose and the URLs the model fetches.
 
 ## Environment variables
 
-`ANTHROPIC_API_KEY` and the other provider keys, `MOCO_HOME`, `MOCO_MODEL`, `MOCO_CONFIG`, `MOCO_SHELL`, `ANTHROPIC_BASE_URL`.
+`ANTHROPIC_API_KEY` and the other provider keys, `MOCO_HOME`, `MOCO_MODEL`, `MOCO_CONFIG`, `MOCO_SHELL`, `MOCO_LOG`, `ANTHROPIC_BASE_URL`.

@@ -128,6 +128,10 @@ pub struct PermReq {
     pub save: Vec<String>,
     /// Ask even if the rules allow (configured denies still win). Used for unparsed shell commands.
     pub force_ask: bool,
+    /// For `shell`: the whole command line, which the command classifier judges (`classifier.rs`).
+    pub command: Option<String>,
+    /// The id of the tool call asking, so the front end can tie what happens to the request to that call's row.
+    pub call_id: String,
 }
 
 /// Implemented by the agent loop: evaluates rules, prompts the user, blocks until answered.
@@ -218,6 +222,8 @@ pub struct ToolCtx<'a> {
     pub spill_dir: PathBuf,
     pub permitter: &'a dyn Permitter,
     pub cancel: &'a AtomicBool,
+    /// The model's id for this tool call.
+    pub call_id: &'a str,
 }
 
 impl ToolCtx<'_> {
@@ -242,7 +248,7 @@ impl ToolCtx<'_> {
     }
 
     pub fn permit(&self, action: &str, resources: Vec<String>, save: Vec<String>) -> Result<(), ToolError> {
-        self.permitter.check(&PermReq { action: action.into(), resources, save, force_ask: false })
+        self.permitter.check(&PermReq { action: action.into(), resources, save, force_ask: false, command: None, call_id: self.call_id.into() })
     }
 
     /// Anything outside the working directory and project root needs `external_directory`.
@@ -424,7 +430,7 @@ pub(crate) mod testutil {
             self.dir.join("work")
         }
         pub fn ctx(&self) -> ToolCtx<'_> {
-            ToolCtx { formatters: &self.formatters, media: MediaCaps::default(), session_id: "ses_test", host: &self.host, cwd: self.work(), project_root: self.work(), spill_dir: self.dir.join("spill"), permitter: &self.perm, cancel: &self.cancel }
+            ToolCtx { formatters: &self.formatters, media: MediaCaps::default(), session_id: "ses_test", host: &self.host, cwd: self.work(), project_root: self.work(), spill_dir: self.dir.join("spill"), permitter: &self.perm, cancel: &self.cancel, call_id: "call_test" }
         }
         pub fn file(&self, rel: &str, content: &[u8]) -> PathBuf {
             let p = self.work().join(rel);
