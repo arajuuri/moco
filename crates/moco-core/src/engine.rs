@@ -1659,6 +1659,25 @@ mod tests {
         assert_eq!(ui.log(), ["start:read", "done:read:true", "usage", "text:it says hi", "usage"]);
     }
 
+    /// Issue #6 through the whole engine: a model that sends one `edit` per hunk for the same file in one step gets
+    /// every hunk applied, however the threads are scheduled.
+    #[test]
+    fn parallel_edits_to_one_file_in_one_step_all_land() {
+        let n = 10;
+        let mut events: Vec<Event> = (0..n).map(|i| Event::ToolCall { id: format!("e{i}"), name: "edit".into(), input: json!({"path":"a.txt","oldString":format!("slot{i}=old"),"newString":format!("slot{i}=new")}) }).collect();
+        events.push(Event::Finish { reason: FinishReason::ToolUse, usage: Usage::default() });
+        let f = fixture(vec![Scripted::Events(events), text("done")]);
+        f.file("a.txt", &(0..n).map(|i| format!("slot{i}=old\n")).collect::<String>());
+        f.say("rename every slot");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        let after = std::fs::read_to_string(f.dir.join("work/a.txt")).unwrap();
+        assert_eq!(after.matches("=new").count(), n, "every edit landed:\n{after}");
+        let reqs = f.fake.requests.lock().unwrap();
+        let results = last_user_blocks(&reqs[1]);
+        assert_eq!(results.len(), n);
+        assert!(results.iter().all(|b| matches!(b, Block::ToolResult { is_error: false, .. })), "{results:?}");
+    }
+
     #[test]
     fn parallel_tool_calls_all_complete_before_the_next_step() {
         let f = fixture(vec![

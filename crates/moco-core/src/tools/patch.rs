@@ -194,6 +194,7 @@ impl Tool for Patch {
 
         // Resolve and permission-check every path before touching anything.
         let mut resources = vec![];
+        let mut files: Vec<PathBuf> = vec![];
         for op in &ops {
             let paths: Vec<&String> = match op {
                 Op::Add { path, .. } | Op::Delete { path } => vec![path],
@@ -203,10 +204,14 @@ impl Tool for Patch {
                 let abs = ctx.resolve(p);
                 ctx.check_external(abs.parent().unwrap_or(&abs))?;
                 resources.push(ctx.display(&abs));
+                files.push(abs);
             }
         }
         resources.dedup();
         ctx.permit("edit", resources, vec!["*".into()])?;
+        // Every file this patch touches is ours until it is written and formatted (issue #6). Taken after the
+        // prompt, which can take minutes, and before the first read.
+        let _locks = super::fsio::lock_files(&files);
 
         // Stage the result of every op in memory; later ops see earlier ones.
         let mut staged: HashMap<PathBuf, Option<Vec<u8>>> = HashMap::new();
@@ -289,7 +294,7 @@ impl Tool for Patch {
                     if let Some(dir) = p.parent() {
                         std::fs::create_dir_all(dir).map_err(|e| ToolError::fail(e.to_string()))?;
                     }
-                    std::fs::write(p, bytes).map_err(|e| ToolError::fail(format!("{}: {e}", p.display())))?;
+                    super::fsio::write_atomic(p, bytes).map_err(|e| ToolError::fail(format!("{}: {e}", p.display())))?;
                 }
                 None => {
                     let _ = std::fs::remove_file(p);
@@ -299,8 +304,8 @@ impl Tool for Patch {
         // Format what was written (not what was deleted); say so for each file the formatter changed or choked on.
         let mut notes = vec![];
         for p in &order {
-            if staged[p].is_some() {
-                if let Some(n) = ctx.format_file(p) {
+            if let Some(written) = &staged[p] {
+                if let Some(n) = ctx.format_file(p, written) {
                     notes.push(format!("{}: {n}", ctx.display(p)));
                 }
             }
@@ -412,6 +417,42 @@ mod tests {
         assert_eq!(std::fs::read_to_string(w.join("plain.rs")).unwrap(), "fn x() {}\n");
         assert!(!w.join("old.txt").exists());
         assert!(o.text.contains("new.txt: Formatted with upcase") && o.text.contains("edit.txt: Formatted with upcase") && !o.text.contains("plain.rs: ") && !o.text.contains("old.txt: "), "{}", o.text);
+    }
+
+    #[test]
+    fn patched_files_keep_their_mode_and_nothing_is_left_beside_them() {
+        use std::os::unix::fs::PermissionsExt;
+        let env = Env::new();
+        let p = env.file("run.sh", b"#!/bin/sh\necho old\n");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        run(&env, "*** Begin Patch\n*** Update File: run.sh\n@@\n-echo old\n+echo new\n*** Add File: other.txt\n+hi\n*** End Patch").unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "#!/bin/sh\necho new\n");
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o755);
+        let mut names: Vec<String> = std::fs::read_dir(env.work()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        assert_eq!(names, ["other.txt", "run.sh"], "{names:?}");
+    }
+
+    /// A patch and an edit that touch the same file at the same time both land (issue #6).
+    #[test]
+    fn a_patch_and_edits_on_one_file_do_not_lose_each_other() {
+        let env = Env::new();
+        let body: String = (0..9).map(|i| format!("row{i}=old\n")).collect();
+        let p = env.file("t.txt", body.as_bytes());
+        std::thread::scope(|s| {
+            for i in 0..8 {
+                let env = &env;
+                s.spawn(move || {
+                    super::super::edit::Edit.run(&json!({"path":"t.txt","oldString":format!("row{i}=old"),"newString":format!("row{i}=new")}), &env.ctx()).unwrap();
+                });
+            }
+            let env = &env;
+            s.spawn(move || {
+                run(env, "*** Begin Patch\n*** Update File: t.txt\n@@\n-row8=old\n+row8=new\n*** End Patch").unwrap();
+            });
+        });
+        let after = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(after.matches("=new").count(), 9, "{after}");
     }
 
     #[test]

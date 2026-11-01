@@ -1,5 +1,6 @@
 //! Built-in tools (docs/04-tools.md). Synchronous; cancellation via an `AtomicBool`.
 pub mod edit;
+pub mod fsio;
 pub mod glob;
 pub mod grep;
 pub mod html;
@@ -265,13 +266,19 @@ impl ToolCtx<'_> {
         )
     }
 
-    /// Run the configured formatter on a file a tool just wrote. Only files inside the project are touched.
-    /// Returns a sentence for the tool's output when the formatter changed the file or failed.
-    pub fn format_file(&self, path: &Path) -> Option<String> {
+    /// Run the configured formatter on a file a tool just wrote (`written` is what it wrote). Only files inside the
+    /// project are touched. Returns text for the tool's output when the formatter changed the file or failed; when it
+    /// changed the file the text lists the lines it changed, so the model need not read the file again.
+    pub fn format_file(&self, path: &Path, written: &[u8]) -> Option<String> {
         if self.formatters.is_empty() || !self.is_internal(path) || path.starts_with(&self.spill_dir) {
             return None;
         }
-        crate::format::note(&self.formatters.run(path, &self.cwd))
+        let outcome = self.formatters.run(path, &self.cwd);
+        let changes = match outcome {
+            crate::format::Outcome::Changed { .. } => std::fs::read(path).ok().and_then(|after| fsio::changes(written, &after)),
+            _ => None,
+        };
+        crate::format::note_with_changes(&outcome, changes)
     }
 
     pub fn cancelled(&self) -> bool {

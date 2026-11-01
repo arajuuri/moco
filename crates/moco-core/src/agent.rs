@@ -190,15 +190,27 @@ pub struct EnvInfo<'a> {
 pub fn system_prompt(agent: &Agent, tools: &[&dyn Tool], env: &EnvInfo) -> String {
     let has = |n: &str| tools.iter().any(|t| t.name() == n);
     let mut guidance = vec![];
+    // The tools that change files. With any of them, the shell is for running programs, not for editing (issue #22):
+    // a script edit skips the edit permission, the inline diff and the formatter, and costs more to review.
+    let writers: Vec<&str> = ["edit", "write", "patch"].into_iter().filter(|n| has(n)).collect();
     if has("shell") {
-        guidance.push("- Prefer dedicated tools over shell commands; fall back to the shell when a tool cannot do what you need.");
-        guidance.push("- Do not chain shell commands with separators like `echo \"====\"`; or `printf '---'`; the output becomes noisy in a way that makes the user's side of the conversation worse.");
+        if writers.is_empty() {
+            guidance.push("- Prefer dedicated tools over shell commands; fall back to the shell when a tool cannot do what you need.".to_string());
+        } else {
+            let names = match writers.as_slice() {
+                [one] => format!("the {one} tool"),
+                [init @ .., last] => format!("the {} or {last} tools", init.join(", ")),
+                [] => unreachable!(),
+            };
+            guidance.push(format!("- Prefer dedicated tools over shell commands. Use the shell to run programs, never to create or change files: no python or perl scripts, `sed -i`, `awk`, `echo`/`printf`/`cat` redirection (`>`, `>>`), `tee` or heredocs for that. Use {names} instead. If an edit fails, correct the call (read the file again only if you need to) and retry it; do not switch to the shell."));
+        }
+        guidance.push("- Do not chain shell commands with separators like `echo \"====\"`; or `printf '---'`; the output becomes noisy in a way that makes the user's side of the conversation worse.".to_string());
     }
     if has("write") {
-        guidance.push("- Use the write tool to create files or completely replace their content. Prefer using the edit tool for targeted changes.");
+        guidance.push("- Use the write tool to create files or completely replace their content. Prefer using the edit tool for targeted changes.".to_string());
     }
     if has("edit") {
-        guidance.push("- Use the edit tool for targeted changes to existing text files. It replaces the exact text in `oldString` with `newString`, and the values must differ. By default, `oldString` must occur exactly once. If it occurs multiple times, include more surrounding context to make it unique or set `replaceAll` to true to replace every occurrence.");
+        guidance.push("- Use the edit tool for targeted changes to existing text files. It replaces the exact text in `oldString` with `newString`, and the values must differ. By default, `oldString` must occur exactly once. If it occurs multiple times, include more surrounding context to make it unique or set `replaceAll` to true to replace every occurrence. To change several places in one file, pass `edits`, a list of replacements applied in order and all-or-nothing, in one call.".to_string());
     }
     let mut s = String::from(
         "You are an AI agent running in moco, a coding agent harness. Help the user accomplish their goals using the tools you have available.\n\n\
@@ -208,7 +220,7 @@ pub fn system_prompt(agent: &Agent, tools: &[&dyn Tool], env: &EnvInfo) -> Strin
 - Prefer parallelizing independent tool calls.\n",
     );
     for g in guidance {
-        s.push_str(g);
+        s.push_str(&g);
         s.push('\n');
     }
     s.push_str(
@@ -311,6 +323,17 @@ mod tests {
         assert!(full.contains("Use the edit tool for targeted changes") && full.contains("Working directory: /w"));
         let no_edit = system_prompt(&find(&builtin(), "build").unwrap(), &refs[4..], &env);
         assert!(!no_edit.contains("edit tool") && no_edit.contains("Prefer dedicated tools"));
+        // The shell is for running programs: with a file-changing tool at hand the prompt says so, and names the tools.
+        assert!(full.contains("never to create or change files") && full.contains("the edit, write or patch tools"), "{full}");
+        assert!(!full.contains("fall back to the shell"), "the old advice to fall back to the shell is gone");
+        assert!(full.contains("pass `edits`"), "the multi-edit form is mentioned");
+        // Without any of them there is nothing to point to, so the older, general advice stays.
+        let no_writers: Vec<&dyn Tool> = tools.iter().filter(|t| !matches!(t.name(), "edit" | "write" | "patch")).map(|t| t.as_ref()).collect();
+        let readonly = system_prompt(&find(&builtin(), "build").unwrap(), &no_writers, &env);
+        assert!(readonly.contains("fall back to the shell") && !readonly.contains("never to create or change files"), "{readonly}");
+        // One of them: named alone.
+        let only_edit: Vec<&dyn Tool> = tools.iter().filter(|t| !matches!(t.name(), "write" | "patch")).map(|t| t.as_ref()).collect();
+        assert!(system_prompt(&find(&builtin(), "build").unwrap(), &only_edit, &env).contains("Use the edit tool instead."));
         assert!(!full.contains("Project instructions"));
         let with = EnvInfo { instructions: "Instructions from: /w/AGENTS.md\nuse tabs\n", ..env };
         let p = system_prompt(&find(&builtin(), "build").unwrap(), &refs, &with);
