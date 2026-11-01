@@ -2644,7 +2644,8 @@ mod tests {
         // Commands that are never sent to the model leave a debug line saying why, and no verdict.
         let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "sudo ls"})), text("done")], auto_careful_with(Some(Default::default()), vec![]));
         f.say("go");
-        assert_eq!(f.run(&TestUi::replying(vec![Reply::Once])), RunOutcome::Idle);
+        // Reject the prompt: approving it would really run `sudo`, which waits for a password on the terminal.
+        assert_eq!(f.run(&TestUi::replying(vec![Reply::Reject(None)])), RunOutcome::Declined);
         assert!(classifier_log(&f.session.id, "INFO").is_empty());
         let skipped = classifier_log(&f.session.id, "DEBUG");
         assert!(skipped.len() == 1 && skipped[0].contains("skipped (opaque or never-classify list)") && skipped[0].contains("sudo ls"), "{skipped:?}");
