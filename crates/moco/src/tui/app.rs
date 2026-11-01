@@ -25,6 +25,8 @@ pub enum Ev {
     Reasoning(String),
     Retry { attempt: u32, secs: u64, error: String },
     Usage { usage: Usage, cost: Option<f64>, session_cost: f64, context: u64, limit: Option<u64> },
+    /// A permission-classifier call: its cost, the session total (which includes it) and the classifier's share of it.
+    ClassifierUsage { cost: f64, session_cost: f64, classifier_cost: f64 },
     Notice(String),
     Status(String),
     Todos(Vec<Todo>),
@@ -263,6 +265,8 @@ struct RunUsage {
     cost: f64,
     priced: bool,
     steps: u32,
+    /// Spent this turn on classifying shell commands (in the session total, not in `cost`).
+    classifier: f64,
 }
 
 pub struct App {
@@ -283,6 +287,8 @@ pub struct App {
     pub permission_mode: PermissionMode,
     pub title: Option<String>,
     pub session_cost: f64,
+    /// The part of `session_cost` spent on the permission classifier.
+    pub classifier_cost: f64,
     pub context: u64,
     pub limit: Option<u64>,
     pub hint: Option<String>,
@@ -346,6 +352,7 @@ impl App {
             permission_mode: PermissionMode::default(),
             title: None,
             session_cost: 0.0,
+            classifier_cost: 0.0,
             context: 0,
             limit: None,
             hint: None,
@@ -483,7 +490,10 @@ impl App {
             return;
         }
         let sep = self.glyphs.sep;
-        let cost = if r.priced { format!("${:.4} {sep} session ${:.4}", r.cost, self.session_cost) } else { "cost n/a".to_string() };
+        let mut cost = if r.priced { format!("${:.4} {sep} session ${:.4}", r.cost, self.session_cost) } else { "cost n/a".to_string() };
+        if r.classifier > 0.0 {
+            cost.push_str(&format!(" + classifier ${:.4}", r.classifier));
+        }
         let wrote = if r.usage.cache_write > 0 { format!(" {sep} {} cache written", human(r.usage.cache_write)) } else { String::new() };
         self.rows.push(Row::Usage(format!("{} in {sep} {} out {sep} {} cached{wrote} {sep} {cost}", human(r.usage.input), human(r.usage.output), human(r.usage.cache_read))));
     }
@@ -534,6 +544,13 @@ impl App {
                     self.session_cost = session_cost;
                     self.context = context;
                     self.limit = limit;
+                }
+            }
+            Ev::ClassifierUsage { cost, session_cost, classifier_cost } => {
+                self.run.classifier += cost;
+                if depth == 0 {
+                    self.session_cost = session_cost;
+                    self.classifier_cost = classifier_cost;
                 }
             }
             Ev::Notice(n) => self.rows.push(Row::Error(if depth > 0 { format!("[{agent}] {n}") } else { n })),
@@ -1602,6 +1619,9 @@ impl App {
         }
         if self.session_cost > 0.0 {
             v.push(Line::from(vec![Span::styled(" cost    ", t.dim), Span::raw(format!("${:.4}", self.session_cost))]));
+            if self.classifier_cost > 0.0 {
+                v.push(Line::styled(format!("  incl. classifier ${:.4}", self.classifier_cost), t.dim));
+            }
         }
         if !self.todos.is_empty() {
             v.push(Line::default());
@@ -2633,6 +2653,27 @@ mod tests {
         a.input.clear();
         a.cursor = 0;
         assert!(screen(&mut a, 90, 8).join("\n").contains("Ctrl-K commands, Ctrl-Q quits"));
+    }
+
+    #[test]
+    fn classifier_spend_updates_the_total_at_once_and_is_shown_on_its_own() {
+        let mut a = App::new("m", "build");
+        a.running = true;
+        a.session_cost = 0.0100;
+        let wide = |a: &mut App| screen(a, 120, 24).join("\n");
+        assert!(!wide(&mut a).contains("classifier"), "nothing to show before the classifier has cost anything");
+        // The run is rejected before any step reports usage; the total must still move.
+        text(&mut a, Ev::ClassifierUsage { cost: 0.0004, session_cost: 0.0104, classifier_cost: 0.0004 });
+        assert_eq!((a.session_cost, a.classifier_cost), (0.0104, 0.0004));
+        let s = wide(&mut a);
+        assert!(s.contains("cost    $0.0104") && s.contains("incl. classifier $0.0004"), "{s}");
+        // A subagent's call counts toward this turn's classifier spend but never replaces the totals.
+        a.update(AppEvent::Engine { depth: 1, agent: "general".into(), ev: Ev::ClassifierUsage { cost: 0.0002, session_cost: 9.0, classifier_cost: 9.0 } });
+        assert_eq!((a.session_cost, a.classifier_cost), (0.0104, 0.0004));
+        text(&mut a, Ev::Usage { usage: Usage { input: 10, output: 5, cache_read: 0, cache_write: 0 }, cost: Some(0.0050), session_cost: 0.0156, context: 100, limit: Some(1000) });
+        a.update(AppEvent::RunDone(Ok(RunOutcome::Idle)));
+        let joined = screen(&mut a, 120, 24).join("\n");
+        assert!(joined.contains("$0.0050 · session $0.0156 + classifier $0.0006"), "{joined}");
     }
 
     #[test]

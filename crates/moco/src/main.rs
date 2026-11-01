@@ -43,6 +43,8 @@ struct RunUsage {
     cost: f64,
     priced: bool,
     session_cost: f64,
+    /// Spent this turn on classifying shell commands (also part of the session total, not of `cost`).
+    classifier: f64,
     context: u64,
     limit: Option<u64>,
     steps: u32,
@@ -75,7 +77,10 @@ impl Terminal {
         if r.steps == 0 {
             return;
         }
-        let cost = if r.priced { format!("${:.4} (session ${:.4})", r.cost, r.session_cost) } else { "cost n/a".to_string() };
+        let mut cost = if r.priced { format!("${:.4} (session ${:.4})", r.cost, r.session_cost) } else { "cost n/a".to_string() };
+        if r.classifier > 0.0 {
+            cost.push_str(&format!(" + classifier ${:.4}", r.classifier));
+        }
         let ctx = match r.limit {
             Some(l) if l > 0 => format!("context {}% of {}", (r.context * 100 / l).min(100), human(l)),
             _ => format!("context {}", human(r.context)),
@@ -139,6 +144,7 @@ impl Terminal {
                 r.priced |= cost.is_some();
                 r.steps += 1;
             }
+            UiEvent::ClassifierUsage { cost, .. } => self.run.lock().unwrap().classifier += cost,
             UiEvent::Retry { attempt, wait, error } => println!("{DIM}{pad}[{agent}] retrying in {}s (attempt {attempt}): {error}{RESET}", wait.as_secs()),
             UiEvent::Notice(n) => eprintln!("{RED}{pad}[{agent}] {n}{RESET}"),
             _ => {}
@@ -215,6 +221,12 @@ impl Ui for Terminal {
                 r.context = *context_tokens;
                 r.limit = *context_limit;
                 r.steps += 1;
+                return;
+            }
+            UiEvent::ClassifierUsage { cost, session_cost, .. } => {
+                let mut r = self.run.lock().unwrap();
+                r.classifier += cost;
+                r.session_cost = *session_cost;
                 return;
             }
             UiEvent::ToolStarted { name, input } => {
@@ -670,6 +682,10 @@ fn main() {
     let found_commands = commands::discover(&app_dir, &cwd, &cfg.commands);
     engine_cfg.skills = found_skills.clone();
     engine_cfg.small_model = cfg.small_model.clone();
+    engine_cfg.classifier = loaded.classifier.settings();
+    if engine_cfg.classifier.is_some() {
+        eprintln!("permission classifier: on");
+    }
     let (mcp_specs, mcp_warnings) = mcp_specs(&cfg, &loaded.mcp_origins, &app_dir, &cwd);
     for w in &mcp_warnings {
         eprintln!("warning: {w}");

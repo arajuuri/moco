@@ -277,9 +277,37 @@ pub struct TuiConfig {
     pub ascii: Option<bool>,
 }
 
+/// `permission_classifier`: let a cheap model approve routine shell commands that would otherwise ask
+/// (see `classifier.rs`). Read only from the user's own config, never from a project's.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ClassifierConfig {
+    pub enabled: bool,
+    /// `provider/model`; defaults to `small_model`, then the session's model.
+    pub model: Option<String>,
+    /// Milliseconds to wait for a verdict before asking the user (default 5000).
+    pub timeout: Option<u64>,
+    /// Also let background subagents, which cannot answer prompts, use it (default true).
+    pub background: Option<bool>,
+}
+
+impl ClassifierConfig {
+    /// `None` unless enabled.
+    pub fn settings(&self) -> Option<crate::classifier::Settings> {
+        let d = crate::classifier::Settings::default();
+        self.enabled.then(|| crate::classifier::Settings {
+            model: self.model.clone(),
+            timeout: self.timeout.map(std::time::Duration::from_millis).unwrap_or(d.timeout),
+            background: self.background.unwrap_or(d.background),
+        })
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Loaded {
     pub config: Config,
+    /// From the user-level config files only (`<app dir>/config/` and `MOCO_CONFIG`); a project's is ignored with a warning.
+    pub classifier: ClassifierConfig,
     pub sources: Vec<PathBuf>,
     pub warnings: Vec<String>,
     /// For each `mcp.servers` entry, the config file that defined it last (so project-supplied servers can be vetted).
@@ -440,13 +468,23 @@ pub fn discover(app_dir: &Path, cwd: &Path) -> Vec<PathBuf> {
 pub fn load(app_dir: &Path, cwd: &Path) -> Loaded {
     let mut merged = Value::Object(Default::default());
     let mut out = Loaded::default();
+    let mut user_classifier = Value::Null;
     for path in discover(app_dir, cwd) {
         let parsed = std::fs::read_to_string(&path)
             .map_err(|e| e.to_string())
             .and_then(|raw| substitute(&raw, path.parent().unwrap_or(Path::new("."))))
             .and_then(|raw| serde_json::from_str::<Value>(&strip_jsonc(&raw)).map_err(|e| e.to_string()));
         match parsed {
-            Ok(v) if v.is_object() => {
+            Ok(mut v) if v.is_object() => {
+                if let Some(c) = v.as_object_mut().and_then(|o| o.remove("permission_classifier")) {
+                    let user_level = path.parent() == Some(app_dir.join("config").as_path()) || std::env::var_os("MOCO_CONFIG").is_some_and(|p| PathBuf::from(p) == path);
+                    if !user_level {
+                        // A project must not be able to relax the user's prompts by switching this on.
+                        out.warnings.push(format!("{}: permission_classifier is only read from your own config ({}), ignored here", path.display(), app_dir.join("config").display()));
+                    } else {
+                        user_classifier = merge(user_classifier, c, "permission_classifier");
+                    }
+                }
                 for name in v["mcp"]["servers"].as_object().into_iter().flat_map(|o| o.keys()) {
                     out.mcp_origins.insert(name.clone(), path.clone());
                 }
@@ -461,6 +499,12 @@ pub fn load(app_dir: &Path, cwd: &Path) -> Loaded {
             }
             Ok(_) => out.warnings.push(format!("{}: top level must be an object", path.display())),
             Err(e) => out.warnings.push(format!("{}: {e}", path.display())),
+        }
+    }
+    if !user_classifier.is_null() {
+        match serde_json::from_value::<ClassifierConfig>(user_classifier) {
+            Ok(c) => out.classifier = c,
+            Err(e) => out.warnings.push(format!("invalid permission_classifier: {e}")),
         }
     }
     match serde_json::from_value::<Config>(merged) {
@@ -581,6 +625,28 @@ mod tests {
             merge(base, over, ""),
             json!({"model":"b","permissions":[1,2],"agents":{"build":{"steps":5,"permissions":[1,2]}},"list":[2]})
         );
+    }
+
+    #[test]
+    fn the_classifier_is_read_from_the_users_config_only() {
+        let root = tmp();
+        let (app, proj) = (root.join("app"), root.join("proj"));
+        std::fs::create_dir_all(app.join("config")).unwrap();
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("moco.json"), r#"{"permission_classifier":{"enabled":true,"model":"evil/m"}}"#).unwrap();
+        let l = load(&app, &proj);
+        assert_eq!(l.classifier.settings(), None, "a project cannot switch it on");
+        assert!(l.warnings.iter().any(|w| w.contains("permission_classifier") && w.contains("ignored")), "{:?}", l.warnings);
+
+        std::fs::write(app.join("config/moco.jsonc"), r#"{"permission_classifier":{"enabled":true,"model":"anthropic/haiku","timeout":2500,"background":false}}"#).unwrap();
+        let l = load(&app, &proj);
+        let s = l.classifier.settings().unwrap();
+        assert_eq!((s.model.as_deref(), s.timeout, s.background), (Some("anthropic/haiku"), std::time::Duration::from_millis(2500), false));
+
+        std::fs::write(app.join("config/moco.jsonc"), r#"{"permission_classifier":{"enabled":true}}"#).unwrap();
+        let s = load(&app, &proj).classifier.settings().unwrap();
+        assert_eq!((s.model, s.timeout, s.background), (None, std::time::Duration::from_secs(5), true));
+        assert_eq!(ClassifierConfig::default().settings(), None, "off unless enabled");
     }
 
     #[test]

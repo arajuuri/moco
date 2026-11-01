@@ -128,6 +128,8 @@ pub struct PermReq {
     pub save: Vec<String>,
     /// Ask even if the rules allow (configured denies still win). Used for unparsed shell commands.
     pub force_ask: bool,
+    /// For `shell`: the whole command line, which the command classifier judges (`classifier.rs`).
+    pub command: Option<String>,
 }
 
 /// Implemented by the agent loop: evaluates rules, prompts the user, blocks until answered.
@@ -242,7 +244,7 @@ impl ToolCtx<'_> {
     }
 
     pub fn permit(&self, action: &str, resources: Vec<String>, save: Vec<String>) -> Result<(), ToolError> {
-        self.permitter.check(&PermReq { action: action.into(), resources, save, force_ask: false })
+        self.permitter.check(&PermReq { action: action.into(), resources, save, force_ask: false, command: None })
     }
 
     /// Anything outside the working directory and project root needs `external_directory`.

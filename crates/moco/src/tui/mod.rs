@@ -120,6 +120,7 @@ impl TuiUi {
             UiEvent::StepUsage { usage, cost, session_cost, context_tokens, context_limit } => {
                 Ev::Usage { usage: *usage, cost: *cost, session_cost: *session_cost, context: *context_tokens, limit: *context_limit }
             }
+            UiEvent::ClassifierUsage { cost, session_cost, classifier_cost } => Ev::ClassifierUsage { cost: *cost, session_cost: *session_cost, classifier_cost: *classifier_cost },
             UiEvent::Notice(n) => Ev::Notice(n.to_string()),
             UiEvent::Status(s) => Ev::Status(s.to_string()),
             UiEvent::Todos(t) => Ev::Todos(t.to_vec()),
@@ -195,13 +196,14 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
 
     // Show the stored conversation of the session we start in (--continue, --session).
     let load_rows = |app: &mut App, sid: &str| {
-        let (messages, revert, totals) = {
+        let (messages, revert, totals, classifier) = {
             let st = engine.store.lock().unwrap();
-            (st.messages(sid).unwrap_or_default(), st.revert(sid).ok().flatten(), st.usage_totals(sid).map(|t| t.0).unwrap_or(0.0))
+            (st.messages(sid).unwrap_or_default(), st.revert(sid).ok().flatten(), st.usage_totals(sid).map(|t| t.0).unwrap_or(0.0), st.classifier_cost(sid).unwrap_or(0.0))
         };
         let hidden = revert.as_ref().and_then(|r| r["messageId"].as_str().map(String::from));
         app.rows = builtin::history_rows(&messages, hidden.as_deref());
         app.session_cost = totals;
+        app.classifier_cost = classifier;
         app.scroll = 0;
     };
     // Model, agent and title as stored for the session.

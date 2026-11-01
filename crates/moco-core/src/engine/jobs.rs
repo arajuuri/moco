@@ -57,6 +57,9 @@ struct Unattended;
 
 impl Ui for Unattended {
     fn event(&self, _: &UiEvent) {}
+    fn unattended(&self) -> bool {
+        true
+    }
     fn ask(&self, _: &PermissionPrompt) -> Reply {
         Reply::Reject(Some("This needs approval, but you are a subagent running in the background and nobody is present to give it. Do not retry it; do what is possible without it and say what needs approval.".into()))
     }

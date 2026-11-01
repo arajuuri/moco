@@ -5,13 +5,14 @@
 //! produced tool calls. History is reloaded from the store on every step.
 use crate::agent::{self, Agent};
 use crate::snapshot::{FileDiff, Snapshots};
-use crate::{blobs, catalog, compaction, config, instructions, skills, title};
+use crate::{blobs, catalog, classifier, compaction, config, instructions, skills, title};
 use crate::chat;
 use crate::permission::{self, Effect, PermissionMode, Rule};
 use crate::provider::{retry, Block, ChatMessage, Event, FinishReason, Provider, ProviderError, Request, Role, ToolDef, Usage};
 use crate::store::{Mode, Session, Store, StoreError};
 use crate::tools::{self, project_root_of, Host, MediaCaps, PermReq, Permitter, Question, SubagentRequest, SubagentResult, Todo, Tool, ToolCtx, ToolError, ToolOutput};
 use serde_json::{json, Value};
+mod classify;
 mod jobs;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -42,6 +43,9 @@ pub enum UiEvent<'a> {
     Retry { attempt: u32, wait: Duration, error: &'a str },
     /// After each step: this step's tokens and cost, session total, and how full the context is.
     StepUsage { usage: Usage, cost: Option<f64>, session_cost: f64, context_tokens: u64, context_limit: Option<u64> },
+    /// The permission classifier was called (`classifier.rs`): what the call cost, the session total (which includes
+    /// it) and the part of that total spent on classifying.
+    ClassifierUsage { cost: f64, session_cost: f64, classifier_cost: f64 },
     Notice(&'a str),
     /// Progress that is not an error (compaction started or finished).
     Status(&'a str),
@@ -64,6 +68,11 @@ pub trait Ui: Sync {
     fn ask_questions(&self, _questions: &[Question]) -> Option<Vec<Vec<String>>> {
         None
     }
+    /// Nobody can answer a prompt (a background subagent). The command classifier then runs only if its
+    /// `background` setting allows it.
+    fn unattended(&self) -> bool {
+        false
+    }
 }
 
 /// Wraps the parent's UI for a subagent session: events are tagged, prompts go to the same user.
@@ -81,6 +90,9 @@ impl Ui for ChildUi<'_> {
     }
     fn ask_questions(&self, q: &[Question]) -> Option<Vec<Vec<String>>> {
         self.parent.ask_questions(q)
+    }
+    fn unattended(&self) -> bool {
+        self.parent.unattended()
     }
 }
 
@@ -124,6 +136,8 @@ pub struct EngineConfig {
     pub snapshot_max_files: usize,
     /// Model for titles and other small jobs (`provider/model`); the session's model when unset.
     pub small_model: Option<String>,
+    /// Automatic classification of shell commands that would otherwise ask (off unless set; see `classifier.rs`).
+    pub classifier: Option<classifier::Settings>,
     /// Discovered skills (see `skills::discover`).
     pub skills: Vec<skills::Skill>,
     /// MCP servers whose tools join the built-in ones. Their tool list is read again for every request.
@@ -154,6 +168,7 @@ impl EngineConfig {
             snapshots: true,
             snapshot_max_files: 50_000,
             small_model: None,
+            classifier: None,
             skills: vec![],
             mcp: None,
             formatters: Default::default(),
@@ -186,6 +201,10 @@ pub struct Engine {
     snapshot_off: Mutex<HashSet<String>>,
     /// Sessions a title was already attempted for in this process.
     title_tried: Mutex<HashSet<String>>,
+    /// Commands the classifier allowed in this process (per session and directory); only allows are remembered.
+    classified: Mutex<HashSet<String>>,
+    /// Classifier models already reported as having no price (once each per process).
+    unpriced_noted: Mutex<HashSet<String>>,
     /// Weak handle to this engine once it is shared (`share`): detached background threads need an owner.
     me: Mutex<std::sync::Weak<Engine>>,
     jobs: jobs::Jobs,
@@ -278,12 +297,12 @@ struct AttemptResult {
 impl Engine {
     /// Single provider answering every model ref.
     pub fn new(store: Store, provider: Box<dyn Provider>, cfg: EngineConfig) -> Self {
-        Engine { store: Mutex::new(store), providers: HashMap::new(), fallback: Some(provider), tools: tools::all(subagent_list(&cfg), cfg.skills.clone(), cfg.websearch.clone()).into_iter().map(Arc::from).collect(), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()), title_tried: Mutex::new(HashSet::new()), me: Mutex::new(std::sync::Weak::new()), jobs: jobs::Jobs::default(), notifier: Mutex::new(None) }
+        Engine { store: Mutex::new(store), providers: HashMap::new(), fallback: Some(provider), tools: tools::all(subagent_list(&cfg), cfg.skills.clone(), cfg.websearch.clone()).into_iter().map(Arc::from).collect(), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()), title_tried: Mutex::new(HashSet::new()), classified: Mutex::new(HashSet::new()), unpriced_noted: Mutex::new(HashSet::new()), me: Mutex::new(std::sync::Weak::new()), jobs: jobs::Jobs::default(), notifier: Mutex::new(None) }
     }
 
     /// One client per provider id; a model ref's provider part picks the client.
     pub fn with_providers(store: Store, providers: HashMap<String, Box<dyn Provider>>, cfg: EngineConfig) -> Self {
-        Engine { store: Mutex::new(store), providers, fallback: None, tools: tools::all(subagent_list(&cfg), cfg.skills.clone(), cfg.websearch.clone()).into_iter().map(Arc::from).collect(), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()), title_tried: Mutex::new(HashSet::new()), me: Mutex::new(std::sync::Weak::new()), jobs: jobs::Jobs::default(), notifier: Mutex::new(None) }
+        Engine { store: Mutex::new(store), providers, fallback: None, tools: tools::all(subagent_list(&cfg), cfg.skills.clone(), cfg.websearch.clone()).into_iter().map(Arc::from).collect(), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()), title_tried: Mutex::new(HashSet::new()), classified: Mutex::new(HashSet::new()), unpriced_noted: Mutex::new(HashSet::new()), me: Mutex::new(std::sync::Weak::new()), jobs: jobs::Jobs::default(), notifier: Mutex::new(None) }
     }
 
     pub fn catalog(&self) -> &catalog::Catalog {
@@ -629,6 +648,7 @@ impl Engine {
             ui,
             declined: &declined,
             ask_lock: &self.prompt_lock,
+            classify: self.cfg.classifier.as_ref().filter(|s| s.background || !ui.unattended()).map(|settings| classify::ClassifyCtx { engine: self, session: &session, settings, cancel }),
         };
 
         let mut retries = 0u32;
@@ -729,14 +749,7 @@ impl Engine {
     /// Best effort: any failure just leaves the session untitled. Only errors where the request provably never ran
     /// (connection refused, DNS) are retried, up to 3 times, since this is a one-shot generation.
     fn generate_title(&self, session: &Session, text: &str, ui: &dyn Ui, cancel: &AtomicBool) {
-        let agent = agent::find(self.agents_of(session), &session.agent).or_else(|| self.agents_of(session).first().cloned());
-        let model_ref = self
-            .cfg
-            .small_model
-            .clone()
-            .or(session.model.clone())
-            .or(agent.and_then(|a| a.model))
-            .unwrap_or_else(|| self.cfg.model.clone());
+        let model_ref = self.small_model_ref(session);
         let (provider_id, model_id) = config::split_model(&model_ref);
         let Some(provider) = self.providers.get(provider_id).map(|p| p.as_ref()).or(self.fallback.as_deref()) else { return };
         let req = Request {
@@ -1281,9 +1294,42 @@ struct EnginePermitter<'a> {
     /// Set when the user declines without feedback: every other pending/future request of the batch fails too.
     declined: &'a AtomicBool,
     ask_lock: &'a Mutex<()>,
+    /// Present when the command classifier is on for this step.
+    classify: Option<classify::ClassifyCtx<'a>>,
 }
 
 impl EnginePermitter<'_> {
+    /// The classifier may answer for a shell command that would only ask because of a default rule. It never
+    /// overrides a rule the user or the careful preset's always-ask list wrote, and never sees opaque or dangerous
+    /// commands. `true` = run it without asking.
+    fn auto_allowed(&self, req: &PermReq) -> bool {
+        let (Some(c), Some(command)) = (&self.classify, &req.command) else { return false };
+        if req.action != "shell" || req.force_ask {
+            return false;
+        }
+        let parsed = tools::shellparse::parse(command);
+        if classifier::never_classify(&parsed) {
+            return false;
+        }
+        let saved = self.store.lock().unwrap_or_else(|e| e.into_inner()).saved_permissions(&self.project_id).unwrap_or_default();
+        if !permission::only_default_asks(&req.action, &req.resources, &self.rules, &saved) {
+            return false;
+        }
+        match c.engine.classify_command(c.session, command, &parsed, c.settings, self.ui, c.cancel) {
+            classifier::Verdict::Allow { risk, reason } => {
+                let shown = classifier::sanitize(command, 100);
+                self.ui.event(&UiEvent::Notice(&if reason.is_empty() { format!("auto: {risk}: {shown}") } else { format!("auto: {risk}: {shown} ({reason})") }));
+                true
+            }
+            classifier::Verdict::Ask { reason } => {
+                if !reason.is_empty() {
+                    self.ui.event(&UiEvent::Notice(&format!("classifier: asking you because {reason}")));
+                }
+                false
+            }
+        }
+    }
+
     fn effect(&self, req: &PermReq) -> Effect {
         let saved = self.store.lock().unwrap_or_else(|e| e.into_inner()).saved_permissions(&self.project_id).unwrap_or_default();
         let e = permission::decide(&req.action, &req.resources, &self.rules, &saved);
@@ -1300,6 +1346,9 @@ impl Permitter for EnginePermitter<'_> {
             Effect::Allow => Ok(()),
             Effect::Deny => Err(ToolError::Blocked(format!("Permission denied: {} {}", req.action, req.resources.join(", ")))),
             Effect::Ask => {
+                if self.auto_allowed(req) {
+                    return Ok(());
+                }
                 let _one_prompt_at_a_time = self.ask_lock.lock().unwrap_or_else(|e| e.into_inner());
                 if self.declined.load(Ordering::Relaxed) {
                     return Err(ToolError::Declined);
@@ -1363,6 +1412,7 @@ mod tests {
             UiEvent::ToolFinished { name, ok, .. } => format!("done:{name}:{ok}"),
             UiEvent::Retry { attempt, wait, .. } => format!("retry:{attempt}:{}", wait.as_secs()),
             UiEvent::StepUsage { .. } => "usage".into(),
+            UiEvent::ClassifierUsage { .. } => "classifier-usage".into(),
             UiEvent::Notice(n) => format!("notice:{n}"),
             UiEvent::Status(n) => format!("status:{n}"),
             UiEvent::Todos(t) => format!("todos:{}", t.len()),
@@ -2124,6 +2174,248 @@ mod tests {
         f.engine.store().set_permission_mode(&f.session.id, Some("manual")).unwrap();
         f.say("again");
         assert_eq!(f.run(&TestUi::replying(vec![Reply::Reject(None)])), RunOutcome::Declined);
+    }
+
+    // --- command classifier (classifier.rs) ---
+
+    fn verdict(v: &str, risk: &str) -> Scripted {
+        text(&format!(r#"{{"verdict":"{v}","risk":"{risk}","reason":"because"}}"#))
+    }
+
+    fn manual_with(settings: Option<classifier::Settings>, more: Vec<Rule>) -> impl FnOnce(&mut EngineConfig) {
+        move |c| {
+            let mut manual = agent::builtin_for(PermissionMode::Manual);
+            for a in &mut manual {
+                a.permissions.extend(more.iter().cloned());
+            }
+            c.permission_mode = PermissionMode::Manual;
+            c.agents_by_mode = BTreeMap::from([(PermissionMode::Manual, manual), (PermissionMode::Auto, agent::builtin_for(PermissionMode::Auto))]);
+            // A model with a catalog price, so cost is real (and the no-price notice stays out of the way).
+            c.small_model = Some(PRICED.into());
+            c.classifier = settings;
+        }
+    }
+
+    const PRICED: &str = "anthropic/claude-haiku-5-5";
+
+    fn shell_twice(cmd: &str) -> Vec<Scripted> {
+        vec![tool_call("t1", "shell", json!({"command": cmd})), tool_call("t2", "shell", json!({"command": cmd})), text("done")]
+    }
+
+    fn notices(ui: &TestUi) -> Vec<String> {
+        ui.log().into_iter().filter(|l| l.starts_with("notice:")).collect()
+    }
+
+    #[test]
+    fn the_classifier_allows_a_routine_command_once_and_remembers_it() {
+        let f = fixture_cfg(shell_twice("echo hi"), manual_with(Some(Default::default()), vec![]));
+        f.fake.script_verdicts(vec![verdict("allow", "read-only")]);
+        f.say("go");
+        let ui = TestUi::default(); // a prompt would panic
+        assert_eq!(f.run(&ui), RunOutcome::Idle);
+        assert_eq!(f.fake.classifier_requests.lock().unwrap().len(), 1, "the second identical command is not classified again");
+        let n = notices(&ui);
+        assert_eq!(n[0], "notice:auto: read-only: echo hi (because)");
+        assert_eq!(n[1], "notice:auto: allowed earlier: echo hi");
+        let req = f.fake.classifier_requests.lock().unwrap()[0].clone();
+        assert_eq!(req.system, classifier::SYSTEM);
+        assert!(req.tools.is_empty() && req.messages.len() == 1, "no conversation history goes to the classifier");
+        let input: Value = serde_json::from_str(&all_text(&req)).unwrap();
+        assert_eq!(input["command"], "echo hi");
+        assert!(input["cwd"].as_str().unwrap().ends_with("/work"));
+        // Three main steps and one classifier call, all on the session's bill.
+        assert_eq!(f.engine.store().usage_totals(&f.session.id).unwrap().1.input, 40);
+    }
+
+    #[test]
+    fn classifier_spend_is_priced_reported_at_once_and_counted_in_the_session() {
+        let f = fixture_cfg(shell_twice("echo hi"), |c| {
+            manual_with(Some(Default::default()), vec![])(c);
+            c.model = PRICED.into(); // the three main steps cost money too
+        });
+        f.fake.script_verdicts(vec![verdict("allow", "read-only")]);
+        f.say("go");
+        let seen = Mutex::new(vec![]);
+        struct Spy<'a>(&'a TestUi, &'a Mutex<Vec<(f64, f64, f64)>>);
+        impl Ui for Spy<'_> {
+            fn event(&self, e: &UiEvent) {
+                if let UiEvent::ClassifierUsage { cost, session_cost, classifier_cost } = e {
+                    self.1.lock().unwrap().push((*cost, *session_cost, *classifier_cost));
+                }
+                self.0.event(e)
+            }
+            fn ask(&self, p: &PermissionPrompt) -> Reply {
+                self.0.ask(p)
+            }
+        }
+        let inner = TestUi::default();
+        assert_eq!(f.engine.run(&f.session.id, &Spy(&inner, &seen), &AtomicBool::new(false), false).unwrap(), RunOutcome::Idle);
+        // 10 input and 5 output tokens at $0.10 / $0.50 per million, for the one call that was made.
+        let call = (10.0 * 0.1 + 5.0 * 0.5) / 1e6;
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "the cached second command costs nothing and reports nothing");
+        assert!((seen[0].0 - call).abs() < 1e-12 && (seen[0].2 - call).abs() < 1e-12, "{seen:?}");
+        assert!((seen[0].1 - call).abs() < 1e-12, "when the call is made, no step has finished yet: {seen:?}");
+        let st = f.engine.store();
+        let (total, _) = st.usage_totals(&f.session.id).unwrap();
+        assert!((total - 4.0 * call).abs() < 1e-12, "three steps and one classifier call, all in the total: {total}");
+        assert!((st.classifier_cost(&f.session.id).unwrap() - call).abs() < 1e-12, "the classifier's share is shown on its own");
+        assert!(!inner.log().iter().any(|l| l.contains("no price")));
+    }
+
+    #[test]
+    fn a_classifier_model_without_a_price_is_said_so_once() {
+        let f = fixture_cfg(shell_twice("echo hi"), |c| {
+            manual_with(Some(classifier::Settings { model: Some("anthropic/claude-unpriced".into()), ..Default::default() }), vec![])(c);
+        });
+        f.fake.script_verdicts(vec![verdict("ask", "unknown"), verdict("ask", "unknown")]);
+        f.say("go");
+        let ui = TestUi::replying(vec![Reply::Once, Reply::Once]);
+        f.run(&ui);
+        assert_eq!(f.fake.classifier_requests.lock().unwrap().len(), 2);
+        let said: Vec<String> = ui.log().into_iter().filter(|l| l.contains("no price")).collect();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("anthropic/claude-unpriced") && said[0].contains("$0.00"));
+        assert_eq!(f.engine.store().classifier_cost(&f.session.id).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn a_subagents_classifier_spend_rolls_up_to_its_parent() {
+        let st = Store::open_memory().unwrap();
+        let parent = st.create_session("/tmp/p", "build").unwrap();
+        let child = st.create_child_session(&parent, "general").unwrap();
+        let u = Usage { input: 1, ..Default::default() };
+        st.add_usage(&child.id, 0.5, &u).unwrap();
+        st.add_classifier_usage(&child.id, 0.25, &u).unwrap();
+        assert_eq!((st.classifier_cost(&child.id).unwrap(), st.classifier_cost(&parent.id).unwrap()), (0.25, 0.25));
+        assert_eq!(st.usage_totals(&parent.id).unwrap().0, 0.75);
+    }
+
+    #[test]
+    fn anything_but_a_safe_allow_asks_the_user() {
+        for (reply, why) in [
+            (Some(verdict("allow", "network")), "network: because"),
+            (Some(verdict("ask", "unknown")), "because"),
+            (Some(verdict("deny", "destructive")), "the classifier advises against this: because"),
+            (Some(text("I think it is fine")), "the classifier gave no usable answer"),
+            (None, "the classifier gave no usable answer"),
+        ] {
+            let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "make"})), text("done")], manual_with(Some(Default::default()), vec![]));
+            f.fake.script_verdicts(reply.into_iter().collect());
+            f.say("go");
+            let ui = TestUi::replying(vec![Reply::Once]);
+            assert_eq!(f.run(&ui), RunOutcome::Idle, "{why}");
+            assert_eq!(ui.asked.lock().unwrap().len(), 1, "{why}");
+            assert!(notices(&ui).contains(&format!("notice:classifier: asking you because {why}")), "{why}: {:?}", notices(&ui));
+        }
+        // A refusal is remembered nowhere: the same command is classified (and asked) again.
+        let f = fixture_cfg(shell_twice("make"), manual_with(Some(Default::default()), vec![]));
+        f.fake.script_verdicts(vec![verdict("ask", "unknown"), verdict("ask", "unknown")]);
+        f.say("go");
+        let ui = TestUi::replying(vec![Reply::Once, Reply::Once]);
+        f.run(&ui);
+        assert_eq!(f.fake.classifier_requests.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn dangerous_opaque_and_explicitly_ruled_commands_never_reach_the_classifier() {
+        for (cmd, rules) in [
+            ("git push origin main", vec![]),
+            ("rm -rf build", vec![]),
+            ("sudo make install", vec![]),
+            ("echo $(whoami)", vec![]),
+            ("make test", vec![Rule::new("shell", "make *", Effect::Ask)]),
+            ("make test", vec![Rule::new("shell", "*", Effect::Ask)]),
+        ] {
+            let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": cmd})), text("done")], manual_with(Some(Default::default()), rules));
+            f.fake.script_verdicts(vec![verdict("allow", "read-only")]);
+            f.say("go");
+            let ui = TestUi::replying(vec![Reply::Reject(None)]);
+            assert_eq!(f.run(&ui), RunOutcome::Declined, "{cmd}");
+            assert_eq!(ui.asked.lock().unwrap().len(), 1, "{cmd}");
+            assert!(f.fake.classifier_requests.lock().unwrap().is_empty(), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn a_rule_based_deny_stays_a_deny_and_the_classifier_is_off_by_default() {
+        let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "make"})), text("done")], manual_with(Some(Default::default()), vec![Rule::new("shell", "make", Effect::Deny)]));
+        f.fake.script_verdicts(vec![verdict("allow", "read-only")]);
+        f.say("go");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        assert!(matches!(&last_user_blocks(&f.fake.requests.lock().unwrap()[1])[0], Block::ToolResult { is_error: true, content, .. } if content.starts_with("Permission denied: shell")));
+        assert!(f.fake.classifier_requests.lock().unwrap().is_empty());
+
+        let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "echo hi"})), text("done")], manual_with(None, vec![]));
+        f.say("go");
+        let ui = TestUi::replying(vec![Reply::Once]);
+        f.run(&ui);
+        assert_eq!(ui.asked.lock().unwrap().len(), 1);
+        assert!(f.fake.classifier_requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_slow_classifier_times_out_into_a_prompt() {
+        let settings = classifier::Settings { timeout: Duration::from_millis(150), ..Default::default() };
+        let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "echo hi"})), text("done")], manual_with(Some(settings), vec![]));
+        f.fake.delay_classifier(Duration::from_secs(30));
+        f.fake.script_verdicts(vec![verdict("allow", "read-only")]);
+        f.say("go");
+        let ui = TestUi::replying(vec![Reply::Once]);
+        let start = std::time::Instant::now();
+        assert_eq!(f.run(&ui), RunOutcome::Idle);
+        assert!(start.elapsed() < Duration::from_secs(10));
+        assert_eq!(ui.asked.lock().unwrap().len(), 1);
+        assert!(notices(&ui).iter().any(|n| n.contains("did not answer in time")));
+    }
+
+    #[test]
+    fn the_classifier_model_comes_from_its_setting_then_the_small_model() {
+        let settings = classifier::Settings { model: Some("anthropic/claude-judge".into()), ..Default::default() };
+        let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "echo hi"})), text("done")], |c| {
+            manual_with(Some(settings), vec![])(c);
+            c.small_model = Some("anthropic/claude-small".into());
+        });
+        f.fake.script_verdicts(vec![verdict("allow", "read-only")]);
+        f.say("go");
+        f.run(&TestUi::default());
+        assert_eq!(f.fake.classifier_requests.lock().unwrap()[0].model, "claude-judge");
+
+        let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "echo hi"})), text("done")], |c| {
+            manual_with(Some(Default::default()), vec![])(c);
+            c.small_model = Some("anthropic/claude-small".into());
+        });
+        f.fake.script_verdicts(vec![verdict("allow", "read-only")]);
+        f.say("go");
+        f.run(&TestUi::default());
+        assert_eq!(f.fake.classifier_requests.lock().unwrap()[0].model, "claude-small");
+    }
+
+    /// A UI nobody is behind, like a background subagent's.
+    struct Away;
+    impl Ui for Away {
+        fn event(&self, _: &UiEvent) {}
+        fn ask(&self, _: &PermissionPrompt) -> Reply {
+            Reply::Reject(Some("nobody here".into()))
+        }
+        fn unattended(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn unattended_runs_use_the_classifier_only_when_background_is_on() {
+        for (background, runs_unprompted) in [(true, true), (false, false)] {
+            let settings = classifier::Settings { background, ..Default::default() };
+            let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "echo hi"})), text("done")], manual_with(Some(settings), vec![]));
+            f.fake.script_verdicts(vec![verdict("allow", "read-only")]);
+            f.say("go");
+            assert_eq!(f.engine.run(&f.session.id, &Away, &AtomicBool::new(false), false).unwrap(), RunOutcome::Idle);
+            let reqs = f.fake.requests.lock().unwrap();
+            let result = &last_user_blocks(&reqs[1])[0];
+            assert_eq!(matches!(result, Block::ToolResult { is_error: false, .. }), runs_unprompted, "background={background}");
+            assert_eq!(f.fake.classifier_requests.lock().unwrap().len(), usize::from(background));
+        }
     }
 
     #[test]

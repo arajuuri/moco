@@ -3,6 +3,7 @@ pub mod agent;
 pub mod auth;
 pub mod blobs;
 pub mod catalog;
+pub mod classifier;
 pub mod commands;
 pub mod chat;
 pub mod compaction;

@@ -15,22 +15,50 @@ pub struct Rule {
     pub action: String,
     pub resource: String,
     pub effect: Effect,
+    /// An `ask` that is only a default (the mode's catch-all, the careful preset's `shell *`), which the command
+    /// classifier may upgrade to allow. Never set by config: an `ask` the user wrote is final.
+    #[serde(skip)]
+    pub soft: bool,
 }
 
 impl Rule {
     pub fn new(action: &str, resource: &str, effect: Effect) -> Self {
-        Rule { action: action.into(), resource: resource.into(), effect }
+        Rule { action: action.into(), resource: resource.into(), effect, soft: false }
     }
+    /// A default `ask` that the command classifier may relax (see `soft`).
+    pub fn soft_ask(action: &str, resource: &str) -> Self {
+        Rule { soft: true, ..Rule::new(action, resource, Effect::Ask) }
+    }
+}
+
+fn last_match<'a>(action: &str, resource: &str, rules: &'a [Rule]) -> Option<&'a Rule> {
+    rules.iter().rev().find(|r| wildcard::matches(action, &r.action) && wildcard::matches(resource, &r.resource))
 }
 
 /// Last matching rule wins; no match means `Ask`.
 pub fn evaluate(action: &str, resource: &str, rules: &[Rule]) -> Effect {
-    rules
-        .iter()
-        .rev()
-        .find(|r| wildcard::matches(action, &r.action) && wildcard::matches(resource, &r.resource))
-        .map(|r| r.effect)
-        .unwrap_or(Effect::Ask)
+    last_match(action, resource, rules).map(|r| r.effect).unwrap_or(Effect::Ask)
+}
+
+/// True when every `ask` on these resources is only a default (a soft rule, or no rule at all), so the command
+/// classifier may decide instead of the user. One explicit `ask` (or a `deny`) among them makes it false.
+pub fn only_default_asks(action: &str, resources: &[String], configured: &[Rule], saved: &[Rule]) -> bool {
+    let all: Vec<Rule> = configured.iter().chain(saved).cloned().collect();
+    let mut asks = false;
+    for r in resources {
+        match last_match(action, r, &all) {
+            Some(rule) if rule.effect == Effect::Deny => return false,
+            Some(rule) if rule.effect == Effect::Ask => {
+                if !rule.soft {
+                    return false;
+                }
+                asks = true;
+            }
+            Some(_) => {}
+            None => asks = true,
+        }
+    }
+    asks
 }
 
 /// How much moco asks before it acts. `Manual` is the default; `Auto` allows what the default ruleset allows.
@@ -77,7 +105,7 @@ pub fn mode_rules(mode: PermissionMode) -> Vec<Rule> {
         PermissionMode::Auto => default_rules(),
         // Ask for everything, then allow what only reads or plans: a prompt for every read would make the mode unusable.
         PermissionMode::Manual => {
-            let mut rules = vec![Rule::new("*", "*", Effect::Ask)];
+            let mut rules = vec![Rule::soft_ask("*", "*")];
             rules.extend([
                 Rule::new("read", "*", Effect::Allow),
                 Rule::new("glob", "*", Effect::Allow),
@@ -114,7 +142,7 @@ pub fn preset_rules(name: &str) -> Option<Vec<Rule>> {
     match name {
         "trusted" => Some(vec![]),
         "careful" => {
-            let mut rules = vec![Rule::new("shell", "*", Effect::Ask)];
+            let mut rules = vec![Rule::soft_ask("shell", "*")];
             for c in ["ls *", "cat *", "head *", "tail *", "wc *", "rg *", "grep *", "git status *", "git diff *", "git log *", "git show *", "cargo check *", "cargo test *", "cargo build *"] {
                 rules.push(Rule::new("shell", c, Effect::Allow));
             }
@@ -204,6 +232,26 @@ mod tests {
         assert_eq!(evaluate("shell", "ls", &auto), Allow);
         assert_eq!(evaluate("edit", "a.rs", &auto), Allow);
         assert_eq!(PermissionMode::default(), PermissionMode::Manual);
+    }
+
+    #[test]
+    fn only_default_asks_are_open_to_the_classifier() {
+        let manual = mode_rules(PermissionMode::Manual);
+        assert!(only_default_asks("shell", &res(&["ls -la"]), &manual, &[]));
+        assert!(only_default_asks("shell", &res(&["ls"]), &[], &[]), "no rule at all is a default ask");
+        let careful: Vec<Rule> = manual.iter().cloned().chain(preset_rules("careful").unwrap()).collect();
+        assert!(only_default_asks("shell", &res(&["make test"]), &careful, &[]));
+        assert!(!only_default_asks("shell", &res(&["git push origin x"]), &careful, &[]), "the always-ask list is final");
+        assert!(!only_default_asks("shell", &res(&["make", "sudo rm x"]), &careful, &[]));
+        assert!(!only_default_asks("shell", &res(&["cat a"]), &careful, &[]), "nothing asks: nothing to classify");
+        // A rule the user wrote is explicit even when it looks like the default one.
+        let mut user = manual.clone();
+        user.push(Rule::new("shell", "*", Effect::Ask));
+        assert!(!only_default_asks("shell", &res(&["make"]), &user, &[]));
+        user.push(Rule::new("shell", "make", Effect::Deny));
+        assert!(!only_default_asks("shell", &res(&["make"]), &user, &[]));
+        let from_json: Rule = serde_json::from_str(r#"{"action":"shell","resource":"*","effect":"ask","soft":true}"#).unwrap();
+        assert!(!from_json.soft, "config cannot mark a rule soft");
     }
 
     #[test]

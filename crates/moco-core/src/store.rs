@@ -51,6 +51,8 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (4, "alter table session add column fork_session_id text; alter table session add column fork_boundary text;"),
     (5, "alter table session add column variant text;"),
     (6, "alter table session add column permission_mode text;"),
+    // The part of `cost` that went to the permission classifier (it is also counted in `cost`).
+    (7, "alter table session add column classifier_cost real not null default 0;"),
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -252,6 +254,16 @@ impl Store {
     /// Add one step's usage to the session totals (`cost` in USD; `tokens` is a JSON object of running sums).
     /// Subagent spend also counts toward every ancestor session, so a parent's total covers its whole tree.
     pub fn add_usage(&self, session_id: &str, cost: f64, usage: &crate::provider::Usage) -> Result<()> {
+        self.add_usage_of(session_id, cost, usage, false)
+    }
+
+    /// As `add_usage`, for a permission classifier call: also counted in `classifier_cost`, so it can be shown on
+    /// its own while the session total still covers everything.
+    pub fn add_classifier_usage(&self, session_id: &str, cost: f64, usage: &crate::provider::Usage) -> Result<()> {
+        self.add_usage_of(session_id, cost, usage, true)
+    }
+
+    fn add_usage_of(&self, session_id: &str, cost: f64, usage: &crate::provider::Usage, classifier: bool) -> Result<()> {
         let mut cur = Some(session_id.to_string());
         let mut hops = 0;
         while let Some(id) = cur {
@@ -260,7 +272,10 @@ impl Store {
             for (k, v) in [("input", usage.input), ("output", usage.output), ("cacheRead", usage.cache_read), ("cacheWrite", usage.cache_write)] {
                 t[k] = serde_json::json!(t[k].as_u64().unwrap_or(0) + v);
             }
-            self.conn.execute("update session set cost=cost+?2, tokens=?3, time_updated=?4 where id=?1", params![id, cost, t.to_string(), now_ms()])?;
+            self.conn.execute(
+                "update session set cost=cost+?2, tokens=?3, time_updated=?4, classifier_cost=classifier_cost+?5 where id=?1",
+                params![id, cost, t.to_string(), now_ms(), if classifier { cost } else { 0.0 }],
+            )?;
             cur = self.conn.query_row("select parent_id from session where id=?1", [&id], |r| r.get::<_, Option<String>>(0)).optional()?.flatten();
             hops += 1;
             if hops > 32 {
@@ -268,6 +283,11 @@ impl Store {
             }
         }
         Ok(())
+    }
+
+    /// The part of the session's cost (children included) that went to the permission classifier.
+    pub fn classifier_cost(&self, session_id: &str) -> Result<f64> {
+        Ok(self.conn.query_row("select classifier_cost from session where id=?1", [session_id], |r| r.get(0))?)
     }
 
     /// (cost in USD, token sums) for the session.
@@ -589,7 +609,7 @@ impl Store {
 
     pub fn saved_permissions(&self, project_id: &str) -> Result<Vec<Rule>> {
         let mut stmt = self.conn.prepare("select action, resource from permission_saved where project_id=?1 order by rowid")?;
-        let rows = stmt.query_map([project_id], |r| Ok(Rule { action: r.get(0)?, resource: r.get(1)?, effect: Effect::Allow }))?;
+        let rows = stmt.query_map([project_id], |r| Ok(Rule { action: r.get(0)?, resource: r.get(1)?, effect: Effect::Allow, soft: false }))?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
