@@ -55,23 +55,33 @@ pub(crate) fn tail(text: &str) -> Option<(String, usize, usize)> {
 
 /// Start `command` in its own process group, stdout and stderr combined into `out_path` (one file with a shared
 /// offset keeps them interleaved), no stdin.
-pub(crate) fn spawn(command: &str, workdir: &Path, out_path: &Path) -> Result<Child, ToolError> {
+/// `sandbox_root` is `Some(project root)` to run it inside the sandbox (when one is active; see `sandbox.rs`).
+pub(crate) fn spawn(command: &str, workdir: &Path, out_path: &Path, sandbox_root: Option<&Path>) -> Result<Child, ToolError> {
     if let Some(dir) = out_path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| ToolError::fail(e.to_string()))?;
     }
     let file = std::fs::File::create(out_path).map_err(|e| ToolError::fail(e.to_string()))?;
     let err_file = file.try_clone().map_err(|e| ToolError::fail(e.to_string()))?;
-    Command::new(shell_program())
-        .arg("-c")
-        .arg(command)
-        .current_dir(workdir)
+    let shell = shell_program();
+    let mut cmd = match sandbox_root.and_then(|root| crate::sandbox::wrap(&shell, command, root)) {
+        Some((program, args)) => {
+            let mut c = Command::new(program);
+            c.args(args);
+            c
+        }
+        None => {
+            let mut c = Command::new(&shell);
+            c.arg("-c").arg(command);
+            c
+        }
+    };
+    cmd.current_dir(workdir)
         .env("TERM", "dumb")
         .stdin(Stdio::null())
         .stdout(Stdio::from(file))
         .stderr(Stdio::from(err_file))
-        .process_group(0)
-        .spawn()
-        .map_err(|e| ToolError::fail(format!("failed to start shell: {e}")))
+        .process_group(0);
+    cmd.spawn().map_err(|e| ToolError::fail(format!("failed to start shell: {e}")))
 }
 
 /// How a command ended.
@@ -136,11 +146,15 @@ pub(crate) fn wait(child: &mut Child, out_path: &Path, timeout: Option<Duration>
 }
 
 /// Run `command` to completion, no model involved. `timeout_ms` 0 means no timeout.
-pub(crate) fn run_foreground(command: &str, workdir: &Path, spill_dir: &Path, timeout_ms: u64, cancel: &AtomicBool) -> Result<Finished, ToolError> {
+pub(crate) fn run_foreground(command: &str, workdir: &Path, spill_dir: &Path, timeout_ms: u64, cancel: &AtomicBool, sandbox_root: Option<&Path>) -> Result<Finished, ToolError> {
     let out_path = spill_dir.join(format!("{}.txt", crate::id::new_id("shell")));
-    let mut child = spawn(command, workdir, &out_path)?;
+    let mut child = spawn(command, workdir, &out_path, sandbox_root)?;
     let timeout = (timeout_ms > 0).then(|| Duration::from_millis(timeout_ms));
-    Ok(wait(&mut child, &out_path, timeout, &|| cancel.load(std::sync::atomic::Ordering::Relaxed), false))
+    let mut f = wait(&mut child, &out_path, timeout, &|| cancel.load(std::sync::atomic::Ordering::Relaxed), false);
+    if sandbox_root.is_some() && crate::sandbox::active() {
+        crate::sandbox::annotate(&mut f.text, f.exit);
+    }
+    Ok(f)
 }
 
 impl Tool for Shell {
@@ -158,7 +172,8 @@ Do not use interactive commands.\n\n{BACKGROUND_INSTRUCTION}"
         json!({"type":"object","properties":{
             "command":{"type":"string"},"workdir":{"type":"string","description":"Directory to run in"},
             "timeout":{"type":"integer","minimum":0,"description":"Timeout in milliseconds"},
-            "background":{"type":"boolean","description":"Run in the background and return at once; you are told when it exits"}},"required":["command"]})
+            "background":{"type":"boolean","description":"Run in the background and return at once; you are told when it exits"},
+            "unsandboxed":{"type":"boolean","description":"Only when the sandbox blocked a command that must run: run it outside the sandbox. The user is asked first."}},"required":["command"]})
     }
     fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let command = str_arg(input, "command")?;
@@ -183,17 +198,25 @@ Do not use interactive commands.\n\n{BACKGROUND_INSTRUCTION}"
         }
         resources.dedup();
         save.dedup();
-        ctx.permitter.check(&PermReq { action: "shell".into(), resources, save, force_ask: parsed.opaque })?;
+        let unsandbox_save = save.clone();
+        ctx.permitter.check(&PermReq { action: "shell".into(), resources: resources.clone(), save, force_ask: parsed.opaque })?;
+
+        // Leaving the sandbox is its own permission, so a blanket `shell` allow does not cover it.
+        let unsandboxed = opt_bool(input, "unsandboxed").unwrap_or(false) && crate::sandbox::active();
+        if unsandboxed {
+            ctx.permitter.check(&PermReq { action: "shell.unsandboxed".into(), resources, save: unsandbox_save, force_ask: parsed.opaque })?;
+        }
 
         if background {
-            let (id, path) = ctx.host.start_background_shell(command, &workdir, timeout_ms.filter(|t| *t > 0).map(Duration::from_millis))?;
+            let (id, path) = ctx.host.start_background_shell(command, &workdir, timeout_ms.filter(|t| *t > 0).map(Duration::from_millis), unsandboxed)?;
             return Ok(ToolOutput {
                 text: format!("Command moved to the background (shell ID: {id}).\nOutput is streaming to: {}", path.display()),
                 metadata: json!({"shellID": id, "outputPath": path.to_string_lossy(), "status": "running"}),
             });
         }
 
-        let f = run_foreground(command, &workdir, &ctx.spill_dir, timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS), ctx.cancel)?;
+        let root = (!unsandboxed).then_some(ctx.project_root.as_path());
+        let f = run_foreground(command, &workdir, &ctx.spill_dir, timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS), ctx.cancel, root)?;
         if f.killed {
             return Err(ToolError::Interrupted);
         }

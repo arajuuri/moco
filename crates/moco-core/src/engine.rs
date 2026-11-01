@@ -1247,9 +1247,9 @@ impl Host for EngineHost<'_> {
         self.engine.run_subagent(self.session, req, self.ui, self.cancel)
     }
 
-    fn start_background_shell(&self, command: &str, workdir: &std::path::Path, timeout: Option<Duration>) -> Result<(String, PathBuf), ToolError> {
+    fn start_background_shell(&self, command: &str, workdir: &std::path::Path, timeout: Option<Duration>, unsandboxed: bool) -> Result<(String, PathBuf), ToolError> {
         let eng = self.engine.shared()?;
-        eng.start_shell_job(self.session, command, workdir, timeout)
+        eng.start_shell_job(self.session, command, workdir, timeout, unsandboxed)
     }
 
     fn start_background_subagent(&self, req: SubagentRequest) -> Result<String, ToolError> {
