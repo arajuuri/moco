@@ -61,7 +61,7 @@ If a call fails, the error says what is closest in the file: correct the call an
                 return Err(ToolError::fail(format!("{}newString must be different from oldString", label(i))));
             }
         }
-        ctx.check_external(path.parent().unwrap_or(&path))?;
+        ctx.check_external_file(&path)?;
         ctx.permit("edit", vec![ctx.display(&path)], vec!["*".into()])?;
         // From here to the end of formatting no other call may change this file (issue #6).
         let _locks = fsio::lock_files([&path]);

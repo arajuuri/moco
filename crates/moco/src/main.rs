@@ -659,7 +659,8 @@ fn main() {
         // A session always runs in the directory it was started in.
         (Some(s), _) => std::path::PathBuf::from(&s.directory).canonicalize().unwrap_or_else(|e| die(&format!("the session's directory {} is not available: {e}", s.directory))),
         (None, Some(d)) => std::path::PathBuf::from(d).canonicalize().unwrap_or_else(|e| die(&format!("--dir: {e}"))),
-        (None, None) => std::env::current_dir().unwrap_or_else(|e| die(&e.to_string())),
+        // The symlink-free path, so the system prompt, the session and the saved permissions all use one name.
+        (None, None) => std::env::current_dir().and_then(|d| d.canonicalize()).unwrap_or_else(|e| die(&e.to_string())),
     };
     let cwd_str = cwd.to_string_lossy().into_owned();
     std::env::set_current_dir(&cwd).ok();

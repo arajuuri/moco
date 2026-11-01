@@ -202,7 +202,7 @@ impl Tool for Patch {
             };
             for p in paths {
                 let abs = ctx.resolve(p);
-                ctx.check_external(abs.parent().unwrap_or(&abs))?;
+                ctx.check_external_file(&abs)?;
                 resources.push(ctx.display(&abs));
                 files.push(abs);
             }
