@@ -25,6 +25,8 @@ pub enum Ev {
     Reasoning(String),
     Retry { attempt: u32, secs: u64, error: String },
     Usage { usage: Usage, cost: Option<f64>, session_cost: f64, context: u64, limit: Option<u64> },
+    /// The classifier let this shell command through without asking.
+    AutoAllowed { command: String, risk: String, reason: String },
     /// A permission-classifier call: its cost, the session total (which includes it) and the classifier's share of it.
     ClassifierUsage { cost: f64, session_cost: f64, classifier_cost: f64 },
     Notice(String),
@@ -238,7 +240,7 @@ pub enum ToolState {
 pub enum Row {
     User(String),
     Assistant(String),
-    Tool { depth: usize, agent: String, name: String, summary: String, state: ToolState, detail: Option<String>, output: String },
+    Tool { depth: usize, agent: String, name: String, summary: String, state: ToolState, detail: Option<String>, output: String, auto: Option<String> },
     /// The model's reasoning, shown according to the detail level.
     Reasoning(String),
     /// The welcome card at the top of a session.
@@ -516,7 +518,18 @@ impl App {
                     _ => self.rows.push(Row::Assistant(t)),
                 }
             }
-            Ev::Tool { name, summary, detail } => self.rows.push(Row::Tool { depth, agent, name, summary, state: ToolState::Running, detail, output: String::new() }),
+            Ev::Tool { name, summary, detail } => self.rows.push(Row::Tool { depth, agent, name, summary, state: ToolState::Running, detail, output: String::new(), auto: None }),
+            Ev::AutoAllowed { command, risk, reason } => {
+                // The marker goes on the shell row this command belongs to: the newest one still running that
+                // shows the same text and has no marker yet.
+                let found = self.rows.iter_mut().rev().find(|r| matches!(r, Row::Tool { depth: d, name, summary, state: ToolState::Running, auto: None, .. } if *d == depth && name == "shell" && command.starts_with(summary.trim_end_matches('.'))));
+                let label = if reason.is_empty() { risk } else { format!("{risk}: {reason}") };
+                match found {
+                    Some(Row::Tool { auto, .. }) => *auto = Some(label),
+                    _ if depth == 0 => self.push_info(format!("auto: {label}")),
+                    _ => {}
+                }
+            }
             Ev::ToolDone { name, ok, msg, output: out } => {
                 let found = self.rows.iter_mut().rev().find(|r| matches!(r, Row::Tool { depth: d, name: n, state: ToolState::Running, .. } if *d == depth && *n == name));
                 if let Some(Row::Tool { state, output, .. }) = found {
@@ -1400,7 +1413,7 @@ impl App {
                 let text = clip_width(&text, room);
                 out.push(Line::from(vec![Span::raw(format!("{M}{pad}")), Span::styled(format!("{} ", if running { g.active } else { g.done }), if failed > 0 { t.error } else { t.accent }), Span::styled(text, if failed > 0 { t.error } else { dim })]));
             }
-            Row::Tool { depth, agent, name, summary, state, detail, output } => {
+            Row::Tool { depth, agent, name, summary, state, detail, output, auto } => {
                 let pad = "  ".repeat(*depth);
                 let glyph = match state {
                     ToolState::Running => Span::styled(if (self.tick / 3) % 2 == 0 { g.run } else { g.idle }, t.accent),
@@ -1409,9 +1422,17 @@ impl App {
                 };
                 let who = if *depth > 0 { format!("{agent} {} ", g.sep) } else { String::new() };
                 let head = format!("{who}{name:<6} ");
+                let mark = auto.as_ref().map(|a| format!("  {} auto: {a}", g.sep));
                 let room = width.saturating_sub(M.len() + pad.len() + 2 + display_width(&head));
+                // The marker is shown whole when it fits; the command is what gives way.
+                let mark_room = mark.as_ref().map_or(0, |m| display_width(m).min(room / 2));
+                let room = room.saturating_sub(mark_room);
                 let sum = if display_width(summary) > room { format!("{}{}", clip_width(summary, room.saturating_sub(1)), g.ellipsis) } else { summary.clone() };
-                out.push(Line::from(vec![Span::raw(format!("{M}{pad}")), glyph, Span::raw(" "), Span::styled(head, t.accent), Span::styled(sum, dim)]));
+                let mut spans = vec![Span::raw(format!("{M}{pad}")), glyph, Span::raw(" "), Span::styled(head, t.accent), Span::styled(sum, dim)];
+                if let Some(m) = mark {
+                    spans.push(Span::styled(clip_width(&m, mark_room), t.ok));
+                }
+                out.push(Line::from(spans));
                 let indent = format!("{M}{pad}  ");
                 if let (Some(d), true) = (detail, self.level >= 1) {
                     let cap = if self.level >= 2 { usize::MAX } else { DETAIL_LINES };
@@ -2561,6 +2582,31 @@ mod tests {
         assert!(screen(&mut a, 40, 10).join("\n").contains("use **bol"));
         text(&mut a, Ev::Text("d** now".into()));
         assert!(screen(&mut a, 40, 10).join("\n").contains("use bold now"));
+    }
+
+    #[test]
+    fn an_auto_allowed_command_marks_its_own_tool_row() {
+        let mut a = App::new("m", "build");
+        text(&mut a, Ev::Tool { name: "shell".into(), summary: "cargo test -p moco-core".into(), detail: None });
+        text(&mut a, Ev::Tool { name: "shell".into(), summary: "ls -la".into(), detail: None });
+        text(&mut a, Ev::AutoAllowed { command: "ls -la".into(), risk: "read-only".into(), reason: "lists files".into() });
+        let s = screen(&mut a, 80, 12).join("\n");
+        let row = |needle: &str| s.lines().find(|l| l.contains(needle)).unwrap_or("").to_string();
+        assert!(row("ls -la").contains("auto: read-only: lists files"), "{s}");
+        assert!(!row("cargo test").contains("auto:"), "the other row is not marked: {s}");
+        // A second marker for the same command goes to the next unmarked row, never twice to one.
+        text(&mut a, Ev::AutoAllowed { command: "cargo test -p moco-core".into(), risk: "project-write".into(), reason: String::new() });
+        let s = screen(&mut a, 80, 12).join("\n");
+        assert!(s.lines().find(|l| l.contains("cargo test")).unwrap().contains("auto: project-write"), "{s}");
+        // With nothing to attach to (the row is gone or finished), it still shows up as a line of its own.
+        text(&mut a, Ev::AutoAllowed { command: "pwd".into(), risk: "read-only".into(), reason: String::new() });
+        assert!(screen(&mut a, 80, 14).join("\n").contains("auto: read-only"), "fallback line");
+        // A narrow screen clips the command, not the marker.
+        let mut b = App::new("m", "build");
+        text(&mut b, Ev::Tool { name: "shell".into(), summary: "a-very-long-command-name --with --many --flags --that --go --on".into(), detail: None });
+        text(&mut b, Ev::AutoAllowed { command: "a-very-long-command-name --with --many --flags --that --go --on".into(), risk: "read-only".into(), reason: String::new() });
+        let s = screen(&mut b, 44, 6).join("\n");
+        assert!(s.contains("auto: read-only"), "{s}");
     }
 
     fn tool_with_detail(a: &mut App, name: &str, detail: &str) {

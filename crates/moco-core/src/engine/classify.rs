@@ -26,16 +26,20 @@ impl Engine {
     }
 
     /// Ask the classifier about `command`. Anything that goes wrong (no model, no provider, timeout, error, garbled
-    /// reply) is an `Ask`: the user decides. Only allows are remembered, for this session and directory.
+    /// reply) is an `Ask`: the user decides. Only allows are remembered, for this session and directory. Every
+    /// decision is logged (target `classifier`, on at `info` unless the log filter says otherwise).
     pub(super) fn classify_command(&self, session: &Session, command: &str, parsed: &Parsed, settings: &Settings, ui: &dyn Ui, cancel: &AtomicBool) -> Verdict {
         let commands: Vec<String> = parsed.commands.iter().map(|c| c.text.clone()).collect();
         let key = format!("{}\u{0}{}\u{0}{}", session.id, session.directory, if commands.is_empty() { command.trim().to_string() } else { commands.join(" ; ") });
+        let shown = classifier::sanitize(command, 200);
         if self.classified.lock().unwrap_or_else(|e| e.into_inner()).contains(&key) {
+            crate::log_info!("classifier", "session={} decision=allow cached=true command={shown}", session.id);
             return Verdict::Allow { risk: "allowed earlier".into(), reason: String::new() };
         }
         let model_ref = settings.model.clone().unwrap_or_else(|| self.small_model_ref(session));
         let (provider_id, model_id) = config::split_model(&model_ref);
         if self.provider_for(provider_id).is_none() {
+            crate::log_info!("classifier", "session={} decision=ask model={model_ref} reason=provider not connected command={shown}", session.id);
             return Verdict::Ask { reason: format!("the classifier's provider '{provider_id}' is not connected") };
         }
         let root = project_root_of(std::path::Path::new(&session.directory));
@@ -48,14 +52,20 @@ impl Engine {
             overlay: self.base_overlay(provider_id, model_id),
             ..Default::default()
         };
-        let Some((reply, usage)) = self.call_classifier(provider_id, req, settings.timeout, cancel) else {
-            return Verdict::Ask { reason: "the classifier did not answer in time".into() };
+        let started = Instant::now();
+        let (reply, usage) = match self.call_classifier(provider_id, req, settings.timeout, cancel) {
+            Ok(r) => r,
+            Err(why) => {
+                crate::log_info!("classifier", "session={} decision=ask model={model_ref} ms={} reason={why} command={shown}", session.id, started.elapsed().as_millis());
+                return Verdict::Ask { reason: "the classifier did not answer in time".into() };
+            }
         };
+        let ms = started.elapsed().as_millis();
         let priced = self.cfg.catalog.model(provider_id, model_id).and_then(|m| catalog::cost(m, &usage));
         let cost = priced.unwrap_or(0.0);
         let (session_cost, classifier_cost) = {
             let st = self.store();
-            let _ = st.add_classifier_usage(&session.id, cost, &usage);
+            st.add_classifier_usage(&session.id, cost, &usage).log_err("store", "recording classifier usage");
             (st.usage_totals(&session.id).map(|t| t.0).unwrap_or(0.0), st.classifier_cost(&session.id).unwrap_or(0.0))
         };
         // Shown at once: the run may end (a rejection, an interrupt) before another step reports the total.
@@ -64,16 +74,33 @@ impl Engine {
             ui.event(&UiEvent::Notice(&format!("the classifier model {model_ref} has no price in the catalog, so its cost is counted as $0.00 (set a price under providers.<id>.models, or pick a model with one)")));
         }
         let verdict = classifier::parse_reply(&reply);
-        if matches!(verdict, Verdict::Allow { .. }) {
+        let (said, risk) = classifier::reply_fields(&reply);
+        let (decision, why) = match &verdict {
+            Verdict::Allow { reason, .. } => ("allow", reason.as_str()),
+            Verdict::Ask { reason } => ("ask", reason.as_str()),
+        };
+        crate::log_info!(
+            "classifier",
+            "session={} decision={decision} model_verdict={} risk={} model={model_ref} ms={ms} tokens_in={} tokens_out={} cost={cost:.5} reason={why} command={shown}",
+            session.id,
+            if said.is_empty() { "-" } else { &said },
+            if risk.is_empty() { "-" } else { &risk },
+            usage.input + usage.cache_read + usage.cache_write,
+            usage.output
+        );
+        crate::log_debug!("classifier", "session={} raw reply: {}", session.id, classifier::sanitize(&reply, 500));
+        if let Verdict::Allow { risk, reason } = &verdict {
             self.classified.lock().unwrap_or_else(|e| e.into_inner()).insert(key);
+            self.store().record_auto_allow(&session.id, command, risk, reason, &model_ref).log_err("store", "recording an automatic allow");
         }
         verdict
     }
 
     /// One non-streaming call with a time limit. When the engine is shared the call runs on its own thread, so a
     /// stalled connection cannot hold up the tool past the limit; otherwise it runs inline.
-    fn call_classifier(&self, provider_id: &str, req: Request, timeout: Duration, cancel: &AtomicBool) -> Option<(String, Usage)> {
-        fn collect(provider: &dyn Provider, req: &Request, stop: &AtomicBool) -> Option<(String, Usage)> {
+    fn call_classifier(&self, provider_id: &str, req: Request, timeout: Duration, cancel: &AtomicBool) -> Result<(String, Usage), String> {
+        fn collect(provider: Option<&dyn Provider>, req: &Request, stop: &AtomicBool) -> Result<(String, Usage), String> {
+            let provider = provider.ok_or("no provider")?;
             let (mut out, mut usage) = (String::new(), Usage::default());
             provider
                 .stream(req, stop, &mut |ev| match ev {
@@ -81,25 +108,29 @@ impl Engine {
                     Event::Finish { usage: u, .. } => usage = u,
                     _ => {}
                 })
-                .ok()?;
-            Some((out, usage))
+                .map_err(|e| format!("provider error: {}", e.message()))?;
+            Ok((out, usage))
         }
-        let Ok(me) = self.shared() else { return collect(self.provider_for(provider_id)?, &req, cancel) };
+        let Ok(me) = self.shared() else { return collect(self.provider_for(provider_id), &req, cancel) };
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         let (stop2, pid) = (stop.clone(), provider_id.to_string());
         std::thread::spawn(move || {
-            let _ = tx.send(me.provider_for(&pid).and_then(|p| collect(p, &req, &stop2)));
+            let _ = tx.send(collect(me.provider_for(&pid), &req, &stop2));
         });
         let end = Instant::now() + timeout;
         loop {
             match rx.recv_timeout(Duration::from_millis(25)) {
                 Ok(r) => return r,
-                Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Err("the classifier thread ended without an answer".into()),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if cancel.load(Ordering::Relaxed) || Instant::now() >= end {
+                    if cancel.load(Ordering::Relaxed) {
                         stop.store(true, Ordering::Relaxed);
-                        return None;
+                        return Err("interrupted".into());
+                    }
+                    if Instant::now() >= end {
+                        stop.store(true, Ordering::Relaxed);
+                        return Err(format!("no answer within {} ms", timeout.as_millis()));
                     }
                 }
             }

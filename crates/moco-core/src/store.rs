@@ -53,6 +53,14 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (6, "alter table session add column permission_mode text;"),
     // The part of `cost` that went to the permission classifier (it is also counted in `cost`).
     (7, "alter table session add column classifier_cost real not null default 0;"),
+    // Shell commands the permission classifier allowed without asking (the `/permissions` listing; issue #28).
+    (
+        8,
+        "create table auto_allow(
+        id integer primary key autoincrement, session_id text not null references session(id) on delete cascade,
+        at integer not null, command text not null, risk text not null, reason text not null, model text not null);
+     create index auto_allow_session on auto_allow(session_id);",
+    ),
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -70,6 +78,18 @@ pub struct Session {
     pub permission_mode: Option<String>,
     /// Set for subagent sessions.
     pub parent_id: Option<String>,
+}
+
+/// A shell command the permission classifier let through without asking.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AutoAllow {
+    pub session_id: String,
+    /// Milliseconds since the epoch.
+    pub at: i64,
+    pub command: String,
+    pub risk: String,
+    pub reason: String,
+    pub model: String,
 }
 
 /// One row of the session list.
@@ -133,7 +153,7 @@ fn now_ms() -> i64 {
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+            crate::log::LogErr::log_err(std::fs::create_dir_all(dir), "store", "creating the data directory");
         }
         let conn = Connection::open(path)?;
         conn.query_row("pragma journal_mode=wal", [], |_| Ok(()))?;
@@ -286,6 +306,23 @@ impl Store {
     }
 
     /// The part of the session's cost (children included) that went to the permission classifier.
+    /// Remember a command the classifier allowed without asking.
+    pub fn record_auto_allow(&self, session_id: &str, command: &str, risk: &str, reason: &str, model: &str) -> Result<()> {
+        let command: String = command.chars().take(2000).collect();
+        self.conn.execute("insert into auto_allow(session_id, at, command, risk, reason, model) values (?1,?2,?3,?4,?5,?6)", params![session_id, now_ms(), command, risk, reason, model])?;
+        Ok(())
+    }
+
+    /// What the classifier allowed in this session and in the subagent sessions below it, oldest first.
+    pub fn auto_allows(&self, session_id: &str) -> Result<Vec<AutoAllow>> {
+        let mut stmt = self.conn.prepare(
+            "with recursive tree(id) as (select ?1 union all select s.id from session s join tree on s.parent_id = tree.id)
+             select a.session_id, a.at, a.command, a.risk, a.reason, a.model from auto_allow a where a.session_id in (select id from tree) order by a.id",
+        )?;
+        let rows = stmt.query_map([session_id], |r| Ok(AutoAllow { session_id: r.get(0)?, at: r.get(1)?, command: r.get(2)?, risk: r.get(3)?, reason: r.get(4)?, model: r.get(5)? }))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     pub fn classifier_cost(&self, session_id: &str) -> Result<f64> {
         Ok(self.conn.query_row("select classifier_cost from session where id=?1", [session_id], |r| r.get(0))?)
     }
@@ -615,22 +652,29 @@ impl Store {
 
     /// Write-ahead execution claim. Returns false if the session is already claimed.
     pub fn claim(&self, session_id: &str) -> Result<bool> {
-        Ok(self.conn.execute("update session set claim_at=?2 where id=?1 and claim_at is null", params![session_id, now_ms()])? > 0)
+        let got = self.conn.execute("update session set claim_at=?2 where id=?1 and claim_at is null", params![session_id, now_ms()])? > 0;
+        crate::log_debug!("store", "claim session={session_id} {}", if got { "taken" } else { "refused: already claimed" });
+        Ok(got)
     }
 
     pub fn release(&self, session_id: &str) -> Result<()> {
         self.conn.execute("update session set claim_at=null, resume_attempts=0 where id=?1", [session_id])?;
+        crate::log_debug!("store", "release session={session_id}");
         Ok(())
     }
 
     /// On startup: sessions left claimed by a crash. Bumps the attempt counter; sessions over `max_attempts`
     /// are released instead of resumed. Returns the ids to resume.
     pub fn recover_claims(&self, max_attempts: i64) -> Result<Vec<String>> {
-        self.conn.execute("update session set claim_at=null where claim_at is not null and resume_attempts>=?1", [max_attempts])?;
+        let dropped = self.conn.execute("update session set claim_at=null where claim_at is not null and resume_attempts>=?1", [max_attempts])?;
+        if dropped > 0 {
+            crate::log_warn!("store", "recover: {dropped} session(s) crashed {max_attempts} times in a row and will not be resumed again");
+        }
         let mut stmt = self.conn.prepare("select id from session where claim_at is not null and parent_id is null")?;
         let ids: Vec<String> = stmt.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
         for id in &ids {
             self.conn.execute("update session set resume_attempts=resume_attempts+1 where id=?1", [id])?;
+            crate::log_warn!("store", "recover: session={id} was left claimed by a crash; resuming it");
         }
         Ok(ids)
     }
@@ -911,6 +955,23 @@ mod tests {
         s.save_permission("prj_other", "edit", "*").unwrap();
         let rules = s.saved_permissions(&ses.project_id).unwrap();
         assert_eq!(rules, [Rule::new("shell", "git push *", Effect::Allow)]);
+    }
+
+    #[test]
+    fn auto_allows_are_listed_oldest_first_with_the_subagents_below() {
+        let s = Store::open_memory().unwrap();
+        let top = s.create_session("/p", "build").unwrap();
+        let other = s.create_session("/p", "build").unwrap();
+        let child = s.create_child_session(&top, "general").unwrap();
+        s.record_auto_allow(&top.id, "ls", "read-only", "", "m/a").unwrap();
+        s.record_auto_allow(&child.id, "cargo test", "project-write", "tests", "m/a").unwrap();
+        s.record_auto_allow(&other.id, "pwd", "read-only", "", "m/a").unwrap();
+        let got: Vec<(String, String)> = s.auto_allows(&top.id).unwrap().into_iter().map(|a| (a.command, a.risk)).collect();
+        assert_eq!(got, [("ls".to_string(), "read-only".to_string()), ("cargo test".to_string(), "project-write".to_string())]);
+        assert_eq!(s.auto_allows(&child.id).unwrap().len(), 1, "a subagent sees its own");
+        assert_eq!(s.auto_allows(&other.id).unwrap()[0].command, "pwd");
+        s.record_auto_allow(&top.id, &"x".repeat(5000), "read-only", "", "m").unwrap();
+        assert_eq!(s.auto_allows(&top.id).unwrap().last().unwrap().command.len(), 2000, "very long commands are cut");
     }
 
     #[test]

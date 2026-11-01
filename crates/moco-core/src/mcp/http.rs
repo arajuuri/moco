@@ -205,13 +205,16 @@ impl Inner {
                 Err(PostErr::Rpc(RpcError::Unauthorized(www))) => {
                     if self.oauth && !refreshed && oauth::load(&self.app_dir, &self.url).is_some_and(|s| s.refresh_token.is_some()) {
                         refreshed = true;
+                        crate::log_info!("mcp", "{} answered 401; trying the refresh token", self.url);
                         if oauth::refresh(&self.app_dir, &self.url).is_ok() {
                             continue;
                         }
                     }
+                    crate::log_warn!("mcp", "{} answered 401 and there is no way to renew the credentials", self.url);
                     return Err(RpcError::Unauthorized(www));
                 }
                 Err(PostErr::SessionExpired) if !reinit && !is_initialize => {
+                    crate::log_info!("mcp", "{} dropped the session; starting a new one", self.url);
                     reinit = true;
                     *lock(&self.session) = None;
                     self.handshake(timeout)?;

@@ -143,6 +143,12 @@ impl Manager {
     }
 
     fn set_status(&self, name: &str, status: Status) {
+        match &status {
+            Status::Failed(why) => crate::log_warn!("mcp", "server={name} failed: {why}"),
+            Status::NeedsAuth(_) => crate::log_info!("mcp", "server={name} needs authorization (run /mcp login {name})"),
+            Status::Connected => crate::log_info!("mcp", "server={name} connected"),
+            _ => {}
+        }
         if let Some(s) = self.lock().iter_mut().find(|s| s.spec.name == name) {
             s.status = status;
         }
@@ -167,6 +173,7 @@ impl Manager {
             }
         });
         let started = Instant::now();
+        crate::log_info!("mcp", "connect server={name} transport={}", if spec.config.is_remote() { "http" } else { "stdio" });
         let client: Arc<dyn McpConn> = if spec.config.is_remote() {
             let Some(url) = spec.config.url.clone() else { return self.set_status(name, Status::Failed("a remote server needs a `url`".into())) };
             let opts = HttpOptions { url, headers: spec.config.headers.clone(), oauth: OAuthSetting::resolve(&spec.config.oauth).is_some(), app_dir: self.app_dir.clone(), notify };
@@ -189,20 +196,28 @@ impl Manager {
             };
             let left = self.timeouts.startup.saturating_sub(started.elapsed());
             if let Err(e) = client.initialize(left.max(Duration::from_millis(200))) {
+                let tail = crate::log::tail(&client.stderr_tail(), 8);
+                if !tail.is_empty() {
+                    crate::log_warn!("mcp", "server={name} stderr tail: {tail}");
+                }
                 self.set_status(name, Status::Failed(e));
                 return; // dropping the client stops the process
             }
+            crate::log_info!("mcp", "server={name} initialized in {} ms: {}", started.elapsed().as_millis(), client.info()["serverInfo"]);
             client
         };
+        let client = crate::mcp::client::LoggedConn::wrap(name, client);
         if let Some(s) = self.lock().iter_mut().find(|s| s.spec.name == name) {
             s.client = Some(client);
         }
         match self.read_catalog(name) {
             Ok(c) => {
+                crate::log_info!("mcp", "server={name} catalog: {} tools, {} prompts, {} resources, ready after {} ms", c.tools.len(), c.prompts.len(), c.resources.len(), started.elapsed().as_millis());
                 if let Some(s) = self.lock().iter_mut().find(|s| s.spec.name == name) {
                     s.catalog = c;
                     s.status = Status::Connected;
                 }
+                crate::log_info!("mcp", "server={name} connected");
             }
             Err(e) => self.set_status(name, Status::Failed(format!("connected, but listing failed: {e}"))),
         }
@@ -232,10 +247,14 @@ impl Manager {
 
     /// Re-read one server's tools, prompts and resources (after it announced a change).
     pub fn refresh(&self, name: &str) {
-        if let Ok(c) = self.read_catalog(name) {
-            if let Some(s) = self.lock().iter_mut().find(|s| s.spec.name == name) {
-                s.catalog = c;
+        match self.read_catalog(name) {
+            Ok(c) => {
+                crate::log_info!("mcp", "server={name} catalog refreshed: {} tools, {} prompts, {} resources", c.tools.len(), c.prompts.len(), c.resources.len());
+                if let Some(s) = self.lock().iter_mut().find(|s| s.spec.name == name) {
+                    s.catalog = c;
+                }
             }
+            Err(e) => crate::log_warn!("mcp", "server={name} catalog refresh failed: {e}"),
         }
     }
 

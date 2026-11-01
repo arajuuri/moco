@@ -17,6 +17,9 @@ pub struct OpenAiChat {
 
 impl OpenAiChat {
     pub fn new(api_key: Option<String>, base_url: String, headers: BTreeMap<String, String>) -> Self {
+        if let Some(k) = &api_key {
+            crate::log::add_secret(k);
+        }
         OpenAiChat {
             api_key,
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -227,19 +230,25 @@ impl Parser {
 
 impl Provider for OpenAiChat {
     fn stream(&self, req: &Request, cancel: &AtomicBool, on_event: &mut dyn FnMut(Event)) -> Result<(), ProviderError> {
-        let mut call = self.agent.post(&format!("{}/chat/completions", self.base_url)).set("content-type", "application/json");
+        let url = format!("{}/chat/completions", self.base_url);
+        let mut call = self.agent.post(&url).set("content-type", "application/json");
         if let Some(k) = &self.api_key {
             call = call.set("authorization", &format!("Bearer {k}"));
         }
         for (k, v) in self.headers.iter().chain(req.overlay.headers.iter().map(|(k, v)| (k, v))) {
             call = call.set(k, v);
         }
-        let body = build_body(req, self.base_url.contains("api.openai.com"));
-        let resp = match call.send_string(&body.to_string()) {
+        let body = build_body(req, self.base_url.contains("api.openai.com")).to_string();
+        let mut shown: Vec<(&str, &str)> = self.api_key.iter().map(|k| ("authorization", k.as_str())).collect();
+        shown.extend(self.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).chain(req.overlay.headers.iter().map(|(k, v)| (k.as_str(), v.as_str()))));
+        super::trace_http("openai-chat", &url, &shown, &body);
+        let resp = match call.send_string(&body) {
             Ok(r) => r,
             Err(ureq::Error::Status(code, r)) => {
                 let ra = r.header("retry-after").and_then(|s| s.trim().parse::<u64>().ok());
-                return Err(classify_http(code, &r.into_string().unwrap_or_default(), ra));
+                let text = r.into_string().unwrap_or_default();
+                super::log_http_error("openai-chat", code, ra, &text);
+                return Err(classify_http(code, &text, ra));
             }
             Err(ureq::Error::Transport(t)) => {
                 let kind = match t.kind() {

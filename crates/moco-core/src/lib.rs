@@ -12,6 +12,7 @@ pub mod engine;
 pub mod format;
 pub mod id;
 pub mod instructions;
+pub mod log;
 pub mod markdown;
 pub mod mcp;
 pub mod media;

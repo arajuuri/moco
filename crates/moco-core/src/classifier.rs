@@ -76,6 +76,15 @@ pub fn parse_reply(raw: &str) -> Verdict {
     }
 }
 
+/// What the model said, for the log: its own verdict and risk (empty when the reply is garbled). `parse_reply` turns
+/// the same reply into the decision that is actually taken.
+pub fn reply_fields(raw: &str) -> (String, String) {
+    let (Some(a), Some(b)) = (raw.find('{'), raw.rfind('}')) else { return Default::default() };
+    let Ok(v) = serde_json::from_str::<Value>(&raw[a..=b.max(a)]) else { return Default::default() };
+    let text = |k: &str| v[k].as_str().unwrap_or("").trim().to_ascii_lowercase();
+    (sanitize(&text("verdict"), 20), sanitize(&text("risk"), 30))
+}
+
 /// One line of printable text: model output reaches the terminal, so control characters are dropped.
 pub fn sanitize(s: &str, max: usize) -> String {
     let one_line: String = s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
@@ -150,6 +159,14 @@ mod tests {
         ] {
             assert!(!ok(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn the_log_gets_the_models_own_words() {
+        assert_eq!(reply_fields(r#"{"verdict":"Deny","risk":"Destructive","reason":"x"}"#), ("deny".into(), "destructive".into()));
+        assert_eq!(reply_fields("noise ```{\"verdict\":\"allow\",\"risk\":\"read-only\"}```"), ("allow".into(), "read-only".into()));
+        assert_eq!(reply_fields("not json"), (String::new(), String::new()));
+        assert_eq!(reply_fields("{\"verdict\":\"allow\\u001b[2J\"}").0, "allow [2j", "control characters are dropped");
     }
 
     #[test]

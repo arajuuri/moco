@@ -7,6 +7,7 @@ use crate::agent::{self, Agent};
 use crate::snapshot::{FileDiff, Snapshots};
 use crate::{blobs, catalog, classifier, compaction, config, instructions, skills, title};
 use crate::chat;
+use crate::log::LogErr;
 use crate::permission::{self, Effect, PermissionMode, Rule};
 use crate::provider::{retry, Block, ChatMessage, Event, FinishReason, Provider, ProviderError, Request, Role, ToolDef, Usage};
 use crate::store::{Mode, Session, Store, StoreError};
@@ -46,6 +47,9 @@ pub enum UiEvent<'a> {
     /// The permission classifier was called (`classifier.rs`): what the call cost, the session total (which includes
     /// it) and the part of that total spent on classifying.
     ClassifierUsage { cost: f64, session_cost: f64, classifier_cost: f64 },
+    /// The classifier let a shell command through without asking. `command` is one line, `risk` is what the model
+    /// judged it to be (or `allowed earlier` for a repeat), `reason` may be empty.
+    AutoAllowed { command: &'a str, risk: &'a str, reason: &'a str },
     Notice(&'a str),
     /// Progress that is not an error (compaction started or finished).
     Status(&'a str),
@@ -260,6 +264,27 @@ struct Prepared<'a> {
     tools: Vec<Arc<dyn Tool>>,
 }
 
+fn describe_undo(r: &Result<UndoResult, StoreError>) -> String {
+    match r {
+        Ok(UndoResult::Done(rep)) => format!("done: {} message(s) hidden, files restored={} (restored {}, deleted {})", rep.hidden_messages, rep.files_restored, rep.restored.len(), rep.deleted.len()),
+        Ok(other) => format!("{other:?}"),
+        Err(e) => format!("store error: {e}"),
+    }
+}
+
+/// One line per finished tool call: name, outcome, duration and the size of what the model gets back.
+fn log_tool(name: &str, outcome: &Result<ToolOutput, ToolError>, elapsed: Duration) {
+    let (status, size) = match outcome {
+        Ok(o) => ("ok", o.text.len()),
+        Err(ToolError::Failure(m)) => ("error", m.len()),
+        Err(ToolError::Declined) => ("declined", 0),
+        Err(ToolError::Corrected(m)) => ("corrected", m.len()),
+        Err(ToolError::Blocked(m)) => ("blocked", m.len()),
+        Err(ToolError::Interrupted) => ("interrupted", 0),
+    };
+    crate::log_debug!("tool", "{name} {status} ms={} output_bytes={size}", elapsed.as_millis());
+}
+
 fn subagent_list(cfg: &EngineConfig) -> Vec<(String, String)> {
     cfg.agents.iter().filter(|a| a.subagent()).map(|a| (a.id.clone(), a.description.clone())).collect()
 }
@@ -446,6 +471,39 @@ impl Engine {
         self.media_caps(p, m)
     }
 
+    /// Lines for `/permissions`: what the classifier allowed without asking in this session (and its subagents), and
+    /// the "always allow" rules saved for the project.
+    pub fn permissions_report(&self, sid: &str) -> Result<Vec<String>, StoreError> {
+        let (session, auto) = {
+            let st = self.store();
+            (st.session(sid)?.expect("session exists"), st.auto_allows(sid)?)
+        };
+        let saved = self.store().saved_permissions(&session.project_id)?;
+        let mode = self.permission_mode_of(&session);
+        let mut out = vec![format!(
+            "permission mode: {}; the command classifier is {}",
+            mode.name(),
+            match (&self.cfg.classifier, mode) {
+                (None, _) => "off (permission_classifier.enabled is false)".to_string(),
+                (Some(_), PermissionMode::Manual) => "idle (it only works in auto mode)".to_string(),
+                (Some(s), _) => format!("on ({})", s.model.clone().unwrap_or_else(|| self.small_model_ref(&session))),
+            }
+        )];
+        out.push(format!("allowed automatically in this session: {}", auto.len()));
+        for a in auto.iter().rev().take(50).rev() {
+            let when = crate::log::stamp(a.at).replace('T', " ");
+            out.push(format!("  {} {:<14} {}{}", &when[..19], a.risk, classifier::sanitize(&a.command, 100), if a.reason.is_empty() { String::new() } else { format!("  ({})", a.reason) }));
+        }
+        if auto.len() > 50 {
+            out.push(format!("  ... {} older not shown", auto.len() - 50));
+        }
+        out.push(format!("saved \"always allow\" rules for this project: {}", saved.len()));
+        for r in &saved {
+            out.push(format!("  {:<20} {}", r.action, r.resource));
+        }
+        Ok(out)
+    }
+
     pub fn app_dir(&self) -> &std::path::Path {
         &self.cfg.app_dir
     }
@@ -480,12 +538,20 @@ impl Engine {
     /// Run until idle. `resume` continues a run that was interrupted by a crash (the claim is still held).
     pub fn run(&self, session_id: &str, ui: &dyn Ui, cancel: &AtomicBool, resume: bool) -> Result<RunOutcome, StoreError> {
         if !resume && !self.store().claim(session_id)? {
+            crate::log_info!("engine", "run session={session_id} not started: another run holds the claim");
             return Ok(RunOutcome::Busy);
         }
+        crate::log_info!("engine", "run start session={session_id} resume={resume}");
+        let run_started = std::time::Instant::now();
         // Sending a new prompt after /undo makes the undo permanent.
-        if let Err(e) = self.commit_pending(session_id) {
-            self.store().release(session_id)?;
-            return Err(e);
+        match self.commit_pending(session_id) {
+            Ok(0) => {}
+            Ok(n) => crate::log_info!("engine", "session={session_id} undo made permanent: {n} message(s) deleted"),
+            Err(e) => {
+                crate::log_error!("engine", "session={session_id} could not commit the pending undo: {e}");
+                self.store().release(session_id)?;
+                return Err(e);
+            }
         }
         self.auto_failed.lock().unwrap().remove(session_id);
         // An untitled session gets a title from a small model call that runs alongside the first turn.
@@ -497,6 +563,12 @@ impl Engine {
             self.drain(session_id, ui, cancel, resume)
         });
         self.store().release(session_id)?;
+        let ms = run_started.elapsed().as_millis();
+        match &outcome {
+            Ok(RunOutcome::Failed(why)) => crate::log_warn!("engine", "run end session={session_id} outcome=failed ms={ms}: {why}"),
+            Ok(o) => crate::log_info!("engine", "run end session={session_id} outcome={o:?} ms={ms}"),
+            Err(e) => crate::log_error!("engine", "run end session={session_id} store error ms={ms}: {e}"),
+        }
         outcome
     }
 
@@ -633,6 +705,7 @@ impl Engine {
         let Prepared { session, agent, req, provider, provider_id, model_id, tools: step_tools, .. } = p;
         let (provider_id, model_id) = (provider_id.as_str(), model_id.as_str());
         let caps = self.media_caps(provider_id, model_id);
+        crate::log_debug!("engine", "step session={sid} step={step} agent={} model={provider_id}/{model_id} messages={} tools={}", agent.id, req.messages.len(), req.tools.len());
 
         let snapshot = self.take_snapshot(&session, ui);
         let mut first = json!({ "parts": [] });
@@ -660,6 +733,7 @@ impl Engine {
                     // Safe to retry: no tool has run, and the partial output is discarded.
                     retries += 1;
                     if let Some(wait) = retry::delay(retries, e, (self.cfg.jitter)()) {
+                        crate::log_warn!("engine", "retry session={sid} step={step} attempt={retries} wait_ms={}: {}", wait.as_millis(), e.message());
                         ui.event(&UiEvent::Retry { attempt: retries, wait, error: &e.message() });
                         self.store().set_message_parts(&msg_id, &[])?;
                         (self.cfg.sleep)(wait, cancel);
@@ -668,6 +742,7 @@ impl Engine {
                         }
                         continue;
                     }
+                    crate::log_warn!("engine", "giving up session={sid} step={step} after {} retries: {}", retries - 1, e.message());
                     break r;
                 }
                 _ => break r,
@@ -677,6 +752,7 @@ impl Engine {
         // The provider rejected the prompt as too long before producing anything: compact once and retry the step.
         if let (Err(ProviderError::ContextOverflow(_)), false, false) = (&result.stream, result.dispatched, overflowed) {
             if !cancel.load(Ordering::Relaxed) {
+                crate::log_warn!("engine", "context overflow session={sid} step={step}: compacting and retrying once");
                 self.store().delete_message(&msg_id)?;
                 match self.compact_inner(sid, "overflow", ui, cancel)? {
                     CompactResult::Compacted { .. } => return self.run_step_inner(sid, step, ui, cancel, true),
@@ -707,10 +783,11 @@ impl Engine {
             let context_tokens = usage.input + usage.cache_read + usage.cache_write + usage.output;
             let session_cost = {
                 let st = self.store();
-                let _ = st.add_usage(sid, cost.unwrap_or(0.0), usage);
+                st.add_usage(sid, cost.unwrap_or(0.0), usage).log_err("store", "recording token usage");
                 st.usage_totals(sid).map(|t| t.0).unwrap_or(0.0)
             };
             data["cost"] = json!(cost);
+            crate::log_debug!("engine", "usage session={sid} step={step} model={provider_id}/{model_id} input={} output={} cache_read={} cache_write={} cost={} session_cost={session_cost:.4}", usage.input, usage.output, usage.cache_read, usage.cache_write, cost.map_or("unpriced".to_string(), |c| format!("{c:.4}")));
             ui.event(&UiEvent::StepUsage { usage: *usage, cost, session_cost, context_tokens, context_limit: model.map(|m| m.limit.context).filter(|l| *l > 0) });
         }
         let outcome = match &result.stream {
@@ -732,6 +809,7 @@ impl Engine {
             }
         };
         self.store().update_message(&msg_id, &data)?;
+        crate::log_debug!("engine", "step end session={sid} step={step} tool_calls={tool_calls} next={}", match &outcome { StepOutcome::Continue => "continue".to_string(), StepOutcome::Done => "done".to_string(), StepOutcome::Stop(o) => format!("stop:{o:?}") });
         Ok(outcome)
     }
 
@@ -782,7 +860,7 @@ impl Engine {
         let st = self.store();
         if st.set_title_if_empty(&session.id, &title).unwrap_or(false) {
             let cost = self.cfg.catalog.model(provider_id, model_id).and_then(|m| catalog::cost(m, &usage)).unwrap_or(0.0);
-            let _ = st.add_usage(&session.id, cost, &usage);
+            st.add_usage(&session.id, cost, &usage).log_err("store", "recording title usage");
             drop(st);
             ui.event(&UiEvent::Titled(&title));
         }
@@ -881,9 +959,18 @@ impl Engine {
             let st = self.store();
             st.last_snapshot(&session.id).ok().flatten().or_else(|| session.parent_id.as_ref().and_then(|p| st.last_snapshot(p).ok().flatten()))
         };
-        match self.snaps(session).capture(std::path::Path::new(&session.directory), prev.as_deref()) {
-            Ok(id) => Some(id),
+        let started = std::time::Instant::now();
+        let snaps = self.snaps(session);
+        match snaps.capture(std::path::Path::new(&session.directory), prev.as_deref()) {
+            Ok(id) => {
+                if crate::log::enabled(crate::log::Level::Debug, "snapshot") {
+                    let files = snaps.manifest(&id).map(|m| m.files.len().to_string()).unwrap_or_else(|_| "?".into());
+                    crate::log_debug!("snapshot", "captured session={} files={files} ms={}", session.id, started.elapsed().as_millis());
+                }
+                Some(id)
+            }
             Err(e) => {
+                crate::log_warn!("snapshot", "capture failed session={} after {} ms, snapshots are off for this session: {e}", session.id, started.elapsed().as_millis());
                 self.snapshot_off.lock().unwrap().insert(session.id.clone());
                 ui.event(&UiEvent::Notice(&format!("snapshots are off for this session (undo and diff unavailable): {e}")));
                 None
@@ -917,6 +1004,7 @@ impl Engine {
         }
         let r = self.undo_inner(sid);
         self.store().release(sid)?;
+        crate::log_info!("engine", "undo session={sid}: {}", describe_undo(&r));
         r
     }
 
@@ -974,6 +1062,7 @@ impl Engine {
             Ok(UndoResult::Done(report))
         })();
         self.store().release(sid)?;
+        crate::log_info!("engine", "redo session={sid}: {}", describe_undo(&r));
         r
     }
 
@@ -1033,6 +1122,8 @@ impl Engine {
         let update = compaction::has_checkpoint(&eff);
         let before: u64 = eff.iter().map(compaction::estimate).sum();
         let limit = self.cfg.catalog.model(&provider_id, &model_id).map(|m| m.limit.context).filter(|l| *l > 0);
+        crate::log_info!("engine", "compaction start session={sid} trigger={trigger} replacing={k} messages, about {before} tokens, model={provider_id}/{model_id}");
+        let compaction_started = std::time::Instant::now();
         ui.event(&UiEvent::Status(&format!("compacting {k} message(s) ({trigger})...")));
 
         let mut portion: Vec<crate::store::Message> = eff[..k].to_vec();
@@ -1087,10 +1178,12 @@ impl Engine {
             }
         }
         if let Some(e) = failure {
+            crate::log_warn!("engine", "compaction failed session={sid} trigger={trigger}: {e}");
             return Ok(CompactResult::Failed(e));
         }
         let summary = reply.trim().to_string();
         if summary.is_empty() {
+            crate::log_warn!("engine", "compaction failed session={sid} trigger={trigger}: the model returned an empty summary");
             return Ok(CompactResult::Failed("the model returned an empty summary".into()));
         }
         let after: u64 = compaction::estimate_text(&summary) + eff[k..].iter().map(compaction::estimate).sum::<u64>();
@@ -1100,6 +1193,7 @@ impl Engine {
             let cost = self.cfg.catalog.model(&provider_id, &model_id).and_then(|m| catalog::cost(m, &usage_total)).unwrap_or(0.0);
             st.add_usage(sid, cost, &usage_total)?;
         }
+        crate::log_info!("engine", "compaction done session={sid} trigger={trigger} tokens {before} -> {after} ms={}", compaction_started.elapsed().as_millis());
         ui.event(&UiEvent::Status(&format!("compacted: about {} -> {} tokens", human_tokens(before), human_tokens(after))));
         Ok(CompactResult::Compacted { before, after })
     }
@@ -1120,6 +1214,7 @@ impl Engine {
                     attempt += 1;
                     match retry::delay(attempt, &e, (self.cfg.jitter)()) {
                         Some(wait) if !cancel.load(Ordering::Relaxed) => {
+                            crate::log_warn!("engine", "retry summary request attempt={attempt} wait_ms={}: {}", wait.as_millis(), e.message());
                             ui.event(&UiEvent::Retry { attempt, wait, error: &e.message() });
                             (self.cfg.sleep)(wait, cancel);
                             if cancel.load(Ordering::Relaxed) {
@@ -1169,17 +1264,22 @@ impl Engine {
                     ui.event(&UiEvent::ToolStarted { name: &name, input: &input });
                     parts.push(chat::tool_part(&id, &name, &input));
                     let idx = parts.len() - 1;
-                    let _ = self.store().set_message_parts(msg_id, &parts);
+                    self.store().set_message_parts(msg_id, &parts).log_err("store", "saving a tool call");
                     let tool = step_tools.iter().find(|t| t.name() == name).map(|t| t.as_ref());
                     let (cwd, root, spill) = (cwd.clone(), root.clone(), spill.clone());
                     handles.push((
                         idx,
-                        s.spawn(move || match tool {
-                            None => Err(ToolError::fail(format!("Unknown tool: {name}"))),
-                            Some(t) => {
-                                let host = EngineHost { engine: self, session, ui, cancel };
-                                t.run(&input, &ToolCtx { formatters: &self.cfg.formatters, media: caps, session_id: &session.id, host: &host, cwd, project_root: root, spill_dir: spill, permitter, cancel })
-                            }
+                        s.spawn(move || {
+                            let started = std::time::Instant::now();
+                            let outcome = match tool {
+                                None => Err(ToolError::fail(format!("Unknown tool: {name}"))),
+                                Some(t) => {
+                                    let host = EngineHost { engine: self, session, ui, cancel };
+                                    t.run(&input, &ToolCtx { formatters: &self.cfg.formatters, media: caps, session_id: &session.id, host: &host, cwd, project_root: root, spill_dir: spill, permitter, cancel })
+                                }
+                            };
+                            log_tool(&name, &outcome, started.elapsed());
+                            outcome
                         }),
                     ));
                 }
@@ -1194,7 +1294,7 @@ impl Engine {
                     if let Some(p) = out.metadata["path"].as_str() {
                         let st = self.store();
                         for ins in instructions::discover_between(std::path::Path::new(p), &cwd) {
-                            let _ = st.add_instruction(&session.id, &ins.to_string_lossy());
+                            st.add_instruction(&session.id, &ins.to_string_lossy()).log_err("store", "remembering an instruction file");
                         }
                     }
                 }
@@ -1214,10 +1314,24 @@ impl Engine {
                 for a in out.take_media() {
                     match blobs::put(&self.cfg.app_dir, &a.bytes) {
                         Ok(hash) => media.push(json!({"mediaType": a.media_type, "blob": hash, "size": a.bytes.len(), "name": a.name})),
-                        Err(e) => out.text.push_str(&format!("\n[could not store the attachment {}: {e}]", a.name)),
+                        Err(e) => {
+                            crate::log_warn!("tool", "{name}: could not store the attachment {}: {e}", a.name);
+                            out.text.push_str(&format!("\n[could not store the attachment {}: {e}]", a.name))
+                        }
                     }
                 }
-                let text = crate::truncate::truncate(&out.text, spill).map(|t| t.text).unwrap_or(out.text);
+                let text = match crate::truncate::truncate(&out.text, spill) {
+                    Ok(t) => {
+                        if let Some(p) = &t.output_path {
+                            crate::log_debug!("tool", "{name} output truncated; the full text is in {}", p.display());
+                        }
+                        t.text
+                    }
+                    Err(e) => {
+                        crate::log_warn!("tool", "{name}: could not save the long output to {}: {e}", spill.display());
+                        out.text
+                    }
+                };
                 let text = if text.is_empty() { "(no output)".to_string() } else { text };
                 ui.event(&UiEvent::ToolFinished { name, ok: true, text: &text });
                 let mut state = json!({"status":"completed","output":text,"metadata":out.metadata});
@@ -1310,17 +1424,18 @@ impl EnginePermitter<'_> {
         }
         let parsed = tools::shellparse::parse(command);
         if classifier::never_classify(&parsed) {
+            crate::log_debug!("classifier", "session={} skipped (opaque or never-classify list): {}", c.session.id, classifier::sanitize(command, 200));
             return false;
         }
         let saved = self.store.lock().unwrap_or_else(|e| e.into_inner()).saved_permissions(&self.project_id).unwrap_or_default();
         if !permission::only_default_asks(&req.action, &req.resources, &self.rules, &saved) {
+            crate::log_debug!("classifier", "session={} skipped (an explicit rule decides): {}", c.session.id, classifier::sanitize(command, 200));
             return false;
         }
         match c.engine.classify_command(c.session, command, &parsed, c.settings, self.ui, c.cancel) {
             classifier::Verdict::Allow { risk, reason } => {
-                let shown = classifier::sanitize(command, 100);
-                // Status, not Notice: an allowed command is not an error and must not be drawn like one.
-                self.ui.event(&UiEvent::Status(&if reason.is_empty() { format!("auto: {risk}: {shown}") } else { format!("auto: {risk}: {shown} ({reason})") }));
+                // Its own event, not a Notice: an allowed command is not an error, and the TUI marks the tool row with it.
+                self.ui.event(&UiEvent::AutoAllowed { command: &classifier::sanitize(command, 100), risk: &risk, reason: &reason });
                 true
             }
             classifier::Verdict::Ask { reason } => {
@@ -1364,7 +1479,7 @@ impl Permitter for EnginePermitter<'_> {
                     Reply::Always => {
                         let st = self.store.lock().unwrap_or_else(|e| e.into_inner());
                         for pat in &req.save {
-                            let _ = st.save_permission(&self.project_id, &req.action, pat);
+                            st.save_permission(&self.project_id, &req.action, pat).log_err("store", "saving an always-allow rule");
                         }
                         Ok(())
                     }
@@ -1415,6 +1530,7 @@ mod tests {
             UiEvent::Retry { attempt, wait, .. } => format!("retry:{attempt}:{}", wait.as_secs()),
             UiEvent::StepUsage { .. } => "usage".into(),
             UiEvent::ClassifierUsage { .. } => "classifier-usage".into(),
+            UiEvent::AutoAllowed { command, risk, reason } => format!("auto:{risk}:{command}:{reason}"),
             UiEvent::Notice(n) => format!("notice:{n}"),
             UiEvent::Status(n) => format!("status:{n}"),
             UiEvent::Todos(t) => format!("todos:{}", t.len()),
@@ -2231,8 +2347,8 @@ mod tests {
         assert_eq!(f.run(&ui), RunOutcome::Idle);
         assert_eq!(f.fake.classifier_requests.lock().unwrap().len(), 1, "the second identical command is not classified again");
         let n = notices(&ui);
-        assert_eq!(n[0], "status:auto: read-only: echo hi (because)");
-        assert_eq!(n[1], "status:auto: allowed earlier: echo hi");
+        assert_eq!(n[0], "auto:read-only:echo hi:because");
+        assert_eq!(n[1], "auto:allowed earlier:echo hi:");
         let req = f.fake.classifier_requests.lock().unwrap()[0].clone();
         assert_eq!(req.system, classifier::SYSTEM);
         assert!(req.tools.is_empty() && req.messages.len() == 1, "no conversation history goes to the classifier");
@@ -2383,6 +2499,75 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(10));
         assert_eq!(ui.asked.lock().unwrap().len(), 1);
         assert!(notices(&ui).iter().any(|n| n.contains("did not answer in time")));
+    }
+
+    /// The classifier lines logged for one session, oldest first (the `session=` field is unique per test).
+    fn classifier_log(sid: &str, level: &str) -> Vec<String> {
+        crate::log::capture::global_lines(&format!("session={sid}")).into_iter().filter(|l| l.starts_with(&format!("{level} classifier:"))).collect()
+    }
+
+    #[test]
+    fn every_classifier_decision_is_logged_and_listed_by_permissions() {
+        crate::log::capture::ensure_global("debug");
+        let f = fixture_cfg(shell_twice("echo hi"), auto_careful_with(Some(Default::default()), vec![]));
+        f.fake.script_verdicts(vec![verdict("allow", "read-only")]);
+        f.say("go");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        let sid = &f.session.id;
+        let lines = classifier_log(sid, "INFO");
+        assert_eq!(lines.len(), 2, "one line per decision, the repeat included: {lines:?}");
+        for part in ["decision=allow", "model_verdict=allow", "risk=read-only", "model=anthropic/claude-haiku-5-5", " ms=", "tokens_in=", "tokens_out=", "cost=", "reason=because", "command=echo hi"] {
+            assert!(lines[0].contains(part), "{part} missing from {}", lines[0]);
+        }
+        assert!(lines[1].contains("decision=allow cached=true") && lines[1].contains("command=echo hi"), "{}", lines[1]);
+        assert!(!classifier_log(sid, "DEBUG").is_empty(), "the raw reply is kept at debug");
+
+        // What `/permissions` shows: the mode, the model, the command (once, not per repeat) and the saved rules.
+        let report = f.engine.permissions_report(sid).unwrap();
+        assert!(report[0].contains("permission mode: auto") && report[0].contains("on (anthropic/claude-haiku-5-5)"), "{report:?}");
+        assert_eq!(report[1], "allowed automatically in this session: 1");
+        assert!(report[2].contains("read-only") && report[2].contains("echo hi") && report[2].contains("(because)"), "{report:?}");
+        assert_eq!(report[3], "saved \"always allow\" rules for this project: 0");
+        f.engine.store().save_permission(&f.session.project_id, "shell", "cargo test *").unwrap();
+        assert!(f.engine.permissions_report(sid).unwrap().iter().any(|l| l.contains("shell") && l.contains("cargo test *")));
+
+        // The other states are described honestly.
+        f.engine.store().set_permission_mode(sid, Some("manual")).unwrap();
+        assert!(f.engine.permissions_report(sid).unwrap()[0].contains("idle (it only works in auto mode)"));
+        let off = fixture_cfg(vec![text("hi")], auto_careful_with(None, vec![]));
+        assert!(off.engine.permissions_report(&off.session.id).unwrap()[0].contains("off (permission_classifier.enabled is false)"));
+    }
+
+    #[test]
+    fn declines_timeouts_and_skips_are_logged_with_their_cause() {
+        crate::log::capture::ensure_global("debug");
+        // The model advises against it: logged with the model's own words, and the user is asked.
+        let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "make"})), text("done")], auto_careful_with(Some(Default::default()), vec![]));
+        f.fake.script_verdicts(vec![verdict("deny", "destructive")]);
+        f.say("go");
+        assert_eq!(f.run(&TestUi::replying(vec![Reply::Once])), RunOutcome::Idle);
+        let lines = classifier_log(&f.session.id, "INFO");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("decision=ask model_verdict=deny risk=destructive") && lines[0].contains("command=make"), "{}", lines[0]);
+        assert_eq!(f.engine.store().auto_allows(&f.session.id).unwrap().len(), 0, "only allows are listed");
+
+        // No answer in time: the cause is in the log.
+        let settings = classifier::Settings { timeout: Duration::from_millis(150), ..Default::default() };
+        let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "echo hi"})), text("done")], auto_careful_with(Some(settings), vec![]));
+        f.fake.delay_classifier(Duration::from_secs(30));
+        f.fake.script_verdicts(vec![verdict("allow", "read-only")]);
+        f.say("go");
+        assert_eq!(f.run(&TestUi::replying(vec![Reply::Once])), RunOutcome::Idle);
+        let lines = classifier_log(&f.session.id, "INFO");
+        assert!(lines.len() == 1 && lines[0].contains("decision=ask") && lines[0].contains("no answer within 150 ms"), "{lines:?}");
+
+        // Commands that are never sent to the model leave a debug line saying why, and no verdict.
+        let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "sudo ls"})), text("done")], auto_careful_with(Some(Default::default()), vec![]));
+        f.say("go");
+        assert_eq!(f.run(&TestUi::replying(vec![Reply::Once])), RunOutcome::Idle);
+        assert!(classifier_log(&f.session.id, "INFO").is_empty());
+        let skipped = classifier_log(&f.session.id, "DEBUG");
+        assert!(skipped.len() == 1 && skipped[0].contains("skipped (opaque or never-classify list)") && skipped[0].contains("sudo ls"), "{skipped:?}");
     }
 
     #[test]

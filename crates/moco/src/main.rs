@@ -250,6 +250,11 @@ impl Ui for Terminal {
                 self.newline_if_needed();
                 println!("{DIM}{n}{RESET}");
             }
+            UiEvent::AutoAllowed { command, risk, reason } => {
+                self.newline_if_needed();
+                println!("{DIM}  auto: {risk}{}{RESET}", if reason.is_empty() { String::new() } else { format!(" ({reason})") });
+                let _ = command; // the line belongs to the tool call printed just above
+            }
         }
         let _ = std::io::stdout().flush();
     }
@@ -477,6 +482,7 @@ fn main() {
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let mut raw: Vec<String> = std::env::args().skip(1).collect();
     let app_dir = auth::app_dir();
+    moco_core::log::init(&app_dir);
 
     // Subcommands that need no session.
     match raw.first().map(String::as_str) {
@@ -523,6 +529,38 @@ fn main() {
                     if !all && list.is_empty() {
                         println!("{DIM}(only sessions started in {} are shown; use --all for every directory){RESET}", tilde(&cwd));
                     }
+                }
+            }
+            return;
+        }
+        Some("logs") => {
+            let rest: Vec<&str> = raw.iter().skip(1).map(String::as_str).collect();
+            let follow = rest.iter().any(|a| matches!(*a, "--follow" | "-f"));
+            if rest.contains(&"--path") {
+                println!("{}", moco_core::log::log_dir(&app_dir).display());
+                return;
+            }
+            let n = rest.iter().position(|a| matches!(*a, "--lines" | "-n")).and_then(|i| rest.get(i + 1)).map(|v| v.parse::<usize>().unwrap_or_else(|_| die("--lines needs a number"))).unwrap_or(100);
+            if let Some(bad) = rest.iter().find(|a| a.starts_with('-') && !matches!(**a, "--follow" | "-f" | "--lines" | "-n" | "--path")) {
+                die(&format!("unknown option {bad}; usage: moco logs [--follow] [--lines N] [--path]"));
+            }
+            match moco_core::log::latest_file(&app_dir) {
+                Some(path) => {
+                    let text = moco_core::log::read_tail(&path, n).unwrap_or_else(|e| die(&format!("{}: {e}", path.display())));
+                    print!("{text}");
+                }
+                None if !follow => println!("{DIM}(no log yet in {}; set MOCO_LOG=info or debug to record more){RESET}", moco_core::log::log_dir(&app_dir).display()),
+                None => {}
+            }
+            if follow {
+                let mut f = moco_core::log::Follow::new(&app_dir, true);
+                loop {
+                    let new = f.poll();
+                    if !new.is_empty() {
+                        print!("{new}");
+                        let _ = std::io::stdout().flush();
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(400));
                 }
             }
             return;
@@ -578,7 +616,7 @@ fn main() {
             }
             "--help" | "-h" => {
                 println!(
-                    "usage: moco [--continue | --session ID] [--model PROVIDER/MODEL] [--agent ID] [--permission-mode manual|auto] [--effort LEVEL] [--dir PATH] [-p PROMPT] [--plain] [--version]\n       moco sessions [--all] [--archived] | rename ID TITLE | archive ID | unarchive ID\n       moco models [FILTER] [--refresh]\n       moco auth PROVIDER"
+                    "usage: moco [--continue | --session ID] [--model PROVIDER/MODEL] [--agent ID] [--permission-mode manual|auto] [--effort LEVEL] [--dir PATH] [-p PROMPT] [--plain] [--version]\n       moco sessions [--all] [--archived] | rename ID TITLE | archive ID | unarchive ID\n       moco models [FILTER] [--refresh]\n       moco auth PROVIDER\n       moco logs [--follow] [--lines N] [--path]\n\nlogging: MOCO_LOG=error|warn|info|debug|trace (default warn; `warn,mcp=trace` sets one target) or the `log` config key.\n         Files: <data dir>/data/logs/moco-YYYY-MM-DD.log (7 days kept). Nothing is ever printed to the terminal."
                 );
                 return;
             }
@@ -604,6 +642,8 @@ fn main() {
         eprintln!("warning: config: {w}");
     }
     let cfg = loaded.config;
+    moco_core::log::configure(cfg.log.as_deref());
+    moco_core::log_info!("main", "start dir={} sources={}", cwd_str, loaded.sources.len());
     if let (Some(sh), None) = (&cfg.shell, std::env::var_os("MOCO_SHELL")) {
         std::env::set_var("MOCO_SHELL", sh);
     }
@@ -881,6 +921,14 @@ fn main() {
                     Err(e) => eprintln!("{RED}{e}{RESET}"),
                 }
             }
+            "/permissions" => match engine.permissions_report(&session.id) {
+                Ok(lines) => {
+                    for l in lines {
+                        println!("{DIM}{l}{RESET}");
+                    }
+                }
+                Err(e) => eprintln!("{RED}{e}{RESET}"),
+            },
             l if l == "/jobs" || l.starts_with("/jobs ") => {
                 let arg = l.trim_start_matches("/jobs").trim();
                 if let Some(id) = arg.strip_prefix("output") {
@@ -958,7 +1006,7 @@ fn main() {
                 }
             }
             "/help" => println!(
-                "/model [FILTER|PROVIDER/MODEL]  show, search or switch the model\n/agent <id>                     switch agent\n/mode [manual|auto]             ask before acting (manual, the default) or run tools without asking (auto)\n/effort [level|default]          reasoning effort for models that offer levels\n/compact                        summarize older messages to free up context\n/sessions [all|archived]       list sessions (/resume <n|id> to continue one)\n/rename <title>                 name this session\n/fork [N]                       copy this conversation into a new session\n/archive [n|id]                 hide a session from the list (/unarchive to restore)\n/undo, /redo                    undo the last turn's file changes and messages, or bring them back\n/diff                           changes in the working tree since this session started\n/new                            start a new session\n/jobs                           background commands and subagents (output <id>, kill <id>)\n!<command>                      run a shell command yourself; the assistant is told\n/skills, /commands, /mcp       list skills, custom slash commands (also MCP prompts) and MCP servers (@name mentions a skill, agent or file)\n/exit                           quit (Ctrl-C interrupts a running turn)"
+                "/model [FILTER|PROVIDER/MODEL]  show, search or switch the model\n/agent <id>                     switch agent\n/mode [manual|auto]             ask before acting (manual, the default) or run tools without asking (auto)\n/effort [level|default]          reasoning effort for models that offer levels\n/compact                        summarize older messages to free up context\n/sessions [all|archived]       list sessions (/resume <n|id> to continue one)\n/rename <title>                 name this session\n/fork [N]                       copy this conversation into a new session\n/archive [n|id]                 hide a session from the list (/unarchive to restore)\n/undo, /redo                    undo the last turn's file changes and messages, or bring them back\n/diff                           changes in the working tree since this session started\n/new                            start a new session\n/jobs                           background commands and subagents (output <id>, kill <id>)\n/permissions                    what the classifier allowed automatically, and the saved always-allow rules\n!<command>                      run a shell command yourself; the assistant is told\n/skills, /commands, /mcp       list skills, custom slash commands (also MCP prompts) and MCP servers (@name mentions a skill, agent or file)\n/exit                           quit (Ctrl-C interrupts a running turn)"
             ),
             l if l == "/sessions" || l.starts_with("/sessions ") => {
                 let which = l.trim_start_matches("/sessions").trim();

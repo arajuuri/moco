@@ -204,6 +204,8 @@ pub struct Config {
     pub snapshots: Option<bool>,
     /// `provider/model` for small background jobs such as titles (default: the session's model).
     pub small_model: Option<String>,
+    /// Diagnostic log filter, as for `MOCO_LOG`: `"debug"`, `"warn,mcp=trace"`. `MOCO_LOG` wins when set.
+    pub log: Option<String>,
     pub providers: BTreeMap<String, ProviderConfig>,
     /// `provider/model`
     pub model: Option<String>,
