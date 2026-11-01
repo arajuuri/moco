@@ -1267,6 +1267,8 @@ impl Engine {
                 Event::ToolCall { id, name, input } => {
                     text_idx = None;
                     dispatched = true;
+                    // Claude Code's argument names become ours before anything sees the call (see `normalize_input`).
+                    let input = tools::normalize_input(&name, input);
                     ui.event(&UiEvent::ToolStarted { id: &id, name: &name, input: &input });
                     parts.push(chat::tool_part(&id, &name, &input));
                     let idx = parts.len() - 1;
@@ -1657,6 +1659,54 @@ mod tests {
         let m = f.msgs();
         assert_eq!(m[1].data["parts"][0]["state"]["status"], "completed");
         assert_eq!(ui.log(), ["start:read", "done:read:true", "usage", "text:it says hi", "usage"]);
+    }
+
+    /// Issue #6 through the whole engine: a model that sends one `edit` per hunk for the same file in one step gets
+    /// every hunk applied, however the threads are scheduled.
+    #[test]
+    fn parallel_edits_to_one_file_in_one_step_all_land() {
+        let n = 10;
+        let mut events: Vec<Event> = (0..n).map(|i| Event::ToolCall { id: format!("e{i}"), name: "edit".into(), input: json!({"path":"a.txt","oldString":format!("slot{i}=old"),"newString":format!("slot{i}=new")}) }).collect();
+        events.push(Event::Finish { reason: FinishReason::ToolUse, usage: Usage::default() });
+        let f = fixture(vec![Scripted::Events(events), text("done")]);
+        f.file("a.txt", &(0..n).map(|i| format!("slot{i}=old\n")).collect::<String>());
+        f.say("rename every slot");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        let after = std::fs::read_to_string(f.dir.join("work/a.txt")).unwrap();
+        assert_eq!(after.matches("=new").count(), n, "every edit landed:\n{after}");
+        let reqs = f.fake.requests.lock().unwrap();
+        let results = last_user_blocks(&reqs[1]);
+        assert_eq!(results.len(), n);
+        assert!(results.iter().all(|b| matches!(b, Block::ToolResult { is_error: false, .. })), "{results:?}");
+    }
+
+    /// A model that uses Claude Code's argument names gets the same result, and the stored call, which is what later
+    /// requests replay, carries our names.
+    #[test]
+    fn claude_code_argument_names_work_for_read_write_and_edit() {
+        let f = fixture(vec![
+            tool_call("r", "read", json!({"file_path":"a.txt"})),
+            tool_call("e", "edit", json!({"file_path":"a.txt","old_string":"one","new_string":"1"})),
+            tool_call("m", "edit", json!({"file_path":"a.txt","edits":[{"old_string":"two","new_string":"2"}]})),
+            tool_call("w", "write", json!({"file_path":"b.txt","content":"made"})),
+            text("done"),
+        ]);
+        f.file("a.txt", "one two\n");
+        f.say("go");
+        let ui = TestUi::default();
+        assert_eq!(f.run(&ui), RunOutcome::Idle);
+        assert_eq!(std::fs::read_to_string(f.dir.join("work/a.txt")).unwrap(), "1 2\n");
+        assert_eq!(std::fs::read_to_string(f.dir.join("work/b.txt")).unwrap(), "made");
+        let reqs = f.fake.requests.lock().unwrap();
+        let errors: Vec<Block> = reqs.iter().flat_map(|r| last_user_blocks(r)).filter(|b| matches!(b, Block::ToolResult { is_error: true, .. })).collect();
+        assert!(errors.is_empty(), "{errors:?}");
+        // What was stored (and is replayed to the model on later steps) uses our names.
+        let stored: Vec<Value> = f.msgs().into_iter().flat_map(|m| m.data["parts"].as_array().cloned().unwrap_or_default()).filter(|p| p["type"] == "tool").collect();
+        let input = |id: &str| stored.iter().find(|p| p["id"] == id).unwrap()["input"].clone();
+        assert_eq!(input("r"), json!({"path":"a.txt"}));
+        assert_eq!(input("e"), json!({"path":"a.txt","oldString":"one","newString":"1"}));
+        assert_eq!(input("m"), json!({"path":"a.txt","edits":[{"oldString":"two","newString":"2"}]}));
+        assert_eq!(input("w"), json!({"path":"b.txt","content":"made"}));
     }
 
     #[test]

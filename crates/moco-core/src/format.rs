@@ -148,6 +148,14 @@ pub fn note(outcome: &Outcome) -> Option<String> {
     }
 }
 
+/// Like `note`, but when the lines the formatter changed are known they replace the advice to read the file again.
+pub fn note_with_changes(outcome: &Outcome, changes: Option<String>) -> Option<String> {
+    match (outcome, changes) {
+        (Outcome::Changed { name }, Some(c)) => Some(format!("Formatted with {name}: the file now differs from what you wrote in these lines (every other line is as you wrote it, so there is no need to read the file again):\n{c}")),
+        _ => note(outcome),
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;

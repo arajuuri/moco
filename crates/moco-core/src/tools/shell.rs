@@ -173,7 +173,7 @@ impl Tool for Shell {
         format!(
             "Run a shell command in the working directory (or `workdir`). stdout and stderr are combined. \
 Default timeout is 120000 ms (0 disables). Long output is truncated to its last 2000 lines / 50 KiB; the full output is saved to a file. \
-Do not use interactive commands.\n\n{BACKGROUND_INSTRUCTION}"
+Do not use interactive commands. Do not use this tool to create or change files (python or perl scripts, `sed -i`, `awk`, redirection such as `>` or `>>`, `tee`, heredocs) when the edit, write or patch tool can do it; if an edit fails, correct the edit call and retry it.\n\n{BACKGROUND_INSTRUCTION}"
         )
     }
     fn schema(&self) -> Value {
@@ -238,6 +238,13 @@ Do not use interactive commands.\n\n{BACKGROUND_INSTRUCTION}"
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_description_sends_file_changes_to_the_edit_tools() {
+        let d = super::Shell.description();
+        assert!(d.contains("Do not use this tool to create or change files") && d.contains("`sed -i`") && d.contains("edit, write or patch"), "{d}");
+        assert!(d.contains("correct the edit call and retry it"), "{d}");
+    }
+
     use super::super::testutil::Env;
     use super::*;
     use std::sync::atomic::Ordering;
