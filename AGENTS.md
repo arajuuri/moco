@@ -20,6 +20,10 @@ moco -p "prompt"                    # one-shot; bare `moco` is the interactive T
 - Credentials: the provider's env var (e.g. `ANTHROPIC_API_KEY`) or `~/Library/Application Support/moco/auth.json` (`{"anthropic": {"key": "..."}}`, mode 600). `MOCO_HOME` moves the data directory; **always point it at a temp dir** when experimenting with auth, sessions or the catalog cache. Other overrides: `MOCO_CONFIG`, `MOCO_MODEL`, `MOCO_SHELL`, `MOCO_ASCII`. Subcommands: `moco auth|models|sessions`.
 - `scripts/update-catalog-snapshot.py` regenerates `crates/moco-core/src/catalog_snapshot.json`. `scripts/tui-gallery.py` renders `tui/gallery.rs` sample screens to PNG (`MOCO_GALLERY=dir`) so you can look at a TUI change.
 
+## Issues and project board
+
+Track work with GitHub's fields, not labels or title prefixes: issue Type (Bug, Feature, Enhancement, Task), Priority (Urgent/High/Medium/Low), and on the Moco project Status, Size and Estimate (hours). Area labels (`security`, `stability`, `performance`, `error-handling`, `code-quality`) are separate. Don't put `[High]` or `[Bug]` in titles or recreate the old `bug`/`enhancement`/`priority:` labels. Definitions and `gh` recipes are in `CONTRIBUTING.md`.
+
 ## Architecture
 
 `crates/moco-core` is the UI-independent engine. `crates/moco` is the front end: line-based chat and one-shot in `main.rs`, and the ratatui UI in `tui/`. `app.rs` is a pure model (`update`/`render`, tested via `TestBackend`) and `mod.rs` is the event loop with the engine on a worker thread. Pty tests are `tests/tui.rs` + `tui_pty.py`; the plan is `docs/12-tui-plan.md`. `spike/` and `spike-tui/` are standalone probes with their own workspaces. Don't build them as part of the workspace.
