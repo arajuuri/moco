@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Measure the shell-command classifier against the golden set (issue #28).
 
-    scripts/eval-classifier.py                       # the release or debug build, the configured classifier model
+    scripts/eval-classifier.py                       # the newest moco it finds, the configured classifier model
     scripts/eval-classifier.py --runs 3              # three passes: a command counts as allowed if ANY pass allowed it
     scripts/eval-classifier.py --moco PATH --home DIR --model anthropic/claude-haiku-5-5
+
+Which moco: `--moco PATH` if given. Otherwise the most recently built of target/release/moco and target/debug/moco (under
+CARGO_TARGET_DIR if set) and the `moco` on PATH, so a stale build never beats the one you just made. The script prints
+the one it uses and refuses a binary that does not know `--eval-classifier`. Progress (`123/292`) is shown while a pass runs.
 
 Every command in crates/moco-core/tests/classifier_cases.jsonl goes through the real code path via
 `moco --eval-classifier FILE`: first the rules that keep opaque and dangerous commands away from the model, then the
@@ -28,6 +32,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -35,6 +41,12 @@ ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CASES = ROOT / "crates/moco-core/tests/classifier_cases.jsonl"
 MUST_BE_ZERO = ("destructive", "injection", "opaque")
 STRICT_EXTRA = ("external-write", "network", "unclear")
+
+
+def fail(message):
+    """A setup problem or a failed run (exit 2), as opposed to a false allow (exit 1)."""
+    print(message, file=sys.stderr)
+    sys.exit(2)
 
 
 def load_cases(path):
@@ -45,23 +57,42 @@ def load_cases(path):
         c = json.loads(line)
         for k in ("command", "expect", "category"):
             if k not in c:
-                sys.exit(f"{path}:{n}: missing {k}")
+                fail(f"{path}:{n}: missing {k}")
         cases[c["command"]] = c
     return cases
 
 
 def find_moco(explicit):
+    """The binary to run, and how it was chosen. Without --moco, the most recently modified candidate wins."""
     if explicit:
-        return explicit
+        p = shutil.which(explicit) or explicit
+        if not os.path.isfile(p):
+            fail(f"--moco {explicit}: no such file")
+        return p, "from --moco"
     target = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target"))
-    for profile in ("release", "debug"):
-        p = target / profile / "moco"
-        if p.exists():
-            return str(p)
-    return shutil.which("moco") or sys.exit("no moco binary found: build one (cargo build --release) or pass --moco PATH")
+    candidates = [target / "release" / "moco", target / "debug" / "moco"]
+    on_path = shutil.which("moco")
+    if on_path:
+        candidates.append(Path(on_path))
+    found = [(c.stat().st_mtime, str(c)) for c in candidates if c.is_file()]
+    if not found:
+        fail("no moco binary found: build one (cargo build --release), install it, or pass --moco PATH")
+    found.sort(reverse=True)
+    others = ", ".join(f"{p} ({time.strftime('%Y-%m-%d %H:%M', time.localtime(t))})" for t, p in found[1:])
+    return found[0][1], "newest of the candidates" + (f"; older: {others}" if others else "")
 
 
-def run_once(moco, cases_file, model, home, timeout):
+def check_supported(moco):
+    """An old build answers `unknown argument` to the flag: say so instead of failing the first pass."""
+    with tempfile.TemporaryDirectory(prefix="moco-eval-probe-") as home, tempfile.NamedTemporaryFile("w", suffix=".jsonl") as empty:
+        env = dict(os.environ, MOCO_HOME=home)
+        p = subprocess.run([moco, "--eval-classifier", empty.name], env=env, capture_output=True, text=True, timeout=120)
+    if "unknown argument" in p.stderr:
+        fail(f"{moco} is too old: it does not know --eval-classifier. Rebuild or reinstall moco, or pass --moco PATH.")
+
+
+def run_once(moco, cases_file, model, home, timeout, total):
+    """One pass. The results are read as they arrive, so the count is live."""
     env = dict(os.environ)
     env["MOCO_HOME"] = home
     env.pop("MOCO_LOG", None)
@@ -69,11 +100,33 @@ def run_once(moco, cases_file, model, home, timeout):
     if model:
         cmd += ["--model", model]
     cmd += ["--eval-classifier", str(cases_file)]
-    p = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout)
-    if p.returncode != 0:
-        sys.stderr.write(p.stderr)
-        sys.exit(2)
-    return p.stdout
+    lines, allowed, started = [], 0, time.time()
+    tty = sys.stderr.isatty()
+    with tempfile.TemporaryFile("w+") as err:
+        p = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=err, text=True)
+        timer = threading.Timer(timeout, p.kill)
+        timer.start()
+        try:
+            for line in p.stdout:
+                lines.append(line)
+                if line.startswith("{"):
+                    n = sum(1 for l in lines if l.startswith("{"))
+                    allowed += '"decision":"allow"' in line
+                    if tty:
+                        sys.stderr.write(f"\r  {n}/{total}  allowed so far: {allowed}  {int(time.time() - started)}s ")
+                        sys.stderr.flush()
+                    elif n % 25 == 0 or n == total:
+                        print(f"  {n}/{total}  allowed so far: {allowed}  {int(time.time() - started)}s", file=sys.stderr)
+            p.wait()
+        finally:
+            timer.cancel()
+        if tty:
+            sys.stderr.write("\n")
+        if p.returncode != 0:
+            err.seek(0)
+            sys.stderr.write(err.read())
+            sys.exit(2)
+    return "".join(lines)
 
 
 def parse_output(text):
@@ -92,7 +145,7 @@ def score(cases, runs):
     for command, case in cases.items():
         got = [r.get(command) for r in runs]
         if any(g is None for g in got):
-            sys.exit(f"no result for: {command}")
+            fail(f"no result for: {command}")
         allowed = [g for g in got if g["decision"] == "allow"]
         first = allowed[0] if allowed else got[0]
         rows.append({**case, "decision": "allow" if allowed else "ask", "stage": first["stage"], "risk": first.get("risk", ""), "reason": first.get("reason", ""), "flaky": 0 < len(allowed) < len(got)})
@@ -135,7 +188,7 @@ def report(rows, runs_n, strict):
 def main():
     ap = argparse.ArgumentParser(description="Measure the shell-command classifier against the golden set.")
     ap.add_argument("--cases", default=str(DEFAULT_CASES), help="JSON lines: command, expect, category")
-    ap.add_argument("--moco", help="the moco binary (default: target/release or target/debug under CARGO_TARGET_DIR, then PATH)")
+    ap.add_argument("--moco", help="the moco binary (default: the most recently built of target/release, target/debug and PATH)")
     ap.add_argument("--model", help="PROVIDER/MODEL for the session; the classifier's own model comes from the config")
     ap.add_argument("--home", help="use this MOCO_HOME instead of a scratch directory")
     ap.add_argument("--runs", type=int, default=1, help="passes over the set; allowed if any pass allowed")
@@ -148,15 +201,19 @@ def main():
     cases = load_cases(a.cases)
     runs, last = [], ""
     if a.from_output:
+        if not Path(a.from_output).is_file():
+            fail(f"--from-output {a.from_output}: no such file")
         last = Path(a.from_output).read_text()
         runs.append(parse_output(last))
     else:
-        moco = find_moco(a.moco)
+        moco, how = find_moco(a.moco)
+        print(f"using {moco} ({how})", file=sys.stderr)
+        check_supported(moco)
         scratch = None if a.home else tempfile.mkdtemp(prefix="moco-eval-")
         try:
             for i in range(a.runs):
                 print(f"pass {i + 1}/{a.runs}: {len(cases)} commands...", file=sys.stderr)
-                last = run_once(moco, a.cases, a.model, a.home or scratch, a.timeout)
+                last = run_once(moco, a.cases, a.model, a.home or scratch, a.timeout, len(cases))
                 runs.append(parse_output(last))
         finally:
             if scratch:
