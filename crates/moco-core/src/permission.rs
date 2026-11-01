@@ -103,9 +103,10 @@ impl PermissionMode {
 pub fn mode_rules(mode: PermissionMode) -> Vec<Rule> {
     match mode {
         PermissionMode::Auto => default_rules(),
-        // Ask for everything, then allow what only reads or plans: a prompt for every read would make the mode unusable.
+        // Ask for everything (a hard ask: nothing here is ever decided automatically, the classifier is for auto mode
+        // only), then allow what only reads or plans: a prompt for every read would make the mode unusable.
         PermissionMode::Manual => {
-            let mut rules = vec![Rule::soft_ask("*", "*")];
+            let mut rules = vec![Rule::new("*", "*", Effect::Ask)];
             rules.extend([
                 Rule::new("read", "*", Effect::Allow),
                 Rule::new("glob", "*", Effect::Allow),
@@ -237,15 +238,15 @@ mod tests {
     #[test]
     fn only_default_asks_are_open_to_the_classifier() {
         let manual = mode_rules(PermissionMode::Manual);
-        assert!(only_default_asks("shell", &res(&["ls -la"]), &manual, &[]));
+        assert!(!only_default_asks("shell", &res(&["ls -la"]), &manual, &[]), "manual mode is fully manual");
         assert!(only_default_asks("shell", &res(&["ls"]), &[], &[]), "no rule at all is a default ask");
-        let careful: Vec<Rule> = manual.iter().cloned().chain(preset_rules("careful").unwrap()).collect();
+        let careful: Vec<Rule> = mode_rules(PermissionMode::Auto).into_iter().chain(preset_rules("careful").unwrap()).collect();
         assert!(only_default_asks("shell", &res(&["make test"]), &careful, &[]));
         assert!(!only_default_asks("shell", &res(&["git push origin x"]), &careful, &[]), "the always-ask list is final");
         assert!(!only_default_asks("shell", &res(&["make", "sudo rm x"]), &careful, &[]));
         assert!(!only_default_asks("shell", &res(&["cat a"]), &careful, &[]), "nothing asks: nothing to classify");
         // A rule the user wrote is explicit even when it looks like the default one.
-        let mut user = manual.clone();
+        let mut user = careful.clone();
         user.push(Rule::new("shell", "*", Effect::Ask));
         assert!(!only_default_asks("shell", &res(&["make"]), &user, &[]));
         user.push(Rule::new("shell", "make", Effect::Deny));

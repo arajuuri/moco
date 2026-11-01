@@ -648,7 +648,8 @@ impl Engine {
             ui,
             declined: &declined,
             ask_lock: &self.prompt_lock,
-            classify: self.cfg.classifier.as_ref().filter(|s| s.background || !ui.unattended()).map(|settings| classify::ClassifyCtx { engine: self, session: &session, settings, cancel }),
+            // Manual mode is fully manual: the classifier only ever works in auto mode.
+            classify: self.cfg.classifier.as_ref().filter(|_| self.permission_mode_of(&session) == PermissionMode::Auto).filter(|s| s.background || !ui.unattended()).map(|settings| classify::ClassifyCtx { engine: self, session: &session, settings, cancel }),
         };
 
         let mut retries = 0u32;
@@ -2182,14 +2183,16 @@ mod tests {
         text(&format!(r#"{{"verdict":"{v}","risk":"{risk}","reason":"because"}}"#))
     }
 
-    fn manual_with(settings: Option<classifier::Settings>, more: Vec<Rule>) -> impl FnOnce(&mut EngineConfig) {
+    /// Auto mode with the careful preset: the one place a default (soft) ask exists for the classifier to relax.
+    fn auto_careful_with(settings: Option<classifier::Settings>, more: Vec<Rule>) -> impl FnOnce(&mut EngineConfig) {
         move |c| {
-            let mut manual = agent::builtin_for(PermissionMode::Manual);
-            for a in &mut manual {
+            let mut auto = agent::builtin_for(PermissionMode::Auto);
+            for a in &mut auto {
+                a.permissions.extend(permission::preset_rules("careful").unwrap());
                 a.permissions.extend(more.iter().cloned());
             }
-            c.permission_mode = PermissionMode::Manual;
-            c.agents_by_mode = BTreeMap::from([(PermissionMode::Manual, manual), (PermissionMode::Auto, agent::builtin_for(PermissionMode::Auto))]);
+            c.permission_mode = PermissionMode::Auto;
+            c.agents_by_mode = BTreeMap::from([(PermissionMode::Manual, agent::builtin_for(PermissionMode::Manual)), (PermissionMode::Auto, auto)]);
             // A model with a catalog price, so cost is real (and the no-price notice stays out of the way).
             c.small_model = Some(PRICED.into());
             c.classifier = settings;
@@ -2207,8 +2210,20 @@ mod tests {
     }
 
     #[test]
+    fn manual_mode_is_fully_manual_and_never_calls_the_classifier() {
+        let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "echo hi"})), text("done")], auto_careful_with(Some(Default::default()), vec![]));
+        f.engine.store().set_permission_mode(&f.session.id, Some("manual")).unwrap();
+        f.fake.script_verdicts(vec![verdict("allow", "read-only")]);
+        f.say("go");
+        let ui = TestUi::replying(vec![Reply::Once]); // the one prompt is answered; a second would panic
+        assert_eq!(f.run(&ui), RunOutcome::Idle);
+        assert!(f.fake.classifier_requests.lock().unwrap().is_empty(), "manual mode asks the user, nothing is classified");
+        assert!(ui.replies.lock().unwrap().is_empty(), "the prompt was shown");
+    }
+
+    #[test]
     fn the_classifier_allows_a_routine_command_once_and_remembers_it() {
-        let f = fixture_cfg(shell_twice("echo hi"), manual_with(Some(Default::default()), vec![]));
+        let f = fixture_cfg(shell_twice("echo hi"), auto_careful_with(Some(Default::default()), vec![]));
         f.fake.script_verdicts(vec![verdict("allow", "read-only")]);
         f.say("go");
         let ui = TestUi::default(); // a prompt would panic
@@ -2230,7 +2245,7 @@ mod tests {
     #[test]
     fn classifier_spend_is_priced_reported_at_once_and_counted_in_the_session() {
         let f = fixture_cfg(shell_twice("echo hi"), |c| {
-            manual_with(Some(Default::default()), vec![])(c);
+            auto_careful_with(Some(Default::default()), vec![])(c);
             c.model = PRICED.into(); // the three main steps cost money too
         });
         f.fake.script_verdicts(vec![verdict("allow", "read-only")]);
@@ -2266,7 +2281,7 @@ mod tests {
     #[test]
     fn a_classifier_model_without_a_price_is_said_so_once() {
         let f = fixture_cfg(shell_twice("echo hi"), |c| {
-            manual_with(Some(classifier::Settings { model: Some("anthropic/claude-unpriced".into()), ..Default::default() }), vec![])(c);
+            auto_careful_with(Some(classifier::Settings { model: Some("anthropic/claude-unpriced".into()), ..Default::default() }), vec![])(c);
         });
         f.fake.script_verdicts(vec![verdict("ask", "unknown"), verdict("ask", "unknown")]);
         f.say("go");
@@ -2300,7 +2315,7 @@ mod tests {
             (Some(text("I think it is fine")), "the classifier gave no usable answer"),
             (None, "the classifier gave no usable answer"),
         ] {
-            let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "make"})), text("done")], manual_with(Some(Default::default()), vec![]));
+            let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "make"})), text("done")], auto_careful_with(Some(Default::default()), vec![]));
             f.fake.script_verdicts(reply.into_iter().collect());
             f.say("go");
             let ui = TestUi::replying(vec![Reply::Once]);
@@ -2309,7 +2324,7 @@ mod tests {
             assert!(notices(&ui).contains(&format!("notice:classifier: asking you because {why}")), "{why}: {:?}", notices(&ui));
         }
         // A refusal is remembered nowhere: the same command is classified (and asked) again.
-        let f = fixture_cfg(shell_twice("make"), manual_with(Some(Default::default()), vec![]));
+        let f = fixture_cfg(shell_twice("make"), auto_careful_with(Some(Default::default()), vec![]));
         f.fake.script_verdicts(vec![verdict("ask", "unknown"), verdict("ask", "unknown")]);
         f.say("go");
         let ui = TestUi::replying(vec![Reply::Once, Reply::Once]);
@@ -2327,7 +2342,7 @@ mod tests {
             ("make test", vec![Rule::new("shell", "make *", Effect::Ask)]),
             ("make test", vec![Rule::new("shell", "*", Effect::Ask)]),
         ] {
-            let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": cmd})), text("done")], manual_with(Some(Default::default()), rules));
+            let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": cmd})), text("done")], auto_careful_with(Some(Default::default()), rules));
             f.fake.script_verdicts(vec![verdict("allow", "read-only")]);
             f.say("go");
             let ui = TestUi::replying(vec![Reply::Reject(None)]);
@@ -2339,14 +2354,14 @@ mod tests {
 
     #[test]
     fn a_rule_based_deny_stays_a_deny_and_the_classifier_is_off_by_default() {
-        let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "make"})), text("done")], manual_with(Some(Default::default()), vec![Rule::new("shell", "make", Effect::Deny)]));
+        let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "make"})), text("done")], auto_careful_with(Some(Default::default()), vec![Rule::new("shell", "make", Effect::Deny)]));
         f.fake.script_verdicts(vec![verdict("allow", "read-only")]);
         f.say("go");
         assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
         assert!(matches!(&last_user_blocks(&f.fake.requests.lock().unwrap()[1])[0], Block::ToolResult { is_error: true, content, .. } if content.starts_with("Permission denied: shell")));
         assert!(f.fake.classifier_requests.lock().unwrap().is_empty());
 
-        let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "echo hi"})), text("done")], manual_with(None, vec![]));
+        let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "echo hi"})), text("done")], auto_careful_with(None, vec![]));
         f.say("go");
         let ui = TestUi::replying(vec![Reply::Once]);
         f.run(&ui);
@@ -2357,7 +2372,7 @@ mod tests {
     #[test]
     fn a_slow_classifier_times_out_into_a_prompt() {
         let settings = classifier::Settings { timeout: Duration::from_millis(150), ..Default::default() };
-        let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "echo hi"})), text("done")], manual_with(Some(settings), vec![]));
+        let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "echo hi"})), text("done")], auto_careful_with(Some(settings), vec![]));
         f.fake.delay_classifier(Duration::from_secs(30));
         f.fake.script_verdicts(vec![verdict("allow", "read-only")]);
         f.say("go");
@@ -2373,7 +2388,7 @@ mod tests {
     fn the_classifier_model_comes_from_its_setting_then_the_small_model() {
         let settings = classifier::Settings { model: Some("anthropic/claude-judge".into()), ..Default::default() };
         let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "echo hi"})), text("done")], |c| {
-            manual_with(Some(settings), vec![])(c);
+            auto_careful_with(Some(settings), vec![])(c);
             c.small_model = Some("anthropic/claude-small".into());
         });
         f.fake.script_verdicts(vec![verdict("allow", "read-only")]);
@@ -2382,7 +2397,7 @@ mod tests {
         assert_eq!(f.fake.classifier_requests.lock().unwrap()[0].model, "claude-judge");
 
         let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "echo hi"})), text("done")], |c| {
-            manual_with(Some(Default::default()), vec![])(c);
+            auto_careful_with(Some(Default::default()), vec![])(c);
             c.small_model = Some("anthropic/claude-small".into());
         });
         f.fake.script_verdicts(vec![verdict("allow", "read-only")]);
@@ -2407,7 +2422,7 @@ mod tests {
     fn unattended_runs_use_the_classifier_only_when_background_is_on() {
         for (background, runs_unprompted) in [(true, true), (false, false)] {
             let settings = classifier::Settings { background, ..Default::default() };
-            let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "echo hi"})), text("done")], manual_with(Some(settings), vec![]));
+            let f = fixture_cfg(vec![tool_call("t1", "shell", json!({"command": "echo hi"})), text("done")], auto_careful_with(Some(settings), vec![]));
             f.fake.script_verdicts(vec![verdict("allow", "read-only")]);
             f.say("go");
             assert_eq!(f.engine.run(&f.session.id, &Away, &AtomicBool::new(false), false).unwrap(), RunOutcome::Idle);
