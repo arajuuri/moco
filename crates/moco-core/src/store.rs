@@ -14,6 +14,11 @@ pub enum StoreError {
 }
 pub type Result<T> = std::result::Result<T, StoreError>;
 
+/// `directory` with symlinks resolved (as far as it exists), so every spelling of a directory is one project.
+fn canonical_dir(directory: &str) -> String {
+    crate::tools::real_path(Path::new(directory)).to_string_lossy().into_owned()
+}
+
 const MIGRATIONS: &[(i64, &str)] = &[
     (
         1,
@@ -61,6 +66,8 @@ const MIGRATIONS: &[(i64, &str)] = &[
         at integer not null, command text not null, risk text not null, reason text not null, model text not null);
      create index auto_allow_session on auto_allow(session_id);",
     ),
+    // Which process holds the execution claim, so another start can tell a live run from a crash (issue #7).
+    (9, "alter table session add column claim_pid integer;"),
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -188,10 +195,17 @@ impl Store {
         crate::log::LogErr::log_err(self.conn.execute("delete from auto_allow where at < ?1", [now_ms() - keep_ms]), "store", "pruning old automatic allows");
     }
 
-    /// Project id is derived from the directory, so reopening the same directory finds the same project.
+    /// Project id is derived from the directory, so reopening the same directory finds the same project. A directory
+    /// reachable under two names (a symlinked parent) is one project: the symlink-free name is the one stored, and a
+    /// project recorded earlier under the name as given is still found.
     pub fn project_for(&self, directory: &str) -> Result<String> {
-        if let Some(id) = self.conn.query_row("select id from project where directory=?1", [directory], |r| r.get(0)).optional()? {
-            return Ok(id);
+        let given = directory;
+        let directory = canonical_dir(given);
+        let directory = directory.as_str();
+        for d in [directory, given] {
+            if let Some(id) = self.conn.query_row("select id from project where directory=?1", [d], |r| r.get(0)).optional()? {
+                return Ok(id);
+            }
         }
         let id = new_id("prj");
         let name = Path::new(directory).file_name().map(|n| n.to_string_lossy().into_owned());
@@ -204,6 +218,8 @@ impl Store {
 
     pub fn create_session(&self, directory: &str, agent: &str) -> Result<Session> {
         let project_id = self.project_for(directory)?;
+        let directory = canonical_dir(directory);
+        let directory = directory.as_str();
         let id = new_id("ses");
         let t = now_ms();
         self.conn.execute(
@@ -353,8 +369,8 @@ impl Store {
             .conn
             .query_row(
                 "select id, project_id, directory, agent, title, model, parent_id, variant, permission_mode from session
-                 where directory=?1 and parent_id is null and time_archived is null order by id desc limit 1",
-                [directory],
+                 where directory in (?1, ?2) and parent_id is null and time_archived is null order by id desc limit 1",
+                [canonical_dir(directory).as_str(), directory],
                 |r| Ok(Session { id: r.get(0)?, project_id: r.get(1)?, directory: r.get(2)?, agent: r.get(3)?, title: r.get(4)?, model: r.get(5)?, parent_id: r.get(6)?, variant: r.get(7)?, permission_mode: r.get(8)? }),
             )
             .optional()?)
@@ -367,10 +383,11 @@ impl Store {
             "select s.id, s.title, s.directory, s.agent, s.model, s.cost, s.time_created, s.time_updated, s.time_archived is not null, s.fork_session_id,
                     (select count(*) from message m where m.session_id=s.id and m.type in ('user','assistant'))
              from session s
-             where s.parent_id is null and (s.time_archived is not null) = ?1 and (?2 is null or s.directory = ?2)
+             where s.parent_id is null and (s.time_archived is not null) = ?1 and (?2 is null or s.directory in (?2, ?4))
              order by s.time_updated desc, s.id desc limit ?3",
         )?;
-        let rows = stmt.query_map(params![archived, directory, limit as i64], |r| {
+        let canonical = directory.map(canonical_dir);
+        let rows = stmt.query_map(params![archived, directory, limit as i64, canonical], |r| {
             Ok(SessionSummary {
                 id: r.get(0)?,
                 title: r.get(1)?,
@@ -573,6 +590,47 @@ impl Store {
         Ok(out)
     }
 
+    /// Message rows as stored, `{id, type, data, time_created}`, oldest first (for exports).
+    pub fn message_rows(&self, session_id: &str) -> Result<Vec<Value>> {
+        let mut stmt = self.conn.prepare("select id, type, data, time_created from message where session_id=?1 order by id")?;
+        let rows = stmt.query_map([session_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?)))?;
+        let mut out = vec![];
+        for row in rows {
+            let (id, kind, data, t) = row?;
+            out.push(serde_json::json!({"id": id, "type": kind, "data": serde_json::from_str::<Value>(&data)?, "time_created": t}));
+        }
+        Ok(out)
+    }
+
+    /// Session metadata for exports: ids, directory, agent, model, times, cost, tokens and fork origin.
+    pub fn session_meta(&self, session_id: &str) -> Result<Option<Value>> {
+        let row = self
+            .conn
+            .query_row(
+                "select id, parent_id, directory, agent, title, model, variant, time_created, time_updated, cost, tokens, fork_session_id from session where id=?1",
+                [session_id],
+                |r| {
+                    let tokens: Option<String> = r.get(10)?;
+                    Ok(serde_json::json!({
+                        "id": r.get::<_, String>(0)?, "parent_id": r.get::<_, Option<String>>(1)?, "directory": r.get::<_, String>(2)?,
+                        "agent": r.get::<_, String>(3)?, "title": r.get::<_, Option<String>>(4)?, "model": r.get::<_, Option<String>>(5)?,
+                        "variant": r.get::<_, Option<String>>(6)?, "time_created": r.get::<_, i64>(7)?, "time_updated": r.get::<_, i64>(8)?,
+                        "cost": r.get::<_, f64>(9)?, "tokens": tokens.and_then(|t| serde_json::from_str::<Value>(&t).ok()).unwrap_or(Value::Null),
+                        "forked_from": r.get::<_, Option<String>>(11)?,
+                    }))
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Ids of the subagent sessions directly below a session, oldest first.
+    pub fn child_session_ids(&self, session_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("select id from session where parent_id=?1 order by id")?;
+        let rows = stmt.query_map([session_id], |r| r.get(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     /// Durable admission. Re-sending the same inbox id is idempotent (first admission wins).
     pub fn enqueue(&self, session_id: &str, inbox_id: Option<&str>, mode: Mode, kind: &str, data: &Value) -> Result<String> {
         let id = inbox_id.map(String::from).unwrap_or_else(|| new_id("ibx"));
@@ -662,34 +720,68 @@ impl Store {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
-    /// Write-ahead execution claim. Returns false if the session is already claimed.
+    /// Write-ahead execution claim, owned by this process. Returns false if the session is already claimed.
     pub fn claim(&self, session_id: &str) -> Result<bool> {
-        let got = self.conn.execute("update session set claim_at=?2 where id=?1 and claim_at is null", params![session_id, now_ms()])? > 0;
+        let got = self.conn.execute(
+            "update session set claim_at=?2, claim_pid=?3 where id=?1 and claim_at is null",
+            params![session_id, now_ms(), std::process::id() as i64],
+        )? > 0;
         crate::log_debug!("store", "claim session={session_id} {}", if got { "taken" } else { "refused: already claimed" });
         Ok(got)
     }
 
+    /// Releases the claim, unless another live process has taken it over.
     pub fn release(&self, session_id: &str) -> Result<()> {
-        self.conn.execute("update session set claim_at=null, resume_attempts=0 where id=?1", [session_id])?;
+        self.conn.execute(
+            "update session set claim_at=null, claim_pid=null, resume_attempts=0 where id=?1 and (claim_pid is null or claim_pid=?2)",
+            params![session_id, std::process::id() as i64],
+        )?;
         crate::log_debug!("store", "release session={session_id}");
         Ok(())
     }
 
-    /// On startup: sessions left claimed by a crash. Bumps the attempt counter; sessions over `max_attempts`
-    /// are released instead of resumed. Returns the ids to resume.
+    /// On startup: sessions left claimed by a process that is gone (a crash). Claims held by a live process are left
+    /// alone. Top-level sessions get the attempt counter bumped and are re-owned by this process; those over
+    /// `max_attempts` are released instead of resumed. Stale subagent claims are released. Returns the ids to resume.
     pub fn recover_claims(&self, max_attempts: i64) -> Result<Vec<String>> {
-        let dropped = self.conn.execute("update session set claim_at=null where claim_at is not null and resume_attempts>=?1", [max_attempts])?;
-        if dropped > 0 {
-            crate::log_warn!("store", "recover: {dropped} session(s) crashed {max_attempts} times in a row and will not be resumed again");
-        }
-        let mut stmt = self.conn.prepare("select id from session where claim_at is not null and parent_id is null")?;
-        let ids: Vec<String> = stmt.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
-        for id in &ids {
-            self.conn.execute("update session set resume_attempts=resume_attempts+1 where id=?1", [id])?;
-            crate::log_warn!("store", "recover: session={id} was left claimed by a crash; resuming it");
+        let mut stmt = self.conn.prepare("select id, claim_pid, parent_id, resume_attempts from session where claim_at is not null")?;
+        let rows: Vec<(String, Option<i64>, Option<String>, i64)> =
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<std::result::Result<_, _>>()?;
+        let me = std::process::id() as i64;
+        let mut ids = Vec::new();
+        for (id, pid, parent, attempts) in rows {
+            if let Some(p) = pid.filter(|p| pid_alive(*p)) {
+                crate::log_debug!("store", "recover: session={id} is claimed by live process {p}; leaving it");
+                continue;
+            }
+            if parent.is_some() {
+                self.conn.execute("update session set claim_at=null, claim_pid=null, resume_attempts=0 where id=?1", [&id])?;
+                crate::log_warn!("store", "recover: subagent session={id} was left claimed by a crash; released");
+            } else if attempts >= max_attempts {
+                self.conn.execute("update session set claim_at=null, claim_pid=null where id=?1", [&id])?;
+                crate::log_warn!("store", "recover: session={id} crashed {max_attempts} times in a row and will not be resumed again");
+            } else {
+                self.conn.execute("update session set resume_attempts=resume_attempts+1, claim_pid=?2 where id=?1", params![id, me])?;
+                crate::log_warn!("store", "recover: session={id} was left claimed by a crash; resuming it");
+                ids.push(id);
+            }
         }
         Ok(ids)
     }
+
+    /// Test helper: make the claim look like it belongs to a process that no longer exists.
+    #[cfg(test)]
+    pub(crate) fn orphan_claim(&self, session_id: &str) {
+        self.conn.execute("update session set claim_pid=?2 where id=?1", params![session_id, i32::MAX as i64]).unwrap();
+    }
+}
+
+/// Whether a process with this id exists (signal 0 only checks). EPERM means it exists but is someone else's.
+fn pid_alive(pid: i64) -> bool {
+    if pid <= 0 || pid > i32::MAX as i64 {
+        return false;
+    }
+    unsafe { libc::kill(pid as i32, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) }
 }
 
 #[cfg(test)]
@@ -771,8 +863,8 @@ mod tests {
         let other = s.create_session("/work/proj", "build").unwrap();
         assert_eq!(s.find_sessions(&ses.id).unwrap().len(), 1);
         let tail = &ses.id[ses.id.len() - 6..];
-        assert_eq!(s.find_sessions(tail).unwrap().iter().map(|x| x.id.clone()).collect::<Vec<_>>(), [ses.id.clone()], "by suffix");
-        assert!(s.find_sessions(&ses.id[..8]).unwrap().len() >= 1, "by prefix");
+        assert_eq!(s.find_sessions(tail).unwrap().iter().map(|x| x.id.clone()).collect::<Vec<_>>(), std::slice::from_ref(&ses.id), "by suffix");
+        assert!(!s.find_sessions(&ses.id[..8]).unwrap().is_empty(), "by prefix");
         assert_eq!(s.find_sessions("ses_").unwrap().len(), 2, "an ambiguous piece returns every match so the caller can refuse");
         assert!(s.find_sessions("").unwrap().is_empty() && s.find_sessions("zzzzzz").unwrap().is_empty());
         let child = s.create_child_session(&ses, "general").unwrap();
@@ -880,6 +972,24 @@ mod tests {
         let (s, ses) = store();
         assert_eq!(s.project_for("/work/proj").unwrap(), ses.project_id);
         assert_ne!(s.project_for("/work/other").unwrap(), ses.project_id);
+    }
+
+    #[test]
+    fn both_spellings_of_a_symlinked_directory_are_one_project() {
+        let (s, _) = store();
+        let base = std::env::temp_dir().join(crate::id::new_id("moco-store"));
+        std::fs::create_dir_all(base.join("real/proj")).unwrap();
+        std::os::unix::fs::symlink(base.join("real"), base.join("link")).unwrap();
+        let (real, link) = (base.join("real/proj"), base.join("link/proj"));
+        let a = s.create_session(real.to_str().unwrap(), "build").unwrap();
+        let b = s.create_session(link.to_str().unwrap(), "build").unwrap();
+        assert_eq!(a.project_id, b.project_id);
+        assert_eq!(a.directory, b.directory);
+        for dir in [&real, &link] {
+            assert_eq!(s.list_sessions(Some(dir.to_str().unwrap()), false, 10).unwrap().len(), 2);
+            assert_eq!(s.latest_session(dir.to_str().unwrap()).unwrap().unwrap().id, b.id);
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -1017,13 +1127,39 @@ mod tests {
         let (s, ses) = store();
         assert!(s.claim(&ses.id).unwrap());
         assert!(!s.claim(&ses.id).unwrap(), "already claimed");
-        // Simulated crash: claim remains. Each restart resumes until the cap.
+        // Simulated crash: claim remains, owner gone. Each restart resumes until the cap.
+        s.orphan_claim(&ses.id);
         assert_eq!(s.recover_claims(2).unwrap(), [ses.id.clone()]);
+        s.orphan_claim(&ses.id);
         assert_eq!(s.recover_claims(2).unwrap(), [ses.id.clone()]);
+        s.orphan_claim(&ses.id);
         assert!(s.recover_claims(2).unwrap().is_empty(), "attempt cap reached, claim dropped");
         assert!(s.claim(&ses.id).unwrap());
         s.release(&ses.id).unwrap();
         assert!(s.recover_claims(2).unwrap().is_empty());
+    }
+
+    #[test]
+    fn live_claim_of_another_handle_is_not_recovered() {
+        let dir = std::env::temp_dir().join(new_id("moco-claim"));
+        let path = dir.join("moco.db");
+        let a = Store::open(&path).unwrap();
+        let b = Store::open(&path).unwrap();
+        let ses = a.create_session("/p", "build").unwrap();
+        let child = a.create_child_session(&ses, "general").unwrap();
+        assert!(a.claim(&ses.id).unwrap());
+        // A second start (live owner) must neither resume the session nor count an attempt.
+        for _ in 0..5 {
+            assert!(b.recover_claims(3).unwrap().is_empty());
+        }
+        assert!(!b.claim(&ses.id).unwrap(), "still claimed by the live owner");
+        // The owner dies: the top-level session is resumed, the stale subagent claim is released.
+        assert!(a.claim(&child.id).unwrap());
+        a.orphan_claim(&ses.id);
+        a.orphan_claim(&child.id);
+        assert_eq!(b.recover_claims(3).unwrap(), [ses.id.clone()]);
+        assert!(b.claim(&child.id).unwrap(), "stale subagent claim was released");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

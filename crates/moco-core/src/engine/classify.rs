@@ -79,17 +79,19 @@ impl Engine {
             return Verdict::Ask { reason: format!("the classifier's provider '{provider_id}' is not connected") };
         }
         let root = project_root_of(std::path::Path::new(&session.directory));
+        let (effort, max_tokens) = self.short_answer_shape(provider_id, model_id, 200);
         let req = Request {
             model: model_id.to_string(),
             system: classifier::SYSTEM.into(),
             messages: vec![ChatMessage { role: Role::User, content: vec![Block::Text(classifier::request_text(command, &commands, &session.directory, &root.to_string_lossy()))] }],
             tools: vec![],
-            max_tokens: 200,
+            max_tokens,
+            effort,
             overlay: self.base_overlay(provider_id, model_id),
             ..Default::default()
         };
         let started = Instant::now();
-        let (reply, usage) = match self.call_classifier(provider_id, req, settings.timeout, cancel) {
+        let (reply, usage, cut_off) = match self.call_classifier(provider_id, req, settings.timeout, cancel) {
             Ok(r) => r,
             Err(CallError::Interrupted) => {
                 // Esc while the classifier was thinking: nothing was decided, so no decision line and no message.
@@ -114,8 +116,12 @@ impl Engine {
         if priced.is_none() && self.unpriced_noted.lock().unwrap_or_else(|e| e.into_inner()).insert(model_ref.clone()) {
             ui.event(&UiEvent::Notice(&format!("the classifier model {model_ref} has no price in the catalog, so its cost is counted as $0.00 (set a price under providers.<id>.models, or pick a model with one)")));
         }
-        let verdict = classifier::parse_reply(&reply);
         let (said, risk) = classifier::reply_fields(&reply);
+        let verdict = match classifier::parse_reply(&reply) {
+            // The model ran out of tokens before it finished the answer (thinking counts): say so, not "no usable answer".
+            Verdict::Ask { .. } if cut_off && said.is_empty() => Verdict::Ask { reason: "the classifier's reply was cut off at its token limit".into() },
+            v => v,
+        };
         let (decision, why) = match &verdict {
             Verdict::Allow { reason, .. } => ("allow", reason.as_str()),
             Verdict::Ask { reason } => ("ask", reason.as_str()),
@@ -139,21 +145,25 @@ impl Engine {
 
     /// One non-streaming call with a time limit. When the engine is shared the call runs on its own thread, so a
     /// stalled connection cannot hold up the tool past the limit; otherwise it runs inline.
-    fn call_classifier(&self, provider_id: &str, req: Request, timeout: Duration, cancel: &AtomicBool) -> Result<(String, Usage), CallError> {
-        fn collect(provider: Option<&dyn Provider>, req: &Request, stop: &AtomicBool) -> Result<(String, Usage), CallError> {
+    fn call_classifier(&self, provider_id: &str, req: Request, timeout: Duration, cancel: &AtomicBool) -> Result<(String, Usage, bool), CallError> {
+        /// The reply, what it cost, and whether the model stopped at `max_tokens`.
+        fn collect(provider: Option<&dyn Provider>, req: &Request, stop: &AtomicBool) -> Result<(String, Usage, bool), CallError> {
             let provider = provider.ok_or_else(|| CallError::Failed("no provider".into()))?;
-            let (mut out, mut usage) = (String::new(), Usage::default());
+            let (mut out, mut usage, mut cut_off) = (String::new(), Usage::default(), false);
             provider
                 .stream(req, stop, &mut |ev| match ev {
                     Event::TextDelta(t) => out.push_str(&t),
-                    Event::Finish { usage: u, .. } => usage = u,
+                    Event::Finish { usage: u, reason } => {
+                        usage = u;
+                        cut_off = reason == FinishReason::MaxTokens;
+                    }
                     _ => {}
                 })
                 .map_err(|e| match e {
                     ProviderError::Interrupted => CallError::Interrupted,
                     e => CallError::Failed(format!("provider error: {}", e.message())),
                 })?;
-            Ok((out, usage))
+            Ok((out, usage, cut_off))
         }
         let Ok(me) = self.shared() else { return collect(self.provider_for(provider_id), &req, cancel) };
         let stop = Arc::new(AtomicBool::new(false));

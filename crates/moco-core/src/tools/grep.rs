@@ -1,14 +1,17 @@
 use super::*;
 use ignore::WalkBuilder;
 use regex::RegexBuilder;
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 
-/// Files larger than this are skipped.
-const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 /// Matches are counted exactly up to `limit * COUNT_FACTOR`, then the search stops.
 const COUNT_FACTOR: usize = 10;
 
 pub struct Grep;
+
+/// Files bigger than this are skipped (and reported).
+const MAX_FILE_BYTES: u64 = 256 * 1024 * 1024;
+/// Only this much of a line is searched, so one enormous line cannot be buffered whole.
+const MAX_LINE_BYTES: usize = 64 * 1024;
 
 impl Tool for Grep {
     fn name(&self) -> &'static str {
@@ -43,6 +46,7 @@ impl Tool for Grep {
 
         let mut out: Vec<String> = vec![];
         let mut total = 0usize;
+        let mut skipped = 0usize;
         // Stop counting precisely after this many matches; report "N+".
         let count_cap = limit.saturating_mul(COUNT_FACTOR);
         let mut capped = false;
@@ -67,10 +71,12 @@ impl Tool for Grep {
                     continue;
                 }
             }
-            if entry.metadata().is_ok_and(|m| m.len() > MAX_FILE_BYTES) {
+            let Ok(file) = std::fs::File::open(path) else { continue };
+            // Data dumps and logs of this size are not what grep is for here, and would take minutes.
+            if file.metadata().is_ok_and(|m| m.len() > MAX_FILE_BYTES) {
+                skipped += 1;
                 continue;
             }
-            let Ok(file) = std::fs::File::open(path) else { continue };
             let mut reader = BufReader::new(file);
             let mut buf = Vec::new();
             let mut n = 0usize;
@@ -78,9 +84,9 @@ impl Tool for Grep {
                 if n % 1024 == 0 && ctx.cancelled() {
                     return Err(ToolError::Interrupted);
                 }
-                buf.clear();
-                match reader.read_until(b'\n', &mut buf) {
-                    Ok(0) | Err(_) => break,
+                // A line is matched on its first MAX_LINE_BYTES only: a minified bundle is one huge line.
+                match super::fsio::read_line_capped(&mut reader, &mut buf, MAX_LINE_BYTES) {
+                    Ok((0, _)) | Err(_) => break,
                     Ok(_) => {}
                 }
                 n += 1;
@@ -103,13 +109,17 @@ impl Tool for Grep {
                 }
             }
         }
+        let note = if skipped > 0 { format!("[{skipped} file(s) over {} MiB were skipped; search them with the shell tool if needed]", MAX_FILE_BYTES / (1024 * 1024)) } else { String::new() };
         if out.is_empty() {
-            return Ok(ToolOutput::text("No matches found"));
+            return Ok(ToolOutput::text(if note.is_empty() { "No matches found".to_string() } else { format!("No matches found\n\n{note}") }));
         }
         let mut text = out.join("\n");
         if total > limit {
             let plus = if capped { "+" } else { "" };
             text.push_str(&format!("\n\n[showing {limit} of {total}{plus} matches; narrow the pattern or raise limit]"));
+        }
+        if !note.is_empty() {
+            text.push_str(&format!("\n\n{note}"));
         }
         Ok(ToolOutput { text, metadata: json!({"matches": total}) })
     }
@@ -122,6 +132,17 @@ mod tests {
 
     fn run(env: &Env, v: Value) -> Result<String, ToolError> {
         Grep.run(&v, &env.ctx()).map(|o| o.text)
+    }
+
+    #[test]
+    fn a_huge_single_line_is_searched_by_its_start_and_the_next_lines_still_count() {
+        let env = Env::new();
+        let mut data = b"needle ".to_vec();
+        data.extend(std::iter::repeat_n(b'x', 300_000));
+        data.extend_from_slice(b"\nsecond needle\n");
+        env.file("min.js", &data);
+        let t = run(&env, json!({"pattern":"needle"})).unwrap();
+        assert!(t.starts_with("min.js:1: needle xxx") && t.contains("min.js:2: second needle"), "{}", &t[..t.len().min(100)]);
     }
 
     #[test]

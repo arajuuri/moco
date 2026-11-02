@@ -1,4 +1,5 @@
 //! moco: terminal chat (full screen on a terminal; line based with --plain, with -p or when piped).
+#![allow(clippy::type_complexity)]
 mod tui;
 use moco_core::catalog::{Catalog, ProviderInfo};
 use moco_core::mcp::{self, oauth::LoginIo, trust, Manager, ServerSpec};
@@ -537,6 +538,35 @@ fn main() {
                     store.set_title(&ses.id, title.trim()).unwrap_or_else(|e| die(&e.to_string()));
                     println!("renamed {}", short(&ses.id));
                 }
+                Some("export") => {
+                    const USAGE: &str = "usage: moco sessions export ID [--md | --json | --jsonl] [--children] [--include-hidden] [-o FILE]";
+                    let mut opts = moco_core::export::Options::default();
+                    let (mut id, mut file) = (None, None);
+                    let mut it = rest.iter().skip(1);
+                    while let Some(a) = it.next() {
+                        match *a {
+                            "--md" => opts.format = moco_core::export::Format::Markdown,
+                            "--json" => opts.format = moco_core::export::Format::Json,
+                            "--jsonl" => opts.format = moco_core::export::Format::Jsonl,
+                            "--children" => opts.children = true,
+                            "--include-hidden" => opts.include_hidden = true,
+                            "-o" | "--output" => file = Some(it.next().copied().unwrap_or_else(|| die("-o needs a file name"))),
+                            f if f.starts_with('-') => die(&format!("unknown option {f}; {USAGE}")),
+                            _ if id.is_none() => id = Some(*a),
+                            _ => die(USAGE),
+                        }
+                    }
+                    let Some(id) = id else { die(USAGE) };
+                    let ses = pick_session(&store, id, &[]).unwrap_or_else(|e| die(&format!("export: {e}")));
+                    let text = moco_core::export::export(&store, &ses.id, &opts).unwrap_or_else(|e| die(&format!("export: {e}")));
+                    match file {
+                        Some(f) => {
+                            std::fs::write(f, &text).unwrap_or_else(|e| die(&format!("{f}: {e}")));
+                            eprintln!("wrote {f}");
+                        }
+                        None => print!("{text}"),
+                    }
+                }
                 Some(cmd @ ("archive" | "unarchive")) => {
                     let ses = need(cmd);
                     store.set_archived(&ses.id, cmd == "archive").unwrap_or_else(|e| die(&e.to_string()));
@@ -659,7 +689,8 @@ fn main() {
         // A session always runs in the directory it was started in.
         (Some(s), _) => std::path::PathBuf::from(&s.directory).canonicalize().unwrap_or_else(|e| die(&format!("the session's directory {} is not available: {e}", s.directory))),
         (None, Some(d)) => std::path::PathBuf::from(d).canonicalize().unwrap_or_else(|e| die(&format!("--dir: {e}"))),
-        (None, None) => std::env::current_dir().unwrap_or_else(|e| die(&e.to_string())),
+        // The symlink-free path, so the system prompt, the session and the saved permissions all use one name.
+        (None, None) => std::env::current_dir().and_then(|d| d.canonicalize()).unwrap_or_else(|e| die(&e.to_string())),
     };
     let cwd_str = cwd.to_string_lossy().into_owned();
     std::env::set_current_dir(&cwd).ok();
@@ -672,7 +703,13 @@ fn main() {
     moco_core::log::configure(cfg.log.as_deref());
     moco_core::log_info!("main", "start dir={} sources={}", cwd_str, loaded.sources.len());
     if let (Some(sh), None) = (&cfg.shell, std::env::var_os("MOCO_SHELL")) {
-        std::env::set_var("MOCO_SHELL", sh);
+        // A project's `shell` is an executable that every shell call would run, so it needs approval like an MCP server.
+        let origin = loaded.shell_origin.as_ref();
+        if origin.is_none_or(|o| trust::origin_is_trusted(o, &app_dir)) || project_command_allowed(&app_dir, origin, "shell", "shell", sh, &trust::fingerprint_shell(&cwd, sh)) {
+            std::env::set_var("MOCO_SHELL", sh);
+        } else {
+            eprintln!("warning: shell '{sh}' from {} is ignored: project-defined commands need your approval (run moco in a terminal, or set MOCO_TRUST_PROJECT_CONFIG=1)", origin.map(|o| tilde(&o.display().to_string())).unwrap_or_default());
+        }
     }
     // The flag applies to this session and is the default for new ones; otherwise the config key is the default (manual).
     let flag_mode = permission_mode_arg.as_deref().map(|s| permission::PermissionMode::parse(s).unwrap_or_else(|| die(&format!("--permission-mode must be manual or auto, not {s}"))));
@@ -1072,7 +1109,7 @@ fn main() {
             }
             l if l.starts_with("/fork") => {
                 let arg = l.trim_start_matches("/fork").trim();
-                match arg.parse::<usize>().or_else(|_| if arg.is_empty() { Ok(0) } else { Err(()) }) {
+                match arg.parse::<usize>().or(if arg.is_empty() { Ok(0) } else { Err(()) }) {
                     Err(()) => println!("usage: /fork [N]   (N = branch off before the Nth most recent prompt; no N copies everything)"),
                     Ok(n) => match engine.fork(&session.id, n) {
                         Ok(Some(f)) => {

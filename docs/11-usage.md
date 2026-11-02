@@ -32,7 +32,7 @@ By hand: `MACOSX_DEPLOYMENT_TARGET=10.14 CARGO_TARGET_DIR=<a directory outside t
 | `moco --dir PATH` | Work in another directory |
 | `moco models [filter] [--refresh]` | Providers with connection state, or models with context size and price; `--refresh` downloads the full catalog |
 | `moco auth PROVIDER` | Store an API key |
-| `moco sessions [--all] [--archived]` | List sessions; `rename ID TITLE`, `archive ID`, `unarchive ID` |
+| `moco sessions [--all] [--archived]` | List sessions; `rename ID TITLE`, `archive ID`, `unarchive ID`; `export ID [--md\|--json\|--jsonl] [--children] [--include-hidden] [-o FILE]` writes a transcript (Markdown by default, to stdout without `-o`; read-only, safe while the session runs). Exports are **not redacted**: pasted keys and tool output appear as stored |
 | `moco logs [--follow] [--lines N] [--path]` | Show the end of the newest log file, follow it, or print the log directory (see "Logging") |
 
 ## Inside the chat
@@ -46,6 +46,7 @@ By hand: `MACOSX_DEPLOYMENT_TARGET=10.14 CARGO_TARGET_DIR=<a directory outside t
 | `/undo`, `/redo` | Undo the last turn's file changes and messages (repeat to go back further) or bring them back; the next prompt makes an undo permanent |
 | `/diff` | Changes in the working tree since the session started |
 | `/sessions [all\|archived]`, `/resume <n\|id>` | List and continue sessions (numbers refer to the last list) |
+| `/export [path]` | Write this conversation as Markdown (default `moco-<id>.md` in the project directory; not redacted) |
 | `/rename <title>`, `/fork [N]`, `/archive [n\|id]`, `/unarchive <n\|id>` | Manage sessions; `/fork N` branches off before your Nth most recent prompt |
 | `/skills`, `/commands` | List the skills and custom slash commands that were found (MCP prompts included) |
 | `/mcp`, `/mcp reconnect <name>` | Show the MCP servers and their state, or restart one |

@@ -234,15 +234,27 @@ impl ToolCtx<'_> {
     }
 
     /// Inside the working directory or project, or in the folder where long tool output is kept (so the model can
-    /// read what a truncated command printed without an `external_directory` prompt).
+    /// read what a truncated command printed without an `external_directory` prompt). Paths are compared with symlinks
+    /// resolved: a project reached through a symlinked parent is internal under either name, and a symlink inside the
+    /// project that leads out of it is not.
     pub fn is_internal(&self, p: &Path) -> bool {
-        p.starts_with(&self.cwd) || p.starts_with(&self.project_root) || p.starts_with(&self.spill_dir)
+        let real = real_path(p);
+        [&self.cwd, &self.project_root, &self.spill_dir].iter().any(|root| real.starts_with(real_path(root)))
     }
 
-    /// Relative to the working directory when internal, absolute otherwise.
+    /// Relative to the working directory when internal, absolute otherwise. The path is shown as it was given.
     pub fn display(&self, p: &Path) -> String {
         if self.is_internal(p) {
-            p.strip_prefix(&self.cwd).or_else(|_| p.strip_prefix(&self.project_root)).unwrap_or(p).to_string_lossy().into_owned()
+            let rel = |base: &Path| p.strip_prefix(base).ok().map(Path::to_path_buf);
+            let real = real_path(p);
+            let rel_real = |base: &Path| real.strip_prefix(real_path(base)).ok().map(Path::to_path_buf);
+            rel(&self.cwd)
+                .or_else(|| rel(&self.project_root))
+                .or_else(|| rel_real(&self.cwd))
+                .or_else(|| rel_real(&self.project_root))
+                .unwrap_or_else(|| p.to_path_buf())
+                .to_string_lossy()
+                .into_owned()
         } else {
             p.to_string_lossy().into_owned()
         }
@@ -258,12 +270,26 @@ impl ToolCtx<'_> {
         if self.is_internal(dir) {
             return Ok(());
         }
-        let root = project_root_of(dir);
+        // The symlink-free name, so what the user allows once or always holds for every spelling of the directory.
+        let dir = real_path(dir);
+        let root = project_root_of(&dir);
         self.permit(
             "external_directory",
             vec![format!("{}/*", dir.display())],
             vec![format!("{}/*", root.display())],
         )
+    }
+
+    /// `check_external` for a file a tool reads or writes: its folder, and, when the file is a symlink, the folder of
+    /// what it points to (a link inside the project can lead out of it).
+    pub fn check_external_file(&self, path: &Path) -> Result<(), ToolError> {
+        let dir = path.parent().unwrap_or(path);
+        self.check_external(dir)?;
+        let target = real_path(path);
+        match target.parent() {
+            Some(t) if t != real_path(dir) => self.check_external(t),
+            _ => Ok(()),
+        }
     }
 
     /// Run the configured formatter on a file a tool just wrote (`written` is what it wrote). Only files inside the
@@ -291,7 +317,37 @@ pub fn project_root_of(dir: &Path) -> PathBuf {
     dir.ancestors().find(|a| a.join(".git").exists()).unwrap_or(dir).to_path_buf()
 }
 
-/// Lexical normalization (`.`/`..`), no symlink resolution.
+/// `p` with symlinks resolved. The part that does not exist yet (a file about to be created, in a folder that is
+/// about to be created) is appended to its nearest existing ancestor. A dangling symlink is followed to where it
+/// would create the file.
+pub fn real_path(p: &Path) -> PathBuf {
+    real_path_at(p, 0)
+}
+
+fn real_path_at(p: &Path, depth: u32) -> PathBuf {
+    let p = normalize(p);
+    let mut rest: Vec<&std::ffi::OsStr> = vec![];
+    let mut cur: &Path = &p;
+    loop {
+        let base = match std::fs::canonicalize(cur) {
+            Ok(real) => Some(real),
+            Err(_) if depth < 40 => std::fs::read_link(cur).ok().map(|t| real_path_at(&cur.parent().unwrap_or(Path::new("/")).join(t), depth + 1)),
+            Err(_) => None,
+        };
+        if let Some(real) = base {
+            return rest.iter().rev().fold(real, |acc, c| acc.join(c));
+        }
+        match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name);
+                cur = parent;
+            }
+            _ => return p,
+        }
+    }
+}
+
+/// Lexical normalization (`.`/`..`), no symlink resolution. Use `real_path` to compare locations.
 pub fn normalize(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for c in p.components() {
@@ -415,6 +471,103 @@ mod alias_tests {
         assert_eq!(normalize_input("edit", json!("text")), json!("text"));
         assert_eq!(normalize_input("edit", json!({"edits":"x","file_path":"a"})), json!({"edits":"x","path":"a"}));
         assert_eq!(normalize_input("edit", json!({"edits":[1,"two"],"file_path":"a"})), json!({"edits":[1,"two"],"path":"a"}));
+    }
+}
+
+#[cfg(test)]
+mod symlink_tests {
+    use super::testutil::*;
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    /// `<env>/real/proj` reached as `<env>/link/proj` too; `<env>/outside` is elsewhere.
+    fn setup(env: &Env) -> (PathBuf, PathBuf, PathBuf) {
+        let real = env.dir.join("real/proj");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(env.dir.join("outside")).unwrap();
+        symlink(env.dir.join("real"), env.dir.join("link")).unwrap();
+        (real, env.dir.join("link/proj"), env.dir.join("outside"))
+    }
+
+    fn ctx_in<'a>(env: &'a Env, cwd: &Path) -> ToolCtx<'a> {
+        ToolCtx { cwd: cwd.to_path_buf(), project_root: cwd.to_path_buf(), ..env.ctx() }
+    }
+
+    fn write(ctx: &ToolCtx, path: &Path) {
+        write::Write.run(&json!({"path": path.to_string_lossy(), "content": "x"}), ctx).unwrap();
+    }
+
+    fn external(env: &Env) -> Vec<String> {
+        env.perm.asked().into_iter().filter(|r| r.action == "external_directory").flat_map(|r| r.resources).collect()
+    }
+
+    #[test]
+    fn both_spellings_of_the_project_are_internal() {
+        let env = Env::new();
+        let (real, link, _) = setup(&env);
+        for cwd in [&real, &link] {
+            let ctx = ctx_in(&env, cwd);
+            for base in [&real, &link] {
+                assert!(ctx.is_internal(&base.join("a.txt")));
+                write(&ctx, &base.join("a.txt"));
+                write(&ctx, &base.join("new/deeper/b.txt"));
+            }
+        }
+        assert!(external(&env).is_empty(), "{:?}", external(&env));
+        assert_eq!(std::fs::read_to_string(real.join("new/deeper/b.txt")).unwrap(), "x");
+    }
+
+    #[test]
+    fn display_keeps_the_spelling_given() {
+        let env = Env::new();
+        let (real, link, _) = setup(&env);
+        let ctx = ctx_in(&env, &link);
+        assert_eq!(ctx.display(&real.join("src/a.rs")), "src/a.rs");
+        assert_eq!(ctx.display(&link.join("src/a.rs")), "src/a.rs");
+        assert_eq!(ctx.display(&env.dir.join("outside/o.txt")), env.dir.join("outside/o.txt").to_string_lossy());
+    }
+
+    #[test]
+    fn a_link_inside_the_project_that_leads_out_is_external() {
+        let env = Env::new();
+        let (real, _, outside) = setup(&env);
+        let ctx = ctx_in(&env, &real);
+        symlink(&outside, real.join("dirlink")).unwrap();
+        std::fs::write(outside.join("secret.txt"), "s").unwrap();
+        symlink(outside.join("secret.txt"), real.join("filelink")).unwrap();
+        symlink(outside.join("not-yet.txt"), real.join("dangling")).unwrap();
+
+        assert!(!ctx.is_internal(&real.join("dirlink/x.txt")));
+        for target in ["dirlink/x.txt", "dirlink/sub/x.txt", "filelink", "dangling"] {
+            let before = external(&env).len();
+            write(&ctx, &real.join(target));
+            let asked = external(&env);
+            assert_eq!(asked.len(), before + 1, "{target}");
+            assert!(asked.last().unwrap().starts_with(&format!("{}/", std::fs::canonicalize(&outside).unwrap().display())), "{target}: {asked:?}");
+        }
+    }
+
+    #[test]
+    fn a_new_file_resolves_through_its_nearest_existing_ancestor() {
+        let env = Env::new();
+        let (real, link, _) = setup(&env);
+        let want = std::fs::canonicalize(&real).unwrap().join("a/b/c.txt");
+        assert_eq!(real_path(&link.join("a/b/c.txt")), want);
+        assert_eq!(real_path(&link.join("a/./b/../b/c.txt")), want);
+    }
+
+    #[test]
+    fn the_always_rule_is_the_same_for_both_spellings() {
+        let env = Env::new();
+        let (real, link, outside) = setup(&env);
+        symlink(&outside, env.dir.join("outlink")).unwrap();
+        let ctx = ctx_in(&env, &real);
+        write(&ctx, &outside.join("a.txt"));
+        write(&ctx, &env.dir.join("outlink/a.txt"));
+        let asked: Vec<PermReq> = env.perm.asked().into_iter().filter(|r| r.action == "external_directory").collect();
+        assert_eq!(asked.len(), 2);
+        assert_eq!((&asked[0].resources, &asked[0].save), (&asked[1].resources, &asked[1].save));
+        let _ = link;
     }
 }
 
