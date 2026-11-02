@@ -509,7 +509,7 @@ pub fn load(app_dir: &Path, cwd: &Path) -> Loaded {
             .and_then(|raw| serde_json::from_str::<Value>(&strip_jsonc(&raw)).map_err(|e| e.to_string()));
         match parsed {
             Ok(mut v) if v.is_object() => {
-                let user_level = path.parent() == Some(app_dir.join("config").as_path()) || std::env::var_os("MOCO_CONFIG").is_some_and(|p| PathBuf::from(p) == path);
+                let user_level = path.parent() == Some(app_dir.join("config").as_path()) || std::env::var_os("MOCO_CONFIG").is_some_and(|p| p == path);
                 if !user_level {
                     strip_provider_endpoints(&mut v, &path, &mut out.warnings);
                 }
