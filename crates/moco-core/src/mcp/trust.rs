@@ -25,6 +25,12 @@ pub fn fingerprint_formatter(project_dir: &Path, name: &str, cfg: &FormatterConf
     Sha256::digest(canon.to_string().as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The same for a project's `shell` executable.
+pub fn fingerprint_shell(project_dir: &Path, shell: &str) -> String {
+    let canon = serde_json::json!({"kind": "shell", "dir": project_dir.to_string_lossy(), "shell": shell});
+    Sha256::digest(canon.to_string().as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn approved(app_dir: &Path) -> Vec<String> {
     std::fs::read_to_string(store(app_dir))
         .ok()
@@ -79,6 +85,14 @@ mod tests {
         assert_ne!(a, fingerprint_formatter(Path::new("/p"), "fmt", &changed));
         let as_server = McpServerConfig { command: f.command.clone(), ..Default::default() };
         assert_ne!(a, fingerprint(Path::new("/p"), "fmt", &as_server), "approving a server never approves a formatter of the same name");
+    }
+
+    #[test]
+    fn shell_fingerprints_track_project_and_path() {
+        let a = fingerprint_shell(Path::new("/p"), "./sh");
+        assert_eq!(a, fingerprint_shell(Path::new("/p"), "./sh"));
+        assert_ne!(a, fingerprint_shell(Path::new("/q"), "./sh"));
+        assert_ne!(a, fingerprint_shell(Path::new("/p"), "./other"));
     }
 
     #[test]

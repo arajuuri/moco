@@ -673,7 +673,13 @@ fn main() {
     moco_core::log::configure(cfg.log.as_deref());
     moco_core::log_info!("main", "start dir={} sources={}", cwd_str, loaded.sources.len());
     if let (Some(sh), None) = (&cfg.shell, std::env::var_os("MOCO_SHELL")) {
-        std::env::set_var("MOCO_SHELL", sh);
+        // A project's `shell` is an executable that every shell call would run, so it needs approval like an MCP server.
+        let origin = loaded.shell_origin.as_ref();
+        if origin.is_none_or(|o| trust::origin_is_trusted(o, &app_dir)) || project_command_allowed(&app_dir, origin, "shell", "shell", sh, &trust::fingerprint_shell(&cwd, sh)) {
+            std::env::set_var("MOCO_SHELL", sh);
+        } else {
+            eprintln!("warning: shell '{sh}' from {} is ignored: project-defined commands need your approval (run moco in a terminal, or set MOCO_TRUST_PROJECT_CONFIG=1)", origin.map(|o| tilde(&o.display().to_string())).unwrap_or_default());
+        }
     }
     // The flag applies to this session and is the default for new ones; otherwise the config key is the default (manual).
     let flag_mode = permission_mode_arg.as_deref().map(|s| permission::PermissionMode::parse(s).unwrap_or_else(|| die(&format!("--permission-mode must be manual or auto, not {s}"))));
