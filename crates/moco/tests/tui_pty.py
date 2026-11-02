@@ -63,6 +63,30 @@ def wait_for(pattern, timeout=15):
     fail("timeout waiting for %r" % pattern)
 
 
+def wait_for_response(user_text, timeout=15):
+    import json, sqlite3
+    db = os.path.join(home, "data", "moco.db")
+    end = time.time() + timeout
+    while time.time() < end:
+        pump(0.1)
+        try:
+            rows = sqlite3.connect(db).execute("select type, data from message order by id").fetchall()
+        except sqlite3.Error:
+            continue
+        for i, (kind, data) in enumerate(rows):
+            if kind != "user" or json.loads(data).get("text") != user_text:
+                continue
+            for next_kind, next_data in rows[i + 1:]:
+                if next_kind != "assistant":
+                    continue
+                assistant = json.loads(next_data)
+                parts = assistant.get("parts", [])
+                if "usage" in assistant and any(p.get("type") == "text" for p in parts) and not any(p.get("type") == "tool" for p in parts):
+                    return
+            break
+    fail("timeout waiting for response to %r" % user_text)
+
+
 def send(b):
     os.write(fd, b)
 
@@ -180,7 +204,7 @@ elif scenario == "chat":
     send(b"\t")  # Tab completes it
     send(b"\r")  # sends "look at @a.txt": the mention was completed, so the file gets attached
     wait_for(r"attached.*a\.txt")
-    wait_for(r"Thefilesays:ONE-LINE-OF-TEXT(.|\n)*Thefilesays:ONE-LINE-OF-TEXT|in,\d+out(.|\n)*in,\d+out")
+    wait_for_response("look at @a.txt")
     send(b"/model\r")
     wait_for(r"model·1")  # the picker lists the one connected model
     wait_for(r"fake/m")
