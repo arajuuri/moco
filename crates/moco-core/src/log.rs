@@ -489,12 +489,18 @@ pub fn tail(text: &str, lines: usize) -> String {
 
 /// The last `n` lines of a log file. Reads backwards from the end in chunks, so a big file costs only what the tail needs.
 pub fn read_tail(path: &Path, n: usize) -> std::io::Result<String> {
+    read_tail_bounded(path, n, u64::MAX)
+}
+
+/// Like `read_tail`, but reads at most about `max_bytes` from the end, so a file with a few enormous lines
+/// (or none at all) cannot be pulled into memory. Past the cap the first line returned may be cut short.
+pub fn read_tail_bounded(path: &Path, n: usize, max_bytes: u64) -> std::io::Result<String> {
     use std::io::{Read, Seek, SeekFrom};
     const CHUNK: u64 = 64 * 1024;
     let mut f = std::fs::File::open(path)?;
     let (mut start, mut buf, mut newlines) = (f.metadata()?.len(), Vec::<u8>::new(), 0usize);
     // One newline more than asked for, so that the first line kept is whole.
-    while start > 0 && newlines <= n {
+    while start > 0 && newlines <= n && (buf.len() as u64) < max_bytes {
         let step = start.min(CHUNK);
         start -= step;
         f.seek(SeekFrom::Start(start))?;
@@ -506,7 +512,7 @@ pub fn read_tail(path: &Path, n: usize) -> std::io::Result<String> {
     }
     let text = String::from_utf8_lossy(&buf);
     let mut lines: Vec<&str> = text.lines().collect();
-    if start > 0 && !lines.is_empty() {
+    if start > 0 && lines.len() > 1 {
         lines.remove(0); // cut off mid-line by the chunk boundary
     }
     Ok(lines[lines.len().saturating_sub(n)..].iter().map(|l| format!("{l}\n")).collect())

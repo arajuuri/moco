@@ -27,6 +27,45 @@ pub(crate) fn kill_group(pid: u32) {
     }
 }
 
+/// A command whose output file grows past this is killed (1 GiB).
+const MAX_OUTPUT_FILE_BYTES: u64 = 1024 * 1024 * 1024;
+/// Output files up to this size are read whole; bigger ones only from the end.
+const READ_WHOLE_BYTES: u64 = 4 * 1024 * 1024;
+/// How much of the end of a big output file is read. Well over the 50 KiB that is kept.
+const TAIL_WINDOW_BYTES: u64 = 256 * 1024;
+
+/// The output file's text, and its exact line count when only the end of it was read (so the caller reports the
+/// real total). Memory use is bounded however much the command wrote.
+fn read_output(path: &Path) -> (String, Option<usize>) {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else { return (String::new(), None) };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    if len <= READ_WHOLE_BYTES {
+        let mut raw = Vec::new();
+        let _ = f.read_to_end(&mut raw);
+        return (String::from_utf8_lossy(&raw).into_owned(), None);
+    }
+    // Count lines in a streaming pass, as `split('\n')` would: one more than the newlines.
+    let mut lines = 1usize;
+    let mut chunk = vec![0u8; 64 * 1024];
+    while let Ok(n) = f.read(&mut chunk) {
+        if n == 0 {
+            break;
+        }
+        lines += chunk[..n].iter().filter(|b| **b == b'\n').count();
+    }
+    let start = len - TAIL_WINDOW_BYTES;
+    let mut raw = Vec::new();
+    if f.seek(SeekFrom::Start(start)).is_ok() {
+        let _ = f.take(TAIL_WINDOW_BYTES).read_to_end(&mut raw);
+    }
+    // The window starts mid-line (and maybe mid-character): drop that partial first line when there is a whole one after it.
+    if let Some(nl) = raw.iter().position(|b| *b == b'\n') {
+        raw.drain(..=nl);
+    }
+    (String::from_utf8_lossy(&raw).into_owned(), Some(lines))
+}
+
 /// Keep the last 2000 lines / 50 KiB (the end of command output matters most).
 pub(crate) fn tail(text: &str) -> Option<(String, usize, usize)> {
     let lines: Vec<&str> = text.split('\n').collect();
@@ -100,9 +139,15 @@ pub(crate) struct Finished {
 /// Wait for `child` (polling), killing its process group when `timeout` passes or `stop()` turns true.
 /// The output file is removed afterwards unless it was truncated or `keep_file` is set.
 pub(crate) fn wait(child: &mut Child, out_path: &Path, timeout: Option<Duration>, stop: &dyn Fn() -> bool, keep_file: bool) -> Finished {
+    wait_capped(child, out_path, timeout, stop, keep_file, MAX_OUTPUT_FILE_BYTES)
+}
+
+/// `wait`, killing the command as well when its output file grows past `output_cap` bytes (`yes`, a runaway log),
+/// so it cannot fill the disk.
+fn wait_capped(child: &mut Child, out_path: &Path, timeout: Option<Duration>, stop: &dyn Fn() -> bool, keep_file: bool, output_cap: u64) -> Finished {
     let pid = child.id();
     let start = Instant::now();
-    let (mut timed_out, mut killed) = (false, false);
+    let (mut timed_out, mut killed, mut over_cap) = (false, false, false);
     let status = loop {
         match child.try_wait() {
             Ok(Some(s)) => break s,
@@ -117,7 +162,10 @@ pub(crate) fn wait(child: &mut Child, out_path: &Path, timeout: Option<Duration>
         } else if timeout.is_some_and(|t| start.elapsed() >= t) {
             timed_out = true;
         }
-        if killed || timed_out {
+        if !killed && !timed_out && std::fs::metadata(out_path).is_ok_and(|m| m.len() > output_cap) {
+            over_cap = true;
+        }
+        if killed || timed_out || over_cap {
             kill_group(pid);
             break child.wait().unwrap_or_default();
         }
@@ -126,14 +174,18 @@ pub(crate) fn wait(child: &mut Child, out_path: &Path, timeout: Option<Duration>
     // Reap stragglers left in the process group after the shell exits.
     kill_group(pid);
 
-    let raw = std::fs::read(out_path).unwrap_or_default();
-    let full = String::from_utf8_lossy(&raw).into_owned();
+    let (full, total_lines) = read_output(out_path);
     let (mut text, truncated) = match tail(&full) {
-        Some((kept, n, total)) => (format!("[output truncated: showing last {n} of {total} lines; full output saved to {}]\n{kept}", out_path.display()), true),
+        Some((kept, n, total)) => (format!("[output truncated: showing last {n} of {} lines; full output saved to {}]\n{kept}", total_lines.unwrap_or(total), out_path.display()), true),
+        // Only the end of a big file was read; even if that end is short it is not the whole output.
+        None if total_lines.is_some() => (format!("[output truncated: showing last {} of {} lines; full output saved to {}]\n{full}", full.split('\n').count(), total_lines.unwrap_or(0), out_path.display()), true),
         None => (full, false),
     };
     if !truncated && !keep_file {
         let _ = std::fs::remove_file(out_path);
+    }
+    if over_cap {
+        text.push_str(&format!("\n\n[output exceeded {} MiB and the command was killed]", output_cap / (1024 * 1024)));
     }
     if timed_out {
         text.push_str(&format!("\n\n[command timed out after {} ms and was killed]", timeout.map_or(0, |t| t.as_millis())));
@@ -333,6 +385,38 @@ mod tests {
         assert!(o.text.contains("line3000") && !o.text.contains("\nline1\n"));
         let path = o.metadata["outputPath"].as_str().unwrap();
         assert!(std::fs::read_to_string(path).unwrap().contains("line1\n"));
+    }
+
+    #[test]
+    fn huge_output_is_read_from_the_end_with_the_true_line_count() {
+        let env = Env::new();
+        // 1,200,000 lines of "line" = 6,000,000 bytes, over the read-whole threshold.
+        let o = run(&env, json!({"command":"yes line | head -c 6000000"})).unwrap();
+        assert!(o.text.starts_with("[output truncated: showing last 2000 of 1200001 lines;"), "{}", &o.text[..100]);
+        assert!(o.text.ends_with("line\n"), "the end of the output is kept");
+        let path = o.metadata["outputPath"].as_str().unwrap();
+        assert_eq!(std::fs::metadata(path).unwrap().len(), 6_000_000, "the full output is still saved");
+    }
+
+    #[test]
+    fn a_short_end_of_a_huge_output_is_still_marked_truncated() {
+        let env = Env::new();
+        // One 5 MB line, then a short one: the window ends up holding only "tail".
+        let o = run(&env, json!({"command":"head -c 5000000 /dev/zero | tr '\\0' x; echo; echo tail"})).unwrap();
+        assert!(o.text.starts_with("[output truncated:") && o.text.ends_with("tail\n"), "{}", &o.text[..80]);
+        assert_eq!(o.metadata["truncated"], true);
+    }
+
+    #[test]
+    fn output_past_the_cap_kills_the_command() {
+        let env = Env::new();
+        let out = env.work().join("capped.txt");
+        let mut child = spawn("yes", &env.work(), &out, None).unwrap();
+        let t = Instant::now();
+        let f = wait_capped(&mut child, &out, None, &|| false, false, 1024 * 1024);
+        assert!(t.elapsed() < Duration::from_secs(10), "took {:?}", t.elapsed());
+        assert!(f.text.contains("output exceeded 1 MiB and the command was killed"), "{}", &f.text[f.text.len().saturating_sub(200)..]);
+        assert!(f.truncated && f.signal.is_some());
     }
 
     #[test]

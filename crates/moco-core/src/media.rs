@@ -96,7 +96,7 @@ pub fn sniff(b: &[u8]) -> Option<Sniffed> {
     None
 }
 
-fn human(n: usize) -> String {
+pub(crate) fn human(n: usize) -> String {
     if n >= 1024 * 1024 { format!("{:.1} MiB", n as f64 / 1024.0 / 1024.0) } else { format!("{} KiB", n.div_ceil(1024)) }
 }
 
