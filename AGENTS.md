@@ -13,7 +13,7 @@ scripts/install.sh                  # build for 10.14 and install to ~/.local/bi
 moco -p "prompt"                    # one-shot; bare `moco` is the interactive TUI (--plain for line chat); --continue resumes
 ```
 
-- There is no CI, and clippy and rustfmt are not installed on the Mojave machine. Don't reformat files wholesale.
+- CI runs workspace clippy/tests on Linux and checks the macOS binary's deployment target. Clippy and rustfmt are not installed on the Mojave machine; don't reformat files wholesale.
 - Integration tests in `crates/moco/tests/` and the MCP tests need `python3` (fake LLM/MCP servers, a pty driver). Without it, some skip silently and the MCP tests fail.
 - **Set `CARGO_TARGET_DIR` outside the repo** (`$HOME/moco-target` on the Mac, `/home/ubuntu/.cache/moco-target` on Linux). On the Linux dev box the repo is an sshfs mount of the Mac's disk, so a shared `target/` breaks intermittently and mixes Linux and macOS artifacts.
 - Mojave test machine: `ssh claude@semis-mac-pro.lan` (10.14.6, Xcode 11.3.1, rustup). Build there with `MACOSX_DEPLOYMENT_TARGET=10.14` and check `otool -l <binary> | grep minos`, which must say 10.14. Run `cargo test` on both Linux and the Mac for changes touching processes, paths or files. Do real-API experiments in a scratch directory outside the synced repo.
