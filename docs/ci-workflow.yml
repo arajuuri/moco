@@ -36,7 +36,7 @@ jobs:
       - name: Check minos <= 10.14
         run: |
           for bin in target/release/moco; do
-            otool -l "$bin" | grep -A3 LC_BUILD_VERSION
+            otool -l "$bin" | grep -A3 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX'
             minos=$(otool -l "$bin" | awk '/LC_BUILD_VERSION/{f=1} f&&$1=="minos"{print $2; exit}')
             if [ -z "$minos" ]; then
               minos=$(otool -l "$bin" | awk '/LC_VERSION_MIN_MACOSX/{f=1} f&&$1=="version"{print $2; exit}')
