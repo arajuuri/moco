@@ -1985,7 +1985,8 @@ mod tests {
             st.add_message(&f.session.id, "user", &json!({"text":"do it"})).unwrap();
             st.add_message(&f.session.id, "assistant", &json!({"parts":[{"type":"tool","id":"t1","name":"shell","input":{"command":"x"},"state":{"status":"running"}}]})).unwrap();
             assert!(st.claim(&f.session.id).unwrap());
-            assert_eq!(st.recover_claims(3).unwrap(), std::slice::from_ref(&f.session.id));
+            st.orphan_claim(&f.session.id);
+            assert_eq!(st.recover_claims(3).unwrap(), [f.session.id.clone()]);
         }
         let ui = TestUi::default();
         assert_eq!(f.engine.run(&f.session.id, &ui, &AtomicBool::new(false), true).unwrap(), RunOutcome::Idle);
