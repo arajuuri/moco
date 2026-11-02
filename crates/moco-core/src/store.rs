@@ -61,6 +61,8 @@ const MIGRATIONS: &[(i64, &str)] = &[
         at integer not null, command text not null, risk text not null, reason text not null, model text not null);
      create index auto_allow_session on auto_allow(session_id);",
     ),
+    // Which process holds the execution claim, so another start can tell a live run from a crash (issue #7).
+    (9, "alter table session add column claim_pid integer;"),
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -662,34 +664,68 @@ impl Store {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
-    /// Write-ahead execution claim. Returns false if the session is already claimed.
+    /// Write-ahead execution claim, owned by this process. Returns false if the session is already claimed.
     pub fn claim(&self, session_id: &str) -> Result<bool> {
-        let got = self.conn.execute("update session set claim_at=?2 where id=?1 and claim_at is null", params![session_id, now_ms()])? > 0;
+        let got = self.conn.execute(
+            "update session set claim_at=?2, claim_pid=?3 where id=?1 and claim_at is null",
+            params![session_id, now_ms(), std::process::id() as i64],
+        )? > 0;
         crate::log_debug!("store", "claim session={session_id} {}", if got { "taken" } else { "refused: already claimed" });
         Ok(got)
     }
 
+    /// Releases the claim, unless another live process has taken it over.
     pub fn release(&self, session_id: &str) -> Result<()> {
-        self.conn.execute("update session set claim_at=null, resume_attempts=0 where id=?1", [session_id])?;
+        self.conn.execute(
+            "update session set claim_at=null, claim_pid=null, resume_attempts=0 where id=?1 and (claim_pid is null or claim_pid=?2)",
+            params![session_id, std::process::id() as i64],
+        )?;
         crate::log_debug!("store", "release session={session_id}");
         Ok(())
     }
 
-    /// On startup: sessions left claimed by a crash. Bumps the attempt counter; sessions over `max_attempts`
-    /// are released instead of resumed. Returns the ids to resume.
+    /// On startup: sessions left claimed by a process that is gone (a crash). Claims held by a live process are left
+    /// alone. Top-level sessions get the attempt counter bumped and are re-owned by this process; those over
+    /// `max_attempts` are released instead of resumed. Stale subagent claims are released. Returns the ids to resume.
     pub fn recover_claims(&self, max_attempts: i64) -> Result<Vec<String>> {
-        let dropped = self.conn.execute("update session set claim_at=null where claim_at is not null and resume_attempts>=?1", [max_attempts])?;
-        if dropped > 0 {
-            crate::log_warn!("store", "recover: {dropped} session(s) crashed {max_attempts} times in a row and will not be resumed again");
-        }
-        let mut stmt = self.conn.prepare("select id from session where claim_at is not null and parent_id is null")?;
-        let ids: Vec<String> = stmt.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
-        for id in &ids {
-            self.conn.execute("update session set resume_attempts=resume_attempts+1 where id=?1", [id])?;
-            crate::log_warn!("store", "recover: session={id} was left claimed by a crash; resuming it");
+        let mut stmt = self.conn.prepare("select id, claim_pid, parent_id, resume_attempts from session where claim_at is not null")?;
+        let rows: Vec<(String, Option<i64>, Option<String>, i64)> =
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<std::result::Result<_, _>>()?;
+        let me = std::process::id() as i64;
+        let mut ids = Vec::new();
+        for (id, pid, parent, attempts) in rows {
+            if let Some(p) = pid.filter(|p| pid_alive(*p)) {
+                crate::log_debug!("store", "recover: session={id} is claimed by live process {p}; leaving it");
+                continue;
+            }
+            if parent.is_some() {
+                self.conn.execute("update session set claim_at=null, claim_pid=null, resume_attempts=0 where id=?1", [&id])?;
+                crate::log_warn!("store", "recover: subagent session={id} was left claimed by a crash; released");
+            } else if attempts >= max_attempts {
+                self.conn.execute("update session set claim_at=null, claim_pid=null where id=?1", [&id])?;
+                crate::log_warn!("store", "recover: session={id} crashed {max_attempts} times in a row and will not be resumed again");
+            } else {
+                self.conn.execute("update session set resume_attempts=resume_attempts+1, claim_pid=?2 where id=?1", params![id, me])?;
+                crate::log_warn!("store", "recover: session={id} was left claimed by a crash; resuming it");
+                ids.push(id);
+            }
         }
         Ok(ids)
     }
+
+    /// Test helper: make the claim look like it belongs to a process that no longer exists.
+    #[cfg(test)]
+    pub(crate) fn orphan_claim(&self, session_id: &str) {
+        self.conn.execute("update session set claim_pid=?2 where id=?1", params![session_id, i32::MAX as i64]).unwrap();
+    }
+}
+
+/// Whether a process with this id exists (signal 0 only checks). EPERM means it exists but is someone else's.
+fn pid_alive(pid: i64) -> bool {
+    if pid <= 0 || pid > i32::MAX as i64 {
+        return false;
+    }
+    unsafe { libc::kill(pid as i32, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) }
 }
 
 #[cfg(test)]
@@ -1017,13 +1053,39 @@ mod tests {
         let (s, ses) = store();
         assert!(s.claim(&ses.id).unwrap());
         assert!(!s.claim(&ses.id).unwrap(), "already claimed");
-        // Simulated crash: claim remains. Each restart resumes until the cap.
+        // Simulated crash: claim remains, owner gone. Each restart resumes until the cap.
+        s.orphan_claim(&ses.id);
         assert_eq!(s.recover_claims(2).unwrap(), [ses.id.clone()]);
+        s.orphan_claim(&ses.id);
         assert_eq!(s.recover_claims(2).unwrap(), [ses.id.clone()]);
+        s.orphan_claim(&ses.id);
         assert!(s.recover_claims(2).unwrap().is_empty(), "attempt cap reached, claim dropped");
         assert!(s.claim(&ses.id).unwrap());
         s.release(&ses.id).unwrap();
         assert!(s.recover_claims(2).unwrap().is_empty());
+    }
+
+    #[test]
+    fn live_claim_of_another_handle_is_not_recovered() {
+        let dir = std::env::temp_dir().join(new_id("moco-claim"));
+        let path = dir.join("moco.db");
+        let a = Store::open(&path).unwrap();
+        let b = Store::open(&path).unwrap();
+        let ses = a.create_session("/p", "build").unwrap();
+        let child = a.create_child_session(&ses, "general").unwrap();
+        assert!(a.claim(&ses.id).unwrap());
+        // A second start (live owner) must neither resume the session nor count an attempt.
+        for _ in 0..5 {
+            assert!(b.recover_claims(3).unwrap().is_empty());
+        }
+        assert!(!b.claim(&ses.id).unwrap(), "still claimed by the live owner");
+        // The owner dies: the top-level session is resumed, the stale subagent claim is released.
+        assert!(a.claim(&child.id).unwrap());
+        a.orphan_claim(&ses.id);
+        a.orphan_claim(&child.id);
+        assert_eq!(b.recover_claims(3).unwrap(), [ses.id.clone()]);
+        assert!(b.claim(&child.id).unwrap(), "stale subagent claim was released");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
