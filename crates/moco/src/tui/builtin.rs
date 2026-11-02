@@ -5,6 +5,7 @@ use moco_core::engine::{DiffResult, Engine, UndoReport, UndoResult};
 use moco_core::permission::PermissionMode;
 use moco_core::store::{Message, Session};
 
+#[allow(clippy::large_enum_variant)]
 /// What the event loop must do after a built-in command.
 pub enum Effect {
     None,

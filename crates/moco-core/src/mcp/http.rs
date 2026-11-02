@@ -71,8 +71,7 @@ fn read_events(reader: impl Read, mut on_event: impl FnMut(&str) -> bool) {
     use std::io::BufRead;
     let mut lines = std::io::BufReader::new(reader).lines();
     let mut data: Vec<String> = vec![];
-    loop {
-        let Some(Ok(line)) = lines.next() else { break };
+    while let Some(Ok(line)) = lines.next() {
         if line.is_empty() {
             if !data.is_empty() && on_event(&data.join("\n")) {
                 return;
@@ -173,7 +172,9 @@ impl Inner {
             read_events(reply.resp.into_reader(), |data| {
                 let Ok(v) = serde_json::from_str::<Value>(data) else { return false };
                 match v.as_array() {
-                    Some(batch) => batch.iter().fold(false, |done, m| take(self, m, &mut answer) || done),
+                    // Every message must be handled, so no short-circuiting `any`.
+                    #[allow(clippy::unnecessary_fold)]
+                    Some(batch) => batch.iter().map(|m| take(self, m, &mut answer)).fold(false, |a, b| a || b),
                     None => take(self, &v, &mut answer),
                 }
             });
@@ -257,7 +258,7 @@ impl Inner {
                         self.stop.load(Ordering::Relaxed)
                     });
                 }
-                Err(ureq::Error::Status(code, _)) if matches!(code, 400 | 401 | 403 | 404 | 405 | 406 | 501) => return,
+                Err(ureq::Error::Status(400 | 401 | 403 | 404 | 405 | 406 | 501, _)) => return,
                 Err(_) => {}
             }
             let end = Instant::now() + Duration::from_secs(backoff);

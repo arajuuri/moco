@@ -1,4 +1,5 @@
 //! moco: terminal chat (full screen on a terminal; line based with --plain, with -p or when piped).
+#![allow(clippy::type_complexity)]
 mod tui;
 use moco_core::catalog::{Catalog, ProviderInfo};
 use moco_core::mcp::{self, oauth::LoginIo, trust, Manager, ServerSpec};
@@ -1072,7 +1073,7 @@ fn main() {
             }
             l if l.starts_with("/fork") => {
                 let arg = l.trim_start_matches("/fork").trim();
-                match arg.parse::<usize>().or_else(|_| if arg.is_empty() { Ok(0) } else { Err(()) }) {
+                match arg.parse::<usize>().or(if arg.is_empty() { Ok(0) } else { Err(()) }) {
                     Err(()) => println!("usage: /fork [N]   (N = branch off before the Nth most recent prompt; no N copies everything)"),
                     Ok(n) => match engine.fork(&session.id, n) {
                         Ok(Some(f)) => {

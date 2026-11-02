@@ -1,4 +1,5 @@
 //! moco engine: UI-independent core (docs/00-overview.md).
+#![allow(clippy::type_complexity)]
 pub mod agent;
 pub mod auth;
 pub mod blobs;

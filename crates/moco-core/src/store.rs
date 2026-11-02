@@ -771,8 +771,8 @@ mod tests {
         let other = s.create_session("/work/proj", "build").unwrap();
         assert_eq!(s.find_sessions(&ses.id).unwrap().len(), 1);
         let tail = &ses.id[ses.id.len() - 6..];
-        assert_eq!(s.find_sessions(tail).unwrap().iter().map(|x| x.id.clone()).collect::<Vec<_>>(), [ses.id.clone()], "by suffix");
-        assert!(s.find_sessions(&ses.id[..8]).unwrap().len() >= 1, "by prefix");
+        assert_eq!(s.find_sessions(tail).unwrap().iter().map(|x| x.id.clone()).collect::<Vec<_>>(), std::slice::from_ref(&ses.id), "by suffix");
+        assert!(!s.find_sessions(&ses.id[..8]).unwrap().is_empty(), "by prefix");
         assert_eq!(s.find_sessions("ses_").unwrap().len(), 2, "an ambiguous piece returns every match so the caller can refuse");
         assert!(s.find_sessions("").unwrap().is_empty() && s.find_sessions("zzzzzz").unwrap().is_empty());
         let child = s.create_child_session(&ses, "general").unwrap();
@@ -1018,8 +1018,8 @@ mod tests {
         assert!(s.claim(&ses.id).unwrap());
         assert!(!s.claim(&ses.id).unwrap(), "already claimed");
         // Simulated crash: claim remains. Each restart resumes until the cap.
-        assert_eq!(s.recover_claims(2).unwrap(), [ses.id.clone()]);
-        assert_eq!(s.recover_claims(2).unwrap(), [ses.id.clone()]);
+        assert_eq!(s.recover_claims(2).unwrap(), std::slice::from_ref(&ses.id));
+        assert_eq!(s.recover_claims(2).unwrap(), std::slice::from_ref(&ses.id));
         assert!(s.recover_claims(2).unwrap().is_empty(), "attempt cap reached, claim dropped");
         assert!(s.claim(&ses.id).unwrap());
         s.release(&ses.id).unwrap();
