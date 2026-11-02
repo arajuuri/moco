@@ -662,7 +662,7 @@ impl Engine {
         );
         if agent.id == "plan" {
             // In the system prompt (not appended to the last message) so every request keeps the same prefix.
-            system.push_str("\n");
+            system.push('\n');
             system.push_str(agent::PLAN_REMINDER);
             system.push('\n');
         }
@@ -923,10 +923,7 @@ impl Engine {
                 }
             };
             // A model chosen for this conversation carries over unless the call names one.
-            match req.model.as_ref().or(parent.model.as_ref()) {
-                Some(m) => st.set_model(&child.id, Some(m)).map_err(store_err)?,
-                None => {}
-            }
+            if let Some(m) = req.model.as_ref().or(parent.model.as_ref()) { st.set_model(&child.id, Some(m)).map_err(store_err)? }
             child
         };
         eng.submit(&child.id, &req.prompt, Mode::Steer).map_err(store_err)?;
@@ -1020,7 +1017,7 @@ impl Engine {
             (st.session(sid)?.expect("session exists"), st.messages(sid)?, st.revert(sid)?)
         };
         let marker = revert.as_ref().and_then(|r| r["messageId"].as_str()).map(String::from);
-        let Some(turn) = msgs.iter().filter(|m| m.kind == "user" && marker.as_deref().is_none_or(|mk| m.id.as_str() < mk)).last() else {
+        let Some(turn) = msgs.iter().rfind(|m| m.kind == "user" && marker.as_deref().is_none_or(|mk| m.id.as_str() < mk)) else {
             return Ok(UndoResult::NothingToUndo);
         };
         let snapshot = msgs.iter().filter(|m| m.kind == "assistant" && m.id > turn.id).find_map(|m| m.data["snapshot"].as_str().map(String::from));
@@ -1698,7 +1695,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(f.dir.join("work/a.txt")).unwrap(), "1 2\n");
         assert_eq!(std::fs::read_to_string(f.dir.join("work/b.txt")).unwrap(), "made");
         let reqs = f.fake.requests.lock().unwrap();
-        let errors: Vec<Block> = reqs.iter().flat_map(|r| last_user_blocks(r)).filter(|b| matches!(b, Block::ToolResult { is_error: true, .. })).collect();
+        let errors: Vec<Block> = reqs.iter().flat_map(last_user_blocks).filter(|b| matches!(b, Block::ToolResult { is_error: true, .. })).collect();
         assert!(errors.is_empty(), "{errors:?}");
         // What was stored (and is replayed to the model on later steps) uses our names.
         let stored: Vec<Value> = f.msgs().into_iter().flat_map(|m| m.data["parts"].as_array().cloned().unwrap_or_default()).filter(|p| p["type"] == "tool").collect();
@@ -2922,9 +2919,9 @@ mod tests {
         let dir = f.dir.join("app/data/snapshots").join(&pid).join("manifests");
         assert!(std::fs::read_dir(&dir).unwrap().count() >= 3);
         // A session active within the window protects its snapshots, however old the files are.
-        assert_eq!(f.engine.prune_snapshots(&[pid.clone()], Duration::from_secs(3600)), (0, 0));
+        assert_eq!(f.engine.prune_snapshots(std::slice::from_ref(&pid), Duration::from_secs(3600)), (0, 0));
         // With a zero window every session counts as stale: old snapshots go (the files on disk never do).
-        let (manifests, blobs) = f.engine.prune_snapshots(&[pid.clone()], Duration::ZERO);
+        let (manifests, blobs) = f.engine.prune_snapshots(std::slice::from_ref(&pid), Duration::ZERO);
         assert!(manifests >= 3 && blobs >= 3, "{manifests} {blobs}");
         assert_eq!(read_work(&f, "a.txt").as_deref(), Some("v2"));
         match f.engine.undo(&f.session.id).unwrap() {

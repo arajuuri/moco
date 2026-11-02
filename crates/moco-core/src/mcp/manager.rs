@@ -707,7 +707,7 @@ mod tests {
 
     fn start(specs: Vec<ServerSpec>, timeouts: McpTimeouts) -> Arc<Manager> {
         let m = Manager::start(specs, &timeouts, &std::env::temp_dir());
-        assert!(m.wait_ready(Duration::from_secs(20)), "servers did not settle: {:?}", m.status().iter().map(|s| describe(s)).collect::<Vec<_>>());
+        assert!(m.wait_ready(Duration::from_secs(20)), "servers did not settle: {:?}", m.status().iter().map(describe).collect::<Vec<_>>());
         m
     }
 

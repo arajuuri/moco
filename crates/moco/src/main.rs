@@ -1,4 +1,5 @@
 //! moco: terminal chat (full screen on a terminal; line based with --plain, with -p or when piped).
+#![allow(clippy::type_complexity)]
 mod tui;
 use moco_core::catalog::{Catalog, ProviderInfo};
 use moco_core::mcp::{self, oauth::LoginIo, trust, Manager, ServerSpec};
@@ -672,7 +673,13 @@ fn main() {
     moco_core::log::configure(cfg.log.as_deref());
     moco_core::log_info!("main", "start dir={} sources={}", cwd_str, loaded.sources.len());
     if let (Some(sh), None) = (&cfg.shell, std::env::var_os("MOCO_SHELL")) {
-        std::env::set_var("MOCO_SHELL", sh);
+        // A project's `shell` is an executable that every shell call would run, so it needs approval like an MCP server.
+        let origin = loaded.shell_origin.as_ref();
+        if origin.is_none_or(|o| trust::origin_is_trusted(o, &app_dir)) || project_command_allowed(&app_dir, origin, "shell", "shell", sh, &trust::fingerprint_shell(&cwd, sh)) {
+            std::env::set_var("MOCO_SHELL", sh);
+        } else {
+            eprintln!("warning: shell '{sh}' from {} is ignored: project-defined commands need your approval (run moco in a terminal, or set MOCO_TRUST_PROJECT_CONFIG=1)", origin.map(|o| tilde(&o.display().to_string())).unwrap_or_default());
+        }
     }
     // The flag applies to this session and is the default for new ones; otherwise the config key is the default (manual).
     let flag_mode = permission_mode_arg.as_deref().map(|s| permission::PermissionMode::parse(s).unwrap_or_else(|| die(&format!("--permission-mode must be manual or auto, not {s}"))));
@@ -1072,7 +1079,7 @@ fn main() {
             }
             l if l.starts_with("/fork") => {
                 let arg = l.trim_start_matches("/fork").trim();
-                match arg.parse::<usize>().or_else(|_| if arg.is_empty() { Ok(0) } else { Err(()) }) {
+                match arg.parse::<usize>().or(if arg.is_empty() { Ok(0) } else { Err(()) }) {
                     Err(()) => println!("usage: /fork [N]   (N = branch off before the Nth most recent prompt; no N copies everything)"),
                     Ok(n) => match engine.fork(&session.id, n) {
                         Ok(Some(f)) => {

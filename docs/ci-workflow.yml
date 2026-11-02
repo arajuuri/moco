@@ -1,0 +1,47 @@
+# Proposed CI. Copy to .github/workflows/ci.yml (the Claude app cannot push to that directory).
+# `cargo fmt --check` is left out on purpose: the tree is not rustfmt formatted (~1900 diffs),
+# so enabling it needs a one-off `cargo fmt` commit first.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace # python3 is preinstalled; the fake MCP/LLM servers need it
+
+  macos-minos:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build with the Mojave deployment target
+        run: cargo build --release
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "10.14"
+      - name: Check minos <= 10.14
+        run: |
+          for bin in target/release/moco; do
+            otool -l "$bin" | grep -A3 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX'
+            minos=$(otool -l "$bin" | awk '/LC_BUILD_VERSION/{f=1} f&&$1=="minos"{print $2; exit}')
+            if [ -z "$minos" ]; then
+              minos=$(otool -l "$bin" | awk '/LC_VERSION_MIN_MACOSX/{f=1} f&&$1=="version"{print $2; exit}')
+            fi
+            echo "$bin minos=$minos"
+            [ -n "$minos" ] || { echo "no minos found"; exit 1; }
+            [ "$(printf '%s\n10.14\n' "$minos" | sort -V | tail -1)" = "10.14" ] || { echo "minos $minos > 10.14"; exit 1; }
+          done
