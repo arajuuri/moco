@@ -3,6 +3,9 @@ use ignore::WalkBuilder;
 use regex::RegexBuilder;
 use std::io::BufReader;
 
+/// Matches are counted exactly up to `limit * COUNT_FACTOR`, then the search stops.
+const COUNT_FACTOR: usize = 10;
+
 pub struct Grep;
 
 /// Files bigger than this are skipped (and reported).
@@ -44,27 +47,31 @@ impl Tool for Grep {
         let mut out: Vec<String> = vec![];
         let mut total = 0usize;
         let mut skipped = 0usize;
-        let walker = WalkBuilder::new(&root).hidden(true).git_ignore(true).git_global(true).git_exclude(true).require_git(false).build();
-        let mut files: Vec<PathBuf> = walker
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
-            .map(|e| e.into_path())
-            .collect();
-        if root.is_file() {
-            files = vec![root.clone()];
-        }
-        files.sort();
-        for path in files {
+        // Stop counting precisely after this many matches; report "N+".
+        let count_cap = limit.saturating_mul(COUNT_FACTOR);
+        let mut capped = false;
+
+        // Stream the walk (sorted per directory, so output is deterministic) and
+        // check for cancellation on every entry instead of collecting first.
+        let mut builder = WalkBuilder::new(&root);
+        builder.hidden(true).git_ignore(true).git_global(true).git_exclude(true).require_git(false);
+        builder.sort_by_file_path(|a, b| a.cmp(b));
+        'files: for entry in builder.build() {
             if ctx.cancelled() {
                 return Err(ToolError::Interrupted);
             }
-            let rel = path.strip_prefix(&root).unwrap_or(&path).to_path_buf();
+            let Ok(entry) = entry else { continue };
+            if !entry.file_type().is_some_and(|t| t.is_file()) {
+                continue;
+            }
+            let path = entry.path();
+            let rel = path.strip_prefix(&root).unwrap_or(path).to_path_buf();
             if let Some(inc) = &include {
                 if !(inc.is_match(&rel) || path.file_name().is_some_and(|n| inc.is_match(n))) {
                     continue;
                 }
             }
-            let Ok(file) = std::fs::File::open(&path) else { continue };
+            let Ok(file) = std::fs::File::open(path) else { continue };
             // Data dumps and logs of this size are not what grep is for here, and would take minutes.
             if file.metadata().is_ok_and(|m| m.len() > MAX_FILE_BYTES) {
                 skipped += 1;
@@ -74,6 +81,9 @@ impl Tool for Grep {
             let mut buf = Vec::new();
             let mut n = 0usize;
             loop {
+                if n % 1024 == 0 && ctx.cancelled() {
+                    return Err(ToolError::Interrupted);
+                }
                 // A line is matched on its first MAX_LINE_BYTES only: a minified bundle is one huge line.
                 match super::fsio::read_line_capped(&mut reader, &mut buf, MAX_LINE_BYTES) {
                     Ok((0, _)) | Err(_) => break,
@@ -92,6 +102,10 @@ impl Tool for Grep {
                         let shown = if line.chars().count() > 300 { format!("{shown}...") } else { shown };
                         out.push(format!("{}:{n}: {}", rel.display(), shown.trim_start()));
                     }
+                    if total >= count_cap {
+                        capped = true;
+                        break 'files;
+                    }
                 }
             }
         }
@@ -101,7 +115,8 @@ impl Tool for Grep {
         }
         let mut text = out.join("\n");
         if total > limit {
-            text.push_str(&format!("\n\n[showing {limit} of {total} matches; narrow the pattern or raise limit]"));
+            let plus = if capped { "+" } else { "" };
+            text.push_str(&format!("\n\n[showing {limit} of {total}{plus} matches; narrow the pattern or raise limit]"));
         }
         if !note.is_empty() {
             text.push_str(&format!("\n\n{note}"));
@@ -152,5 +167,15 @@ mod tests {
         env.file("many.txt", "hit\n".repeat(5).as_bytes());
         let t = run(&env, json!({"pattern":"hit","limit":2})).unwrap();
         assert!(!t.contains("skip.txt") && t.contains("[showing 2 of 5 matches"), "{t}");
+    }
+
+    #[test]
+    fn caps_count_and_single_file_root() {
+        let env = Env::new();
+        env.file("many.txt", "hit\n".repeat(50).as_bytes());
+        let t = run(&env, json!({"pattern":"hit","limit":2})).unwrap();
+        assert!(t.contains("[showing 2 of 20+ matches"), "{t}");
+        let t = run(&env, json!({"pattern":"hit","path":"many.txt","limit":100})).unwrap();
+        assert_eq!(t.lines().count(), 50);
     }
 }
