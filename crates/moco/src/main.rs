@@ -537,6 +537,35 @@ fn main() {
                     store.set_title(&ses.id, title.trim()).unwrap_or_else(|e| die(&e.to_string()));
                     println!("renamed {}", short(&ses.id));
                 }
+                Some("export") => {
+                    const USAGE: &str = "usage: moco sessions export ID [--md | --json | --jsonl] [--children] [--include-hidden] [-o FILE]";
+                    let mut opts = moco_core::export::Options::default();
+                    let (mut id, mut file) = (None, None);
+                    let mut it = rest.iter().skip(1);
+                    while let Some(a) = it.next() {
+                        match *a {
+                            "--md" => opts.format = moco_core::export::Format::Markdown,
+                            "--json" => opts.format = moco_core::export::Format::Json,
+                            "--jsonl" => opts.format = moco_core::export::Format::Jsonl,
+                            "--children" => opts.children = true,
+                            "--include-hidden" => opts.include_hidden = true,
+                            "-o" | "--output" => file = Some(it.next().copied().unwrap_or_else(|| die("-o needs a file name"))),
+                            f if f.starts_with('-') => die(&format!("unknown option {f}; {USAGE}")),
+                            _ if id.is_none() => id = Some(*a),
+                            _ => die(USAGE),
+                        }
+                    }
+                    let Some(id) = id else { die(USAGE) };
+                    let ses = pick_session(&store, id, &[]).unwrap_or_else(|e| die(&format!("export: {e}")));
+                    let text = moco_core::export::export(&store, &ses.id, &opts).unwrap_or_else(|e| die(&format!("export: {e}")));
+                    match file {
+                        Some(f) => {
+                            std::fs::write(f, &text).unwrap_or_else(|e| die(&format!("{f}: {e}")));
+                            eprintln!("wrote {f}");
+                        }
+                        None => print!("{text}"),
+                    }
+                }
                 Some(cmd @ ("archive" | "unarchive")) => {
                     let ses = need(cmd);
                     store.set_archived(&ses.id, cmd == "archive").unwrap_or_else(|e| die(&e.to_string()));

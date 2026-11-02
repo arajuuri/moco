@@ -31,6 +31,7 @@ pub const NAMES: &[(&str, &str)] = &[
     ("compact", "summarize older messages to free up context"),
     ("fork", "copy this conversation into a new session"),
     ("rename", "name this session"),
+    ("export", "write this conversation to a Markdown file"),
     ("archive", "hide a session from the list"),
     ("theme", "pick a color theme"),
     ("queue", "send a prompt after the current turn, or manage waiting prompts"),
@@ -116,7 +117,7 @@ pub fn palette_items(host: &Host) -> Vec<PickItem> {
     let mut add = |name: &str, desc: &str, run: bool| v.push(PickItem { label: format!("/{name}"), detail: desc.to_string(), value: format!("{}/{name}{}", if run { "run:" } else { "ins:" }, if run { "" } else { " " }) });
     for (n, d) in NAMES {
         // Commands that need an argument are inserted into the composer; the rest run at once.
-        add(n, d, !matches!(*n, "rename" | "fork" | "archive" | "mcp" | "queue"));
+        add(n, d, !matches!(*n, "rename" | "export" | "fork" | "archive" | "mcp" | "queue"));
     }
     add("help", "show the keys", true);
     add("exit", "quit", true);
@@ -235,8 +236,17 @@ pub fn run(host: &Host, app: &mut App, sid: &str, agent: &str, name: &str, args:
                 app.push_info("renamed");
             }
         }
+        "export" => {
+            let path = if args.is_empty() { format!("moco-{}.md", crate::short(sid)) } else { args.to_string() };
+            let path = std::path::Path::new(&host.cwd).join(path);
+            let text = moco_core::export::export(&engine.store.lock().unwrap(), sid, &moco_core::export::Options::default()).map_err(|e| e.to_string());
+            match text.and_then(|t| std::fs::write(&path, t).map_err(|e| e.to_string())) {
+                Ok(()) => app.push_info(format!("exported to {} (not redacted: check it for secrets before sharing)", crate::tilde(&path.to_string_lossy()))),
+                Err(e) => err(app, format!("export failed: {e}")),
+            }
+        }
         "fork" => {
-            let n = if args.is_empty() { Some(0) } else { args.parse::<usize>().ok() };
+            let n =if args.is_empty() { Some(0) } else { args.parse::<usize>().ok() };
             match n {
                 None => err(app, "usage: /fork [N]   (N = branch off before the Nth most recent prompt; no N copies everything)"),
                 Some(n) => match engine.fork(sid, n) {
