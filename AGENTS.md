@@ -21,6 +21,13 @@ moco -p "prompt"                    # one-shot; bare `moco` is the interactive T
 - **Classifier evaluation**: `crates/moco-core/tests/classifier_cases.jsonl` is the golden set (command, expected `allow`/`ask`, category) and `cargo test -p moco-core --test classifier_cases` checks it against the rules that need no model. `scripts/eval-classifier.py` runs it against the configured model through the hidden `moco --eval-classifier FILE` and reports false allows (target: none for destructive, injection and opaque commands) and extra asks. It costs tokens and needs a provider key; it records a session, so it uses a scratch `MOCO_HOME`. Rerun it when you change the classifier prompt, the never-classify list or the model.
 - `scripts/update-catalog-snapshot.py` regenerates `crates/moco-core/src/catalog_snapshot.json`. `scripts/tui-gallery.py` renders `tui/gallery.rs` sample screens to PNG (`MOCO_GALLERY=dir`) so you can look at a TUI change.
 
+## Workflow
+
+- The Rust toolchain is pinned in `rust-toolchain.toml` (and in `.github/workflows/*.yml`); bump it deliberately in its own PR. Run `cargo clippy --workspace --all-targets -- -D warnings` on the Linux box before pushing (`rustup component add clippy`); CI treats warnings as errors.
+- Before finishing a PR, fetch `origin/main` and integrate it. If a file you touched changed on main, resolve the conflict keeping both sides' intent and re-run the tests.
+- One PR per issue. Don't start an issue that touches the same files as an open PR; wait for that PR to merge or build on its branch.
+- If CI fails on a lint or error that is also on main, fix it once on main instead of in each PR, so PRs don't pile up duplicate fixes.
+
 ## Issues and project board
 
 Track work with GitHub's fields, not labels or title prefixes: issue Type (Bug, Feature, Enhancement, Task), Priority (Urgent/High/Medium/Low), and on the Moco project Status, Size and Estimate (hours). Area labels (`security`, `stability`, `performance`, `error-handling`, `code-quality`) are separate. Don't put `[High]` or `[Bug]` in titles or recreate the old `bug`/`enhancement`/`priority:` labels. Definitions and `gh` recipes are in `CONTRIBUTING.md`.

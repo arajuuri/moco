@@ -1,0 +1,5 @@
+# Pinned so a new stable release (and its new clippy lints) cannot break main and every open PR at once.
+# Bump deliberately in its own PR, and keep the version in .github/workflows/*.yml in sync.
+[toolchain]
+channel = "1.99.1"
+components = ["clippy"]
