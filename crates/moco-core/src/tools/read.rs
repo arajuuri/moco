@@ -23,8 +23,11 @@ Prefer one larger read over many small slices, and use grep to find specific con
         if !path.exists() {
             path = fuzzy_sibling(&path).ok_or_else(|| ToolError::fail(format!("File not found: {}", path.display())))?;
         }
-        let dir = if path.is_dir() { path.clone() } else { path.parent().unwrap_or(&path).to_path_buf() };
-        ctx.check_external(&dir)?;
+        if path.is_dir() {
+            ctx.check_external(&path)?;
+        } else {
+            ctx.check_external_file(&path)?;
+        }
         ctx.permit("read", vec![ctx.display(&path)], vec!["*".into()])?;
 
         let offset = opt_u64(input, "offset").unwrap_or(1).max(1) as usize;
@@ -333,7 +336,8 @@ mod tests {
         run(&env, json!({"path": outside.to_string_lossy()})).unwrap();
         let asked = env.perm.asked();
         assert_eq!(asked[0].action, "external_directory");
-        assert_eq!(asked[0].resources, [format!("{}/*", env.dir.display())]);
+        // The prompt names the directory with symlinks resolved (on macOS the temp dir is under the /var -> /private/var link).
+        assert_eq!(asked[0].resources, [format!("{}/*", crate::tools::real_path(&env.dir).display())]);
         assert_eq!(asked[1].action, "read");
         assert_eq!(asked[1].resources, [outside.to_string_lossy()]);
     }

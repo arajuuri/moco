@@ -14,6 +14,11 @@ pub enum StoreError {
 }
 pub type Result<T> = std::result::Result<T, StoreError>;
 
+/// `directory` with symlinks resolved (as far as it exists), so every spelling of a directory is one project.
+fn canonical_dir(directory: &str) -> String {
+    crate::tools::real_path(Path::new(directory)).to_string_lossy().into_owned()
+}
+
 const MIGRATIONS: &[(i64, &str)] = &[
     (
         1,
@@ -188,10 +193,17 @@ impl Store {
         crate::log::LogErr::log_err(self.conn.execute("delete from auto_allow where at < ?1", [now_ms() - keep_ms]), "store", "pruning old automatic allows");
     }
 
-    /// Project id is derived from the directory, so reopening the same directory finds the same project.
+    /// Project id is derived from the directory, so reopening the same directory finds the same project. A directory
+    /// reachable under two names (a symlinked parent) is one project: the symlink-free name is the one stored, and a
+    /// project recorded earlier under the name as given is still found.
     pub fn project_for(&self, directory: &str) -> Result<String> {
-        if let Some(id) = self.conn.query_row("select id from project where directory=?1", [directory], |r| r.get(0)).optional()? {
-            return Ok(id);
+        let given = directory;
+        let directory = canonical_dir(given);
+        let directory = directory.as_str();
+        for d in [directory, given] {
+            if let Some(id) = self.conn.query_row("select id from project where directory=?1", [d], |r| r.get(0)).optional()? {
+                return Ok(id);
+            }
         }
         let id = new_id("prj");
         let name = Path::new(directory).file_name().map(|n| n.to_string_lossy().into_owned());
@@ -204,6 +216,8 @@ impl Store {
 
     pub fn create_session(&self, directory: &str, agent: &str) -> Result<Session> {
         let project_id = self.project_for(directory)?;
+        let directory = canonical_dir(directory);
+        let directory = directory.as_str();
         let id = new_id("ses");
         let t = now_ms();
         self.conn.execute(
@@ -353,8 +367,8 @@ impl Store {
             .conn
             .query_row(
                 "select id, project_id, directory, agent, title, model, parent_id, variant, permission_mode from session
-                 where directory=?1 and parent_id is null and time_archived is null order by id desc limit 1",
-                [directory],
+                 where directory in (?1, ?2) and parent_id is null and time_archived is null order by id desc limit 1",
+                [canonical_dir(directory).as_str(), directory],
                 |r| Ok(Session { id: r.get(0)?, project_id: r.get(1)?, directory: r.get(2)?, agent: r.get(3)?, title: r.get(4)?, model: r.get(5)?, parent_id: r.get(6)?, variant: r.get(7)?, permission_mode: r.get(8)? }),
             )
             .optional()?)
@@ -367,10 +381,11 @@ impl Store {
             "select s.id, s.title, s.directory, s.agent, s.model, s.cost, s.time_created, s.time_updated, s.time_archived is not null, s.fork_session_id,
                     (select count(*) from message m where m.session_id=s.id and m.type in ('user','assistant'))
              from session s
-             where s.parent_id is null and (s.time_archived is not null) = ?1 and (?2 is null or s.directory = ?2)
+             where s.parent_id is null and (s.time_archived is not null) = ?1 and (?2 is null or s.directory in (?2, ?4))
              order by s.time_updated desc, s.id desc limit ?3",
         )?;
-        let rows = stmt.query_map(params![archived, directory, limit as i64], |r| {
+        let canonical = directory.map(canonical_dir);
+        let rows = stmt.query_map(params![archived, directory, limit as i64, canonical], |r| {
             Ok(SessionSummary {
                 id: r.get(0)?,
                 title: r.get(1)?,
@@ -880,6 +895,24 @@ mod tests {
         let (s, ses) = store();
         assert_eq!(s.project_for("/work/proj").unwrap(), ses.project_id);
         assert_ne!(s.project_for("/work/other").unwrap(), ses.project_id);
+    }
+
+    #[test]
+    fn both_spellings_of_a_symlinked_directory_are_one_project() {
+        let (s, _) = store();
+        let base = std::env::temp_dir().join(crate::id::new_id("moco-store"));
+        std::fs::create_dir_all(base.join("real/proj")).unwrap();
+        std::os::unix::fs::symlink(base.join("real"), base.join("link")).unwrap();
+        let (real, link) = (base.join("real/proj"), base.join("link/proj"));
+        let a = s.create_session(real.to_str().unwrap(), "build").unwrap();
+        let b = s.create_session(link.to_str().unwrap(), "build").unwrap();
+        assert_eq!(a.project_id, b.project_id);
+        assert_eq!(a.directory, b.directory);
+        for dir in [&real, &link] {
+            assert_eq!(s.list_sessions(Some(dir.to_str().unwrap()), false, 10).unwrap().len(), 2);
+            assert_eq!(s.latest_session(dir.to_str().unwrap()).unwrap().unwrap().id, b.id);
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

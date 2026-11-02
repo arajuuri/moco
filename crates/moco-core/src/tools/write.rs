@@ -16,7 +16,7 @@ For partial changes, use the edit tool instead.".into()
     fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let path = ctx.resolve(str_arg(input, "path")?);
         let content = str_arg(input, "content")?;
-        ctx.check_external(path.parent().unwrap_or(&path))?;
+        ctx.check_external_file(&path)?;
         ctx.permit("edit", vec![ctx.display(&path)], vec!["*".into()])?;
         // No other call may change this file between the read below and the end of formatting (issue #6).
         let _locks = super::fsio::lock_files([&path]);
