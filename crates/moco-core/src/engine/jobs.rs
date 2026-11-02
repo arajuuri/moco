@@ -194,9 +194,9 @@ impl Engine {
         let head = format!("[{id}: {}]", describe(&state));
         match (kind, out) {
             (Kind::Shell, Some(path)) => {
-                let text = std::fs::read_to_string(&path).unwrap_or_default();
-                let all: Vec<&str> = text.lines().collect();
-                let tail = all[all.len().saturating_sub(lines)..].join("\n");
+                // Only the end of the log: a dev server can run for hours and write gigabytes.
+                let text = crate::log::read_tail_bounded(&path, lines, 1024 * 1024).unwrap_or_default();
+                let tail = text.trim_end_matches('\n');
                 Ok(if tail.is_empty() { format!("{head}\n(no output yet)") } else { format!("{head}\n{tail}") })
             }
             _ => {

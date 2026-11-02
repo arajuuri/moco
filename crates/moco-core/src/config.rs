@@ -325,6 +325,8 @@ pub struct Loaded {
     pub mcp_origins: BTreeMap<String, PathBuf>,
     /// The same for `formatter.<name>`: a project's formatter is a command to run, so it must be vetted like an MCP server.
     pub formatter_origins: BTreeMap<String, PathBuf>,
+    /// The config file that set `shell` last: a project's is an executable to run, so it must be vetted too.
+    pub shell_origin: Option<PathBuf>,
 }
 
 /// Remove `//` and `/* */` comments and trailing commas, leaving strings untouched.
@@ -525,6 +527,9 @@ pub fn load(app_dir: &Path, cwd: &Path) -> Loaded {
                 for name in v["formatter"].as_object().into_iter().flat_map(|o| o.keys()) {
                     out.formatter_origins.insert(name.clone(), path.clone());
                 }
+                if v.get("shell").is_some_and(|s| !s.is_null()) {
+                    out.shell_origin = Some(path.clone());
+                }
                 if v["formatter"].is_boolean() {
                     out.formatter_origins.clear(); // `false`/`true` replaces everything defined before it
                 }
@@ -717,6 +722,23 @@ mod tests {
         std::fs::write(app.join("config/moco.json"), r#"{"providers":{"ollama":{"base_url":"http://localhost:11434/v1"}}}"#).unwrap();
         let l = load(&app, &proj);
         assert_eq!(l.config.providers["ollama"].base_url.as_deref(), Some("http://localhost:11434/v1"), "the user's own config is trusted");
+    }
+
+    #[test]
+    fn shell_origin_tells_a_project_shell_from_the_users() {
+        let root = tmp();
+        let (app, proj) = (root.join("app"), root.join("proj"));
+        std::fs::create_dir_all(app.join("config")).unwrap();
+        std::fs::create_dir_all(&proj).unwrap();
+        assert_eq!(load(&app, &proj).shell_origin, None);
+        std::fs::write(app.join("config/moco.jsonc"), r#"{"shell":"/bin/zsh"}"#).unwrap();
+        let l = load(&app, &proj);
+        assert!(crate::mcp::trust::origin_is_trusted(l.shell_origin.as_ref().unwrap(), &app), "the user's own shell is trusted");
+        std::fs::write(proj.join("moco.json"), r#"{"shell":"./mock-shell"}"#).unwrap();
+        let l = load(&app, &proj);
+        assert_eq!(l.config.shell.as_deref(), Some("./mock-shell"));
+        assert_eq!(l.shell_origin.as_deref(), Some(proj.join("moco.json").as_path()));
+        assert!(!crate::mcp::trust::origin_is_trusted(l.shell_origin.as_ref().unwrap(), &app), "a project's shell needs approval");
     }
 
     #[test]

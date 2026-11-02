@@ -578,13 +578,15 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
         stop.store(true, Ordering::Relaxed);
         app.dialogs.clear(); // dropping the senders rejects whatever the run was waiting on
         app.forms.clear();
-        while app.running {
-            match rx.recv_timeout(Duration::from_secs(1)) {
-                Ok(AppEvent::RunDone(_)) | Ok(AppEvent::ShellDone(_)) | Ok(AppEvent::OpDone(_)) | Err(RecvTimeoutError::Disconnected) => break,
-                Ok(AppEvent::Ask { reply, .. }) => {
-                    let _ = reply.send(Reply::Reject(None));
+        if app.running {
+            loop {
+                match rx.recv_timeout(Duration::from_secs(1)) {
+                    Ok(AppEvent::RunDone(_)) | Ok(AppEvent::ShellDone(_)) | Ok(AppEvent::OpDone(_)) | Err(RecvTimeoutError::Disconnected) => break,
+                    Ok(AppEvent::Ask { reply, .. }) => {
+                        let _ = reply.send(Reply::Reject(None));
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
         Ok(())

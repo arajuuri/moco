@@ -47,6 +47,7 @@ fn scenario(name: &str) {
         .output()
         .unwrap();
     let _ = server.kill();
+    let _ = server.wait();
     let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     assert!(out.status.success(), "tui {name} failed\n{stdout}\n{stderr}");
     let _ = std::fs::remove_dir_all(dir);
