@@ -68,6 +68,7 @@ fn run_with_log(tag: &str, level: Option<&str>) -> Option<(String, String, Strin
     }
     let out = cmd.output().unwrap();
     let _ = server.kill();
+    let _ = server.wait();
     let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned());
     assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
     let log = std::fs::read_dir(dir.join("home/data/logs")).ok().and_then(|d| d.filter_map(|e| e.ok()).map(|e| e.path()).next()).map(|f| std::fs::read_to_string(f).unwrap()).unwrap_or_default();

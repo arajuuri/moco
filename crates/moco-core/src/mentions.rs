@@ -151,7 +151,7 @@ pub fn expand(text: &str, ctx: &Ctx) -> (Value, Vec<String>) {
         } else if let Some(s) = ctx.skills.iter().find(|s| s.id == tok) {
             notes.push(format!("loaded skill {}", s.id));
             skill_items.push(json!({"id": s.id, "content": skills::render_content(s)}));
-        } else if ctx.subagents.iter().any(|a| *a == tok) {
+        } else if ctx.subagents.contains(&tok) {
             notes.push(format!("@{tok}: the model will be asked to delegate to it"));
             agents.push(json!(tok));
         } else if let Some(r) = ctx.mcp.and_then(|m| m.find_resource(&tok).map(|r| (m, r))) {

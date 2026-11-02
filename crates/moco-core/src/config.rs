@@ -488,7 +488,7 @@ pub fn load(app_dir: &Path, cwd: &Path) -> Loaded {
         match parsed {
             Ok(mut v) if v.is_object() => {
                 if let Some(c) = v.as_object_mut().and_then(|o| o.remove("permission_classifier")) {
-                    let user_level = path.parent() == Some(app_dir.join("config").as_path()) || std::env::var_os("MOCO_CONFIG").is_some_and(|p| PathBuf::from(p) == path);
+                    let user_level = path.parent() == Some(app_dir.join("config").as_path()) || std::env::var_os("MOCO_CONFIG").is_some_and(|p| p == path);
                     if !user_level {
                         // A project must not be able to relax the user's prompts by switching this on.
                         out.warnings.push(format!("{}: permission_classifier is only read from your own config ({}), ignored here", path.display(), app_dir.join("config").display()));

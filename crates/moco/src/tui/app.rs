@@ -1374,7 +1374,7 @@ impl App {
             Row::Assistant(s) => {
                 for l in md::render(s, width.saturating_sub(M.len()), t, g) {
                     let mut spans = vec![Span::raw(M)];
-                    spans.extend(l.spans.into_iter());
+                    spans.extend(l.spans);
                     out.push(Line::from(spans).style(l.style));
                 }
             }
@@ -1419,7 +1419,7 @@ impl App {
             Row::Tool { depth, agent, name, summary, state, detail, output, auto, .. } => {
                 let pad = "  ".repeat(*depth);
                 let glyph = match state {
-                    ToolState::Running => Span::styled(if (self.tick / 3) % 2 == 0 { g.run } else { g.idle }, t.accent),
+                    ToolState::Running => Span::styled(if (self.tick / 3).is_multiple_of(2) { g.run } else { g.idle }, t.accent),
                     ToolState::Done => Span::styled(g.ok, t.ok),
                     ToolState::Failed(_) => Span::styled(g.fail, t.error),
                 };

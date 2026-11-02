@@ -40,6 +40,7 @@ fn run(protocol: &str, base_path: &str) {
         .output()
         .unwrap();
     let _ = server.kill();
+    let _ = server.wait();
     let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned());
     assert!(out.status.success(), "{protocol}: moco failed\nstdout: {stdout}\nstderr: {stderr}");
     assert!(stdout.contains("> read a.txt"), "{protocol}: the tool call is shown\n{stdout}");
