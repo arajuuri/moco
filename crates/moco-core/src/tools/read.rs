@@ -44,6 +44,15 @@ Prefer one larger read over many small slices, and use grep to find specific con
             return Ok(ToolOutput::text(page.join("\n")));
         }
 
+        // A FIFO, socket or character device (`/dev/zero`) has no end: reading it blocks or never stops.
+        let meta = std::fs::metadata(&path).map_err(|e| ToolError::fail(format!("{}: {e}", path.display())))?;
+        if !meta.is_file() {
+            return Err(ToolError::fail(format!("{} is not a regular file (a device, pipe or socket); use shell to inspect it", path.display())));
+        }
+        if meta.len() > MAX_WHOLE_FILE {
+            return read_streaming(&path, meta.len(), offset, limit, ctx);
+        }
+
         let bytes = std::fs::read(&path).map_err(|e| ToolError::fail(format!("{}: {e}", path.display())))?;
         if let Some(s) = crate::media::sniff(&bytes) {
             // Images and PDFs go to the model as media, judged by their bytes (the extension may lie).
@@ -88,6 +97,75 @@ Prefer one larger read over many small slices, and use grep to find specific con
         }
         Ok(ToolOutput { text: out, metadata: json!({"path": path.to_string_lossy(), "lines": total}) })
     }
+}
+
+/// Files bigger than this are not loaded whole: lines are streamed and the total is not counted.
+const MAX_WHOLE_FILE: u64 = 10 * 1024 * 1024;
+
+/// Read the lines `offset..offset+limit` of a big text file in constant memory.
+fn read_streaming(path: &Path, len: u64, offset: usize, limit: usize, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
+    use std::io::{Read, Seek, SeekFrom};
+    let fail = |e: std::io::Error| ToolError::fail(format!("{}: {e}", path.display()));
+    let mut file = std::fs::File::open(path).map_err(fail)?;
+    let mut head = Vec::new();
+    (&mut file).take(8192).read_to_end(&mut head).map_err(fail)?;
+    let name = ctx.display(path);
+    if let Some(s) = crate::media::sniff(&head) {
+        // Media this big is over the limits; `check` says so (a model that cannot take it gets the plainer message).
+        let accepted = if s.kind == crate::media::Kind::Image { ctx.media.image } else { ctx.media.pdf };
+        if !accepted {
+            return Err(ToolError::fail(format!("{name} is {} but the current model does not accept {} input.", s.kind.label(), s.kind.label())));
+        }
+        crate::media::check(&s, len as usize).map_err(|e| ToolError::fail(format!("{name}: {e}")))?;
+    }
+    if head.contains(&0) {
+        return Err(ToolError::fail(format!("{} is a binary file; use shell to inspect it", path.display())));
+    }
+    file.seek(SeekFrom::Start(0)).map_err(fail)?;
+    let mut reader = std::io::BufReader::new(file);
+    let (mut buf, mut n, mut out) = (Vec::new(), 0usize, String::new());
+    let mut more = false;
+    loop {
+        let (got, cut) = super::fsio::read_line_capped(&mut reader, &mut buf, MAX_LINE * 4 + 4).map_err(fail)?;
+        if got == 0 {
+            break;
+        }
+        n += 1;
+        if n < offset {
+            continue;
+        }
+        if n >= offset + limit {
+            more = true;
+            break;
+        }
+        let text = String::from_utf8_lossy(&buf);
+        let mut line = text.trim_end_matches(['\n', '\r']);
+        if n == 1 {
+            line = line.strip_prefix('\u{feff}').unwrap_or(line);
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!("{n}: "));
+        if cut || line.chars().count() > MAX_LINE {
+            out.extend(line.chars().take(MAX_LINE));
+            out.push_str("... (line truncated to 2000 chars)");
+        } else {
+            out.push_str(line);
+        }
+    }
+    if out.is_empty() {
+        return Err(ToolError::fail(format!("offset {offset} is beyond the end of the file ({n} lines)")));
+    }
+    if more {
+        out.push_str(&format!(
+            "\n\n[showing lines {offset}-{}; the file is {} so its total is not counted; use offset={} to continue, or grep to find specific content]",
+            offset + limit - 1,
+            crate::media::human(len as usize),
+            offset + limit
+        ));
+    }
+    Ok(ToolOutput { text: out, metadata: json!({"path": path.to_string_lossy()}) })
 }
 
 /// macOS screenshot names differ from what models type: NBSP/narrow NBSP vs space, curly quotes, NFC vs NFD.
@@ -150,6 +228,32 @@ mod tests {
         assert!(t.starts_with("2: two") && t.contains("[showing lines 2-2 of 3; use offset=3"), "{t}");
         assert!(run(&env, json!({"path":"a.txt","offset":9})).is_err());
         assert_eq!(env.perm.asked()[0].resources, ["a.txt"]);
+    }
+
+    #[test]
+    fn devices_and_pipes_are_refused_not_read() {
+        let env = Env::new();
+        let outside = Path::new("/dev/zero");
+        let e = run(&env, json!({"path": outside.to_string_lossy()})).unwrap_err().message();
+        assert!(e.contains("not a regular file"), "{e}");
+    }
+
+    #[test]
+    fn a_big_file_is_streamed_by_line_range() {
+        let env = Env::new();
+        // ~12 MB, over the whole-file limit: 1,000,000 lines of "line-NNNNNNN" plus a huge last line.
+        let mut data = String::new();
+        for i in 1..=1_000_000 {
+            data.push_str(&format!("line-{i:07}\n"));
+        }
+        data.push_str(&"y".repeat(100_000));
+        env.file("big.log", data.as_bytes());
+        let t = run(&env, json!({"path":"big.log","offset":500000,"limit":2})).unwrap().text;
+        assert!(t.starts_with("500000: line-0500000\n500001: line-0500001\n\n[showing lines 500000-500001;"), "{t}");
+        assert!(t.contains("offset=500002") && t.contains("grep"), "{t}");
+        let t = run(&env, json!({"path":"big.log","offset":1000001})).unwrap().text;
+        assert!(t.starts_with("1000001: yyy") && t.ends_with("... (line truncated to 2000 chars)"), "{}", &t[..40]);
+        assert!(run(&env, json!({"path":"big.log","offset":2000000})).unwrap_err().message().contains("beyond the end"));
     }
 
     #[test]

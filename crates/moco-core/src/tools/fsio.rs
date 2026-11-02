@@ -95,6 +95,32 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     result
 }
 
+/// Read one line (up to and including `\n`) into `buf` (cleared first), keeping at most `cap` bytes of it. The rest of
+/// a longer line is read and thrown away, so a single-line multi-hundred-MB file costs `cap` bytes of memory.
+/// Returns the bytes consumed from the reader (0 at end of file) and whether the line was cut short.
+pub fn read_line_capped<R: std::io::BufRead>(r: &mut R, buf: &mut Vec<u8>, cap: usize) -> std::io::Result<(usize, bool)> {
+    buf.clear();
+    let (mut consumed, mut cut) = (0usize, false);
+    loop {
+        let chunk = r.fill_buf()?;
+        if chunk.is_empty() {
+            return Ok((consumed, cut));
+        }
+        let (take, done) = match chunk.iter().position(|b| *b == b'\n') {
+            Some(i) => (i + 1, true),
+            None => (chunk.len(), false),
+        };
+        let room = cap.saturating_sub(buf.len());
+        buf.extend_from_slice(&chunk[..take.min(room)]);
+        cut |= take > room;
+        r.consume(take);
+        consumed += take;
+        if done {
+            return Ok((consumed, cut));
+        }
+    }
+}
+
 /// How many changed lines `changes` shows.
 const MAX_SHOWN: usize = 30;
 
