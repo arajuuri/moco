@@ -588,6 +588,47 @@ impl Store {
         Ok(out)
     }
 
+    /// Message rows as stored, `{id, type, data, time_created}`, oldest first (for exports).
+    pub fn message_rows(&self, session_id: &str) -> Result<Vec<Value>> {
+        let mut stmt = self.conn.prepare("select id, type, data, time_created from message where session_id=?1 order by id")?;
+        let rows = stmt.query_map([session_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?)))?;
+        let mut out = vec![];
+        for row in rows {
+            let (id, kind, data, t) = row?;
+            out.push(serde_json::json!({"id": id, "type": kind, "data": serde_json::from_str::<Value>(&data)?, "time_created": t}));
+        }
+        Ok(out)
+    }
+
+    /// Session metadata for exports: ids, directory, agent, model, times, cost, tokens and fork origin.
+    pub fn session_meta(&self, session_id: &str) -> Result<Option<Value>> {
+        let row = self
+            .conn
+            .query_row(
+                "select id, parent_id, directory, agent, title, model, variant, time_created, time_updated, cost, tokens, fork_session_id from session where id=?1",
+                [session_id],
+                |r| {
+                    let tokens: Option<String> = r.get(10)?;
+                    Ok(serde_json::json!({
+                        "id": r.get::<_, String>(0)?, "parent_id": r.get::<_, Option<String>>(1)?, "directory": r.get::<_, String>(2)?,
+                        "agent": r.get::<_, String>(3)?, "title": r.get::<_, Option<String>>(4)?, "model": r.get::<_, Option<String>>(5)?,
+                        "variant": r.get::<_, Option<String>>(6)?, "time_created": r.get::<_, i64>(7)?, "time_updated": r.get::<_, i64>(8)?,
+                        "cost": r.get::<_, f64>(9)?, "tokens": tokens.and_then(|t| serde_json::from_str::<Value>(&t).ok()).unwrap_or(Value::Null),
+                        "forked_from": r.get::<_, Option<String>>(11)?,
+                    }))
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Ids of the subagent sessions directly below a session, oldest first.
+    pub fn child_session_ids(&self, session_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("select id from session where parent_id=?1 order by id")?;
+        let rows = stmt.query_map([session_id], |r| r.get(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     /// Durable admission. Re-sending the same inbox id is idempotent (first admission wins).
     pub fn enqueue(&self, session_id: &str, inbox_id: Option<&str>, mode: Mode, kind: &str, data: &Value) -> Result<String> {
         let id = inbox_id.map(String::from).unwrap_or_else(|| new_id("ibx"));
