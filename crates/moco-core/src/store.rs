@@ -1129,9 +1129,9 @@ mod tests {
         assert!(!s.claim(&ses.id).unwrap(), "already claimed");
         // Simulated crash: claim remains, owner gone. Each restart resumes until the cap.
         s.orphan_claim(&ses.id);
-        assert_eq!(s.recover_claims(2).unwrap(), [ses.id.clone()]);
+        assert_eq!(s.recover_claims(2).unwrap(), std::slice::from_ref(&ses.id));
         s.orphan_claim(&ses.id);
-        assert_eq!(s.recover_claims(2).unwrap(), [ses.id.clone()]);
+        assert_eq!(s.recover_claims(2).unwrap(), std::slice::from_ref(&ses.id));
         s.orphan_claim(&ses.id);
         assert!(s.recover_claims(2).unwrap().is_empty(), "attempt cap reached, claim dropped");
         assert!(s.claim(&ses.id).unwrap());
@@ -1157,7 +1157,7 @@ mod tests {
         assert!(a.claim(&child.id).unwrap());
         a.orphan_claim(&ses.id);
         a.orphan_claim(&child.id);
-        assert_eq!(b.recover_claims(3).unwrap(), [ses.id.clone()]);
+        assert_eq!(b.recover_claims(3).unwrap(), std::slice::from_ref(&ses.id));
         assert!(b.claim(&child.id).unwrap(), "stale subagent claim was released");
         std::fs::remove_dir_all(&dir).ok();
     }

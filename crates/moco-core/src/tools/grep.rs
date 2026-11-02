@@ -81,7 +81,7 @@ impl Tool for Grep {
             let mut buf = Vec::new();
             let mut n = 0usize;
             loop {
-                if n % 1024 == 0 && ctx.cancelled() {
+                if n.is_multiple_of(1024) && ctx.cancelled() {
                     return Err(ToolError::Interrupted);
                 }
                 // A line is matched on its first MAX_LINE_BYTES only: a minified bundle is one huge line.
