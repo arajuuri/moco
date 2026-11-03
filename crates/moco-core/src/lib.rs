@@ -26,6 +26,7 @@ pub mod sandbox;
 pub mod skills;
 pub mod snapshot;
 pub mod store;
+pub mod sysinfo;
 pub mod title;
 pub mod tools;
 pub mod truncate;

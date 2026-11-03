@@ -265,20 +265,8 @@ fn one_line(msg: &str) -> String {
 
 /// What the first line of each file says: enough to tell logs from the Mac and from Linux apart.
 pub fn header() -> String {
-    let kernel = {
-        let mut u: libc::utsname = unsafe { std::mem::zeroed() };
-        if unsafe { libc::uname(&mut u) } == 0 {
-            let s = |f: &[libc::c_char]| unsafe { std::ffi::CStr::from_ptr(f.as_ptr()) }.to_string_lossy().into_owned();
-            format!("{} {}", s(&u.sysname), s(&u.release))
-        } else {
-            "unknown".into()
-        }
-    };
-    let product = if cfg!(target_os = "macos") {
-        std::process::Command::new("sw_vers").arg("-productVersion").output().ok().filter(|o| o.status.success()).map(|o| format!("macOS {}", String::from_utf8_lossy(&o.stdout).trim()))
-    } else {
-        None
-    };
+    let kernel = crate::sysinfo::kernel();
+    let product = if cfg!(target_os = "macos") { crate::sysinfo::product() } else { None };
     format!("moco {} ({}-{}) os=\"{}\" kernel=\"{kernel}\" pid={}", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH, product.unwrap_or_else(|| std::env::consts::OS.to_string()), std::process::id())
 }
 

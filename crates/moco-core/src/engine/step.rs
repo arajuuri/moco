@@ -127,7 +127,7 @@ impl Engine {
         let mut system = agent::system_prompt(
             &agent,
             &advertised,
-            &agent::EnvInfo { cwd: &session.directory, platform: std::env::consts::OS, date: &agent::date_from_unix(now), instructions: &ins, skills: &skill_list },
+            &agent::EnvInfo { cwd: &session.directory, platform: crate::sysinfo::describe(), date: &agent::date_from_unix(now), instructions: &ins, skills: &skill_list },
         );
         if agent.id == "plan" {
             // In the system prompt (not appended to the last message) so every request keeps the same prefix.

@@ -255,7 +255,10 @@ pub fn system_prompt(agent: &Agent, tools: &[&dyn Tool], env: &EnvInfo) -> Strin
         s.push_str("\n# Skills\n");
         s.push_str(env.skills);
     }
-    s.push_str(&format!("\n# Environment\n- Working directory: {}\n- Platform: {}\n- Date: {}\n", env.cwd, env.platform, env.date));
+    s.push_str(&format!(
+        "\n# Environment\n- Working directory: {}\n- Platform: {}\n- Your tools run on this machine, so builds, tests and commands you run here have run on this platform.\n- Date: {}\n",
+        env.cwd, env.platform, env.date
+    ));
     s
 }
 
@@ -323,6 +326,16 @@ mod tests {
             assert_eq!(n[at - 1], "webfetch", "{id}: it sits right after webfetch");
             assert_eq!(crate::permission::evaluate("websearch", "some query", &find(&builtin(), id).unwrap().permissions), Effect::Ask, "{id}");
         }
+    }
+
+    #[test]
+    fn prompt_names_the_machine_the_tools_run_on() {
+        let tools = crate::tools::all(vec![], vec![], None);
+        let refs: Vec<&dyn Tool> = tools.iter().map(|t| t.as_ref()).collect();
+        let env = EnvInfo { cwd: "/w", platform: "macOS 10.14.6, x86_64", date: "2026-10-31", instructions: "", skills: "" };
+        let full = system_prompt(&find(&builtin(), "build").unwrap(), &refs, &env);
+        assert!(full.contains("- Platform: macOS 10.14.6, x86_64\n"), "{full}");
+        assert!(full.contains("Your tools run on this machine"), "{full}");
     }
 
     #[test]
