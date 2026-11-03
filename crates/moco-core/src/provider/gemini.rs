@@ -298,18 +298,9 @@ impl Provider for Gemini {
         let mut shown: Vec<(&str, &str)> = self.api_key.iter().map(|k| ("x-goog-api-key", k.as_str())).collect();
         shown.extend(self.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).chain(req.overlay.headers.iter().map(|(k, v)| (k.as_str(), v.as_str()))));
         super::trace_http("gemini", &url, &shown, &body);
-        let resp = match call.send_string(&body) {
-            Ok(r) => r,
-            Err(ureq::Error::Status(code, r)) => {
-                let ra = r.header("retry-after").and_then(|s| s.trim().parse::<u64>().ok());
-                let text = r.into_string().unwrap_or_default();
-                super::log_http_error("gemini", code, ra, &text);
-                return Err(classify_http(code, &text, ra));
-            }
-            Err(ureq::Error::Transport(t)) => return Err(transport_error(t)),
-        };
+        let lines = super::open_lines("gemini", call, body, cancel, classify_http)?;
         let mut parser = Parser::default();
-        read_sse(resp.into_reader(), cancel, |data| {
+        read_sse(lines, cancel, |data| {
             for ev in parser.feed(data)? {
                 on_event(ev);
             }

@@ -3,8 +3,6 @@
 use super::*;
 use serde_json::json;
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader};
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 pub struct OpenAiChat {
@@ -236,47 +234,16 @@ impl Provider for OpenAiChat {
         let mut shown: Vec<(&str, &str)> = self.api_key.iter().map(|k| ("authorization", k.as_str())).collect();
         shown.extend(self.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).chain(req.overlay.headers.iter().map(|(k, v)| (k.as_str(), v.as_str()))));
         super::trace_http("openai-chat", &url, &shown, &body);
-        let resp = match call.send_string(&body) {
-            Ok(r) => r,
-            Err(ureq::Error::Status(code, r)) => {
-                let ra = r.header("retry-after").and_then(|s| s.trim().parse::<u64>().ok());
-                let text = r.into_string().unwrap_or_default();
-                super::log_http_error("openai-chat", code, ra, &text);
-                return Err(classify_http(code, &text, ra));
-            }
-            Err(ureq::Error::Transport(t)) => {
-                let kind = match t.kind() {
-                    ureq::ErrorKind::ConnectionFailed | ureq::ErrorKind::Dns => TransportKind::Connect,
-                    _ if t.to_string().to_lowercase().contains("timed out") => TransportKind::Timeout,
-                    _ => TransportKind::Other,
-                };
-                return Err(ProviderError::Transport { kind, message: t.to_string() });
-            }
-        };
+        let lines = super::open_lines("openai-chat", call, body, cancel, classify_http)?;
         let mut parser = Parser::default();
-        let mut reader = BufReader::new(resp.into_reader());
-        let mut line = String::new();
         let mut finished = false;
-        loop {
-            if cancel.load(Ordering::Relaxed) {
-                return Err(ProviderError::Interrupted);
+        super::read_sse(lines, cancel, |data| {
+            for ev in parser.feed(data)? {
+                finished |= matches!(ev, Event::Finish { .. });
+                on_event(ev);
             }
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(e) => {
-                    let kind = if e.kind() == std::io::ErrorKind::TimedOut { TransportKind::Timeout } else { TransportKind::Other };
-                    return Err(ProviderError::Transport { kind, message: format!("stream read failed: {e}") });
-                }
-            }
-            if let Some(data) = line.trim_end().strip_prefix("data:") {
-                for ev in parser.feed(data.trim_start())? {
-                    finished |= matches!(ev, Event::Finish { .. });
-                    on_event(ev);
-                }
-            }
-        }
+            Ok(false)
+        })?;
         if !finished {
             if let Some(ev) = parser.finish_event() {
                 finished = true;

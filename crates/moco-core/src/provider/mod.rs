@@ -278,25 +278,113 @@ pub(crate) fn transport_error(t: ureq::Transport) -> ProviderError {
     ProviderError::Transport { kind, message: t.to_string() }
 }
 
-/// Read a server-sent-events body: `on_data` gets the payload of every `data:` line. It returns `Ok(true)` once the
-/// stream is complete (stop reading), and may fail the stream. Stops with `Interrupted` as soon as `cancel` is set.
-pub(crate) fn read_sse(reader: impl std::io::Read, cancel: &AtomicBool, mut on_data: impl FnMut(&str) -> Result<bool, ProviderError>) -> Result<(), ProviderError> {
-    use std::io::BufRead;
-    let mut reader = std::io::BufReader::new(reader);
-    let mut line = String::new();
+enum Msg {
+    /// Response headers arrived with a success status; lines follow.
+    Head,
+    Status(u16, Option<u64>, String),
+    Failed(ProviderError),
+    Line(String),
+    Eof,
+}
+
+/// A response body read on a helper thread, so that waiting for headers or for the next line never blocks the
+/// caller past `cancel`. After a cancel the helper is left to end on its own: it stops at the next line, at EOF or
+/// at the agent's read timeout, and its sends fail once the receiver is gone.
+pub(crate) struct Lines {
+    rx: std::sync::mpsc::Receiver<Msg>,
+}
+
+const CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+fn recv(rx: &std::sync::mpsc::Receiver<Msg>, cancel: &AtomicBool) -> Result<Msg, ProviderError> {
+    use std::sync::mpsc::RecvTimeoutError;
     loop {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(ProviderError::Interrupted);
         }
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => return Ok(()),
-            Ok(_) => {}
-            Err(e) => {
-                let kind = if e.kind() == std::io::ErrorKind::TimedOut { TransportKind::Timeout } else { TransportKind::Other };
-                return Err(ProviderError::Transport { kind, message: format!("stream read failed: {e}") });
+        match rx.recv_timeout(CANCEL_POLL) {
+            Ok(m) => return Ok(m),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(ProviderError::Transport { kind: TransportKind::Other, message: "request thread ended unexpectedly".into() })
             }
         }
+    }
+}
+
+/// Send `body` and return the response lines. Returns `Interrupted` as soon as `cancel` is set, also while the
+/// request is still waiting for response headers. A non-2xx status is logged and mapped with `classify`.
+pub(crate) fn open_lines(
+    provider: &'static str,
+    call: ureq::Request,
+    body: String,
+    cancel: &AtomicBool,
+    classify: impl Fn(u16, &str, Option<u64>) -> ProviderError,
+) -> Result<Lines, ProviderError> {
+    use std::io::BufRead;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let resp = match call.send_string(&body) {
+            Ok(r) => r,
+            Err(ureq::Error::Status(code, r)) => {
+                let ra = r.header("retry-after").and_then(|s| s.trim().parse::<u64>().ok());
+                let text = r.into_string().unwrap_or_default();
+                let _ = tx.send(Msg::Status(code, ra, text));
+                return;
+            }
+            Err(ureq::Error::Transport(t)) => {
+                let _ = tx.send(Msg::Failed(transport_error(t)));
+                return;
+            }
+        };
+        if tx.send(Msg::Head).is_err() {
+            return;
+        }
+        let mut reader = std::io::BufReader::new(resp.into_reader());
+        loop {
+            let mut line = String::new();
+            let msg = match reader.read_line(&mut line) {
+                Ok(0) => Msg::Eof,
+                Ok(_) => Msg::Line(line),
+                Err(e) => {
+                    let kind = if e.kind() == std::io::ErrorKind::TimedOut { TransportKind::Timeout } else { TransportKind::Other };
+                    Msg::Failed(ProviderError::Transport { kind, message: format!("stream read failed: {e}") })
+                }
+            };
+            let last = !matches!(msg, Msg::Line(_));
+            if tx.send(msg).is_err() || last {
+                return;
+            }
+        }
+    });
+    match recv(&rx, cancel)? {
+        Msg::Head => Ok(Lines { rx }),
+        Msg::Status(code, ra, text) => {
+            log_http_error(provider, code, ra, &text);
+            Err(classify(code, &text, ra))
+        }
+        Msg::Failed(e) => Err(e),
+        Msg::Line(_) | Msg::Eof => Err(ProviderError::Transport { kind: TransportKind::Other, message: "unexpected response state".into() }),
+    }
+}
+
+impl Lines {
+    /// The next line, `None` at the end of the body. Honors `cancel` while waiting.
+    fn next(&mut self, cancel: &AtomicBool) -> Result<Option<String>, ProviderError> {
+        match recv(&self.rx, cancel)? {
+            Msg::Line(l) => Ok(Some(l)),
+            Msg::Eof => Ok(None),
+            Msg::Failed(e) => Err(e),
+            Msg::Head | Msg::Status(..) => Err(ProviderError::Transport { kind: TransportKind::Other, message: "unexpected response state".into() }),
+        }
+    }
+}
+
+/// Read a server-sent-events body: `on_data` gets the payload of every `data:` line. It returns `Ok(true)` once the
+/// stream is complete (stop reading), and may fail the stream. Stops with `Interrupted` as soon as `cancel` is set.
+pub(crate) fn read_sse(mut lines: Lines, cancel: &AtomicBool, mut on_data: impl FnMut(&str) -> Result<bool, ProviderError>) -> Result<(), ProviderError> {
+    loop {
+        let Some(line) = lines.next(cancel)? else { return Ok(()) };
         if let Some(data) = line.trim_end().strip_prefix("data:") {
             if on_data(data.trim_start())? {
                 return Ok(());
@@ -372,5 +460,45 @@ mod log_tests {
         });
         assert!(debug.iter().all(|l| !l.contains("hello")), "no bodies below trace: {debug:?}");
         assert_eq!(debug.len(), 2, "request and done: {debug:?}");
+    }
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::testserver::*;
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    fn adapters(url: &str) -> Vec<(&'static str, Box<dyn Provider>)> {
+        vec![
+            ("anthropic", Box::new(anthropic::Anthropic::new("k".into(), Some(url.to_string())))),
+            ("openai-chat", Box::new(openai_chat::OpenAiChat::new(None, format!("{url}/v1"), BTreeMap::new()))),
+            ("openai-responses", Box::new(openai_responses::OpenAiResponses::new(None, format!("{url}/v1"), BTreeMap::new()))),
+            ("gemini", Box::new(gemini::Gemini::new(None, url.to_string(), BTreeMap::new()))),
+        ]
+    }
+
+    /// Esc while the request waits for response headers, and while a started stream goes quiet: the adapter returns
+    /// `Interrupted` within a moment, not after the 120 s read timeout.
+    #[test]
+    fn cancel_is_honored_while_waiting_for_headers_and_during_a_stalled_stream() {
+        for head in [None, Some("data: {\"type\":\"ping\"}\n\n")] {
+            let server = stall(head, Duration::from_secs(60));
+            for (name, p) in adapters(&server.url) {
+                let cancel = AtomicBool::new(false);
+                let started = Instant::now();
+                let r = std::thread::scope(|s| {
+                    s.spawn(|| {
+                        std::thread::sleep(Duration::from_millis(300));
+                        cancel.store(true, Ordering::Relaxed);
+                    });
+                    p.stream(&Request { model: "m".into(), ..Default::default() }, &cancel, &mut |_| {})
+                });
+                assert_eq!(r, Err(ProviderError::Interrupted), "{name} head={head:?}");
+                assert!(started.elapsed() < Duration::from_secs(5), "{name} head={head:?}: {:?}", started.elapsed());
+            }
+        }
     }
 }

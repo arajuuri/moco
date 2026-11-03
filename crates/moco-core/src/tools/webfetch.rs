@@ -78,6 +78,26 @@ Responses over 5 MiB and binary content (images, archives, PDFs) are rejected."
     }
 }
 
+/// Run a blocking network step on a helper thread and wait for it, so a cancel is honored within a moment instead
+/// of after the read timeout. An abandoned helper ends by itself when its request times out.
+fn blocking<T: Send + 'static>(ctx: &ToolCtx, f: impl FnOnce() -> T + Send + 'static) -> Result<T, ToolError> {
+    use std::sync::mpsc::RecvTimeoutError;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    loop {
+        if ctx.cancelled() {
+            return Err(ToolError::Interrupted);
+        }
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(v) => return Ok(v),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return Err(ToolError::fail("the request thread ended unexpectedly")),
+        }
+    }
+}
+
 /// GET with manual redirects: every hop is permission-checked again. Returns (body, content type).
 fn fetch(ctx: &ToolCtx, url: &mut String, timeout: Duration, max_bytes: usize) -> Result<(String, String), ToolError> {
     let agent = ureq::AgentBuilder::new().redirects(0).timeout(timeout).build();
@@ -89,16 +109,17 @@ fn fetch(ctx: &ToolCtx, url: &mut String, timeout: Duration, max_bytes: usize) -
         if ctx.cancelled() {
             return Err(ToolError::Interrupted);
         }
-        let resp = match agent
+        let call = agent
             .get(url)
             .set("User-Agent", UA)
-            .set("Accept", "text/html,application/xhtml+xml,text/markdown,text/plain,application/json;q=0.9,*/*;q=0.8")
-            .call()
-        {
-            Ok(r) => r,
-            Err(ureq::Error::Status(code, _)) => return Err(ToolError::fail(format!("Request failed with status code: {code}"))),
-            Err(ureq::Error::Transport(t)) => return Err(ToolError::fail(format!("Request failed: {t}"))),
-        };
+            .set("Accept", "text/html,application/xhtml+xml,text/markdown,text/plain,application/json;q=0.9,*/*;q=0.8");
+        let resp = blocking(ctx, move || {
+            call.call().map_err(|e| match e {
+                ureq::Error::Status(code, _) => format!("Request failed with status code: {code}"),
+                ureq::Error::Transport(t) => format!("Request failed: {t}"),
+            })
+        })?
+        .map_err(ToolError::fail)?;
         if matches!(resp.status(), 301 | 302 | 303 | 307 | 308) {
             let Some(loc) = resp.header("location") else { return Err(ToolError::fail("Redirect without a Location header")) };
             if hop == MAX_REDIRECTS {
@@ -114,8 +135,11 @@ fn fetch(ctx: &ToolCtx, url: &mut String, timeout: Duration, max_bytes: usize) -
         if resp.header("content-length").and_then(|l| l.parse::<usize>().ok()).is_some_and(|l| l > max_bytes) {
             return Err(ToolError::fail(format!("Response too large (exceeds {max_bytes} byte limit)")));
         }
-        let mut buf = Vec::new();
-        resp.into_reader().take(max_bytes as u64 + 1).read_to_end(&mut buf).map_err(|e| ToolError::fail(format!("Reading the response failed: {e}")))?;
+        let buf = blocking(ctx, move || {
+            let mut buf = Vec::new();
+            resp.into_reader().take(max_bytes as u64 + 1).read_to_end(&mut buf).map(|_| buf)
+        })?
+        .map_err(|e| ToolError::fail(format!("Reading the response failed: {e}")))?;
         if buf.len() > max_bytes {
             return Err(ToolError::fail(format!("Response too large (exceeds {max_bytes} byte limit)")));
         }
@@ -183,6 +207,26 @@ mod tests {
         assert!(run(&env, json!({"url":"ftp://x/y"})).unwrap_err().message().contains("http:// or https://"));
         assert!(run(&env, json!({"url":"https://x","format":"pdf"})).is_err());
         assert!(run(&env, json!({"url":"http://127.0.0.1:1/"})).unwrap_err().message().starts_with("Request failed"));
+    }
+
+    #[test]
+    fn cancel_ends_a_stalled_fetch_at_once() {
+        use std::sync::atomic::Ordering;
+        // Headers never arrive, then headers arrive but the body stalls.
+        for head in [None, Some("")] {
+            let env = Env::new();
+            let s = stall(head, Duration::from_secs(30));
+            let started = std::time::Instant::now();
+            let r = std::thread::scope(|sc| {
+                sc.spawn(|| {
+                    std::thread::sleep(Duration::from_millis(300));
+                    env.cancel.store(true, Ordering::Relaxed);
+                });
+                run(&env, json!({"url": format!("{}/x", s.url), "timeout": 60}))
+            });
+            assert!(matches!(r, Err(ToolError::Interrupted)), "{r:?}");
+            assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        }
     }
 
     #[test]
