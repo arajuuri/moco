@@ -980,6 +980,7 @@ mod tests {
         assert!(f.engine.store().claim(&f.session.id).unwrap(), "claim released");
         let req = &f.fake.requests.lock().unwrap()[0];
         assert!(req.system.contains("moco") && req.system.contains("Working directory"));
+        assert!(req.system.contains(&format!("- Platform: {}\n", crate::sysinfo::describe())), "the request names this machine");
         assert_eq!(req.tools.len(), 12);
     }
 
