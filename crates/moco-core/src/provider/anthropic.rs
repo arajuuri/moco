@@ -2,7 +2,6 @@
 use super::*;
 use serde_json::json;
 use std::collections::HashMap;
-use std::time::Duration;
 
 pub struct Anthropic {
     /// Mark the prompt prefix for Anthropic's prompt cache (`cache_control`). On by default.
@@ -20,7 +19,7 @@ impl Anthropic {
             prompt_cache: true,
             api_key,
             base_url: base_url.unwrap_or_else(|| "https://api.anthropic.com".into()).trim_end_matches('/').to_string(),
-            agent: ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(20)).timeout_read(Duration::from_secs(120)).build(),
+            agent: new_agent(),
         }
     }
 }
