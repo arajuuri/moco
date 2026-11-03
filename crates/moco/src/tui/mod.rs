@@ -225,6 +225,7 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
             app.effort_levels = info.levels;
             app.permission_mode = engine.permission_mode_of(&s);
         }
+        app.cost_limits = engine.limits();
     };
     load_rows(&mut app, &sid);
     refresh_status(&mut app, &sid);

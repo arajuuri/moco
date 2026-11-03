@@ -14,6 +14,8 @@ enum State {
     Stopped,
     Finished,
     Failed(String),
+    /// A spending limit stopped a background subagent (what was exceeded).
+    LimitReached(String),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -54,6 +56,7 @@ fn describe(state: &State) -> String {
         State::Stopped => "stopped".into(),
         State::Finished => "finished".into(),
         State::Failed(e) => format!("failed: {e}"),
+        State::LimitReached(what) => format!("stopped at a spending limit: {what}"),
     }
 }
 
@@ -353,6 +356,11 @@ impl Engine {
             let (state, text) = match result {
                 Ok(r) => (State::Finished, format!("Background subagent finished (sessionID: {}, task: {description}):\n\n{}", child.id, r.output)),
                 Err(ToolError::Interrupted) => (State::Stopped, String::new()),
+                Err(e) if e.message().starts_with(limits::SUBAGENT_STOPPED) => {
+                    let what = e.message().trim_start_matches(limits::SUBAGENT_STOPPED).to_string();
+                    let text = format!("Background subagent stopped at a spending limit (sessionID: {}, task: {description}): {what}. Its work so far is kept in that session. Tell the user; do not start it again unless they agree.", child.id);
+                    (State::LimitReached(what), text)
+                }
                 Err(e) => (State::Failed(e.message()), format!("Background subagent failed (sessionID: {}, task: {description}): {}", child.id, e.message())),
             };
             crate::log_info!("jobs", "finish subagent job={} session={parent_id} {}", child.id, describe(&state));

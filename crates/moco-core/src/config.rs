@@ -251,6 +251,8 @@ pub struct Config {
     pub sandbox: crate::sandbox::SandboxConfig,
     /// Caps on concurrently running background jobs (apply with `Engine::set_job_limits`).
     pub jobs: JobLimits,
+    /// Spending guardrails (see `Limits`); all off unless set.
+    pub limits: Limits,
     pub permissions: Vec<Rule>,
     pub agents: BTreeMap<String, AgentConfig>,
     /// Extra instruction files (paths, `~/` allowed; relative paths resolve against the working directory).
@@ -269,6 +271,28 @@ pub struct JobLimits {
 impl Default for JobLimits {
     fn default() -> Self {
         JobLimits { max_shells: 8, max_subagents: 4 }
+    }
+}
+
+/// `limits`: spending guardrails, `{"maxCostPerRun": 2.0, "maxCostPerSession": 20.0, "maxSteps": 100}`. Costs are in
+/// USD and come from the model catalog; a model without a price cannot be limited by cost (the engine says so once).
+#[derive(Debug, Clone, Copy, PartialEq, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Limits {
+    /// One user prompt until the session is idle again, subagents included.
+    #[serde(alias = "max_cost_per_run")]
+    pub max_cost_per_run: Option<f64>,
+    /// Everything the session (and its subagents) has cost so far.
+    #[serde(alias = "max_cost_per_session")]
+    pub max_cost_per_session: Option<f64>,
+    /// Steps per run for agents without a `steps` of their own.
+    #[serde(alias = "max_steps")]
+    pub max_steps: Option<u32>,
+}
+
+impl Limits {
+    pub fn has_cost_limit(&self) -> bool {
+        self.max_cost_per_run.is_some() || self.max_cost_per_session.is_some()
     }
 }
 
@@ -1005,6 +1029,15 @@ mod tests {
         assert_eq!(evaluate("shell", "git status", &build.permissions), Effect::Allow, "agent rule beats the global one");
         assert_eq!(agents[3].system.as_deref(), Some("Be brief."));
         assert_eq!(evaluate("edit", "x", &agents[3].permissions), Effect::Ask);
+    }
+
+    #[test]
+    fn limits_accept_camel_and_snake_case_and_default_to_off() {
+        assert_eq!(serde_json::from_value::<Config>(json!({})).unwrap().limits, Limits::default());
+        let l = serde_json::from_value::<Config>(json!({"limits": {"maxCostPerRun": 2.0, "maxCostPerSession": 20, "maxSteps": 100}})).unwrap().limits;
+        assert_eq!((l.max_cost_per_run, l.max_cost_per_session, l.max_steps), (Some(2.0), Some(20.0), Some(100)));
+        let l = serde_json::from_value::<Config>(json!({"limits": {"max_cost_per_run": 1.5}})).unwrap().limits;
+        assert_eq!((l.max_cost_per_run, l.max_steps, l.has_cost_limit()), (Some(1.5), None, true));
     }
 
     #[test]

@@ -5,7 +5,7 @@ use moco_core::catalog::{Catalog, ProviderInfo};
 use moco_core::mcp::{self, oauth::LoginIo, trust, Manager, ServerSpec};
 use moco_core::tools::SubagentRequest;
 use moco_core::{commands, compaction, mentions, skills};
-use moco_core::engine::{CompactResult, DiffResult, Engine, UndoReport, UndoResult, EngineConfig, PermissionPrompt, Reply, RunOutcome, Ui, UiEvent};
+use moco_core::engine::{CompactResult, DiffResult, Engine, LimitChoice, UndoReport, UndoResult, EngineConfig, PermissionPrompt, Reply, RunOutcome, Ui, UiEvent};
 use moco_core::provider::registry;
 use moco_core::provider::Usage;
 use moco_core::tools::{Question, Todo};
@@ -54,6 +54,8 @@ struct RunUsage {
 struct Terminal {
     mid_line: AtomicBool,
     run: Mutex<RunUsage>,
+    /// `-p`: nobody is asked whether to go on past a spending limit; the run stops instead.
+    oneshot: bool,
 }
 
 impl Terminal {
@@ -260,6 +262,19 @@ impl Ui for Terminal {
         let _ = std::io::stdout().flush();
     }
 
+    fn ask_limit(&self, what: &str) -> LimitChoice {
+        if self.oneshot {
+            return LimitChoice::Stop;
+        }
+        self.newline_if_needed();
+        println!("{what}.");
+        match self.read_line("  [c] continue  [u] continue without the limit  [s] stop: ").as_deref().map(str::trim) {
+            Some("c") | Some("continue") => LimitChoice::Continue,
+            Some("u") => LimitChoice::ContinueUnlimited,
+            _ => LimitChoice::Stop,
+        }
+    }
+
     fn ask(&self, p: &PermissionPrompt) -> Reply {
         self.newline_if_needed();
         println!("Permission needed: {} {}", p.action, p.resources.join(", "));
@@ -434,6 +449,9 @@ fn print_files(r: &UndoReport) {
         println!("{DIM}{n} file(s) could not be restored (too large or unreadable){RESET}");
     }
 }
+
+/// Exit status of `-p` when a spending limit stopped the run.
+const EXIT_LIMIT: i32 = 3;
 
 fn die(msg: &str) -> ! {
     eprintln!("moco: {msg}");
@@ -673,6 +691,7 @@ fn main() {
     let mut agent_id: Option<String> = None;
     let mut permission_mode_arg: Option<String> = None;
     let mut eval_classifier: Option<String> = None;
+    let (mut max_cost, mut max_steps) = (None::<f64>, None::<u32>);
     let mut args = raw.drain(..);
     while let Some(a) = args.next() {
         let mut value = |flag: &str| args.next().unwrap_or_else(|| die(&format!("{flag} needs a value")));
@@ -682,6 +701,14 @@ fn main() {
             "--agent" => agent_id = Some(value("--agent")),
             "--permission-mode" => permission_mode_arg = Some(value("--permission-mode")),
             "--effort" => effort_arg = Some(value("--effort")),
+            "--max-cost" => {
+                let v = value("--max-cost");
+                max_cost = Some(v.trim_start_matches('$').parse::<f64>().ok().filter(|c| c.is_finite() && *c >= 0.0).unwrap_or_else(|| die(&format!("--max-cost needs an amount in USD, not {v}"))));
+            }
+            "--max-steps" => {
+                let v = value("--max-steps");
+                max_steps = Some(v.parse::<u32>().ok().filter(|n| *n > 0).unwrap_or_else(|| die(&format!("--max-steps needs a positive number, not {v}"))));
+            }
             "--dir" => dir = Some(value("--dir")),
             "--session" | "-s" => session_arg = Some(value("--session")),
             "--prompt" | "-p" => prompt = Some(value("--prompt")),
@@ -695,7 +722,7 @@ fn main() {
             }
             "--help" | "-h" => {
                 println!(
-                    "usage: moco [--continue | --session ID] [--model PROVIDER/MODEL] [--agent ID] [--permission-mode manual|auto] [--effort LEVEL] [--dir PATH] [-p PROMPT] [--plain] [--version]\n       moco sessions [--all] [--archived] | rename ID TITLE | archive ID | unarchive ID\n       moco models [FILTER] [--refresh]\n       moco auth PROVIDER\n       moco logs [--follow] [--lines N] [--path]\n\nlogging: MOCO_LOG=error|warn|info|debug|trace (default warn; `warn,mcp=trace` sets one target) or the `log` config key.\n         Files: <data dir>/data/logs/moco-YYYY-MM-DD.log (7 days kept). Nothing is ever printed to the terminal."
+                    "usage: moco [--continue | --session ID] [--model PROVIDER/MODEL] [--agent ID] [--permission-mode manual|auto] [--effort LEVEL] [--dir PATH] [-p PROMPT [--max-cost USD] [--max-steps N]] [--plain] [--version]\n       -p exit status: 0 done, 1 failed, 2 usage error, 3 stopped by a spending limit (--max-cost, --max-steps or the `limits` config)\n       moco sessions [--all] [--archived] | rename ID TITLE | archive ID | unarchive ID\n       moco models [FILTER] [--refresh]\n       moco auth PROVIDER\n       moco logs [--follow] [--lines N] [--path]\n\nlogging: MOCO_LOG=error|warn|info|debug|trace (default warn; `warn,mcp=trace` sets one target) or the `log` config key.\n         Files: <data dir>/data/logs/moco-YYYY-MM-DD.log (7 days kept). Nothing is ever printed to the terminal."
                 );
                 return;
             }
@@ -724,7 +751,10 @@ fn main() {
     for w in &loaded.warnings {
         eprintln!("warning: config: {w}");
     }
-    let cfg = loaded.config;
+    let mut cfg = loaded.config;
+    // `--max-cost` is the limit for one run (a `-p` prompt); `--max-steps` replaces the default step limit.
+    cfg.limits.max_cost_per_run = max_cost.or(cfg.limits.max_cost_per_run);
+    cfg.limits.max_steps = max_steps.or(cfg.limits.max_steps);
     moco_core::log::configure(cfg.log.as_deref());
     moco_core::log_info!("main", "start dir={} sources={}", cwd_str, loaded.sources.len());
     if let (Some(sh), None) = (&cfg.shell, std::env::var_os("MOCO_SHELL")) {
@@ -800,6 +830,7 @@ fn main() {
     }
     let mut engine_cfg = EngineConfig::new(&model, app_dir.clone());
     engine_cfg.effort = cfg.effort.clone();
+    engine_cfg.limits = cfg.limits;
     engine_cfg.agents = agents;
     engine_cfg.permission_mode = default_mode;
     engine_cfg.agents_by_mode = mode_agents;
@@ -870,7 +901,7 @@ fn main() {
     }
 
     install_sigint();
-    let term = Terminal { mid_line: AtomicBool::new(false), run: Mutex::new(RunUsage::default()) };
+    let term = Terminal { mid_line: AtomicBool::new(false), run: Mutex::new(RunUsage::default()), oneshot: prompt.is_some() };
     let run = |sid: &str, resume: bool| {
         CANCEL.store(false, Ordering::Relaxed);
         let outcome = engine.run(sid, &term, &CANCEL, resume);
@@ -880,6 +911,7 @@ fn main() {
             Ok(RunOutcome::Interrupted) => println!("{DIM}interrupted{RESET}"),
             Ok(RunOutcome::Declined) => println!("{DIM}stopped: tool call rejected{RESET}"),
             Ok(RunOutcome::Failed(_)) => {} // already reported via Notice
+            Ok(RunOutcome::LimitReached { what }) => eprintln!("{RED}stopped: {what}. Raise it with --max-cost / --max-steps or the `limits` config.{RESET}"),
             Ok(RunOutcome::Busy) => eprintln!("session is busy"),
             Err(e) => eprintln!("{RED}store error: {e}{RESET}"),
         }
@@ -964,7 +996,8 @@ fn main() {
         if !send(&session.id, &text) {
             die("could not queue the prompt");
         }
-        let mut ok = matches!(run(&session.id, false), Some(RunOutcome::Idle));
+        let mut last = run(&session.id, false);
+        let mut ok = matches!(last, Some(RunOutcome::Idle));
         // Background jobs started during the run: wait for them and let the assistant report what they produced.
         while ok && !CANCEL.load(Ordering::Relaxed) {
             if engine.running_jobs() > 0 {
@@ -974,13 +1007,19 @@ fn main() {
             if CANCEL.load(Ordering::Relaxed) || engine.store().pending_inbox(&session.id).unwrap_or(0) == 0 {
                 break;
             }
-            ok = matches!(run(&session.id, false), Some(RunOutcome::Idle));
+            last = run(&session.id, false);
+            ok = matches!(last, Some(RunOutcome::Idle));
         }
         engine.kill_all_jobs();
         if let Some(m) = &manager {
             m.shutdown(); // process::exit skips destructors, and the servers must not be left running
         }
-        std::process::exit(if ok { 0 } else { 1 });
+        // 0 done, 1 failed or stopped, 3 stopped by a spending limit (2 is a usage error, see `die`).
+        std::process::exit(match last {
+            _ if ok => 0,
+            Some(RunOutcome::LimitReached { .. }) => EXIT_LIMIT,
+            _ => 1,
+        });
     }
 
     let title_of = |sid: &str| engine.store().session(sid).ok().flatten().and_then(|s| s.title);

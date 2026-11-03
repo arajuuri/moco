@@ -165,6 +165,11 @@ pub const PLAN_REMINDER: &str = "<system-reminder>\nYou are in Plan mode. Discus
 Do not modify any files. Use read-only tools to explore.\n\nYou remain in Plan mode until the user switches agents. \
 If the user asks you to implement changes, do not do so. Tell them they need to switch agents.\n</system-reminder>";
 
+/// The step allowance of a run: the agent's own `steps`, else the configured default (`limits.maxSteps`).
+pub fn effective_steps(agent: &Agent, default: Option<u32>) -> Option<u32> {
+    agent.steps.or(default)
+}
+
 pub const MAX_STEPS: &str = "CRITICAL - MAXIMUM STEPS REACHED
 
 The maximum number of steps allowed for this task has been reached. Tools are disabled until next user input. Respond with text only.
