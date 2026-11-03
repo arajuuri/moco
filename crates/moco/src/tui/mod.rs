@@ -100,7 +100,7 @@ struct TuiUi {
 
 impl TuiUi {
     fn send(&self, e: AppEvent) {
-        let _ = self.tx.lock().unwrap().send(e);
+        let _ = moco_core::engine::lock(&self.tx).send(e);
     }
 
     fn convert(&self, depth: usize, agent: &str, e: &UiEvent) {
@@ -161,7 +161,7 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
 
     let notify_tx = Mutex::new(tx.clone());
     host.engine.set_notifier(Arc::new(move |line| {
-        let _ = notify_tx.lock().unwrap().send(AppEvent::Background(line.to_string()));
+        let _ = moco_core::engine::lock(&notify_tx).send(AppEvent::Background(line.to_string()));
     }));
 
     let mut sid = host.session_id.clone();
@@ -198,7 +198,7 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
     // Show the stored conversation of the session we start in (--continue, --session).
     let load_rows = |app: &mut App, sid: &str| {
         let (messages, revert, totals, classifier) = {
-            let st = engine.store.lock().unwrap();
+            let st = engine.store();
             (st.messages(sid).unwrap_or_default(), st.revert(sid).ok().flatten(), st.usage_totals(sid).map(|t| t.0).unwrap_or(0.0), st.classifier_cost(sid).unwrap_or(0.0))
         };
         let hidden = revert.as_ref().and_then(|r| r["messageId"].as_str().map(String::from));
@@ -209,7 +209,7 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
     };
     // Model, agent and title as stored for the session.
     let refresh_status = |app: &mut App, sid: &str| {
-        if let Some(s) = engine.store.lock().unwrap().session(sid).ok().flatten() {
+        if let Some(s) = engine.store().session(sid).ok().flatten() {
             app.model = engine.model_ref_for(&s);
             app.agent = s.agent.clone();
             app.title = s.title.clone();
@@ -256,7 +256,11 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
             let done_tx = tx.clone();
             let (ui, cancel, sid) = (&ui, &cancel, sid.to_string());
             scope.spawn(move || {
-                let outcome = engine.run(&sid, ui, cancel, resume).map_err(|e| e.to_string());
+                // A panic in the engine must still end the run in the UI, or the turn would look endless.
+                let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine.run(&sid, ui, cancel, resume))) {
+                    Ok(r) => r.map_err(|e| e.to_string()),
+                    Err(p) => Err(format!("the engine crashed: {}", panic_message(p.as_ref()))),
+                };
                 let _ = done_tx.send(AppEvent::RunDone(outcome));
             });
         };
@@ -280,7 +284,7 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
         // Prompts that were sent during a turn leave the inbox when the engine delivers them: that is when
         // they become part of the conversation, so that is when they appear in the transcript.
         let sync_queue = |app: &mut App, sid: &str| {
-            let waiting = engine.store.lock().unwrap().inbox_items(sid).unwrap_or_default();
+            let waiting = engine.store().inbox_items(sid).unwrap_or_default();
             let (still, gone): (Vec<_>, Vec<_>) = std::mem::take(&mut app.queued).into_iter().partition(|q| waiting.iter().any(|w| w.id == q.id));
             for q in gone {
                 app.push_user(q.text);
@@ -321,8 +325,11 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
             let mut handled = 0;
             while let Some(ev) = next.take() {
                 if matches!(ev, AppEvent::RunDone(_)) {
-                    if let Some((agent, model)) = restore.lock().unwrap().take() {
-                        let st = engine.store.lock().unwrap();
+                    if term::reenter_after_panic(&mut terminal)? {
+                        last_sync = std::time::Instant::now();
+                    }
+                    if let Some((agent, model)) = moco_core::engine::lock(&restore).take() {
+                        let st = engine.store();
                         st.set_agent(&sid, &agent).ok();
                         st.set_model(&sid, model.as_deref()).ok();
                     }
@@ -362,7 +369,7 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
                         Action::Quit => quit = true,
                         Action::Interrupt => cancel.store(true, Ordering::Relaxed),
                         Action::Poke => {
-                            let pending = engine.store.lock().unwrap().pending_inbox(&sid).unwrap_or(0);
+                            let pending = engine.store().pending_inbox(&sid).unwrap_or(0);
                             if pending > 0 {
                                 start_run(&mut app, &sid, false);
                             }
@@ -382,7 +389,7 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
                         },
                         Action::Dropped { kind, value } => match kind {
                             app::PickKind::Queue => {
-                                engine.store.lock().unwrap().cancel_inbox(&value).ok();
+                                engine.store().cancel_inbox(&value).ok();
                                 app.queued.retain(|q| q.id != value);
                                 app.push_info("removed the waiting prompt");
                             }
@@ -394,29 +401,29 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
                         },
                         Action::SetPermissionMode(mode) => builtin::set_permission_mode(engine, &sid, &mut app, mode),
                         Action::SetEffort(level) => {
-                            engine.store.lock().unwrap().set_variant(&sid, level.as_deref()).ok();
+                            engine.store().set_variant(&sid, level.as_deref()).ok();
                             refresh_status(&mut app, &sid);
                             app.push_info(format!("reasoning effort: {}", level.as_deref().unwrap_or("default")));
                         }
                         Action::Palette => app.open_picker(app::Picker::new(app::PickKind::Command, "commands", builtin::palette_items(&host), "")),
                         Action::Picked { kind, value } => match kind {
                             app::PickKind::Model => {
-                                engine.store.lock().unwrap().set_model(&sid, Some(&value)).ok();
+                                engine.store().set_model(&sid, Some(&value)).ok();
                                 refresh_status(&mut app, &sid);
                                 app.push_info(format!("model: {value}"));
                             }
                             app::PickKind::Effort => {
-                                engine.store.lock().unwrap().set_variant(&sid, (value != "default").then_some(value.as_str())).ok();
+                                engine.store().set_variant(&sid, (value != "default").then_some(value.as_str())).ok();
                                 refresh_status(&mut app, &sid);
                                 app.push_info(format!("reasoning effort: {value}"));
                             }
                             app::PickKind::Agent => {
-                                engine.store.lock().unwrap().set_agent(&sid, &value).ok();
+                                engine.store().set_agent(&sid, &value).ok();
                                 refresh_status(&mut app, &sid);
                                 app.push_info(format!("agent: {value}"));
                             }
                             app::PickKind::Session => {
-                                let found = engine.store.lock().unwrap().session(&value).ok().flatten();
+                                let found = engine.store().session(&value).ok().flatten();
                                 if let Some(s) = found {
                                     if app.running {
                                         app.rows.push(app::Row::Error("wait for the running turn to finish (or press Esc) before switching sessions".into()));
@@ -431,7 +438,7 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
                             app::PickKind::Queue => {
                                 if let Some(q) = app.queued.iter().find(|q| q.id == value).cloned() {
                                     let mode = if q.steer { Mode::Queue } else { Mode::Steer };
-                                    if engine.store.lock().unwrap().set_inbox_mode(&value, mode).unwrap_or(false) {
+                                    if engine.store().set_inbox_mode(&value, mode).unwrap_or(false) {
                                         sync_queue(&mut app, &sid);
                                         app.push_info(format!("\"{}\" now goes {}", crate::clip(q.text.lines().next().unwrap_or(""), 40), if q.steer { "after the turn" } else { "into the next step" }));
                                     } else {
@@ -543,9 +550,9 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
                                     match (host.command)(&text) {
                                         Ok(r) => {
                                             if r.agent.is_some() || r.model.is_some() {
-                                                let st = engine.store.lock().unwrap();
+                                                let st = engine.store();
                                                 if let Some(cur) = st.session(&sid).ok().flatten() {
-                                                    *restore.lock().unwrap() = Some((cur.agent.clone(), cur.model.clone()));
+                                                    *moco_core::engine::lock(&restore) = Some((cur.agent.clone(), cur.model.clone()));
                                                 }
                                                 if let Some(a) = r.agent.as_ref().filter(|a| engine.agents().iter().any(|x| x.id == **a)) {
                                                     st.set_agent(&sid, a).ok();
@@ -591,6 +598,11 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
         }
         Ok(())
     })
+}
+
+/// The text of a caught panic payload.
+fn panic_message(p: &(dyn std::any::Any + Send)) -> String {
+    p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "unknown panic".into())
 }
 
 #[cfg(test)]

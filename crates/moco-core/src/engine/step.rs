@@ -90,7 +90,7 @@ impl Engine {
     fn prepare(&self, sid: &str, step: u32, ui: &dyn Ui) -> Result<std::result::Result<Prepared<'_>, StepOutcome>, StoreError> {
         let (session, history) = {
             let st = self.store();
-            (st.session(sid)?.expect("session exists"), st.messages(sid)?)
+            (st.session(sid)?.ok_or(StoreError::SessionGone)?, st.messages(sid)?)
         };
         let agents = self.agents_of(&session);
         let agent = agent::find(agents, &session.agent).or_else(|| agents.first().cloned()).expect("at least one agent is configured");
