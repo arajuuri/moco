@@ -630,6 +630,20 @@ mod symlink_tests {
     }
 
     #[test]
+    fn a_linked_parent_out_of_the_project_keeps_its_relative_name() {
+        let env = Env::new();
+        let outside = env.dir.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("o.txt"), "o").unwrap();
+        symlink(&outside, env.work().join("ext")).unwrap();
+        let target = real_path(&outside.join("o.txt")).display().to_string();
+        read::Read.run(&json!({"path":"ext/o.txt"}), &env.ctx()).unwrap();
+        // An absolute spelling of the same link is shown by the same relative name.
+        read::Read.run(&json!({"path": env.work().join("ext/o.txt").display().to_string()}), &env.ctx()).unwrap();
+        assert_eq!(read_resources(&env), [["ext/o.txt".to_string(), target.clone()], ["ext/o.txt".to_string(), target]]);
+    }
+
+    #[test]
     fn edit_write_and_patch_authorize_and_use_the_resolved_target() {
         let env = Env::new();
         env.file(".env", b"A=1\n");
