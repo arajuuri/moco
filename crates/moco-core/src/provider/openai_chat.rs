@@ -373,8 +373,8 @@ mod tests {
         let e = parse(&[r#"{"error":{"message":"The server had an error","type":"server_error"}}"#]).unwrap_err();
         assert!(e.retryable() || matches!(e, ProviderError::InvalidRequest(_)));
         assert!(matches!(parse(&[r#"{"choices":[{"delta":{},"finish_reason":"content_filter"}]}"#]), Err(ProviderError::ContentFilter(_))));
-        let bad = parse(&[r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c","function":{"name":"read","arguments":"{\"a\":"}}]},"finish_reason":"tool_calls"}]}"#]).unwrap_err();
-        assert!(matches!(bad, ProviderError::InvalidRequest(_)));
+        let bad = parse(&[r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c","function":{"name":"read","arguments":"{\"a\":"}}]},"finish_reason":"tool_calls"}]}"#]).unwrap();
+        assert!(bad.iter().any(|e| matches!(e, Event::BadToolCall { id, .. } if id == "c")), "invalid arguments are returned to the model: {bad:?}");
     }
 
     #[test]

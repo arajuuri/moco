@@ -424,3 +424,16 @@ impl Engine {
         }
     }
 }
+
+/// The tool error a model gets for a call whose input was cut off or was not valid JSON. Nothing was run.
+fn bad_call_message(name: &str, error: &str, max_tokens: bool) -> String {
+    let cause = if max_tokens {
+        "The response hit the output token limit (max_tokens) while writing it, so the input was cut off."
+    } else {
+        "The input was probably cut off by the output token limit, or it was malformed."
+    };
+    format!(
+        "The input for the {name} tool call was not valid JSON ({error}), so nothing was run. {cause} \
+         Retry with a smaller input: write large files in smaller parts (create the file, then add to it with edit)."
+    )
+}

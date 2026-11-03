@@ -464,14 +464,14 @@ mod tests {
     }
 
     #[test]
-    fn invalid_tool_json_is_a_non_retryable_error() {
-        let e = parse(&[
+    fn invalid_tool_json_becomes_a_bad_tool_call() {
+        let ev = parse(&[
             r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t","name":"read"}}"#,
             r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"a\":"}}"#,
             r#"{"type":"content_block_stop","index":0}"#,
         ])
-        .unwrap_err();
-        assert!(matches!(e, ProviderError::InvalidRequest(_)) && !e.retryable());
+        .unwrap();
+        assert!(ev.iter().any(|e| matches!(e, Event::BadToolCall { id, name, raw, .. } if id == "t" && name == "read" && raw == "{\"a\":")), "{ev:?}");
     }
 
     #[test]
