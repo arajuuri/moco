@@ -37,7 +37,12 @@ struct Job {
 #[derive(Default)]
 pub(super) struct Jobs {
     list: Mutex<Vec<Job>>,
+    limits: Mutex<crate::config::JobLimits>,
 }
+
+/// `list` shows this many finished jobs; older ones stay inspectable by id (up to `KEEP_FINISHED`).
+const LISTED_FINISHED: usize = 60;
+const KEEP_FINISHED: usize = 1000;
 
 fn describe(state: &State) -> String {
     match state {
@@ -65,12 +70,49 @@ impl Ui for Unattended {
     }
 }
 
+fn slot_result(kind: Kind, running: usize, limit: usize) -> Result<(), ToolError> {
+    if running < limit {
+        return Ok(());
+    }
+    let what = if kind == Kind::Shell { "background shell commands" } else { "background subagents" };
+    Err(ToolError::fail(format!("Too many {what} are running ({running} of {limit} allowed). Check them with the jobs tool and stop one with kill_job, or wait for one to finish, before starting another.")))
+}
+
 impl Engine {
     /// Put the engine behind an `Arc` and give it a handle to itself, which background jobs need.
     pub fn share(self) -> Arc<Engine> {
         let a = Arc::new(self);
         *a.me.lock().unwrap_or_else(|e| e.into_inner()) = Arc::downgrade(&a);
+        a.prune_spill_in_background();
         a
+    }
+
+    /// Delete week-old tool output and job logs, except those of running jobs, on a thread of its own.
+    fn prune_spill_in_background(self: &Arc<Self>) {
+        let (weak, dir) = (Arc::downgrade(self), self.spill_dir());
+        std::thread::spawn(move || {
+            let n = crate::truncate::prune_spill_dir(&dir, crate::truncate::SPILL_MAX_AGE, &|p| weak.upgrade().is_some_and(|e| e.jobs_lock().iter().any(|j| j.state == State::Running && j.out.as_deref() == Some(p))));
+            if n > 0 {
+                crate::log_info!("jobs", "pruned {n} old tool-output files");
+            }
+        });
+    }
+
+    /// Replace the caps on concurrently running background jobs.
+    pub fn set_job_limits(&self, limits: crate::config::JobLimits) {
+        *self.jobs.limits.lock().unwrap_or_else(|e| e.into_inner()) = limits;
+    }
+
+    fn job_limit(&self, kind: Kind) -> usize {
+        let l = *self.jobs.limits.lock().unwrap_or_else(|e| e.into_inner());
+        if kind == Kind::Shell { l.max_shells } else { l.max_subagents }
+    }
+
+    /// Tool error unless another job of `kind` may start now.
+    pub fn check_background_slot(&self, subagent: bool) -> Result<(), ToolError> {
+        let kind = if subagent { Kind::Subagent } else { Kind::Shell };
+        let running = self.jobs_lock().iter().filter(|j| j.kind == kind && j.state == State::Running).count();
+        slot_result(kind, running, self.job_limit(kind))
     }
 
     pub(super) fn shared(&self) -> Result<Arc<Engine>, ToolError> {
@@ -92,11 +134,18 @@ impl Engine {
         self.jobs.list.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn register(&self, job: Job) {
+    /// Add a running job unless its kind is at the cap (checked and added under one lock, so concurrent starts
+    /// cannot both slip through).
+    fn register(&self, job: Job) -> Result<(), ToolError> {
+        let limit = self.job_limit(job.kind);
         let mut list = self.jobs_lock();
+        if job.state == State::Running {
+            slot_result(job.kind, list.iter().filter(|j| j.kind == job.kind && j.state == State::Running).count(), limit)?;
+        }
         list.push(job);
-        // Keep the list short: forget the oldest finished jobs.
-        while list.len() > 60 {
+        // Bound memory: forget the oldest finished jobs. `background_jobs` lists fewer than are kept, so an id
+        // the model was given stays inspectable long after it scrolled out of the list.
+        while list.len() > KEEP_FINISHED {
             match list.iter().position(|j| j.state != State::Running) {
                 Some(i) => {
                     list.remove(i);
@@ -104,6 +153,11 @@ impl Engine {
                 None => break,
             }
         }
+        Ok(())
+    }
+
+    fn unregister(&self, id: &str) {
+        self.jobs_lock().retain(|j| j.id != id);
     }
 
     fn set_state(&self, id: &str, state: State) {
@@ -118,8 +172,25 @@ impl Engine {
     }
 
     pub fn background_jobs(&self, session: Option<&str>) -> Vec<JobInfo> {
-        self.jobs_lock()
+        let list = self.jobs_lock();
+        // All running jobs, plus the most recent finished ones.
+        let mut finished_from_end = 0;
+        let mut shown: Vec<bool> = list
             .iter()
+            .rev()
+            .map(|j| {
+                if j.state == State::Running {
+                    return true;
+                }
+                finished_from_end += 1;
+                finished_from_end <= LISTED_FINISHED
+            })
+            .collect();
+        shown.reverse();
+        list.iter()
+            .zip(shown)
+            .filter(|(_, s)| *s)
+            .map(|(j, _)| j)
             .filter(|j| session.is_none_or(|s| j.session_id == s))
             .map(|j| JobInfo {
                 id: j.id.clone(),
@@ -216,10 +287,17 @@ impl Engine {
         // Background commands inherit the sandbox like foreground ones.
         let root = (!unsandboxed).then(|| crate::tools::project_root_of(Path::new(&session.directory)));
         let sandboxed = root.is_some() && crate::sandbox::active();
-        let mut child = shell::spawn(command, workdir, &out, root.as_deref())?;
-        crate::log_info!("jobs", "start shell job={id} session={} sandboxed={sandboxed} timeout_ms={} command={}", session.id, timeout.map_or("none".to_string(), |t| t.as_millis().to_string()), classifier::sanitize(command, 200));
         let stop = Arc::new(AtomicBool::new(false));
-        self.register(Job { id: id.clone(), kind: Kind::Shell, session_id: session.id.clone(), title: command.to_string(), started: Instant::now(), state: State::Running, out: Some(out.clone()), stop: stop.clone() });
+        // Reserve the slot first (the cap is enforced here), then start the process.
+        self.register(Job { id: id.clone(), kind: Kind::Shell, session_id: session.id.clone(), title: command.to_string(), started: Instant::now(), state: State::Running, out: Some(out.clone()), stop: stop.clone() })?;
+        let mut child = match shell::spawn(command, workdir, &out, root.as_deref()) {
+            Ok(c) => c,
+            Err(e) => {
+                self.unregister(&id);
+                return Err(e);
+            }
+        };
+        crate::log_info!("jobs", "start shell job={id} session={} sandboxed={sandboxed} timeout_ms={} command={}", session.id, timeout.map_or("none".to_string(), |t| t.as_millis().to_string()), classifier::sanitize(command, 200));
         let (eng, sid, cmd, job_id, out_path) = (self.clone(), session.id.clone(), command.to_string(), id.clone(), out.clone());
         std::thread::spawn(move || {
             let mut f = shell::wait(&mut child, &out_path, timeout, &|| stop.load(Ordering::Relaxed), true);
@@ -259,7 +337,16 @@ impl Engine {
     pub(super) fn start_subagent_job(self: &Arc<Self>, parent: &Session, child: &Session, description: &str) {
         let stop = Arc::new(AtomicBool::new(false));
         crate::log_info!("jobs", "start subagent job={} session={} agent={} task={}", child.id, parent.id, child.agent, classifier::sanitize(description, 120));
-        self.register(Job { id: child.id.clone(), kind: Kind::Subagent, session_id: parent.id.clone(), title: description.to_string(), started: Instant::now(), state: State::Running, out: None, stop: stop.clone() });
+        let job = Job { id: child.id.clone(), kind: Kind::Subagent, session_id: parent.id.clone(), title: description.to_string(), started: Instant::now(), state: State::Running, out: None, stop: stop.clone() };
+        if let Err(e) = self.register(job) {
+            // Safety net: the caller should have run `check_background_slot` before creating the child session.
+            let msg = e.message();
+            crate::log_warn!("jobs", "subagent job={} refused: {msg}", child.id);
+            let failed = Job { id: child.id.clone(), kind: Kind::Subagent, session_id: parent.id.clone(), title: description.to_string(), started: Instant::now(), state: State::Failed(msg.clone()), out: None, stop };
+            let _ = self.register(failed);
+            self.tell_session(&parent.id, &format!("Background subagent not started (sessionID: {}, task: {description}): {msg}", child.id), &format!("background subagent {} refused", child.id));
+            return;
+        }
         let (eng, parent_id, child, description) = (self.clone(), parent.id.clone(), child.clone(), description.to_string());
         std::thread::spawn(move || {
             let result = eng.finish_subagent(&child, &Unattended, &stop);
@@ -288,5 +375,86 @@ impl Engine {
         let shown = if f.text.trim().is_empty() { "(no output)".to_string() } else { f.text };
         self.store().add_message(sid, "synthetic", &json!({"text": format!("The user ran this command themselves:\n$ {command}\n\n{shown}"), "description": "user shell command"})).log_err("store", "recording the user's own command");
         Ok(shown)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::fake::FakeProvider;
+
+    fn engine(limits: crate::config::JobLimits) -> (Arc<Engine>, Session, PathBuf) {
+        let dir = std::env::temp_dir().join(crate::id::new_id("moco-jobs"));
+        std::fs::create_dir_all(dir.join("work")).unwrap();
+        let store = Store::open_memory().unwrap();
+        let session = store.create_session(dir.join("work").to_str().unwrap(), "build").unwrap();
+        let eng = Engine::new(store, Box::new(FakeProvider::new(vec![])), EngineConfig::new("test-model", dir.join("app"))).share();
+        eng.set_job_limits(limits);
+        (eng, session, dir)
+    }
+
+    #[test]
+    fn shell_cap_is_a_tool_error_and_frees_up_when_a_job_stops() {
+        let (eng, s, dir) = engine(crate::config::JobLimits { max_shells: 2, max_subagents: 4 });
+        let work = dir.join("work");
+        let a = eng.start_shell_job(&s, "sleep 31", &work, None, true).unwrap().0;
+        eng.start_shell_job(&s, "sleep 32", &work, None, true).unwrap();
+        let err = eng.start_shell_job(&s, "sleep 33", &work, None, true).unwrap_err().message();
+        assert!(err.contains("Too many background shell commands") && err.contains("2 of 2"), "{err}");
+        assert_eq!(eng.running_jobs(), 2);
+        assert!(eng.check_background_slot(false).is_err());
+        // Shells do not use up subagent slots.
+        assert!(eng.check_background_slot(true).is_ok());
+        eng.kill_job(&a).unwrap();
+        assert!(eng.start_shell_job(&s, "sleep 34", &work, None, true).is_ok());
+        eng.kill_all_jobs();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn subagent_cap_applies_to_subagents_only() {
+        let (eng, _s, dir) = engine(crate::config::JobLimits { max_shells: 1, max_subagents: 0 });
+        assert!(eng.check_background_slot(true).unwrap_err().message().contains("background subagents"));
+        assert!(eng.check_background_slot(false).is_ok());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn finished_jobs_stay_inspectable_after_they_leave_the_list() {
+        let (eng, s, dir) = engine(crate::config::JobLimits::default());
+        let mut first = String::new();
+        for i in 0..(LISTED_FINISHED + 5) {
+            let id = format!("shl_test{i:03}");
+            if i == 0 {
+                first = id.clone();
+            }
+            eng.register(Job { id, kind: Kind::Shell, session_id: s.id.clone(), title: format!("job {i}"), started: Instant::now(), state: State::Exited { code: Some(0), signal: None }, out: None, stop: Arc::new(AtomicBool::new(false)) }).unwrap();
+        }
+        let listed = eng.background_jobs(None);
+        assert_eq!(listed.len(), LISTED_FINISHED);
+        assert!(listed.iter().all(|j| j.id != first));
+        assert!(eng.job_output(&first, 10).unwrap().contains("exited (code 0)"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sharing_the_engine_prunes_old_spill_files_in_the_background() {
+        let dir = std::env::temp_dir().join(crate::id::new_id("moco-jobs"));
+        let spill = dir.join("app").join("data").join("tool-output");
+        std::fs::create_dir_all(&spill).unwrap();
+        let old = spill.join("out_old.txt");
+        std::fs::write(&old, "x").unwrap();
+        std::fs::OpenOptions::new().write(true).open(&old).unwrap().set_modified(std::time::SystemTime::now() - Duration::from_secs(10 * 24 * 3600)).unwrap();
+        let fresh = spill.join("out_fresh.txt");
+        std::fs::write(&fresh, "y").unwrap();
+        let store = Store::open_memory().unwrap();
+        let eng = Engine::new(store, Box::new(FakeProvider::new(vec![])), EngineConfig::new("test-model", dir.join("app"))).share();
+        assert_eq!(eng.spill_dir(), spill);
+        let end = Instant::now() + Duration::from_secs(5);
+        while old.exists() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!old.exists() && fresh.exists());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
