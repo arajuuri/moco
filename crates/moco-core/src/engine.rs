@@ -156,6 +156,8 @@ pub struct EngineConfig {
     pub mcp: Option<Arc<crate::mcp::Manager>>,
     /// Run on files the model writes, edits or patches (see `format.rs`).
     pub formatters: crate::format::Formatters,
+    /// Run once per step after the tool batch, on the files the step changed (see `check.rs`).
+    pub checks: crate::check::Checks,
     /// The `websearch` tool is offered when this is set (see `tools/websearch.rs`).
     pub websearch: Option<tools::websearch::Settings>,
     /// Default reasoning effort (config `effort`); a session's or agent's own choice wins.
@@ -184,6 +186,7 @@ impl EngineConfig {
             skills: vec![],
             mcp: None,
             formatters: Default::default(),
+            checks: Default::default(),
             websearch: None,
             effort: None,
             sleep: Box::new(|d, cancel| {
@@ -239,6 +242,8 @@ pub struct Engine {
     prompt_lock: Mutex<()>,
     /// Sessions whose snapshots failed in this process (too many files, I/O error); they are skipped from then on.
     snapshot_off: Mutex<HashSet<String>>,
+    /// Checks that failed the last time they ran, per session and check (a later pass is reported once).
+    check_failing: Mutex<HashSet<String>>,
     /// Sessions a title was already attempted for in this process.
     title_tried: Mutex<HashSet<String>>,
     /// Commands the classifier allowed in this process (per session and directory); only allows are remembered.
@@ -307,12 +312,12 @@ fn add_usage(a: Usage, b: Usage) -> Usage {
 impl Engine {
     /// Single provider answering every model ref.
     pub fn new(store: Store, provider: Box<dyn Provider>, cfg: EngineConfig) -> Self {
-        Engine { store: Mutex::new(store), providers: HashMap::new(), fallback: Some(provider), tools: tools::all(subagent_list(&cfg), cfg.skills.clone(), cfg.websearch.clone()).into_iter().map(Arc::from).collect(), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()), title_tried: Mutex::new(HashSet::new()), classified: Mutex::new(HashSet::new()), unpriced_noted: Mutex::new(HashSet::new()), me: Mutex::new(std::sync::Weak::new()), jobs: jobs::Jobs::default(), notifier: Mutex::new(None) }
+        Engine { store: Mutex::new(store), providers: HashMap::new(), fallback: Some(provider), tools: tools::all(subagent_list(&cfg), cfg.skills.clone(), cfg.websearch.clone()).into_iter().map(Arc::from).collect(), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()), check_failing: Mutex::new(HashSet::new()), title_tried: Mutex::new(HashSet::new()), classified: Mutex::new(HashSet::new()), unpriced_noted: Mutex::new(HashSet::new()), me: Mutex::new(std::sync::Weak::new()), jobs: jobs::Jobs::default(), notifier: Mutex::new(None) }
     }
 
     /// One client per provider id; a model ref's provider part picks the client.
     pub fn with_providers(store: Store, providers: HashMap<String, Box<dyn Provider>>, cfg: EngineConfig) -> Self {
-        Engine { store: Mutex::new(store), providers, fallback: None, tools: tools::all(subagent_list(&cfg), cfg.skills.clone(), cfg.websearch.clone()).into_iter().map(Arc::from).collect(), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()), title_tried: Mutex::new(HashSet::new()), classified: Mutex::new(HashSet::new()), unpriced_noted: Mutex::new(HashSet::new()), me: Mutex::new(std::sync::Weak::new()), jobs: jobs::Jobs::default(), notifier: Mutex::new(None) }
+        Engine { store: Mutex::new(store), providers, fallback: None, tools: tools::all(subagent_list(&cfg), cfg.skills.clone(), cfg.websearch.clone()).into_iter().map(Arc::from).collect(), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()), check_failing: Mutex::new(HashSet::new()), title_tried: Mutex::new(HashSet::new()), classified: Mutex::new(HashSet::new()), unpriced_noted: Mutex::new(HashSet::new()), me: Mutex::new(std::sync::Weak::new()), jobs: jobs::Jobs::default(), notifier: Mutex::new(None) }
     }
 
     pub fn catalog(&self) -> &catalog::Catalog {
@@ -957,6 +962,107 @@ mod tests {
         let results = last_user_blocks(&reqs[1]);
         assert_eq!(results.len(), n);
         assert!(results.iter().all(|b| matches!(b, Block::ToolResult { is_error: false, .. })), "{results:?}");
+    }
+
+    /// Issue #26: a step with several edits runs each matching check once, afterwards, and the model sees the
+    /// diagnostics in the last matching tool's result.
+    fn two_edits_and_a_note(f: &Fixture) -> Vec<Scripted> {
+        f.file("a.txt", "one\ntwo\n");
+        f.file("b.txt", "alpha\n");
+        f.file("c.md", "doc\n");
+        let ev = |id: &str, path: &str, old: &str, new: &str| Event::ToolCall { id: id.into(), name: "edit".into(), input: json!({"path": path, "oldString": old, "newString": new}) };
+        vec![
+            Scripted::Events(vec![ev("e1", "a.txt", "one", "1"), ev("e2", "a.txt", "two", "2"), ev("e3", "b.txt", "alpha", "beta"), ev("e4", "c.md", "doc", "DOC"), Event::Finish { reason: FinishReason::ToolUse, usage: Usage::default() }]),
+            text("done"),
+        ]
+    }
+
+    fn tool_outputs(f: &Fixture) -> Vec<String> {
+        let m = f.msgs();
+        let a = m.iter().find(|m| m.kind == "assistant").unwrap();
+        a.data["parts"].as_array().unwrap().iter().filter(|p| p["type"] == "tool").map(|p| p["state"]["output"].as_str().unwrap_or("").to_string()).collect()
+    }
+
+    fn checks_fixture(allowed: bool, tweak: impl FnOnce(&mut EngineConfig)) -> (Fixture, PathBuf) {
+        let probe = std::env::temp_dir().join(crate::id::new_id("chk-probe"));
+        std::fs::create_dir_all(&probe).unwrap();
+        let p = probe.clone();
+        let f = fixture_cfg(vec![], |cfg| {
+            cfg.checks = crate::check::Checks::from_config(&crate::check::tests::config(&crate::check::tests::recording_script(&p), "txt", None), &|_| allowed);
+            tweak(cfg);
+        });
+        (f, probe)
+    }
+
+    #[test]
+    fn checks_run_once_per_step_on_the_changed_files_and_report_in_the_last_matching_result() {
+        let (f, probe) = checks_fixture(true, |_| {});
+        f.fake.extend(two_edits_and_a_note(&f));
+        f.say("edit things");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        let log = std::fs::read_to_string(probe.join("runs.log")).unwrap();
+        assert_eq!(log.lines().count(), 1, "one run for three .txt edits: {log}");
+        assert!(log.contains("a.txt") && log.contains("b.txt") && !log.contains("c.md"), "{log}");
+        assert_eq!(log.matches("a.txt").count(), 1, "a file edited twice is passed once");
+        let out = tool_outputs(&f);
+        assert!(!out[0].contains("Check fake") && !out[1].contains("Check fake"), "{out:?}");
+        assert!(out[2].contains("Check fake reported problems") && out[2].contains("b.txt:1:1: error: broken"), "{}", out[2]);
+        assert!(!out[3].contains("Check fake"), "the .md edit is not covered: {}", out[3]);
+        let _ = std::fs::remove_dir_all(probe);
+    }
+
+    #[test]
+    fn a_check_that_is_not_approved_never_runs() {
+        let (f, probe) = checks_fixture(false, |_| {});
+        f.fake.extend(two_edits_and_a_note(&f));
+        f.say("edit things");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        assert!(!probe.join("runs.log").exists());
+        assert!(tool_outputs(&f).iter().all(|o| !o.contains("Check fake")));
+        let _ = std::fs::remove_dir_all(probe);
+    }
+
+    #[test]
+    fn checks_false_for_an_agent_turns_them_off() {
+        let (f, probe) = checks_fixture(true, |cfg| {
+            for a in &mut cfg.agents {
+                a.checks = false;
+            }
+        });
+        f.fake.extend(two_edits_and_a_note(&f));
+        f.say("edit things");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        assert!(!probe.join("runs.log").exists());
+        let _ = std::fs::remove_dir_all(probe);
+    }
+
+    #[test]
+    fn a_check_timeout_is_a_note_in_the_tool_result_not_an_error() {
+        let f = fixture_cfg(vec![], |cfg| cfg.checks = crate::check::Checks::from_config(&crate::check::tests::config("sleep 5", "txt", Some(200)), &|_| true));
+        f.fake.extend(two_edits_and_a_note(&f));
+        f.say("edit things");
+        let t = std::time::Instant::now();
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        assert!(t.elapsed() < Duration::from_secs(4));
+        let out = tool_outputs(&f);
+        assert!(out[2].contains("Check fake did not complete: timed out"), "{}", out[2]);
+        let m = f.msgs();
+        assert!(m[1].data["parts"].as_array().unwrap().iter().all(|p| p["state"]["status"] == "completed"));
+    }
+
+    /// A failure is followed by "passed" once the model fixed it, and then silence.
+    #[test]
+    fn a_pass_after_a_failure_is_reported_once() {
+        let f = fixture_cfg(vec![], |cfg| cfg.checks = crate::check::Checks::from_config(&crate::check::tests::config("if grep -q BAD a.txt; then echo 'a.txt:1:1: error: bad'; exit 1; fi", "txt", None), &|_| true));
+        f.file("a.txt", "BAD");
+        let ed = |id: &str, old: &str, new: &str| Scripted::Events(vec![Event::ToolCall { id: id.into(), name: "edit".into(), input: json!({"path": "a.txt", "oldString": old, "newString": new}) }, Event::Finish { reason: FinishReason::ToolUse, usage: Usage::default() }]);
+        f.fake.extend(vec![ed("w1", "BAD", "BAD2"), ed("w2", "BAD2", "fine"), ed("w3", "fine", "fine too"), text("done")]);
+        f.say("go");
+        let _ = f.run(&TestUi::default());
+        let outs: Vec<String> = f.msgs().iter().filter(|m| m.kind == "assistant").filter_map(|m| m.data["parts"][0]["state"]["output"].as_str().map(String::from)).collect();
+        assert!(outs[0].contains("reported problems"), "{outs:?}");
+        assert!(outs[1].contains("Check fake passed."), "{outs:?}");
+        assert!(!outs[2].contains("Check fake"), "{outs:?}");
     }
 
     /// A model that uses Claude Code's argument names gets the same result, and the stored call, which is what later
@@ -2292,6 +2398,9 @@ mod tests {
                 std::fs::File::options().write(true).open(b.path()).unwrap().set_modified(past).unwrap();
             }
         }
+        // The session was last updated at the end of the run, possibly within this millisecond, which a zero window
+        // still counts as recent. Let the clock move on so the session really is outside the window.
+        std::thread::sleep(Duration::from_millis(5));
         let (manifests, blobs) = f.engine.prune_snapshots(std::slice::from_ref(&pid), Duration::ZERO);
         assert!(manifests >= 3 && blobs >= 3, "{manifests} {blobs}");
         assert_eq!(read_work(&f, "a.txt").as_deref(), Some("v2"));

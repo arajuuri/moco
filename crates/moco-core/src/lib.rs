@@ -7,6 +7,7 @@ pub mod catalog;
 pub mod classifier;
 pub mod commands;
 pub mod chat;
+pub mod check;
 pub mod compaction;
 pub mod config;
 pub mod engine;

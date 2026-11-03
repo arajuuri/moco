@@ -15,6 +15,8 @@ pub struct Agent {
     pub steps: Option<u32>,
     /// Default reasoning effort for this agent (a variant name); a session's own choice wins.
     pub effort: Option<String>,
+    /// Run the configured `checks` after this agent's edits (see `check.rs`).
+    pub checks: bool,
     pub permissions: Vec<Rule>,
 }
 
@@ -100,6 +102,7 @@ pub fn builtin_for(mode: PermissionMode) -> Vec<Agent> {
             model: None,
             steps: None,
             effort: None,
+            checks: true,
             permissions: build,
         },
         Agent {
@@ -111,6 +114,7 @@ pub fn builtin_for(mode: PermissionMode) -> Vec<Agent> {
             model: None,
             steps: None,
             effort: None,
+            checks: false,
             permissions: plan,
         },
         Agent {
@@ -122,6 +126,7 @@ pub fn builtin_for(mode: PermissionMode) -> Vec<Agent> {
             model: None,
             steps: None,
             effort: None,
+            checks: true,
             permissions: general,
         },
         Agent {
@@ -133,6 +138,7 @@ pub fn builtin_for(mode: PermissionMode) -> Vec<Agent> {
             model: None,
             steps: None,
             effort: None,
+            checks: false,
             permissions: explore,
         },
     ]

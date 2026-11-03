@@ -2,7 +2,7 @@
 //! config declares one could run code on your machine just by being opened. Servers from your own configuration
 //! (`<app dir>/config/` or `$MOCO_CONFIG`) are trusted; project ones need an explicit yes, remembered per project
 //! directory and exact server definition (a changed command asks again).
-use crate::config::{FormatterConfig, McpServerConfig};
+use crate::config::{CheckConfig, FormatterConfig, McpServerConfig};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
@@ -22,6 +22,12 @@ pub fn fingerprint(project_dir: &Path, name: &str, cfg: &McpServerConfig) -> Str
 /// The same for a project's formatter definition.
 pub fn fingerprint_formatter(project_dir: &Path, name: &str, cfg: &FormatterConfig) -> String {
     let canon = serde_json::json!({"kind": "formatter", "dir": project_dir.to_string_lossy(), "name": name, "command": cfg.command, "extensions": cfg.extensions, "env": cfg.environment});
+    Sha256::digest(canon.to_string().as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The same for a project's check definition.
+pub fn fingerprint_check(project_dir: &Path, name: &str, cfg: &CheckConfig) -> String {
+    let canon = serde_json::json!({"kind": "check", "dir": project_dir.to_string_lossy(), "name": name, "command": cfg.command, "extensions": cfg.extensions, "env": cfg.environment});
     Sha256::digest(canon.to_string().as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
 }
 
