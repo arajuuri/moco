@@ -566,11 +566,34 @@ impl Engine {
         self.auto_failed.lock().unwrap().remove(session_id);
         // An untitled session gets a title from a small model call that runs alongside the first turn.
         let job = self.title_job(session_id);
+        // The title never holds the run back: once the turn is over it gets `TITLE_GRACE` to finish, then it is
+        // cancelled (the provider adapters honor that at once, also while waiting for response headers).
+        let (title_cancel, title_done, drained) = (AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false));
         let outcome = std::thread::scope(|s| {
             if let Some((session, text)) = &job {
-                s.spawn(move || self.generate_title(session, text, ui, cancel));
+                let (title_cancel, title_done) = (&title_cancel, &title_done);
+                s.spawn(move || {
+                    self.generate_title(session, text, ui, title_cancel);
+                    title_done.store(true, Ordering::Relaxed);
+                });
+                let drained = &drained;
+                s.spawn(move || {
+                    let mut drained_at = None;
+                    while !title_done.load(Ordering::Relaxed) {
+                        if drained.load(Ordering::Relaxed) {
+                            drained_at.get_or_insert_with(std::time::Instant::now);
+                        }
+                        if cancel.load(Ordering::Relaxed) || drained_at.is_some_and(|t| t.elapsed() >= TITLE_GRACE) {
+                            title_cancel.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                });
             }
-            self.drain(session_id, ui, cancel, resume)
+            let outcome = self.drain(session_id, ui, cancel, resume);
+            drained.store(true, Ordering::Relaxed);
+            outcome
         });
         claim.release()?;
         // A session deleted from another process mid-run is a failed run, not a crash.
@@ -678,6 +701,8 @@ struct EngineHost<'a> {
 }
 
 const MAX_SUBAGENT_DEPTH: usize = 3;
+/// How long a title request may keep running after the turn it accompanied has ended.
+const TITLE_GRACE: Duration = Duration::from_secs(3);
 
 impl Host for EngineHost<'_> {
     fn set_todos(&self, todos: Vec<Todo>) -> Result<(), ToolError> {

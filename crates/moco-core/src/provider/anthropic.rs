@@ -2,8 +2,6 @@
 use super::*;
 use serde_json::json;
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 pub struct Anthropic {
@@ -252,16 +250,6 @@ impl Parser {
     }
 }
 
-fn transport(e: ureq::Transport) -> ProviderError {
-    let kind = match e.kind() {
-        ureq::ErrorKind::ConnectionFailed | ureq::ErrorKind::Dns => TransportKind::Connect,
-        _ => {
-            if e.to_string().to_lowercase().contains("timed out") { TransportKind::Timeout } else { TransportKind::Other }
-        }
-    };
-    ProviderError::Transport { kind, message: e.to_string() }
-}
-
 impl Provider for Anthropic {
     fn stream(&self, req: &Request, cancel: &AtomicBool, on_event: &mut dyn FnMut(Event)) -> Result<(), ProviderError> {
         let url = format!("{}/v1/messages", self.base_url);
@@ -270,41 +258,17 @@ impl Provider for Anthropic {
         let mut shown = vec![("x-api-key", self.api_key.as_str()), ("anthropic-version", "2023-06-01")];
         shown.extend(req.overlay.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         super::trace_http(PROVIDER, &url, &shown, &body);
-        let resp = req.overlay.headers.iter().fold(resp, |r, (k, v)| r.set(k, v)).send_string(&body);
-        let resp = match resp {
-            Ok(r) => r,
-            Err(ureq::Error::Status(code, r)) => {
-                let ra = r.header("retry-after").and_then(|s| s.trim().parse::<u64>().ok());
-                let body = r.into_string().unwrap_or_default();
-                super::log_http_error(PROVIDER, code, ra, &body);
-                return Err(classify_http(code, &body, ra));
-            }
-            Err(ureq::Error::Transport(t)) => return Err(transport(t)),
-        };
+        let call = req.overlay.headers.iter().fold(resp, |r, (k, v)| r.set(k, v));
+        let lines = super::open_lines(PROVIDER, call, body, cancel, classify_http)?;
         let mut parser = Parser { model: req.model.clone(), ..Default::default() };
-        let mut reader = BufReader::new(resp.into_reader());
-        let mut line = String::new();
         let mut finished = false;
-        loop {
-            if cancel.load(Ordering::Relaxed) {
-                return Err(ProviderError::Interrupted);
+        super::read_sse(lines, cancel, |data| {
+            for ev in parser.feed(data)? {
+                finished |= matches!(ev, Event::Finish { .. });
+                on_event(ev);
             }
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(e) => {
-                    let kind = if e.kind() == std::io::ErrorKind::TimedOut { TransportKind::Timeout } else { TransportKind::Other };
-                    return Err(ProviderError::Transport { kind, message: format!("stream read failed: {e}") });
-                }
-            }
-            if let Some(data) = line.trim_end().strip_prefix("data:") {
-                for ev in parser.feed(data.trim_start())? {
-                    finished |= matches!(ev, Event::Finish { .. });
-                    on_event(ev);
-                }
-            }
-        }
+            Ok(false)
+        })?;
         // The stream must end with message_stop; a silent close means a dropped connection.
         if finished {
             Ok(())

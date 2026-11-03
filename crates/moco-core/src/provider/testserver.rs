@@ -22,6 +22,32 @@ pub struct Server {
     pub requests: Arc<Mutex<Vec<(String, String)>>>, // (headers+request line, body)
 }
 
+/// A server that accepts a request and then goes quiet: with `head` set it first sends those response headers and
+/// the body so far (promising more than it ever delivers), otherwise it sends nothing at all. The connection stays
+/// open for `hold`.
+pub fn stall(head: Option<&str>, hold: std::time::Duration) -> Server {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let requests = Arc::new(Mutex::new(vec![]));
+    let log = requests.clone();
+    let partial = head.map(|b| format!("HTTP/1.1 200 X\r\nContent-Type: text/event-stream\r\nContent-Length: 1000000\r\n\r\n{b}"));
+    std::thread::spawn(move || {
+        while let Ok((mut sock, _)) = listener.accept() {
+            let mut chunk = [0u8; 65536];
+            let n = sock.read(&mut chunk).unwrap_or(0);
+            log.lock().unwrap().push((String::from_utf8_lossy(&chunk[..n]).into_owned(), String::new()));
+            if let Some(p) = &partial {
+                let _ = sock.write_all(p.as_bytes());
+            }
+            std::thread::spawn(move || {
+                std::thread::sleep(hold);
+                drop(sock);
+            });
+        }
+    });
+    Server { url, requests }
+}
+
 pub fn serve(responses: Vec<Canned>) -> Server {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
