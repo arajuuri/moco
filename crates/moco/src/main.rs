@@ -453,6 +453,19 @@ fn print_files(r: &UndoReport) {
 /// Exit status of `-p` when a spending limit stopped the run.
 const EXIT_LIMIT: i32 = 3;
 
+/// `true` when a change to the session was stored. A failure is logged and printed, so the caller can skip its
+/// success message (the change did not happen) instead of reporting what was never saved.
+fn stored<T>(what: &str, r: Result<T, moco_core::store::StoreError>) -> bool {
+    match r {
+        Ok(_) => true,
+        Err(e) => {
+            moco_core::log_warn!("store", "saving {what} failed: {e}");
+            eprintln!("{RED}{what} could not be saved: {e}{RESET}");
+            false
+        }
+    }
+}
+
 fn die(msg: &str) -> ! {
     eprintln!("moco: {msg}");
     std::process::exit(2)
@@ -810,23 +823,24 @@ fn main() {
         None => store.create_session(&cwd_str, &agent_id).unwrap_or_else(|e| die(&e.to_string())),
     };
     if agent_explicit {
-        store.set_agent(&session.id, &agent_id).ok();
+        stored("the --agent choice", store.set_agent(&session.id, &agent_id));
     } else if resumed && agents.iter().any(|a| a.id == session.agent && a.selectable()) {
         agent_id = session.agent.clone(); // a resumed session keeps its own agent
     }
     if let Some(m) = flag_mode {
-        store.set_permission_mode(&session.id, Some(m.name())).ok();
-        session.permission_mode = Some(m.name().into());
+        if stored("the permission mode", store.set_permission_mode(&session.id, Some(m.name()))) {
+            session.permission_mode = Some(m.name().into());
+        }
     }
     // An explicit --model / MOCO_MODEL applies to this session; otherwise a resumed session keeps its own.
     let explicit_model = std::env::args().any(|a| a == "--model" || a == "-m") || std::env::var("MOCO_MODEL").is_ok();
     if explicit_model {
-        store.set_model(&session.id, Some(&model)).ok();
+        stored("the --model choice", store.set_model(&session.id, Some(&model)));
         session.model = Some(model.clone());
     }
 
     if let Some(e) = &effort_arg {
-        store.set_variant(&session.id, Some(e)).ok();
+        stored("the --effort choice", store.set_variant(&session.id, Some(e)));
     }
     let mut engine_cfg = EngineConfig::new(&model, app_dir.clone());
     engine_cfg.effort = cfg.effort.clone();
@@ -1205,7 +1219,9 @@ fn main() {
                 match target {
                     Err(e) => println!("{e}"),
                     Ok(t) => {
-                        engine.store().set_archived(&t.id, !unarchive).ok();
+                        if !stored(if unarchive { "unarchiving" } else { "archiving" }, engine.store().set_archived(&t.id, !unarchive)) {
+                            continue;
+                        }
                         println!("{DIM}{} {}{RESET}", if unarchive { "unarchived" } else { "archived" }, short(&t.id));
                         if !unarchive && t.id == session.id {
                             match engine.store().create_session(&cwd_str, &agent_id) {
@@ -1286,8 +1302,9 @@ fn main() {
                     println!("{DIM}model: {}{RESET}\nconnected: {}\n/model <filter> searches; /model provider/model switches", current(&session.id), connected.join(", "));
                 } else if let Some((pid, mid)) = arg.split_once('/').filter(|(p, _)| connected.iter().any(|c| c == p)) {
                     let known = engine.catalog().model(pid, mid).is_some();
-                    engine.store().set_model(&session.id, Some(arg)).ok();
-                    println!("{DIM}model: {arg}{}{RESET}", if known { "" } else { " (not in the catalog: no price or context limit)" });
+                    if stored("the model choice", engine.store().set_model(&session.id, Some(arg))) {
+                        println!("{DIM}model: {arg}{}{RESET}", if known { "" } else { " (not in the catalog: no price or context limit)" });
+                    }
                 } else if arg.contains('/') && !arg.contains(' ') && engine.catalog().providers.contains_key(arg.split('/').next().unwrap_or("")) {
                     println!("provider '{}' is not connected; run `moco auth {}`", arg.split('/').next().unwrap_or(""), arg.split('/').next().unwrap_or(""));
                 } else {
@@ -1308,11 +1325,13 @@ fn main() {
                 } else if arg.is_empty() {
                     println!("{DIM}reasoning effort: {}{}\nlevels: {}\n/effort <level> sets it, /effort default goes back to the provider's default{RESET}", info.desired.as_deref().unwrap_or("default"), if info.desired.is_some() && !info.offered { " (this model does not offer it, so it is not sent)" } else { "" }, info.levels.join(", "));
                 } else if arg == "default" {
-                    engine.store().set_variant(&session.id, None).ok();
-                    println!("{DIM}reasoning effort: default{RESET}");
+                    if stored("the reasoning effort", engine.store().set_variant(&session.id, None)) {
+                        println!("{DIM}reasoning effort: default{RESET}");
+                    }
                 } else if info.levels.iter().any(|x| x == arg) {
-                    engine.store().set_variant(&session.id, Some(arg)).ok();
-                    println!("{DIM}reasoning effort: {arg}{RESET}");
+                    if stored("the reasoning effort", engine.store().set_variant(&session.id, Some(arg))) {
+                        println!("{DIM}reasoning effort: {arg}{RESET}");
+                    }
                 } else {
                     println!("this model offers: {}", info.levels.join(", "));
                 }
@@ -1324,8 +1343,9 @@ fn main() {
                 if want.is_empty() {
                     println!("{DIM}permission mode: {} ({}){RESET}", current.name(), current.describe());
                 } else if let Some(m) = permission::PermissionMode::parse(want) {
-                    engine.store().set_permission_mode(&session.id, Some(m.name())).ok();
-                    println!("{DIM}permission mode: {} ({}){RESET}", m.name(), m.describe());
+                    if stored("the permission mode", engine.store().set_permission_mode(&session.id, Some(m.name()))) {
+                        println!("{DIM}permission mode: {} ({}){RESET}", m.name(), m.describe());
+                    }
                 } else {
                     println!("usage: /mode [manual|auto]");
                 }
@@ -1335,8 +1355,9 @@ fn main() {
                 match engine.agents().iter().find(|a| a.id == want && a.selectable()) {
                     Some(a) => {
                         agent_id = a.id.clone();
-                        engine.store().set_agent(&session.id, &a.id).ok();
-                        println!("{DIM}agent: {}{RESET}", a.name);
+                        if stored("the agent choice", engine.store().set_agent(&session.id, &a.id)) {
+                            println!("{DIM}agent: {}{RESET}", a.name);
+                        }
                     }
                     None => println!("unknown agent; available: {}", engine.agents().iter().filter(|a| a.selectable()).map(|a| a.id.as_str()).collect::<Vec<_>>().join(", ")),
                 }
@@ -1376,7 +1397,7 @@ fn main() {
                         Ok(r) => {
                             println!("{}", r.output);
                             let st = engine.store();
-                            st.add_message(&session.id, "synthetic", &serde_json::json!({"text": format!("Result of /{} {}:\n\n{}", cmd.name, args.trim(), r.output)})).ok();
+                            stored("the command's result in the conversation (the model will not see it)", st.add_message(&session.id, "synthetic", &serde_json::json!({"text": format!("Result of /{} {}:\n\n{}", cmd.name, args.trim(), r.output)})));
                         }
                         Err(e) => eprintln!("{RED}/{} failed: {}{RESET}", cmd.name, e.message()),
                     }
@@ -1392,13 +1413,13 @@ fn main() {
                         let cur = st.session(&session.id).ok().flatten();
                         if let Some(a) = &cmd.agent {
                             if engine.agents().iter().any(|x| x.id == *a) {
-                                st.set_agent(&session.id, a).ok();
+                                stored("the command's agent", st.set_agent(&session.id, a));
                             } else {
                                 println!("unknown agent '{a}' in /{name}; using the current one");
                             }
                         }
                         if let Some(m) = &cmd.model {
-                            st.set_model(&session.id, Some(m)).ok();
+                            stored("the command's model", st.set_model(&session.id, Some(m)));
                         }
                         (cur.as_ref().map(|c| c.agent.clone()), cur.and_then(|c| c.model))
                     };
@@ -1407,10 +1428,10 @@ fn main() {
                     }
                     let st = engine.store();
                     if let Some(a) = saved_agent {
-                        st.set_agent(&session.id, &a).ok();
+                        stored("the agent of this session (it stays switched after the command)", st.set_agent(&session.id, &a));
                     }
                     if cmd.model.is_some() {
-                        st.set_model(&session.id, saved_model.as_deref()).ok();
+                        stored("the model of this session (it stays switched after the command)", st.set_model(&session.id, saved_model.as_deref()));
                     }
                 }
             }

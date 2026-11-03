@@ -278,6 +278,8 @@ pub struct Engine {
     classified: Mutex<HashSet<String>>,
     /// Classifier models already reported as having no price (once each per process).
     unpriced_noted: Mutex<HashSet<String>>,
+    /// Store-failure notices already shown in this process, by key (see `notice_once`).
+    notified: Mutex<HashSet<String>>,
     /// Spend baselines for the cost limits (see `limits.rs`).
     limit_state: limits::State,
     /// Weak handle to this engine once it is shared (`share`): detached background threads need an owner.
@@ -335,6 +337,21 @@ fn append_user_text(messages: &mut Vec<ChatMessage>, text: String) {
     }
 }
 
+/// Log a failed operation and show `"{what}: {error}"` as a notice the first time `key` fails (later failures are
+/// only logged). Returns the value on success.
+pub(crate) fn notice_once<T, E: std::fmt::Display>(seen: &Mutex<HashSet<String>>, ui: &dyn Ui, key: &str, what: &str, r: std::result::Result<T, E>) -> Option<T> {
+    match r {
+        Ok(v) => Some(v),
+        Err(e) => {
+            crate::log_warn!("store", "{what}: {e}");
+            if lock(seen).insert(key.to_string()) {
+                ui.event(&UiEvent::Notice(&format!("{what}: {e}")));
+            }
+            None
+        }
+    }
+}
+
 fn add_usage(a: Usage, b: Usage) -> Usage {
     Usage { input: a.input + b.input, output: a.output + b.output, cache_read: a.cache_read + b.cache_read, cache_write: a.cache_write + b.cache_write }
 }
@@ -342,12 +359,12 @@ fn add_usage(a: Usage, b: Usage) -> Usage {
 impl Engine {
     /// Single provider answering every model ref.
     pub fn new(store: Store, provider: Box<dyn Provider>, cfg: EngineConfig) -> Self {
-        Engine { store: Mutex::new(store), providers: HashMap::new(), fallback: Some(provider), tools: tools::all(subagent_list(&cfg), cfg.skills.clone(), cfg.websearch.clone()).into_iter().map(Arc::from).collect(), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()), check_failing: Mutex::new(HashSet::new()), title_tried: Mutex::new(HashSet::new()), classified: Mutex::new(HashSet::new()), unpriced_noted: Mutex::new(HashSet::new()), me: Mutex::new(std::sync::Weak::new()), jobs: jobs::Jobs::default(), notifier: Mutex::new(None), limit_state: Default::default() }
+        Engine { store: Mutex::new(store), providers: HashMap::new(), fallback: Some(provider), tools: tools::all(subagent_list(&cfg), cfg.skills.clone(), cfg.websearch.clone()).into_iter().map(Arc::from).collect(), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()), check_failing: Mutex::new(HashSet::new()), title_tried: Mutex::new(HashSet::new()), classified: Mutex::new(HashSet::new()), unpriced_noted: Mutex::new(HashSet::new()), notified: Mutex::new(HashSet::new()), me: Mutex::new(std::sync::Weak::new()), jobs: jobs::Jobs::default(), notifier: Mutex::new(None), limit_state: Default::default() }
     }
 
     /// One client per provider id; a model ref's provider part picks the client.
     pub fn with_providers(store: Store, providers: HashMap<String, Box<dyn Provider>>, cfg: EngineConfig) -> Self {
-        Engine { store: Mutex::new(store), providers, fallback: None, tools: tools::all(subagent_list(&cfg), cfg.skills.clone(), cfg.websearch.clone()).into_iter().map(Arc::from).collect(), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()), check_failing: Mutex::new(HashSet::new()), title_tried: Mutex::new(HashSet::new()), classified: Mutex::new(HashSet::new()), unpriced_noted: Mutex::new(HashSet::new()), me: Mutex::new(std::sync::Weak::new()), jobs: jobs::Jobs::default(), notifier: Mutex::new(None), limit_state: Default::default() }
+        Engine { store: Mutex::new(store), providers, fallback: None, tools: tools::all(subagent_list(&cfg), cfg.skills.clone(), cfg.websearch.clone()).into_iter().map(Arc::from).collect(), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()), check_failing: Mutex::new(HashSet::new()), title_tried: Mutex::new(HashSet::new()), classified: Mutex::new(HashSet::new()), unpriced_noted: Mutex::new(HashSet::new()), notified: Mutex::new(HashSet::new()), me: Mutex::new(std::sync::Weak::new()), jobs: jobs::Jobs::default(), notifier: Mutex::new(None), limit_state: Default::default() }
     }
 
     pub fn catalog(&self) -> &catalog::Catalog {
@@ -476,6 +493,11 @@ impl Engine {
     /// The session store. Poison-tolerant: a panic on another thread must not take the UI down with it.
     pub fn store(&self) -> std::sync::MutexGuard<'_, Store> {
         lock(&self.store)
+    }
+
+    /// Log a failed store write and tell the user once per process per `key` (not on every step). Returns the value.
+    pub(crate) fn store_warn<T, E: std::fmt::Display>(&self, ui: &dyn Ui, key: &str, what: &str, r: std::result::Result<T, E>) -> Option<T> {
+        notice_once(&self.notified, ui, key, what, r)
     }
 
     pub fn spill_dir(&self) -> PathBuf {
@@ -1205,6 +1227,46 @@ mod tests {
         assert!(matches!(&last_user_blocks(&reqs[3])[0], Block::ToolResult { content, is_error: false, .. } if content == "1: SECRET=1"));
         assert_eq!(ui.asked.lock().unwrap().len(), 2, "third read covered by the saved rule");
         assert_eq!(f.engine.store().saved_permissions(&f.session.project_id).unwrap().len(), 1);
+    }
+
+    fn notices_containing(ui: &TestUi, needle: &str) -> usize {
+        ui.log().iter().filter(|l| l.starts_with("notice:") && l.contains(needle)).count()
+    }
+
+    #[test]
+    fn unreadable_saved_permissions_show_one_notice_instead_of_silently_asking() {
+        let f = fixture(vec![tool_call("t1", "read", json!({"path":".env"})), tool_call("t2", "read", json!({"path":".env"})), text("done")]);
+        f.file(".env", "SECRET=1");
+        f.say("go");
+        f.engine.store().exec_for_test("alter table permission_saved rename to permission_saved_away");
+        let ui = TestUi::replying(vec![Reply::Once, Reply::Once]);
+        assert_eq!(f.run(&ui), RunOutcome::Idle);
+        assert_eq!(ui.asked.lock().unwrap().len(), 2, "with nothing readable, every request asks");
+        assert_eq!(notices_containing(&ui, "saved permissions could not be read"), 1, "{:?}", ui.log());
+    }
+
+    #[test]
+    fn an_always_answer_that_cannot_be_stored_shows_a_notice() {
+        let f = fixture(vec![tool_call("t1", "read", json!({"path":".env"})), text("done")]);
+        f.file(".env", "SECRET=1");
+        f.say("go");
+        f.engine.store().exec_for_test("create trigger no_saving before insert on permission_saved begin select raise(abort, 'disk full'); end");
+        let ui = TestUi::replying(vec![Reply::Always]);
+        assert_eq!(f.run(&ui), RunOutcome::Idle, "the call itself still runs");
+        assert_eq!(notices_containing(&ui, "saved permissions could not be stored"), 1, "{:?}", ui.log());
+        assert!(ui.log().iter().any(|l| l.contains("disk full")), "the cause is shown: {:?}", ui.log());
+    }
+
+    #[test]
+    fn a_failing_usage_write_shows_exactly_one_notice_across_steps() {
+        let f = fixture(vec![tool_call("t1", "read", json!({"path":"a.txt"})), tool_call("t2", "read", json!({"path":"a.txt"})), text("done")]);
+        f.file("a.txt", "hi\n");
+        f.say("go");
+        f.engine.store().exec_for_test("create trigger no_usage before update of cost on session begin select raise(abort, 'disk full'); end");
+        let ui = TestUi::default();
+        assert_eq!(f.run(&ui), RunOutcome::Idle);
+        assert_eq!(ui.log().iter().filter(|l| *l == "usage").count(), 3, "three steps ran");
+        assert_eq!(notices_containing(&ui, "token usage and cost could not be recorded"), 1, "{:?}", ui.log());
     }
 
     #[test]

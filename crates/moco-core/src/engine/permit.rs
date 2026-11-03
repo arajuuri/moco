@@ -10,11 +10,20 @@ pub(super) struct EnginePermitter<'a> {
     /// Set when the user declines without feedback: every other pending/future request of the batch fails too.
     pub(super) declined: &'a AtomicBool,
     pub(super) ask_lock: &'a Mutex<()>,
+    /// The engine's record of store failures already shown (see `notice_once`).
+    pub(super) notified: &'a Mutex<HashSet<String>>,
     /// Present when the command classifier is on for this step.
     pub(super) classify: Option<classify::ClassifyCtx<'a>>,
 }
 
 impl EnginePermitter<'_> {
+    /// The rules saved with "always". When they cannot be read the user is told once, because every request then
+    /// asks again as if nothing had been saved.
+    fn saved(&self) -> Vec<Rule> {
+        let r = self.store.lock().unwrap_or_else(|e| e.into_inner()).saved_permissions(&self.project_id);
+        notice_once(self.notified, self.ui, "saved-permissions-read", "saved permissions could not be read, so you may be asked again for things you answered \"always\" to", r).unwrap_or_default()
+    }
+
     /// The classifier may answer for a shell command that would only ask because of a default rule. It never
     /// overrides a rule the user or the careful preset's always-ask list wrote, and never sees opaque or dangerous
     /// commands. `true` = run it without asking.
@@ -28,7 +37,7 @@ impl EnginePermitter<'_> {
             crate::log_debug!("classifier", "session={} skipped (opaque or never-classify list): {}", c.session.id, classifier::sanitize(command, 200));
             return false;
         }
-        let saved = self.store.lock().unwrap_or_else(|e| e.into_inner()).saved_permissions(&self.project_id).unwrap_or_default();
+        let saved = self.saved();
         if !permission::only_default_asks(&req.action, &req.resources, &self.rules, &saved) {
             crate::log_debug!("classifier", "session={} skipped (an explicit rule decides): {}", c.session.id, classifier::sanitize(command, 200));
             return false;
@@ -49,7 +58,7 @@ impl EnginePermitter<'_> {
     }
 
     fn effect(&self, req: &PermReq) -> Effect {
-        let saved = self.store.lock().unwrap_or_else(|e| e.into_inner()).saved_permissions(&self.project_id).unwrap_or_default();
+        let saved = self.saved();
         let e = permission::decide(&req.action, &req.resources, &self.rules, &saved);
         if e == Effect::Allow && req.force_ask { Effect::Ask } else { e }
     }
@@ -78,9 +87,9 @@ impl Permitter for EnginePermitter<'_> {
                 match self.ui.ask(&PermissionPrompt { action: &req.action, resources: &req.resources, save: &req.save }) {
                     Reply::Once => Ok(()),
                     Reply::Always => {
-                        let st = self.store.lock().unwrap_or_else(|e| e.into_inner());
                         for pat in &req.save {
-                            st.save_permission(&self.project_id, &req.action, pat).log_err("store", "saving an always-allow rule");
+                            let r = self.store.lock().unwrap_or_else(|e| e.into_inner()).save_permission(&self.project_id, &req.action, pat);
+                            notice_once(self.notified, self.ui, "saved-permissions-write", "saved permissions could not be stored, so this \"always\" answer is not remembered and you will be asked again", r);
                         }
                         Ok(())
                     }

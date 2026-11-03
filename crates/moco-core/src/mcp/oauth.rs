@@ -64,14 +64,14 @@ pub fn save(app_dir: &Path, server_url: &str, s: &Stored) -> std::io::Result<()>
 }
 
 /// Forget the tokens (and registered client) for a server.
-pub fn remove(app_dir: &Path, server_url: &str) -> bool {
+pub fn remove(app_dir: &Path, server_url: &str) -> Result<bool, String> {
     let mut all = read_all(app_dir);
     if all.remove(server_url).is_none() {
-        return false;
+        return Ok(false);
     }
-    crate::log::LogErr::log_err(std::fs::write(path(app_dir), serde_json::to_string_pretty(&Value::Object(all)).unwrap_or_default()), "mcp", "forgetting stored OAuth tokens");
+    std::fs::write(path(app_dir), serde_json::to_string_pretty(&Value::Object(all)).unwrap_or_default()).map_err(|e| format!("could not forget the stored tokens ({}): {e}", path(app_dir).display()))?;
     crate::log_info!("mcp", "oauth: stored tokens for {server_url} removed");
-    true
+    Ok(true)
 }
 
 // ---- small helpers -------------------------------------------------------------------------------
@@ -285,7 +285,7 @@ fn refresh_locked(app_dir: &Path, server_url: &str) -> Result<String, String> {
         }
     };
     apply_tokens(&mut s, &v)?;
-    save(app_dir, server_url, &s).map_err(|e| e.to_string())?;
+    save(app_dir, server_url, &s).map_err(|e| format!("could not store the refreshed token ({}), so you will have to sign in again: {e}", path(app_dir).display()))?;
     crate::log_info!("mcp", "oauth: token for {server_url} refreshed (expires in {} s)", s.expires_at.map_or("?".to_string(), |e| e.saturating_sub(now()).to_string()));
     Ok(s.access_token.clone().unwrap_or_default())
 }
@@ -301,7 +301,7 @@ pub fn bearer(app_dir: &Path, server_url: &str) -> Option<String> {
         let s = load(app_dir, server_url)?;
         if s.expires_at.is_some_and(|e| e <= now() + 60) {
             return match s.refresh_token {
-                Some(_) => refresh_locked(app_dir, server_url).ok(),
+                Some(_) => crate::log::LogErr::log_err(refresh_locked(app_dir, server_url), "mcp", "refreshing the OAuth token"),
                 None => None,
             };
         }
@@ -466,7 +466,7 @@ pub fn login(app_dir: &Path, server_url: &str, headers: &std::collections::BTree
     let v = token_request(&meta.token_endpoint, &form).inspect_err(|e| crate::log_warn!("mcp", "oauth: exchanging the code failed: {e}"))?;
     let mut stored = Stored { client_id, client_secret, redirect_uri: registered_with, token_endpoint: meta.token_endpoint.clone(), ..Default::default() };
     apply_tokens(&mut stored, &v)?;
-    save(app_dir, server_url, &stored).map_err(|e| format!("could not store the tokens: {e}"))?;
+    save(app_dir, server_url, &stored).map_err(|e| format!("could not store the tokens ({}), so you will have to sign in again next time: {e}", path(app_dir).display()))?;
     crate::log_info!("mcp", "oauth: signed in to {server_url}; tokens stored");
     Ok(())
 }
@@ -546,7 +546,7 @@ mod tests {
         assert_eq!(load(&dir, "https://two/mcp").unwrap().client_id, "d");
         assert_eq!(std::fs::metadata(path(&dir)).unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(bearer(&dir, "https://one/mcp").as_deref(), Some("at"));
-        assert!(remove(&dir, "https://one/mcp") && !remove(&dir, "https://one/mcp"));
+        assert!(remove(&dir, "https://one/mcp") == Ok(true) && remove(&dir, "https://one/mcp") == Ok(false));
         assert!(load(&dir, "https://one/mcp").is_none() && load(&dir, "https://two/mcp").is_some());
         assert_eq!(bearer(&dir, "https://nothing/mcp"), None);
         let _ = std::fs::remove_dir_all(dir);

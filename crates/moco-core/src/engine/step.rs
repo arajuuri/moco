@@ -195,6 +195,7 @@ impl Engine {
             ui,
             declined: &declined,
             ask_lock: &self.prompt_lock,
+            notified: &self.notified,
             // Manual mode is fully manual: the classifier only ever works in auto mode.
             classify: self.cfg.classifier.as_ref().filter(|_| self.permission_mode_of(&session) == PermissionMode::Auto).filter(|s| s.background || !ui.unattended()).map(|settings| classify::ClassifyCtx { engine: self, session: &session, settings, cancel }),
         };
@@ -256,9 +257,9 @@ impl Engine {
             let cost = model.and_then(|m| catalog::cost(m, usage));
             let context_tokens = usage.input + usage.cache_read + usage.cache_write + usage.output;
             let session_cost = {
-                let st = self.store();
-                st.add_usage(sid, cost.unwrap_or(0.0), usage).log_err("store", "recording token usage");
-                st.usage_totals(sid).map(|t| t.0).unwrap_or(0.0)
+                let recorded = self.store().add_usage(sid, cost.unwrap_or(0.0), usage);
+                self.store_warn(ui, "usage", "token usage and cost could not be recorded, so the session totals will be too low", recorded);
+                self.store().usage_totals(sid).map(|t| t.0).unwrap_or(0.0)
             };
             if cost.is_none() {
                 self.note_unpriced_for_limits(ui, &format!("{provider_id}/{model_id}"));
@@ -342,7 +343,8 @@ impl Engine {
                     ui.event(&UiEvent::ToolStarted { id: &id, name: &name, input: &input });
                     parts.push(chat::tool_part(&id, &name, &input));
                     let idx = parts.len() - 1;
-                    self.store().set_message_parts(msg_id, &parts).log_err("store", "saving a tool call");
+                    let saved = self.store().set_message_parts(msg_id, &parts);
+                    self.store_warn(ui, "parts", "a tool call could not be saved, so this session may not resume cleanly after a crash", saved);
                     let tool = step_tools.iter().find(|t| t.name() == name).map(|t| t.as_ref());
                     let (cwd, root, spill) = (cwd.clone(), root.clone(), spill.clone());
                     handles.push((
@@ -369,7 +371,8 @@ impl Engine {
                     ui.event(&UiEvent::ToolStarted { id: &id, name: &name, input: &input });
                     parts.push(chat::tool_part(&id, &name, &input));
                     bad_calls.push((parts.len() - 1, error));
-                    self.store().set_message_parts(msg_id, &parts).log_err("store", "saving a tool call");
+                    let saved = self.store().set_message_parts(msg_id, &parts);
+                    self.store_warn(ui, "parts", "a tool call could not be saved, so this session may not resume cleanly after a crash", saved);
                 }
                 Event::Finish { reason, usage } => finish = Some((reason, usage)),
             });
@@ -388,9 +391,9 @@ impl Engine {
                 if let (true, Ok(out)) = (name == "read", &outcome) {
                     // Reading a file pulls in AGENTS.md files between it and the working directory.
                     if let Some(p) = out.metadata["path"].as_str() {
-                        let st = self.store();
                         for ins in instructions::discover_between(std::path::Path::new(p), &cwd) {
-                            st.add_instruction(&session.id, &ins.to_string_lossy()).log_err("store", "remembering an instruction file");
+                            let added = self.store().add_instruction(&session.id, &ins.to_string_lossy());
+                            self.store_warn(ui, "instruction", "an AGENTS.md file the model read could not be remembered, so its instructions may be dropped on the next step", added);
                         }
                     }
                 }
