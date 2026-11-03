@@ -29,7 +29,7 @@ fn scenario(name: &str) {
                "tui": {},
                "snapshots": false }}"#,
             port.trim(),
-            if name == "steer" { "allow" } else { "ask" },
+            if matches!(name, "steer" | "newsession") { "allow" } else { "ask" },
             if name == "config" { r#"{ "theme": "neon", "keys": { "palette": "f2" }, "away_after": 0, "sidebar": true }"# } else { "{}" }
         ),
     )
@@ -71,6 +71,11 @@ fn prompts_typed_during_a_turn_are_steered_or_queued_and_delivered() {
 #[test]
 fn configured_theme_keys_and_bell() {
     scenario("config");
+}
+
+#[test]
+fn a_prompt_after_new_runs_in_the_new_session() {
+    scenario("newsession");
 }
 
 #[test]
