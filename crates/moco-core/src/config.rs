@@ -222,10 +222,27 @@ pub struct Config {
     pub permission_preset: Option<String>,
     /// Seatbelt sandbox for `shell` (macOS): `{"enabled": true, "writable": ["~/.cargo"], "network": true}`.
     pub sandbox: crate::sandbox::SandboxConfig,
+    /// Caps on concurrently running background jobs (apply with `Engine::set_job_limits`).
+    pub jobs: JobLimits,
     pub permissions: Vec<Rule>,
     pub agents: BTreeMap<String, AgentConfig>,
     /// Extra instruction files (paths, `~/` allowed; relative paths resolve against the working directory).
     pub instructions: Vec<String>,
+}
+
+/// `jobs`: how many background jobs may run at once, `{"max_shells": 8, "max_subagents": 4}`. Starting one more
+/// is a tool error for the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct JobLimits {
+    pub max_shells: usize,
+    pub max_subagents: usize,
+}
+
+impl Default for JobLimits {
+    fn default() -> Self {
+        JobLimits { max_shells: 8, max_subagents: 4 }
+    }
 }
 
 /// `websearch`: which service the `websearch` tool uses.

@@ -45,9 +45,53 @@ pub fn truncate(text: &str, spill_dir: &Path) -> std::io::Result<Truncated> {
     Ok(Truncated { text: kept + &notice, output_path: Some(path) })
 }
 
+/// Spill files older than this are deleted at startup (see `prune_spill_dir`).
+pub const SPILL_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+
+/// Delete `*.txt` files in `dir` last modified more than `max_age` ago, except those `keep` says to leave alone
+/// (logs of running jobs). Returns how many were removed. Errors on single files are ignored.
+pub fn prune_spill_dir(dir: &Path, max_age: std::time::Duration, keep: &dyn Fn(&Path) -> bool) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    let now = std::time::SystemTime::now();
+    let mut removed = 0;
+    for e in entries.flatten() {
+        let path = e.path();
+        if path.extension().is_none_or(|x| x != "txt") {
+            continue;
+        }
+        let Ok(meta) = e.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let old = meta.modified().ok().and_then(|m| now.duration_since(m).ok()).is_some_and(|age| age > max_age);
+        if old && !keep(&path) && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prune_removes_old_spill_files_but_not_new_or_kept_ones() {
+        let d = dir();
+        std::fs::create_dir_all(&d).unwrap();
+        let age = |name: &str, days: u64| {
+            let p = d.join(name);
+            std::fs::write(&p, "x").unwrap();
+            let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+            f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(days * 24 * 3600)).unwrap();
+            p
+        };
+        let (old, fresh, kept, other) = (age("out_old.txt", 10), age("out_new.txt", 1), age("shl_running.txt", 10), age("notes.dat", 10));
+        let n = prune_spill_dir(&d, SPILL_MAX_AGE, &|p| p == kept);
+        assert_eq!(n, 1);
+        assert!(!old.exists() && fresh.exists() && kept.exists() && other.exists());
+        let _ = std::fs::remove_dir_all(d);
+    }
 
     fn dir() -> PathBuf {
         std::env::temp_dir().join(format!("moco-trunc-{}", crate::id::new_id("t")))
