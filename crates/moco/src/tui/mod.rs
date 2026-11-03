@@ -85,11 +85,13 @@ fn load_history(path: &std::path::Path) -> Vec<String> {
 
 fn append_history(path: &std::path::Path, entry: &str) {
     use std::io::Write;
+    use moco_core::log::LogErr;
+    // The history is a convenience: a failure is logged (with the real cause) and never interrupts the session.
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        std::fs::create_dir_all(dir).log_err("tui", "creating the prompt-history directory");
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(f, "{}", serde_json::Value::String(entry.to_string()));
+    if let Some(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path).log_err("tui", "opening the prompt history") {
+        writeln!(f, "{}", serde_json::Value::String(entry.to_string())).log_err("tui", "writing the prompt history");
     }
 }
 
@@ -347,8 +349,8 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
                     }
                     if let Some((agent, model)) = moco_core::engine::lock(&restore).take() {
                         let st = engine.store();
-                        st.set_agent(&sid, &agent).ok();
-                        st.set_model(&sid, model.as_deref()).ok();
+                        let (a, m) = (st.set_agent(&sid, &agent), st.set_model(&sid, model.as_deref()));
+                        builtin::stored_ok(&mut app, "the agent and model of this session (they stay switched after the custom command)", a.and(m));
                     }
                 }
                 if matches!(ev, AppEvent::Delivered) {
@@ -406,9 +408,12 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
                         },
                         Action::Dropped { kind, value } => match kind {
                             app::PickKind::Queue => {
-                                engine.store().cancel_inbox(&value).ok();
-                                app.queued.retain(|q| q.id != value);
-                                app.push_info("removed the waiting prompt");
+                                let cancelled = engine.store().cancel_inbox(&value);
+                                // On failure the prompt is still waiting and will run: keep showing it.
+                                if builtin::stored_ok(&mut app, "the removal of the waiting prompt", cancelled) {
+                                    app.queued.retain(|q| q.id != value);
+                                    app.push_info("removed the waiting prompt");
+                                }
                             }
                             app::PickKind::Job => match engine.kill_job(&value) {
                                 Ok(t) => app.push_info(t),
@@ -418,26 +423,22 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
                         },
                         Action::SetPermissionMode(mode) => builtin::set_permission_mode(engine, &sid, &mut app, mode),
                         Action::SetEffort(level) => {
-                            engine.store().set_variant(&sid, level.as_deref()).ok();
+                            builtin::choose_effort(engine, &sid, &mut app, level.as_deref());
                             refresh_status(&mut app, &sid);
-                            app.push_info(format!("reasoning effort: {}", level.as_deref().unwrap_or("default")));
                         }
                         Action::Palette => app.open_picker(app::Picker::new(app::PickKind::Command, "commands", builtin::palette_items(&host), "")),
                         Action::Picked { kind, value } => match kind {
                             app::PickKind::Model => {
-                                engine.store().set_model(&sid, Some(&value)).ok();
+                                builtin::choose_model(engine, &sid, &mut app, &value, "");
                                 refresh_status(&mut app, &sid);
-                                app.push_info(format!("model: {value}"));
                             }
                             app::PickKind::Effort => {
-                                engine.store().set_variant(&sid, (value != "default").then_some(value.as_str())).ok();
+                                builtin::choose_effort(engine, &sid, &mut app, (value != "default").then_some(value.as_str()));
                                 refresh_status(&mut app, &sid);
-                                app.push_info(format!("reasoning effort: {value}"));
                             }
                             app::PickKind::Agent => {
-                                engine.store().set_agent(&sid, &value).ok();
+                                builtin::choose_agent(engine, &sid, &mut app, &value, &value);
                                 refresh_status(&mut app, &sid);
-                                app.push_info(format!("agent: {value}"));
                             }
                             app::PickKind::Session => {
                                 let found = engine.store().session(&value).ok().flatten();
@@ -572,10 +573,12 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
                                                     *moco_core::engine::lock(&restore) = Some((cur.agent.clone(), cur.model.clone()));
                                                 }
                                                 if let Some(a) = r.agent.as_ref().filter(|a| engine.agents().iter().any(|x| x.id == **a)) {
-                                                    st.set_agent(&sid, a).ok();
+                                                    let stored = st.set_agent(&sid, a);
+                                                    builtin::stored_ok(&mut app, "the command's agent", stored);
                                                 }
                                                 if let Some(m) = &r.model {
-                                                    st.set_model(&sid, Some(m)).ok();
+                                                    let stored = st.set_model(&sid, Some(m));
+                                                    builtin::stored_ok(&mut app, "the command's model", stored);
                                                 }
                                             }
                                             send_prompt(&mut app, &sid, &r.text);
