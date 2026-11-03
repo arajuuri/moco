@@ -82,6 +82,17 @@ The **Status** field on the Moco project:
 
 Move an issue to In progress when work starts, not when it is merely planned.
 
+## Pull requests
+
+- One PR per issue. Put `Closes #N` in the description. If the work has no issue (a bug found
+  while using moco, say), open the PR without one and say so in the description.
+- Pull requests are not added to the project automatically. Add the PR with
+  `gh project item-add` (see below), set Status to **In review**, and give it Size, Estimate and
+  Priority like an issue. Size and Estimate follow the table below. For a PR with no issue,
+  Estimate is the hours the work took, including review.
+- Say in the PR description which checks were run and on which machine (Mojave and/or Linux),
+  and which were not.
+
 ## Size and estimate
 
 Two fields on the project, both set on every issue that still has work left.
@@ -118,6 +129,8 @@ gh api -X PATCH repos/arajuuri/moco/issues/N -f type=Bug
 
 # Priority issue field. The body must be JSON: the field id has to be an integer.
 # Look ids up with: gh api orgs/arajuuri/issue-fields
+# (`gh project field-list` shows Priority with no options: it is an issue field, not a
+# project single-select field.) Works on a PR number too.
 echo '{"issue_field_values":[{"field_id":49312686,"value":"High"}]}' \
   | gh api -X POST repos/arajuuri/moco/issues/N/issue-field-values --input -
 
@@ -129,7 +142,8 @@ gh project item-edit --id ITEM_ID --project-id PROJECT_ID --field-id FIELD_ID \
 gh project item-edit ... --number 8          # Estimate (hours)
 ```
 
-Closed issues are not added to the project automatically. Add one with
-`gh project item-add 1 --owner arajuuri --url ISSUE_URL`.
+Closed issues and pull requests are not added to the project automatically. Add one with
+`gh project item-add 1 --owner arajuuri --url ISSUE_OR_PR_URL --format json`; the `id` in the
+output is the ITEM_ID for `item-edit`. The project id is `PVT_kwDOFOudCc4BpvtY`.
 
 After a bulk change, read the values back before you trust them.
