@@ -50,6 +50,51 @@ fn run(protocol: &str, base_path: &str) {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// `moco -p --max-cost 0.01` on a priced model: the first step (a tool call) costs more than that, so the run stops
+/// before the second step, says why on stderr and exits with status 3 (not 0, 1 for a failure or 2 for bad usage).
+#[test]
+fn max_cost_stops_a_one_shot_run_with_exit_status_3() {
+    if !python_ok() {
+        return eprintln!("skipped: python3 not available");
+    }
+    let dir = std::env::temp_dir().join(format!("moco-e2e-limit-{}", std::process::id()));
+    let work = dir.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(work.join("a.txt"), "ONE-LINE-OF-TEXT\n").unwrap();
+    let violations = dir.join("violations.txt");
+    let mut server = Command::new("python3").arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_llm.py")).arg(&violations).stdout(Stdio::piped()).spawn().unwrap();
+    let mut port = String::new();
+    BufReader::new(server.stdout.as_mut().unwrap()).read_line(&mut port).unwrap();
+    let config = dir.join("moco.jsonc");
+    std::fs::write(
+        &config,
+        format!(
+            r#"{{ "providers": {{ "fake": {{ "base_url": "http://127.0.0.1:{}/v1", "protocol": "openai-responses",
+                 "models": {{ "m": {{ "limit": {{ "context": 100000, "output": 4000 }}, "cost": {{ "input": 1000, "output": 1000 }} }} }} }} }},
+               "snapshots": false }}"#,
+            port.trim()
+        ),
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_moco"))
+        .args(["--model", "fake/m", "--max-cost", "0.01", "--dir"])
+        .arg(&work)
+        .args(["-p", "Read a.txt and tell me what it says."])
+        .env("MOCO_HOME", dir.join("home"))
+        .env("MOCO_CONFIG", &config)
+        .env_remove("ANTHROPIC_API_KEY")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let _ = server.kill();
+    let _ = server.wait();
+    let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned());
+    assert_eq!(out.status.code(), Some(3), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stderr.contains("stopped: This turn has cost $0.1") && stderr.contains("(limit $0.0100)") && stderr.contains("--max-cost"), "{stderr}");
+    assert!(!stdout.contains("The file says"), "the run did not get to its second step\n{stdout}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn openai_responses_round_trip_with_reasoning_replay() {
     if !python_ok() {

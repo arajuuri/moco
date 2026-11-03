@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 mod classify;
 pub use classify::Evaluation;
 mod jobs;
+mod limits;
 mod compact;
 mod permit;
 use permit::EnginePermitter;
@@ -85,6 +86,25 @@ pub trait Ui: Sync {
     fn unattended(&self) -> bool {
         false
     }
+    /// A spending limit was reached (`what` says which and how far over). The default asks through `ask`
+    /// (action `limit`): allow once = continue, always = continue without the limit, reject = stop.
+    fn ask_limit(&self, what: &str) -> LimitChoice {
+        match self.ask(&PermissionPrompt { action: "limit", resources: &[what.to_string()], save: &[] }) {
+            Reply::Once => LimitChoice::Continue,
+            Reply::Always => LimitChoice::ContinueUnlimited,
+            Reply::Reject(_) => LimitChoice::Stop,
+        }
+    }
+}
+
+/// The user's answer when a spending limit is reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitChoice {
+    /// Go on until the same amount has been spent again.
+    Continue,
+    /// Go on and stop checking this limit (for this run, or for the rest of the session's life in this process).
+    ContinueUnlimited,
+    Stop,
 }
 
 /// Wraps the parent's UI for a subagent session: events are tagged, prompts go to the same user.
@@ -106,6 +126,9 @@ impl Ui for ChildUi<'_> {
     fn unattended(&self) -> bool {
         self.parent.unattended()
     }
+    fn ask_limit(&self, what: &str) -> LimitChoice {
+        self.parent.ask_limit(what)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +138,8 @@ pub enum RunOutcome {
     /// A tool call was declined without feedback.
     Declined,
     Failed(String),
+    /// A spending limit (`limits` config, `--max-cost`) stopped the run; `what` says which one and how far over.
+    LimitReached { what: String },
     /// Another runner already holds the session.
     Busy,
 }
@@ -162,6 +187,8 @@ pub struct EngineConfig {
     pub websearch: Option<tools::websearch::Settings>,
     /// Default reasoning effort (config `effort`); a session's or agent's own choice wins.
     pub effort: Option<String>,
+    /// Spending guardrails (config `limits`).
+    pub limits: config::Limits,
     /// Waits for retry backoff; must return early when `cancel` is set.
     pub sleep: Box<dyn Fn(Duration, &AtomicBool) + Send + Sync>,
     pub jitter: Box<dyn Fn() -> f64 + Send + Sync>,
@@ -189,6 +216,7 @@ impl EngineConfig {
             checks: Default::default(),
             websearch: None,
             effort: None,
+            limits: Default::default(),
             sleep: Box::new(|d, cancel| {
                 let end = std::time::Instant::now() + d;
                 while std::time::Instant::now() < end && !cancel.load(Ordering::Relaxed) {
@@ -250,6 +278,8 @@ pub struct Engine {
     classified: Mutex<HashSet<String>>,
     /// Classifier models already reported as having no price (once each per process).
     unpriced_noted: Mutex<HashSet<String>>,
+    /// Spend baselines for the cost limits (see `limits.rs`).
+    limit_state: limits::State,
     /// Weak handle to this engine once it is shared (`share`): detached background threads need an owner.
     me: Mutex<std::sync::Weak<Engine>>,
     jobs: jobs::Jobs,
@@ -312,12 +342,12 @@ fn add_usage(a: Usage, b: Usage) -> Usage {
 impl Engine {
     /// Single provider answering every model ref.
     pub fn new(store: Store, provider: Box<dyn Provider>, cfg: EngineConfig) -> Self {
-        Engine { store: Mutex::new(store), providers: HashMap::new(), fallback: Some(provider), tools: tools::all(subagent_list(&cfg), cfg.skills.clone(), cfg.websearch.clone()).into_iter().map(Arc::from).collect(), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()), check_failing: Mutex::new(HashSet::new()), title_tried: Mutex::new(HashSet::new()), classified: Mutex::new(HashSet::new()), unpriced_noted: Mutex::new(HashSet::new()), me: Mutex::new(std::sync::Weak::new()), jobs: jobs::Jobs::default(), notifier: Mutex::new(None) }
+        Engine { store: Mutex::new(store), providers: HashMap::new(), fallback: Some(provider), tools: tools::all(subagent_list(&cfg), cfg.skills.clone(), cfg.websearch.clone()).into_iter().map(Arc::from).collect(), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()), check_failing: Mutex::new(HashSet::new()), title_tried: Mutex::new(HashSet::new()), classified: Mutex::new(HashSet::new()), unpriced_noted: Mutex::new(HashSet::new()), me: Mutex::new(std::sync::Weak::new()), jobs: jobs::Jobs::default(), notifier: Mutex::new(None), limit_state: Default::default() }
     }
 
     /// One client per provider id; a model ref's provider part picks the client.
     pub fn with_providers(store: Store, providers: HashMap<String, Box<dyn Provider>>, cfg: EngineConfig) -> Self {
-        Engine { store: Mutex::new(store), providers, fallback: None, tools: tools::all(subagent_list(&cfg), cfg.skills.clone(), cfg.websearch.clone()).into_iter().map(Arc::from).collect(), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()), check_failing: Mutex::new(HashSet::new()), title_tried: Mutex::new(HashSet::new()), classified: Mutex::new(HashSet::new()), unpriced_noted: Mutex::new(HashSet::new()), me: Mutex::new(std::sync::Weak::new()), jobs: jobs::Jobs::default(), notifier: Mutex::new(None) }
+        Engine { store: Mutex::new(store), providers, fallback: None, tools: tools::all(subagent_list(&cfg), cfg.skills.clone(), cfg.websearch.clone()).into_iter().map(Arc::from).collect(), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()), check_failing: Mutex::new(HashSet::new()), title_tried: Mutex::new(HashSet::new()), classified: Mutex::new(HashSet::new()), unpriced_noted: Mutex::new(HashSet::new()), me: Mutex::new(std::sync::Weak::new()), jobs: jobs::Jobs::default(), notifier: Mutex::new(None), limit_state: Default::default() }
     }
 
     pub fn catalog(&self) -> &catalog::Catalog {
@@ -683,6 +713,7 @@ impl Engine {
             RunOutcome::Interrupted => return Err(ToolError::Interrupted),
             RunOutcome::Declined => return Err(ToolError::Declined),
             RunOutcome::Failed(m) => return Err(ToolError::fail(format!("Subagent failed: {m}"))),
+            RunOutcome::LimitReached { what } => return Err(ToolError::fail(format!("{}{what}", limits::SUBAGENT_STOPPED))),
             RunOutcome::Busy => return Err(ToolError::fail("that subagent session is already running")),
         }
         Ok(SubagentResult { session_id: child.id.clone(), output: eng.last_assistant_text(&child.id).unwrap_or_else(|| "(the subagent returned no text)".to_string()) })
@@ -2976,5 +3007,182 @@ mod tests {
         let a = crate::provider::anthropic::build_body(&reqs[1], false).to_string();
         assert!(!a.contains("ENC") && !a.contains("SIG") && !a.contains("native"), "nor to Anthropic");
         assert!(!crate::provider::openai_chat::build_body(&reqs[1], false).to_string().contains("ENC"));
+    }
+
+    // ---- spending guardrails (`limits`) ----
+
+    /// One scripted step of a priced model costs this much: 10 input and 5 output tokens at $0.10 / $0.50 per million.
+    const STEP_COST: f64 = (10.0 * 0.1 + 5.0 * 0.5) / 1e6;
+
+    fn read_loop(n: usize) -> Vec<Scripted> {
+        (0..n).map(|i| tool_call(&format!("t{i}"), "read", json!({"path": "a.txt"}))).collect()
+    }
+
+    /// A fixture on a priced model with these limits.
+    fn limited(script: Vec<Scripted>, limits: config::Limits) -> Fixture {
+        let f = fixture_cfg(script, move |c| {
+            c.model = PRICED.into();
+            c.limits = limits;
+        });
+        f.file("a.txt", "hi\n");
+        f
+    }
+
+    fn what_of(o: RunOutcome) -> String {
+        match o {
+            RunOutcome::LimitReached { what } => what,
+            other => panic!("expected a limit to stop the run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_looping_tool_call_script_stops_at_max_steps() {
+        let mut script = read_loop(3);
+        script.push(text("summary of the work"));
+        let f = limited(script, config::Limits { max_steps: Some(3), ..Default::default() });
+        f.say("loop");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        let reqs = f.fake.requests.lock().unwrap();
+        assert_eq!(reqs.len(), 4, "three steps with tools, then the summary step");
+        assert!(reqs[..3].iter().all(|r| !r.tools_disabled && !all_text(r).contains("MAXIMUM STEPS REACHED")));
+        assert!(reqs[3].tools_disabled && all_text(&reqs[3]).contains("MAXIMUM STEPS REACHED"), "the existing max-steps path");
+    }
+
+    #[test]
+    fn an_agents_own_steps_beat_the_default_and_a_model_that_ignores_the_summary_step_is_stopped() {
+        let mut script = read_loop(2);
+        script.push(text("never reached"));
+        let f = fixture_cfg(script, |c| {
+            c.limits = config::Limits { max_steps: Some(5), ..Default::default() };
+            c.agents.iter_mut().for_each(|a| a.steps = Some(1));
+        });
+        f.file("a.txt", "hi\n");
+        f.say("loop");
+        // Step 0 uses a tool; step 1 has tools disabled but the model calls one anyway.
+        let what = what_of(f.run(&TestUi::default()));
+        assert!(what.contains("step limit (1)"), "{what}");
+        assert_eq!(f.fake.calls(), 2);
+    }
+
+    #[test]
+    fn a_run_without_limits_is_not_stopped() {
+        let mut script = read_loop(30);
+        script.push(text("done"));
+        let f = limited(script, config::Limits::default());
+        f.say("loop");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        assert_eq!(f.fake.calls(), 31);
+    }
+
+    #[test]
+    fn max_cost_per_run_stops_the_run_and_counts_a_subagents_spend() {
+        let sub = json!({"agent": "general", "description": "d", "prompt": "SUB-COST do it"});
+        // Own spend after step one: one step. With the subagent's step: two. The limit sits in between.
+        let limit = 1.5 * STEP_COST;
+        let f = limited(vec![tool_call("t1", "subagent", sub.clone()), text("never reached")], config::Limits { max_cost_per_run: Some(limit), ..Default::default() });
+        f.fake.script_route("SUB-COST", vec![text("sub done")]);
+        f.say("delegate");
+        let what = what_of(f.run(&TestUi::replying(vec![Reply::Reject(None)]))); // asked whether to go on: stop
+        assert!(what.starts_with("This turn has cost $0.000007 (limit $0.000005)"), "{what}");
+        assert_eq!(f.fake.calls(), 1, "the parent did not take another step");
+        let (total, _) = f.engine.store().usage_totals(&f.session.id).unwrap();
+        assert!((total - 2.0 * STEP_COST).abs() < 1e-12, "the subagent's step is in the parent's total: {total}");
+        // The same work under a limit that covers both steps goes through.
+        let g = limited(vec![tool_call("t1", "subagent", sub), text("all done")], config::Limits { max_cost_per_run: Some(2.5 * STEP_COST), ..Default::default() });
+        g.fake.script_route("SUB-COST", vec![text("sub done")]);
+        g.say("delegate");
+        assert_eq!(g.run(&TestUi::default()), RunOutcome::Idle);
+    }
+
+    #[test]
+    fn the_run_allowance_starts_again_with_the_next_prompt() {
+        let mut script = read_loop(2);
+        script.push(text("first done"));
+        script.push(tool_call("u1", "read", json!({"path": "a.txt"})));
+        script.push(text("second done"));
+        let f = limited(script, config::Limits { max_cost_per_run: Some(3.0 * STEP_COST), ..Default::default() });
+        f.say("one");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle); // three steps = exactly the limit, not over it
+        f.say("two");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle, "earlier runs do not count toward this run");
+    }
+
+    #[test]
+    fn an_attended_user_can_continue_continue_without_the_limit_or_stop() {
+        // Over the limit after the 2nd step: "continue" gives another allowance; after the 4th the user stops it.
+        let mut script = read_loop(4);
+        script.push(text("never reached"));
+        let f = limited(script, config::Limits { max_cost_per_run: Some(1.5 * STEP_COST), ..Default::default() });
+        f.say("go");
+        let ui = TestUi::replying(vec![Reply::Once, Reply::Reject(None)]);
+        let what = what_of(f.run(&ui));
+        assert!(what.starts_with("This turn has cost"), "{what}");
+        assert_eq!(f.fake.calls(), 4);
+        let asked = ui.asked.lock().unwrap().clone();
+        assert_eq!(asked.len(), 2);
+        assert!(asked.iter().all(|a| a.starts_with("limit This turn has cost $0.000007 (limit $0.000005)")), "{asked:?}");
+
+        // "Without the limit" is asked once and holds for the rest of the run.
+        let mut script = read_loop(5);
+        script.push(text("finished"));
+        let g = limited(script, config::Limits { max_cost_per_run: Some(1.5 * STEP_COST), ..Default::default() });
+        g.say("go");
+        let ui = TestUi::replying(vec![Reply::Always]);
+        assert_eq!(g.run(&ui), RunOutcome::Idle);
+        assert_eq!(ui.asked.lock().unwrap().len(), 1);
+        assert_eq!(g.fake.calls(), 6);
+    }
+
+    #[test]
+    fn max_cost_per_session_stops_a_later_run() {
+        let mut script = vec![tool_call("a1", "read", json!({"path": "a.txt"})), text("first done")];
+        script.extend([tool_call("b1", "read", json!({"path": "a.txt"})), text("never reached")]);
+        let f = limited(script, config::Limits { max_cost_per_session: Some(2.5 * STEP_COST), ..Default::default() });
+        f.say("one");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle, "two steps stay under the limit");
+        f.say("two");
+        let what = what_of(f.run(&TestUi::replying(vec![Reply::Reject(None)])));
+        assert!(what.starts_with("This session has cost $0.00001") && what.ends_with("(limit $0.000009)"), "{what}");
+        assert_eq!(f.fake.calls(), 3, "the second run stopped after its first step");
+    }
+
+    #[test]
+    fn a_background_subagent_stops_with_limit_reached_and_the_parent_is_told() {
+        let f = limited(vec![text("the parent saw the report")], config::Limits { max_cost_per_run: Some(2.5 * STEP_COST), ..Default::default() });
+        let mut script = read_loop(5);
+        script.push(text("never reached"));
+        f.fake.script_route("BG-LIMIT", script);
+        let req = SubagentRequest { agent: "general".into(), description: "costly task".into(), prompt: "BG-LIMIT do the work".into(), model: None, session_id: None };
+        let child = f.engine.begin_subagent(&f.session, &req).unwrap();
+        f.engine.start_subagent_job(&f.session, &child, &req.description);
+        wait_until("the subagent to stop", || f.engine.running_jobs() == 0);
+        let status = f.engine.background_jobs(None)[0].status.clone();
+        assert!(status.starts_with("stopped at a spending limit: This turn has cost"), "{status}");
+        assert_eq!(f.fake.routed_requests.lock().unwrap().len(), 3, "it stopped after the step that passed the limit");
+        // The parent gets the synthetic message with its next run.
+        assert_eq!(f.engine.store().pending_inbox(&f.session.id).unwrap(), 1);
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        let t = all_text(&f.fake.requests.lock().unwrap()[0]);
+        assert!(t.contains("Background subagent stopped at a spending limit (sessionID: ses_") && t.contains("task: costly task") && t.contains("This turn has cost"), "{t}");
+    }
+
+    #[test]
+    fn an_unpriced_model_is_said_so_once_and_never_stopped_by_cost() {
+        let mut script = read_loop(3);
+        script.push(text("done"));
+        let f = fixture_cfg(script, |c| c.limits = config::Limits { max_cost_per_run: Some(0.0), max_cost_per_session: Some(0.0), ..Default::default() });
+        f.file("a.txt", "hi\n");
+        f.say("go");
+        let ui = TestUi::default();
+        assert_eq!(f.run(&ui), RunOutcome::Idle);
+        let said: Vec<String> = ui.log().into_iter().filter(|l| l.contains("cost limit cannot be enforced")).collect();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("test-model"));
+        // Without a cost limit nothing is said.
+        let g = fixture(vec![text("done")]);
+        g.say("go");
+        let ui = TestUi::default();
+        g.run(&ui);
+        assert!(!ui.log().iter().any(|l| l.contains("cost limit")));
     }
 }

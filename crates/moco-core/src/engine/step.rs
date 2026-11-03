@@ -45,10 +45,12 @@ struct AttemptResult {
 impl Engine {
     pub(super) fn drain(&self, sid: &str, ui: &dyn Ui, cancel: &AtomicBool, resume: bool) -> Result<RunOutcome, StoreError> {
         let (mut continuing, mut step) = (resume, 0u32);
+        let _budget = self.limits_begin(sid);
         loop {
             let delivered = self.store().deliver(sid, !continuing)?;
             if !delivered.is_empty() {
                 step = 0; // new user input resets the step allowance
+                self.limits_new_input(sid); // and the cost allowance of the run
                 ui.event(&UiEvent::Delivered);
             }
             if !continuing && delivered.is_empty() {
@@ -100,7 +102,7 @@ impl Engine {
         let eff = compaction::effective(&history);
         let mut messages = self.chat(&eff);
         let mut reminders = vec![];
-        let max_steps_hit = agent.steps.is_some_and(|n| step >= n);
+        let max_steps_hit = agent::effective_steps(&agent, self.cfg.limits.max_steps).is_some_and(|n| step >= n);
         if max_steps_hit {
             reminders.push(agent::MAX_STEPS.to_string());
         }
@@ -173,6 +175,7 @@ impl Engine {
                 }
             }
         }
+        let tools_disabled = p.req.tools_disabled;
         let Prepared { session, agent, req, provider, provider_id, model_id, tools: step_tools, .. } = p;
         let (provider_id, model_id) = (provider_id.as_str(), model_id.as_str());
         let caps = self.media_caps(provider_id, model_id);
@@ -257,6 +260,9 @@ impl Engine {
                 st.add_usage(sid, cost.unwrap_or(0.0), usage).log_err("store", "recording token usage");
                 st.usage_totals(sid).map(|t| t.0).unwrap_or(0.0)
             };
+            if cost.is_none() {
+                self.note_unpriced_for_limits(ui, &format!("{provider_id}/{model_id}"));
+            }
             data["cost"] = json!(cost);
             crate::log_debug!("engine", "usage session={sid} step={step} model={provider_id}/{model_id} input={} output={} cache_read={} cache_write={} cost={} session_cost={session_cost:.4}", usage.input, usage.output, usage.cache_read, usage.cache_write, cost.map_or("unpriced".to_string(), |c| format!("{c:.4}")));
             ui.event(&UiEvent::StepUsage { usage: *usage, cost, session_cost, context_tokens, context_limit: model.map(|m| m.limit.context).filter(|l| *l > 0) });
@@ -276,10 +282,23 @@ impl Engine {
                 if matches!(result.finish, Some((FinishReason::MaxTokens, _))) && tool_calls == 0 {
                     ui.event(&UiEvent::Notice("response stopped at the output token limit"));
                 }
-                if tool_calls > 0 { StepOutcome::Continue } else { StepOutcome::Done }
+                if tool_calls > 0 && tools_disabled {
+                    // The step allowance is used up and the model called tools anyway: don't let it go on.
+                    let n = agent::effective_steps(&agent, self.cfg.limits.max_steps).unwrap_or(step);
+                    StepOutcome::Stop(RunOutcome::LimitReached { what: format!("The step limit ({n}) was reached and the model kept calling tools") })
+                } else if tool_calls > 0 {
+                    StepOutcome::Continue
+                } else {
+                    StepOutcome::Done
+                }
             }
         };
         self.store().update_message(&msg_id, &data)?;
+        // The cost limits: only a step that is followed by another one can be stopped (a finished turn is over anyway).
+        let outcome = match outcome {
+            StepOutcome::Continue => self.check_limits(sid, ui).map_or(StepOutcome::Continue, StepOutcome::Stop),
+            o => o,
+        };
         crate::log_debug!("engine", "step end session={sid} step={step} tool_calls={tool_calls} next={}", match &outcome { StepOutcome::Continue => "continue".to_string(), StepOutcome::Done => "done".to_string(), StepOutcome::Stop(o) => format!("stop:{o:?}") });
         Ok(outcome)
     }

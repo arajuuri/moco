@@ -297,6 +297,8 @@ pub struct App {
     pub session_cost: f64,
     /// The part of `session_cost` spent on the permission classifier.
     pub classifier_cost: f64,
+    /// Configured spending limits, shown next to the cost.
+    pub cost_limits: moco_core::config::Limits,
     pub context: u64,
     pub limit: Option<u64>,
     pub hint: Option<String>,
@@ -361,6 +363,7 @@ impl App {
             title: None,
             session_cost: 0.0,
             classifier_cost: 0.0,
+            cost_limits: Default::default(),
             context: 0,
             limit: None,
             hint: None,
@@ -473,6 +476,10 @@ impl App {
                     Ok(Declined) => {
                         self.attention = Some("stopped: a tool call was rejected".into());
                         self.push_info("stopped: tool call rejected")
+                    }
+                    Ok(LimitReached { what }) => {
+                        self.attention = Some("stopped: spending limit reached".into());
+                        self.push_info(format!("stopped: {what}"))
                     }
                     Ok(Busy) => self.rows.push(Row::Error("session is busy".into())),
                     Err(e) => self.rows.push(Row::Error(e)), // already says what failed ("store error: ...", "the engine crashed: ...")
@@ -1694,7 +1701,14 @@ impl App {
             v.push(Line::from(spans));
         }
         if self.session_cost > 0.0 {
-            v.push(Line::from(vec![Span::styled(" cost    ", t.dim), Span::raw(format!("${:.4}", self.session_cost))]));
+            let mut cost = vec![Span::styled(" cost    ", t.dim), Span::raw(format!("${:.4}", self.session_cost))];
+            if let Some(max) = self.cost_limits.max_cost_per_session {
+                cost.push(Span::styled(format!(" of ${max:.2}"), t.dim));
+            }
+            v.push(Line::from(cost));
+            if let Some(max) = self.cost_limits.max_cost_per_run {
+                v.push(Line::styled(format!("  turn limit ${max:.2}"), t.dim));
+            }
             if self.classifier_cost > 0.0 {
                 v.push(Line::styled(format!("  incl. classifier ${:.4}", self.classifier_cost), t.dim));
             }
@@ -1790,7 +1804,8 @@ impl App {
             segs.push((5, vec![Span::styled(text, t.accent.patch(bar))]));
         }
         if self.session_cost > 0.0 {
-            segs.push((3, vec![Span::styled(format!(" ${:.4} ", self.session_cost), bar)]));
+            let of = self.cost_limits.max_cost_per_session.map(|m| format!(" / ${m:.2}")).unwrap_or_default();
+            segs.push((3, vec![Span::styled(format!(" ${:.4}{of} ", self.session_cost), bar)]));
         }
         if self.jobs > 0 {
             segs.push((1, vec![Span::styled(format!(" {} {} job{} (/jobs) ", g.run, self.jobs, if self.jobs == 1 { "" } else { "s" }), t.accent.patch(bar))]));
@@ -2844,6 +2859,20 @@ mod tests {
         a.update(AppEvent::RunDone(Ok(RunOutcome::Idle)));
         let joined = screen(&mut a, 120, 24).join("\n");
         assert!(joined.contains("$0.0050 · session $0.0156 + classifier $0.0006"), "{joined}");
+    }
+
+    #[test]
+    fn the_configured_spending_limits_show_next_to_the_cost_and_a_stopped_run_says_so() {
+        let mut a = App::new("anthropic/sonnet", "build");
+        a.session_cost = 0.0123;
+        let plain = screen(&mut a, 120, 24).join("\n");
+        assert!(!plain.contains(" of $") && !plain.contains("turn limit"), "nothing is shown without limits:\n{plain}");
+        a.cost_limits = moco_core::config::Limits { max_cost_per_session: Some(20.0), max_cost_per_run: Some(2.0), max_steps: None };
+        let s = screen(&mut a, 120, 24).join("\n");
+        assert!(s.contains("cost    $0.0123 of $20.00") && s.contains("turn limit $2.00") && s.contains("$0.0123 / $20.00"), "{s}");
+        a.update(AppEvent::RunDone(Ok(RunOutcome::LimitReached { what: "This turn has cost $2.04 (limit $2.00)".into() })));
+        assert!(screen(&mut a, 120, 24).join("\n").contains("stopped: This turn has cost $2.04 (limit $2.00)"));
+        assert!(!a.running);
     }
 
     #[test]
