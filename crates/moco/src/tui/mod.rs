@@ -205,17 +205,7 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
     let engine = host.engine;
 
     // Show the stored conversation of the session we start in (--continue, --session).
-    let load_rows = |app: &mut App, sid: &str| {
-        let (messages, revert, totals, classifier) = {
-            let st = engine.store();
-            (st.messages(sid).unwrap_or_default(), st.revert(sid).ok().flatten(), st.usage_totals(sid).map(|t| t.0).unwrap_or(0.0), st.classifier_cost(sid).unwrap_or(0.0))
-        };
-        let hidden = revert.as_ref().and_then(|r| r["messageId"].as_str().map(String::from));
-        app.rows = builtin::history_rows(&messages, hidden.as_deref());
-        app.session_cost = totals;
-        app.classifier_cost = classifier;
-        app.scroll = 0;
-    };
+    let load_rows = |app: &mut App, sid: &str| load_session_view(&engine.store(), app, sid);
     // Model, agent and title as stored for the session.
     let refresh_status = |app: &mut App, sid: &str| {
         if let Some(s) = engine.store().session(sid).ok().flatten() {
@@ -620,6 +610,19 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
     })
 }
 
+/// Replaces what the UI shows (transcript, costs, sidebar todo list) with the stored state of session `sid`. A session
+/// without a stored list clears the previous session's list.
+fn load_session_view(st: &moco_core::store::Store, app: &mut App, sid: &str) {
+    let messages = st.messages(sid).unwrap_or_default();
+    let revert = st.revert(sid).ok().flatten();
+    let hidden = revert.as_ref().and_then(|r| r["messageId"].as_str().map(String::from));
+    app.rows = builtin::history_rows(&messages, hidden.as_deref());
+    app.session_cost = st.usage_totals(sid).map(|t| t.0).unwrap_or(0.0);
+    app.classifier_cost = st.classifier_cost(sid).unwrap_or(0.0);
+    app.todos = st.todos(sid).unwrap_or_default();
+    app.scroll = 0;
+}
+
 /// The text of a caught panic payload.
 fn panic_message(p: &(dyn std::any::Any + Send)) -> String {
     p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "unknown panic".into())
@@ -628,6 +631,27 @@ fn panic_message(p: &(dyn std::any::Any + Send)) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use moco_core::tools::Todo;
+
+    fn todo(content: &str, status: &str) -> Todo {
+        Todo { content: content.into(), status: status.into() }
+    }
+
+    #[test]
+    fn resuming_a_session_restores_its_todo_list_and_switching_clears_it() {
+        let st = moco_core::store::Store::open_memory().unwrap();
+        let with = st.create_session("/tmp/p", "build").unwrap();
+        let without = st.create_session("/tmp/p", "build").unwrap();
+        st.set_todos(&with.id, &[todo("write tests", "in_progress"), todo("ship", "pending")]).unwrap();
+
+        let mut app = App::new("m", "build");
+        load_session_view(&st, &mut app, &with.id);
+        assert_eq!(app.todos, vec![todo("write tests", "in_progress"), todo("ship", "pending")]);
+
+        // Switching to a session that has no list must not keep the previous one.
+        load_session_view(&st, &mut app, &without.id);
+        assert!(app.todos.is_empty());
+    }
 
     #[test]
     fn history_round_trips_multiline_entries_and_keeps_the_last_500() {
