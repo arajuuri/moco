@@ -71,6 +71,8 @@ const MIGRATIONS: &[(i64, &str)] = &[
     ),
     // Which process holds the execution claim, so another start can tell a live run from a crash (issue #7).
     (9, "alter table session add column claim_pid integer;"),
+    // Small key/value state, e.g. when snapshots were last pruned.
+    (10, "create table meta(key text primary key, value text not null);"),
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -557,6 +559,18 @@ impl Store {
     pub fn set_revert(&self, session_id: &str, revert: Option<&Value>) -> Result<()> {
         self.conn.execute("update session set revert=?2, time_updated=?3 where id=?1", params![session_id, revert.map(|v| v.to_string()), now_ms()])?;
         Ok(())
+    }
+
+    /// True (and records now) if at least `interval_ms` passed since the last time this returned true for `key`.
+    /// Atomic, so two processes starting together do not both run the job.
+    pub fn claim_periodic(&self, key: &str, interval_ms: i64) -> Result<bool> {
+        let now = now_ms();
+        let n = self.conn.execute(
+            "insert into meta(key, value) values (?1, ?2)
+             on conflict(key) do update set value=excluded.value where cast(meta.value as integer) <= ?3",
+            params![key, now.to_string(), now - interval_ms],
+        )?;
+        Ok(n == 1)
     }
 
     pub fn project_ids(&self) -> Result<Vec<String>> {
@@ -1112,6 +1126,15 @@ mod tests {
         assert_eq!(left.len(), 1, "the week-old row is pruned when the store opens: {left:?}");
         assert!(left[0].starts_with("mysql"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn claim_periodic_allows_one_run_per_interval() {
+        let s = Store::open_memory().unwrap();
+        assert!(s.claim_periodic("job", 60_000).unwrap());
+        assert!(!s.claim_periodic("job", 60_000).unwrap());
+        assert!(s.claim_periodic("other", 60_000).unwrap());
+        assert!(s.claim_periodic("job", 0).unwrap(), "an interval that has passed claims again");
     }
 
     #[test]

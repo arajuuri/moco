@@ -8,6 +8,7 @@ use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
+use std::fmt::Write as _;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -261,7 +262,8 @@ impl Snapshots {
             }
             let mtime_ns = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_nanos() as u64).unwrap_or(0);
             let mode = meta.permissions().mode() & 0o777;
-            let cached = prev.files.get(&rel).filter(|e| e.size == meta.len() && e.mtime_ns == mtime_ns && mtime_ns != 0 && self.blob_path(&e.hash).exists());
+            let cached = prev.files.get(&rel).filter(|e| e.size == meta.len() && e.mtime_ns == mtime_ns && mtime_ns != 0);
+            // A cached entry's blob is not stat'ed: `prev` was just marked in use, so prune keeps the blobs it refers to.
             let hash = match cached {
                 Some(e) => e.hash.clone(),
                 None => {
@@ -280,17 +282,26 @@ impl Snapshots {
             };
             files.insert(rel, Entry { hash, size: meta.len(), mode, mtime_ns });
         }
-        let mut id_src = String::new();
+        let mut hasher = Sha256::new();
+        let mut line = String::new();
         for (p, e) in &files {
-            id_src.push_str(&format!("{p}\0{}\0{:o}\n", e.hash, e.mode));
+            line.clear();
+            let _ = writeln!(line, "{p}\0{}\0{:o}", e.hash, e.mode);
+            hasher.update(line.as_bytes());
         }
         skipped.sort_by(|a, b| a.path.cmp(&b.path));
         for s in &skipped {
-            id_src.push_str(&format!("skipped\0{}\0{:?}\0{}\0{}\n", s.path, s.reason, s.size, s.mtime_ns));
+            line.clear();
+            let _ = writeln!(line, "skipped\0{}\0{:?}\0{}\0{}", s.path, s.reason, s.size, s.mtime_ns);
+            hasher.update(line.as_bytes());
         }
-        let id = sha(id_src.as_bytes());
-        let manifest = Manifest { files, skipped };
-        write_addressed(&self.manifest_path(&id), serde_json::to_string(&manifest).map_err(|e| SnapError::Io(e.to_string()))?.as_bytes())?;
+        let id = hex(&hasher.finalize());
+        // The id is content-addressed: an existing manifest is the same file, so only mark it as recently used.
+        let mp = self.manifest_path(&id);
+        if !touch(&mp) {
+            let manifest = Manifest { files, skipped };
+            write_addressed(&mp, serde_json::to_string(&manifest).map_err(|e| SnapError::Io(e.to_string()))?.as_bytes())?;
+        }
         Ok(id)
     }
 
@@ -665,6 +676,17 @@ mod tests {
             let ids: Vec<_> = hs.into_iter().map(|h| h.join().unwrap().unwrap()).collect();
             assert!(ids.windows(2).all(|w| w[0] == w[1]));
         });
+    }
+
+    #[test]
+    fn unchanged_capture_does_not_rewrite_the_manifest() {
+        let t = Tree::new();
+        t.put("a.txt", "one");
+        let s1 = t.cap(None);
+        let mp = t.snaps.manifest_path(&s1);
+        std::fs::write(&mp, serde_json::to_string(&t.snaps.manifest(&s1).unwrap()).unwrap() + " ").unwrap(); // marker
+        assert_eq!(t.cap(Some(&s1)), s1);
+        assert!(std::fs::read_to_string(&mp).unwrap().ends_with(' '), "the existing manifest was left alone");
     }
 
     #[test]

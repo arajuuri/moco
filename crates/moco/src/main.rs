@@ -408,6 +408,11 @@ fn print_files(r: &UndoReport) {
     if extra > 0 {
         println!("{DIM}  ... and {extra} more{RESET}");
     }
+    // A modified file is listed twice (old and new version), so count paths.
+    let n = r.skipped.iter().map(|s| s.path.as_str()).collect::<std::collections::BTreeSet<_>>().len();
+    if n > 0 {
+        println!("{DIM}{n} file(s) could not be restored (too large or unreadable){RESET}");
+    }
 }
 
 fn die(msg: &str) -> ! {
@@ -828,9 +833,16 @@ fn main() {
         }
         let _ = std::io::stdout().flush();
     }));
-    // Drop snapshot data that no session active in the last 30 days refers to.
-    let projects = engine.store().project_ids().unwrap_or_default();
-    engine.prune_snapshots(&projects, std::time::Duration::from_secs(30 * 24 * 3600));
+    // Drop snapshot data that no session active in the last 30 days refers to. At most once a day, off the main thread,
+    // and never the snapshots of the session being resumed (it may be older than the window).
+    const PRUNE_EVERY_MS: i64 = 24 * 3600 * 1000;
+    if engine.store().claim_periodic("last_prune_at", PRUNE_EVERY_MS).unwrap_or(false) {
+        let (engine, protect) = (engine.clone(), vec![session.id.clone()]);
+        std::thread::spawn(move || {
+            let projects = engine.store().project_ids().unwrap_or_default();
+            engine.prune_snapshots_protecting(&projects, std::time::Duration::from_secs(30 * 24 * 3600), &protect);
+        });
+    }
 
     install_sigint();
     let term = Terminal { mid_line: AtomicBool::new(false), run: Mutex::new(RunUsage::default()) };
