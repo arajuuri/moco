@@ -268,7 +268,15 @@ impl ToolCtx<'_> {
     /// (a linked final component or a linked parent), the place they lead to. A rule such as `read .env` therefore
     /// applies to `safe.txt -> .env`, and a deny on the target cannot be bypassed through a link.
     pub fn permit_path(&self, action: &str, path: &Path, save: Vec<String>) -> Result<(), ToolError> {
-        let mut resources = vec![self.display(path)];
+        // The name as given: a link that lives in the project keeps its relative name even when it points outside
+        // (`display` would resolve it and show it absolute); the target is checked as its own resource below.
+        let lexical = normalize(path);
+        let name = [&self.cwd, &self.project_root]
+            .iter()
+            .find_map(|base| lexical.strip_prefix(normalize(base)).ok().filter(|r| !r.as_os_str().is_empty()))
+            .map(|r| r.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.display(path));
+        let mut resources = vec![name];
         let real = real_path(path);
         if real != normalize(path) {
             let target = self.display(&real);
