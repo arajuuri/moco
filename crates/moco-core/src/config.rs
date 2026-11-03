@@ -498,6 +498,35 @@ fn strip_provider_endpoints(v: &mut Value, path: &Path, warnings: &mut Vec<Strin
     }
 }
 
+/// A project's config (a cloned repository) may only tighten permissions: rules are last-match-wins, so an
+/// appended `allow` (or an `ask` after the user's `deny`) would silently relax the user's own rules and the
+/// built-in per-agent restrictions. Only `deny` rules are kept, at top level and under `agents.<id>.permissions`.
+fn strip_project_relaxing_rules(v: &mut Value, path: &Path, warnings: &mut Vec<String>) {
+    fn keep_deny(list: &mut Value, scope: &str, path: &Path, warnings: &mut Vec<String>) {
+        let Some(rules) = list.as_array_mut() else { return };
+        let before = rules.len();
+        rules.retain(|r| r.get("effect").and_then(Value::as_str) == Some("deny"));
+        if rules.len() != before {
+            warnings.push(format!(
+                "{}: {} non-deny rule(s) in {scope} ignored; a project can only add deny rules, put allow/ask rules in your own config ({} or $MOCO_CONFIG)",
+                path.display(),
+                before - rules.len(),
+                "the app config dir"
+            ));
+        }
+    }
+    if let Some(p) = v.get_mut("permissions") {
+        keep_deny(p, "permissions", path, warnings);
+    }
+    if let Some(agents) = v.get_mut("agents").and_then(Value::as_object_mut) {
+        for (id, a) in agents.iter_mut() {
+            if let Some(p) = a.get_mut("permissions") {
+                keep_deny(p, &format!("agents.{id}.permissions"), path, warnings);
+            }
+        }
+    }
+}
+
 pub fn load(app_dir: &Path, cwd: &Path) -> Loaded {
     let mut merged = Value::Object(Default::default());
     let mut out = Loaded::default();
@@ -512,6 +541,7 @@ pub fn load(app_dir: &Path, cwd: &Path) -> Loaded {
                 let user_level = path.parent() == Some(app_dir.join("config").as_path()) || std::env::var_os("MOCO_CONFIG").is_some_and(|p| p == path);
                 if !user_level {
                     strip_provider_endpoints(&mut v, &path, &mut out.warnings);
+                    strip_project_relaxing_rules(&mut v, &path, &mut out.warnings);
                 }
                 if let Some(c) = v.as_object_mut().and_then(|o| o.remove("permission_classifier")) {
                     if !user_level {
@@ -750,16 +780,77 @@ mod tests {
         std::fs::create_dir_all(app.join("config")).unwrap();
         std::fs::create_dir_all(inner.join(".moco")).unwrap();
         std::fs::write(app.join("config/moco.jsonc"), r#"{"model":"global/m","default_agent":"plan"}"#).unwrap();
-        std::fs::write(proj.join("moco.json"), r#"{"model":"proj/m","permissions":[{"action":"shell","resource":"*","effect":"ask"}]}"#).unwrap();
+        std::fs::write(proj.join("moco.json"), r#"{"model":"proj/m","permissions":[{"action":"shell","resource":"*","effect":"deny"}]}"#).unwrap();
         std::fs::write(inner.join(".moco/moco.jsonc"), r#"{"model":"inner/m", // c
-            "permissions":[{"action":"shell","resource":"ls *","effect":"allow"},]}"#).unwrap();
+            "permissions":[{"action":"shell","resource":"ls *","effect":"deny"},]}"#).unwrap();
         let l = load(&app, &inner);
         assert!(l.warnings.is_empty(), "{:?}", l.warnings);
         assert_eq!(l.config.model.as_deref(), Some("inner/m"));
         assert_eq!(l.config.default_agent.as_deref(), Some("plan"));
         assert_eq!(l.config.permissions.len(), 2);
-        assert_eq!(l.config.permissions[0].effect, Effect::Ask, "lower priority first");
+        assert_eq!(l.config.permissions[0].resource, "*", "lower priority first");
         assert_eq!(l.sources.len(), 3);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn load_with_project(user: &str, project: &str) -> (Loaded, PathBuf) {
+        let root = tmp();
+        let app = root.join("app");
+        let proj = root.join("proj");
+        std::fs::create_dir_all(app.join("config")).unwrap();
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(app.join("config/moco.json"), user).unwrap();
+        std::fs::write(proj.join("moco.json"), project).unwrap();
+        (load(&app, &proj), root)
+    }
+
+    #[test]
+    fn project_cannot_relax_top_level_user_rules() {
+        use crate::permission::evaluate;
+        let user = r#"{"permissions":[{"action":"shell","resource":"rm *","effect":"deny"},{"action":"edit","resource":"*","effect":"ask"}]}"#;
+        let project = r#"{"permissions":[{"action":"*","resource":"*","effect":"allow"},{"action":"shell","resource":"rm *","effect":"ask"},{"action":"edit","resource":"*","effect":"allow"}]}"#;
+        let (l, root) = load_with_project(user, project);
+        assert!(l.warnings.iter().any(|w| w.contains("3 non-deny")), "{:?}", l.warnings);
+        let agents = resolve_agents(&l.config);
+        let build = &agents.iter().find(|a| a.id == "build").unwrap().permissions;
+        assert_eq!(evaluate("shell", "rm x", build), Effect::Deny);
+        assert_eq!(evaluate("edit", "a.txt", build), Effect::Ask);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_can_still_add_deny_rules() {
+        use crate::permission::evaluate;
+        let (l, root) = load_with_project("{}", r#"{"permissions":[{"action":"shell","resource":"curl *","effect":"deny"}]}"#);
+        assert!(l.warnings.is_empty(), "{:?}", l.warnings);
+        let agents = resolve_agents_in(&l.config, crate::permission::PermissionMode::Auto);
+        let build = &agents.iter().find(|a| a.id == "build").unwrap().permissions;
+        assert_eq!(evaluate("shell", "curl x", build), Effect::Deny);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_cannot_relax_per_agent_rules() {
+        use crate::permission::evaluate;
+        let project = r#"{"agents":{"explore":{"permissions":[{"action":"edit","resource":"*","effect":"allow"}]},"plan":{"permissions":[{"action":"edit","resource":"*","effect":"ask"}]}}}"#;
+        let (l, root) = load_with_project("{}", project);
+        assert!(l.warnings.iter().any(|w| w.contains("agents.explore.permissions")), "{:?}", l.warnings);
+        let agents = resolve_agents(&l.config);
+        let explore = &agents.iter().find(|a| a.id == "explore").unwrap().permissions;
+        assert_eq!(evaluate("edit", "a.txt", explore), Effect::Deny);
+        let plan = &agents.iter().find(|a| a.id == "plan").unwrap().permissions;
+        assert_eq!(evaluate("edit", "a.txt", plan), Effect::Deny);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn user_config_may_still_relax_agent_rules() {
+        use crate::permission::evaluate;
+        let user = r#"{"agents":{"explore":{"permissions":[{"action":"edit","resource":"*","effect":"allow"}]}}}"#;
+        let (l, root) = load_with_project(user, "{}");
+        let agents = resolve_agents(&l.config);
+        let explore = &agents.iter().find(|a| a.id == "explore").unwrap().permissions;
+        assert_eq!(evaluate("edit", "a.txt", explore), Effect::Allow);
         let _ = std::fs::remove_dir_all(root);
     }
 

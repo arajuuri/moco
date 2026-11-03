@@ -68,6 +68,8 @@ Not done: the automatic check that is meant to replace the prompt in auto mode.
 ```
 (`schema/src/agent.ts`). Built-in agents append more rules (see `06-agents-and-prompts.md`). Users append through config `permissions` and per-agent `permissions`.
 
+**Project config can only tighten.** Rules are last-match-wins, so a cloned repository's `moco.json` must not be able to append an `allow` (or an `ask` after the user's `deny`) and relax your rules or a built-in agent's restrictions (e.g. explore's edit deny). In config files other than the app config dir and `$MOCO_CONFIG`, only `deny` rules are kept, both in top-level `permissions` and `agents.<id>.permissions`; the rest are dropped with a warning. Put allow/ask rules in your own config.
+
 ## Resource strings per tool
 
 | Tool | resources | save (for "always") |
