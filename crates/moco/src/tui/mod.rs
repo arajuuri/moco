@@ -53,7 +53,7 @@ pub struct Host<'a> {
     /// The previous process died mid-run: continue that run first.
     pub recovered: bool,
     /// Expand mentions and put the prompt in the inbox; returns its inbox id and notes about attachments.
-    pub submit: &'a dyn Fn(&str, Mode) -> Result<(String, Vec<String>), String>,
+    pub submit: &'a dyn Fn(&str, &str, Mode) -> Result<(String, Vec<String>), String>,
     /// Turn `/name args` into a prompt (custom commands, MCP prompts). `Err` carries a message for the user.
     pub command: &'a dyn Fn(&str) -> Result<Resolved, String>,
     pub completer: Option<Completer>,
@@ -285,7 +285,7 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
         };
 
         // Queue a prompt for the session and start the run, showing attachment notes.
-        let send_prompt = |app: &mut App, sid: &str, text: &str| match (host.submit)(text, Mode::Steer) {
+        let send_prompt = |app: &mut App, sid: &str, text: &str| match (host.submit)(sid, text, Mode::Steer) {
             Ok((_, notes)) => {
                 for n in notes {
                     app.push_info(n);
@@ -393,7 +393,7 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
                                 start_run(&mut app, &sid, false);
                             }
                         }
-                        Action::Enqueue { text, shown, queue } => match (host.submit)(&text, if queue { Mode::Queue } else { Mode::Steer }) {
+                        Action::Enqueue { text, shown, queue } => match (host.submit)(&sid, &text, if queue { Mode::Queue } else { Mode::Steer }) {
                             Ok((id, notes)) => {
                                 for n in notes {
                                     app.push_info(n);

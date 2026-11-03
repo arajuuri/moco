@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Drives `moco --tui` in a pseudo terminal: prompt, permission dialog, streamed answer, resize, quit.
 
-Usage: tui_pty.py MOCO CONFIG HOME WORKDIR SCENARIO    (SCENARIO: chat | sigterm | steer | config | mode | panic)
+Usage: tui_pty.py MOCO CONFIG HOME WORKDIR SCENARIO    (SCENARIO: chat | sigterm | steer | config | mode | newsession | panic)
 Exits 0 when everything held; otherwise prints what went wrong and the screen text so far."""
 import fcntl, os, pty, re, select, signal, struct, sys, termios, time
 
@@ -232,6 +232,14 @@ elif scenario == "chat":
     send(b"\x1b[B\x05\x15")  # back down, End, clear the second
     pump(0.3)
     send(b"\x04")  # Ctrl-D on an empty composer
+    check_restored(wait_exit())
+elif scenario == "newsession":
+    # A prompt typed after /new must run in the new session (it used to be queued in the old one, so nothing happened).
+    send(b"/new\r")
+    wait_for(r"session\w{8}:\(untitled\)")
+    send(b"Read a.txt and tell me what it says.\r")
+    wait_for_response("Read a.txt and tell me what it says.")
+    send(b"\x04")
     check_restored(wait_exit())
 elif scenario == "mode":
     # Tab switches the permission mode; the transcript confirms each switch.

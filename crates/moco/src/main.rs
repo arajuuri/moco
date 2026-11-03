@@ -952,11 +952,11 @@ fn main() {
     // The full-screen UI is the default on a terminal; -p, pipes and --plain keep the line-based chat.
     if prompt.is_none() && want_tui.unwrap_or(on_terminal) {
         let sid = session.id.clone();
-        let submit = |text: &str, mode: Mode| -> Result<(String, Vec<String>), String> {
+        let submit = |sid: &str, text: &str, mode: Mode| -> Result<(String, Vec<String>), String> {
             let subagents = engine.subagent_names();
-            let caps = caps_of(&sid);
+            let caps = caps_of(sid);
             let (m, notes) = mentions::expand(text, &mentions::Ctx { cwd: &cwd, skills: &found_skills, subagents: &subagents, app_dir: &app_dir, caps, mcp: manager.as_deref() });
-            let id = engine.submit_with(&sid, text, Some(m), mode).map_err(|e| format!("could not queue the prompt: {e}"))?;
+            let id = engine.submit_with(sid, text, Some(m), mode).map_err(|e| format!("could not queue the prompt: {e}"))?;
             Ok((id, notes))
         };
         let command = |line: &str| -> Result<tui::Resolved, String> {
