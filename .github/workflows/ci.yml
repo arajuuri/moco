@@ -25,6 +25,16 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace # python3 is preinstalled; the fake MCP/LLM servers need it
 
+  # Tests on macOS: symlinks under /var -> /private/var, case-insensitive file systems, process groups and
+  # sandbox-exec behave differently from Linux. This runner is newer than Mojave, so the Mojave machine run stays a manual check.
+  macos-test:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace # python3 is preinstalled; the fake MCP/LLM servers need it
+
   macos-minos:
     runs-on: macos-15-intel
     steps:
