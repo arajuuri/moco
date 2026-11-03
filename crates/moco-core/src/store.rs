@@ -73,6 +73,9 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (9, "alter table session add column claim_pid integer;"),
     // Small key/value state, e.g. when snapshots were last pruned.
     (10, "create table meta(key text primary key, value text not null);"),
+    // `last_snapshot` looks up the newest assistant message that carries a snapshot; a partial index keeps that from
+    // scanning (and JSON-parsing) every message of a long session. Built over existing rows when it is applied.
+    (11, "create index if not exists message_snapshot on message(session_id, id) where type='assistant' and json_extract(data,'$.snapshot') is not null;"),
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1133,6 +1136,40 @@ mod tests {
         let left: Vec<String> = s.auto_allows(&ses.id).unwrap().into_iter().map(|a| a.command).collect();
         assert_eq!(left.len(), 1, "the week-old row is pruned when the store opens: {left:?}");
         assert!(left[0].starts_with("mysql"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_index_migrates_an_existing_database_and_keeps_last_snapshot() {
+        let dir = std::env::temp_dir().join(new_id("moco-store"));
+        let path = dir.join("moco.db");
+        let ses = {
+            let s = Store::open(&path).unwrap();
+            let ses = s.create_session("/p", "build").unwrap();
+            s.add_message(&ses.id, "assistant", &json!({"parts": [], "snapshot": "snap1"})).unwrap();
+            s.add_message(&ses.id, "assistant", &json!({"parts": []})).unwrap();
+            s.add_message(&ses.id, "assistant", &json!({"parts": [], "snapshot": "snap2"})).unwrap();
+            s.add_message(&ses.id, "assistant", &json!({"parts": []})).unwrap();
+            assert_eq!(s.last_snapshot(&ses.id).unwrap().as_deref(), Some("snap2"));
+            // Back to a version 10 database: no index, no record of the migration.
+            s.exec_for_test("drop index message_snapshot; delete from migrations where version=11;");
+            assert_eq!(s.last_snapshot(&ses.id).unwrap().as_deref(), Some("snap2"));
+            ses
+        };
+        let s = Store::open(&path).unwrap();
+        let n: i64 = s.conn.query_row("select count(*) from sqlite_master where name='message_snapshot'", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1, "the index is created when the store opens");
+        assert_eq!(s.last_snapshot(&ses.id).unwrap().as_deref(), Some("snap2"));
+        let plan: String = s
+            .conn
+            .prepare("explain query plan select json_extract(data,'$.snapshot') from message where session_id=?1 and type='assistant' and json_extract(data,'$.snapshot') is not null order by id desc limit 1")
+            .unwrap()
+            .query_map([&ses.id], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(plan.contains("message_snapshot"), "{plan}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

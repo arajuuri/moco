@@ -5,6 +5,18 @@ pub(super) fn human_tokens(n: u64) -> String {
     if n >= 10_000 { format!("{}k", n / 1000) } else { n.to_string() }
 }
 
+/// How many messages to drop, oldest first from `first`, until the total size fits `budget`. Always keeps at least
+/// one message after `first`.
+fn trim_count(sizes: &[u64], first: usize, budget: u64) -> usize {
+    let mut total: u64 = sizes.iter().sum();
+    let mut n = 0;
+    while sizes.len() - n > first + 1 && total > budget {
+        total -= sizes[first + n];
+        n += 1;
+    }
+    n
+}
+
 impl Engine {
     /// Manual compaction (`/compact`). Holds the session claim while it runs.
     pub fn compact(&self, sid: &str, ui: &dyn Ui, cancel: &AtomicBool) -> Result<CompactResult, StoreError> {
@@ -22,6 +34,12 @@ impl Engine {
             let st = self.store();
             (st.session(sid)?.ok_or(StoreError::SessionGone)?, st.messages(sid)?)
         };
+        self.compact_with(sid, trigger, session, history, ui, cancel)
+    }
+
+    /// `compact_inner` on a session and history the caller has just loaded (the step loop's `prepare` did, so
+    /// auto-compaction does not parse the whole history a second time).
+    pub(super) fn compact_with(&self, sid: &str, trigger: &str, session: Session, history: Vec<crate::store::Message>, ui: &dyn Ui, cancel: &AtomicBool) -> Result<CompactResult, StoreError> {
         let agent = agent::find(self.agents_of(&session), &session.agent).or_else(|| self.agents_of(&session).first().cloned()).expect("an agent");
         let (provider, provider_id, model_id) = match self.resolve_model(&session, &agent) {
             Ok(r) => r,
@@ -41,9 +59,9 @@ impl Engine {
         let first_droppable = usize::from(update);
         // Stay inside the model's window while summarizing: drop the oldest material first.
         if let Some(l) = limit {
-            while portion.len() > first_droppable + 1 && portion.iter().map(compaction::estimate).sum::<u64>() > l * 8 / 10 {
-                portion.remove(first_droppable);
-            }
+            let sizes: Vec<u64> = portion.iter().map(compaction::estimate).collect();
+            let n = trim_count(&sizes, first_droppable, l * 8 / 10);
+            portion.drain(first_droppable..first_droppable + n);
         }
         let mut reply = String::new();
         let mut usage_total = Usage::default();
@@ -136,6 +154,41 @@ impl Engine {
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::trim_count;
+
+    /// The original remove loop, kept as the reference.
+    fn reference(sizes: &[u64], first: usize, budget: u64) -> usize {
+        let mut v = sizes.to_vec();
+        let mut n = 0;
+        while v.len() > first + 1 && v.iter().sum::<u64>() > budget {
+            v.remove(first);
+            n += 1;
+        }
+        n
+    }
+
+    #[test]
+    fn trim_matches_the_remove_loop() {
+        let cases: &[(&[u64], usize, u64, usize)] = &[
+            (&[10, 10, 10, 10], 0, 100, 0),
+            (&[10, 10, 10, 10], 0, 25, 2),
+            (&[10, 10, 10, 10], 0, 0, 3),
+            (&[50, 10, 10, 10], 1, 20, 2),
+            (&[50, 10, 10, 10], 1, 0, 2),
+            (&[5], 0, 0, 0),
+            (&[5, 5], 1, 0, 0),
+            (&[], 0, 0, 0),
+            (&[30, 1, 1, 1], 0, 3, 1),
+        ];
+        for (sizes, first, budget, want) in cases {
+            assert_eq!(trim_count(sizes, *first, *budget), *want, "{sizes:?} {first} {budget}");
+            assert_eq!(reference(sizes, *first, *budget), *want);
         }
     }
 }

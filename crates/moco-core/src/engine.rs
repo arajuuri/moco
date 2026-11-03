@@ -1229,6 +1229,48 @@ mod tests {
         assert_eq!(f.engine.store().saved_permissions(&f.session.project_id).unwrap().len(), 1);
     }
 
+    #[test]
+    fn an_always_answer_covers_the_next_call_of_the_same_step() {
+        let fin = Event::Finish { reason: FinishReason::ToolUse, usage: Usage { input: 10, output: 5, ..Default::default() } };
+        let ev = |id: &str| [Event::ToolInputStart { id: id.into(), name: "read".into() }, Event::ToolCall { id: id.into(), name: "read".into(), input: json!({"path":".env"}) }];
+        let [a, b] = [ev("t1"), ev("t2")];
+        let f = fixture(vec![Scripted::Events(a.into_iter().chain(b).chain([fin]).collect()), text("done")]);
+        f.file(".env", "SECRET=1");
+        f.say("go");
+        // One reply only: a second prompt would panic in the test Ui.
+        let ui = TestUi::replying(vec![Reply::Always]);
+        assert_eq!(f.run(&ui), RunOutcome::Idle);
+        assert_eq!(ui.asked.lock().unwrap().len(), 1, "the second call in the same step is covered by the saved rule");
+        let reqs = f.fake.requests.lock().unwrap();
+        let blocks = last_user_blocks(&reqs[1]);
+        assert!(blocks.iter().all(|b| matches!(b, Block::ToolResult { is_error: false, .. })), "{blocks:?}");
+    }
+
+    #[test]
+    fn a_long_streamed_answer_is_stored_exactly_and_parts_survive_around_tool_calls() {
+        let deltas: Vec<String> = (0..5000).map(|i| format!("w{i} ")).collect();
+        let expected: String = deltas.concat();
+        let mut events: Vec<Event> = deltas.iter().map(|d| Event::TextDelta(d.clone())).collect();
+        events.push(Event::ToolInputStart { id: "t1".into(), name: "read".into() });
+        events.push(Event::ToolCall { id: "t1".into(), name: "read".into(), input: json!({"path":"a.txt"}) });
+        // Text after a tool call starts a new part.
+        events.extend(["after ".to_string(), "call".to_string()].map(Event::TextDelta));
+        events.push(Event::Finish { reason: FinishReason::ToolUse, usage: Usage { input: 10, output: 5, ..Default::default() } });
+        let f = fixture(vec![Scripted::Events(events), text("done")]);
+        f.file("a.txt", "hi\n");
+        f.say("go");
+        let ui = TestUi::default();
+        assert_eq!(f.run(&ui), RunOutcome::Idle);
+        let m = f.msgs();
+        let parts = m[1].data["parts"].as_array().unwrap();
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"].as_str().unwrap(), expected);
+        assert_eq!(parts[1]["type"], "tool");
+        assert_eq!(parts[2]["text"], "after call");
+        let shown: String = ui.log().iter().filter_map(|l| l.strip_prefix("text:")).take(5000).collect();
+        assert_eq!(shown, expected, "the Ui still sees every delta");
+    }
+
     fn notices_containing(ui: &TestUi, needle: &str) -> usize {
         ui.log().iter().filter(|l| l.starts_with("notice:") && l.contains(needle)).count()
     }

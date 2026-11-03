@@ -14,14 +14,27 @@ pub(super) struct EnginePermitter<'a> {
     pub(super) notified: &'a Mutex<HashSet<String>>,
     /// Present when the command classifier is on for this step.
     pub(super) classify: Option<classify::ClassifyCtx<'a>>,
+    /// The saved rules as last read; cleared after a save (see `saved`).
+    pub(super) cache: Mutex<Option<Vec<Rule>>>,
 }
 
 impl EnginePermitter<'_> {
     /// The rules saved with "always". When they cannot be read the user is told once, because every request then
     /// asks again as if nothing had been saved.
     fn saved(&self) -> Vec<Rule> {
+        // Read once per step instead of from SQLite (under the shared store lock) on every check. Only a successful
+        // read is cached, so a failure keeps being retried and reported as before.
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(rules) = cache.as_ref() {
+            return rules.clone();
+        }
         let r = self.store.lock().unwrap_or_else(|e| e.into_inner()).saved_permissions(&self.project_id);
-        notice_once(self.notified, self.ui, "saved-permissions-read", "saved permissions could not be read, so you may be asked again for things you answered \"always\" to", r).unwrap_or_default()
+        let ok = r.is_ok();
+        let rules = notice_once(self.notified, self.ui, "saved-permissions-read", "saved permissions could not be read, so you may be asked again for things you answered \"always\" to", r).unwrap_or_default();
+        if ok {
+            *cache = Some(rules.clone());
+        }
+        rules
     }
 
     /// The classifier may answer for a shell command that would only ask because of a default rule. It never
@@ -91,6 +104,7 @@ impl Permitter for EnginePermitter<'_> {
                             let r = self.store.lock().unwrap_or_else(|e| e.into_inner()).save_permission(&self.project_id, &req.action, pat);
                             notice_once(self.notified, self.ui, "saved-permissions-write", "saved permissions could not be stored, so this \"always\" answer is not remembered and you will be asked again", r);
                         }
+                        *self.cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
                         Ok(())
                     }
                     Reply::Reject(None) => {

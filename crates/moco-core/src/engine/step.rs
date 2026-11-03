@@ -10,6 +10,8 @@ struct Prepared<'a> {
     model_id: String,
     /// History after the latest compaction.
     eff: Vec<crate::store::Message>,
+    /// The full stored history `eff` was cut from, so auto-compaction can reuse it instead of reloading.
+    history: Vec<crate::store::Message>,
     limit: Option<u64>,
     /// The tool list the request was built from (tool calls are looked up here).
     tools: Vec<Arc<dyn Tool>>,
@@ -145,7 +147,7 @@ impl Engine {
             overlay,
         };
         let limit = self.cfg.catalog.model(&provider_id, &model_id).map(|m| m.limit.context).filter(|l| *l > 0);
-        Ok(Ok(Prepared { session, agent, req, provider, provider_id, model_id, eff, limit, tools: all_tools }))
+        Ok(Ok(Prepared { session, agent, req, provider, provider_id, model_id, eff, history, limit, tools: all_tools }))
     }
 
     pub(super) fn run_step_inner(&self, sid: &str, step: u32, ui: &dyn Ui, cancel: &AtomicBool, overflowed: bool) -> Result<StepOutcome, StoreError> {
@@ -158,7 +160,7 @@ impl Engine {
         if let (true, Some(limit)) = (self.cfg.compaction.auto, p.limit) {
             let size = compaction::context_size(&p.eff, compaction::estimate_request(&p.req));
             if size > self.cfg.compaction.threshold(limit) && !self.auto_failed.lock().unwrap().contains(sid) {
-                match self.compact_inner(sid, "auto", ui, cancel)? {
+                match self.compact_with(sid, "auto", p.session.clone(), std::mem::take(&mut p.history), ui, cancel)? {
                     CompactResult::Compacted { .. } => {
                         p = match self.prepare(sid, step, ui)? {
                             Ok(p) => p,
@@ -198,6 +200,7 @@ impl Engine {
             notified: &self.notified,
             // Manual mode is fully manual: the classifier only ever works in auto mode.
             classify: self.cfg.classifier.as_ref().filter(|_| self.permission_mode_of(&session) == PermissionMode::Auto).filter(|s| s.background || !ui.unattended()).map(|settings| classify::ClassifyCtx { engine: self, session: &session, settings, cancel }),
+            cache: Mutex::new(None),
         };
 
         let mut retries = 0u32;
@@ -326,8 +329,10 @@ impl Engine {
                         parts.push(json!({"type":"text","text":""}));
                         parts.len() - 1
                     });
-                    let cur = parts[i]["text"].as_str().unwrap_or("").to_string();
-                    parts[i]["text"] = json!(cur + &t);
+                    // Append in place: copying the text so far on every delta would be quadratic.
+                    if let Value::String(s) = &mut parts[i]["text"] {
+                        s.push_str(&t);
+                    }
                 }
                 Event::ReasoningDelta(t) => ui.event(&UiEvent::ReasoningDelta(&t)),
                 Event::ToolInputStart { .. } => text_idx = None,
