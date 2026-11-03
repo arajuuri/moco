@@ -2984,7 +2984,7 @@ mod tests {
 
     #[test]
     fn a_background_command_reports_back_after_the_turn_that_started_it() {
-        let f = fixture(vec![bg_shell("t1", "sleep 0.3; echo done-bg; exit 3"), text("it is running"), text("noted the result")]);
+        let f = fixture(vec![bg_shell("t1", "sleep 2; echo done-bg; exit 3"), text("it is running"), text("noted the result")]);
         f.say("start it");
         let notes = Arc::new(Mutex::new(vec![]));
         let n = notes.clone();
@@ -2998,7 +2998,7 @@ mod tests {
         assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
         let reqs = f.fake.requests.lock().unwrap();
         let t = all_text(&reqs[2]);
-        assert!(t.contains("Background command finished (shell ID: shl_") && t.contains("exited (code 3)") && t.contains("Command: sleep 0.3; echo done-bg; exit 3") && t.contains("done-bg"), "{t}");
+        assert!(t.contains("Background command finished (shell ID: shl_") && t.contains("exited (code 3)") && t.contains("Command: sleep 2; echo done-bg; exit 3") && t.contains("done-bg"), "{t}");
         assert_eq!(f.engine.background_jobs(None)[0].status, "exited (code 3)");
         assert_eq!(notes.lock().unwrap().len(), 1);
         assert!(notes.lock().unwrap()[0].contains("exited (code 3)"));

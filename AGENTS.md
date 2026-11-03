@@ -1,6 +1,6 @@
 # AGENTS.md
 
-moco is a native coding agent for **macOS 10.14 (Mojave), Intel x86_64**: a clean-room Rust reimplementation of opencode (upstream commit `6c24ec9532`, MIT). `docs/` is the specification; read `docs/00-overview.md`, then `docs/10-roadmap.md` (phases, results, what is left). Phases 0 to 2 are done and Phase 3 (extensibility) is being built slice by slice. Source paths cited in the docs are relative to an opencode checkout, not this repo.
+moco is a native coding agent for **macOS 10.14 (Mojave), Intel x86_64**: a clean-room Rust reimplementation of opencode (upstream commit `6c24ec9532`, MIT). `docs/` is the specification; read `docs/00-overview.md`, then `docs/10-roadmap.md` (phases, results, what is left). `docs/13-architecture.md` describes the code as built (modules, run lifecycle, storage, invariants); keep it in step with structural changes. Phases 0 to 2 are done and Phase 3 (extensibility) is being built slice by slice. Source paths cited in the docs are relative to an opencode checkout, not this repo.
 
 ## Commands
 

@@ -23,6 +23,8 @@ pins Electron 44 (macOS 12+). Nothing in this repo's runtime stack can be made t
 | `09-ui.md`                    | Screens, interactions, key bindings                                |
 | `10-roadmap.md`               | Phased build order with acceptance checks and results per phase    |
 | `11-usage.md`                 | User reference for the app as built: commands, config, storage     |
+| `12-tui-plan.md`              | Plan and status of the full-screen terminal UI                     |
+| `13-architecture.md`          | The code as built: modules, run lifecycle, storage, invariants     |
 
 ## Scope
 

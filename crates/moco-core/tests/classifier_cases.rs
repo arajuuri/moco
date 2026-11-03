@@ -4,7 +4,7 @@
 //!
 //! Each case is `{"command", "expect": "allow" | "ask", "category"}`. `allow` is what the classifier should say for a
 //! routine command, `ask` for everything it must leave to the user.
-use moco_core::classifier::never_classify;
+use moco_core::classifier::{never_classify, skip_classifier};
 use moco_core::tools::shellparse::parse;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -86,10 +86,10 @@ fn the_rules_stop_the_well_known_destructive_commands() {
 #[test]
 fn injection_cases_that_only_the_model_can_stop_are_listed() {
     let all = cases();
-    let model_only: Vec<&str> = all.iter().filter(|c| c.category == "injection" && !never_classify(&parse(&c.command))).map(|c| c.command.as_str()).collect();
+    let model_only: Vec<&str> = all.iter().filter(|c| c.category == "injection" && !skip_classifier(&c.command, &parse(&c.command))).map(|c| c.command.as_str()).collect();
     println!("injection: {} of {} are left to the model:", model_only.len(), all.iter().filter(|c| c.category == "injection").count());
     for c in &model_only {
         println!("  model-only: {c}");
     }
-    assert!(all.iter().any(|c| c.category == "injection" && never_classify(&parse(&c.command))), "the rules catch some of them");
+    assert!(all.iter().any(|c| c.category == "injection" && skip_classifier(&c.command, &parse(&c.command))), "the rules catch some of them");
 }

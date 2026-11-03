@@ -1,0 +1,326 @@
+# Architecture of moco as built
+
+The other documents are the specification (derived from opencode), a usage reference and a roadmap. This one describes
+the code as it is: the pieces, how a prompt travels through them, what is stored where, and which rules hold the design
+together. When code and this document disagree, the code is right: fix the document.
+
+Paths are relative to the repository root. Line counts are left out on purpose; they go stale.
+
+## 1. Shape of the program
+
+moco is one process with no server. A Cargo workspace has two crates:
+
+```
+crates/moco-core   the engine: no terminal, no UI types, no knowledge of how it is shown
+crates/moco        the front end: argument parsing, the line-based chat, and the full-screen UI (tui/)
+```
+
+The only way the engine talks to a front end is the `Ui` trait (`engine.rs`). The front end calls
+`Engine::run` and passes a `Ui`; the engine calls back with events, permission prompts, question forms and spending-limit
+questions. There is no HTTP/SSE boundary, no plugin system and no LSP (see "Deliberately dropped" in `10-roadmap.md`).
+
+```
+          crates/moco                               crates/moco-core
+ +-----------------------------+      +------------------------------------------------+
+ | main.rs                     |      | Engine (engine.rs, engine/*)                   |
+ |   subcommands, flags,       | run  |   claim -> deliver -> step loop -> persist     |
+ |   -p / --plain chat         |----->|     |         |            |                     |
+ | tui/                        |      |     |         |            +--> tools::*  (scoped|
+ |   mod.rs   event loop       |<-----|   Ui events,  |                 threads, 1/call)|
+ |   app.rs   model + render   |  Ui  |   ask(), forms|                       |         |
+ |   builtin  slash commands   |      |               v                       v         |
+ +-----------------------------+      |        provider::* (one adapter   permission,   |
+                                      |        per wire protocol)         sandbox,      |
+                                      |               |                   classifier    |
+                                      |               v                                 |
+                                      |   Store (SQLite) . snapshots . blobs . log      |
+                                      +------------------------------------------------+
+```
+
+Targets: macOS 10.14 on Intel, built with Xcode 11.3.1. That rules out anything that needs a newer OS or async runtime
+tooling, so the code is synchronous Rust on OS threads. HTTP is `ureq`, the database is bundled SQLite (`rusqlite`).
+
+## 2. Modules of `moco-core`
+
+| Area | Files | What it does |
+|---|---|---|
+| Engine | `engine.rs`, `engine/step.rs` | `Engine`, `EngineConfig`, `Ui`, `run`/`drain`, the step loop, request building, streaming and tool dispatch |
+| | `engine/permit.rs` | `EnginePermitter`: rules, "always" answers, prompting, classifier hook |
+| | `engine/classify.rs`, `classifier.rs` | Shell-command classifier (call, cache, verdict handling) and its prompt, parsing and never-classify list |
+| | `engine/compact.rs`, `compaction.rs` | Manual and automatic compaction; what the model sees after a checkpoint |
+| | `engine/undo.rs`, `snapshot.rs` | Per-step snapshots, undo/redo, session diffs |
+| | `engine/jobs.rs` | Background shell commands and subagents |
+| | `engine/limits.rs` | Step and cost limits |
+| | `engine/title.rs`, `title.rs` | Title generation by a small model |
+| Persistence | `store.rs` | SQLite schema, migrations, inbox, claims, saved permissions, usage, todos |
+| | `chat.rs` | Stored messages to provider messages, with repair of dangling tool calls |
+| | `blobs.rs`, `media.rs` | Content-addressed attachments; image and PDF recognition and limits |
+| | `export.rs` | Markdown/JSON/JSONL export of a session |
+| Providers | `provider/mod.rs` | Neutral `Request`, `Event`, `Block`, `Provider` trait, `Logged` wrapper |
+| | `provider/{anthropic,openai_chat,openai_responses,gemini}.rs` | One adapter per wire protocol |
+| | `provider/{registry,effort,retry}.rs`, `catalog.rs`, `auth.rs` | Which providers are connected, reasoning effort, backoff, model catalog, API keys |
+| | `provider/{fake,testserver}.rs` | Test doubles |
+| Tools | `tools/mod.rs` | `Tool`, `ToolCtx`, `Host`, `Permitter`, path helpers, the tool list |
+| | `tools/*.rs` | `read write edit patch glob grep shell jobs webfetch websearch todowrite question subagent skill` |
+| | `tools/shellparse.rs`, `tools/fsio.rs` | Command line to permission resources; atomic writes and per-file locks |
+| Safety | `permission.rs`, `wildcard.rs` | Rule model, modes, presets, evaluation |
+| | `sandbox.rs` | macOS Seatbelt wrapper for `shell` |
+| Agents | `agent.rs` | Built-in agents, the system prompt, reminders |
+| Extensions | `config.rs`, `instructions.rs`, `skills.rs`, `commands.rs`, `mentions.rs` | Config merge, `AGENTS.md`, skills, slash commands, `@` mentions |
+| | `mcp/{client,http,oauth,manager,trust}.rs` | MCP over stdio and Streamable HTTP, OAuth, tool/prompt/resource exposure, project approval |
+| | `format.rs`, `check.rs` | Formatter and check hooks run after edits |
+| Misc | `log.rs`, `truncate.rs`, `id.rs`, `sysinfo.rs`, `markdown.rs` | Diagnostic log, output bounds, ids, host description, frontmatter |
+
+## 3. The life of a prompt
+
+This is the path every request takes, from keystroke to stored answer.
+
+1. **Submit.** The front end calls `Engine::submit`. Mentions (`@file`, `@skill`, `@agent`) were already expanded by
+   `mentions.rs` and are stored with the message. The prompt is written to `session_inbox` with a mode, `steer` (deliver at
+   the next step boundary of a running turn) or `queue` (deliver when the session is idle). Nothing is lost if the process
+   dies here: prompts are persisted before anything runs.
+2. **Claim.** `Engine::run` calls `Store::claim`, which sets `session.claim_at` and `claim_pid` if no one holds the
+   session. If a run already holds it, the result is `RunOutcome::Busy`. A `ClaimGuard` releases the claim on drop, so a panic
+   cannot leave a session stuck. On startup `Store::recover_claims` finds claims whose process is dead and resumes those
+   sessions (at most three times in a row).
+3. **Drain.** `drain` loops. Each pass calls `Store::deliver`, which in one transaction moves inbox rows into the message
+   table. New input resets the step allowance and the per-run cost allowance. With nothing delivered and nothing to continue,
+   the run returns `Idle`. A title job runs alongside the first turn of an untitled session on its own thread and is cancelled
+   shortly after the turn ends.
+4. **Prepare** (`step.rs::prepare`). The history is reloaded from the store on every step. There is no in-memory
+   conversation. `compaction::effective` cuts it at the latest checkpoint, `chat::to_chat` rebuilds provider messages, and
+   `agent::system_prompt` builds the system prompt (base text, tool guidance, agent text, `AGENTS.md`, skills, working
+   directory, platform, date). The advertised tools are the built-in ones the agent may use plus the current MCP tools.
+   Request-time reminders are added here and never stored: the step-limit notice, and the open todo list as `Request::tail`.
+5. **Auto compaction.** If the request is larger than the model's threshold, the engine summarizes the older part first
+   and prepares again.
+6. **Snapshot and placeholder.** A working-tree snapshot is taken (best effort) and an empty assistant message is inserted.
+   It is filled in as the step goes (tool calls are saved as they appear) and replaced by the final message at the end.
+7. **Stream** (`step.rs::attempt`). `Provider::stream` pushes neutral `Event`s: text and reasoning deltas, tool calls,
+   provider-private data, and a finish event with usage. Text goes to the UI as it arrives. A tool call is executed **the
+   moment it is complete**, on a scoped thread, while the model keeps streaming. Tool-call parts are saved to the message as
+   they appear. Retries (`provider/retry.rs`) happen only if no tool call ran in the failed attempt, and the partial output is
+   discarded. A context-overflow error compacts once and retries the step.
+8. **Finish.** Tool threads are joined, `AGENTS.md` files found by `read` are remembered, checks run once on the files the
+   step changed, tool results are bounded (`truncate.rs`) and written into the message parts, usage and cost are added to the
+   session, and the final assistant message is stored.
+9. **Decide.** Tool calls present: `Continue` (another step, after the cost limits are checked). None: `Done`, and the loop
+   delivers any queued input or returns `Idle`. `Declined`, `Interrupted`, `Failed` and `LimitReached` stop the run.
+
+Cancellation is an `AtomicBool` passed down through the engine, the provider adapters (which check it at every read and
+while waiting for headers), the shell tool (which kills the process group) and the retry sleep.
+
+## 4. Storage
+
+One SQLite file, `data/moco.db`, in WAL mode (several moco processes can read while one runs). Migrations are a numbered
+list in `store.rs::MIGRATIONS`. The tables:
+
+| Table | Holds |
+|---|---|
+| `project` | One row per directory, keyed by the symlink-free path |
+| `session` | Directory, agent, title, model, variant, permission mode, parent (subagents), revert marker, cost and token totals, classifier cost, claim owner |
+| `message` | `type` (`user`, `assistant`, `synthetic`, `compaction`) and a JSON `data` column |
+| `session_inbox` | Prompts waiting for delivery, with `steer` or `queue` mode |
+| `permission_saved` | "Always" answers per project |
+| `todo` | The current todo list of a session |
+| `instruction_state` | `AGENTS.md` files that `read` found, so later steps keep them |
+| `auto_allow` | Commands the classifier allowed (pruned after seven days) |
+| `meta` | Key/value bookkeeping, such as when the snapshots were last pruned (`claim_periodic`) |
+
+Message shapes live in `chat.rs`. An assistant message is `{parts: [text | tool{id,name,input,state}], finish, usage,
+cost, snapshot?, error?}`. A compaction message is `{summary, keepFrom, trigger}`. IDs come from `id::new_id(prefix)`: a
+prefix, a strictly increasing time component and random characters, so sorting by id sorts by time (`msg_`, `ses_`, `per_`,
+`evt_`).
+
+Stored messages are never deleted by compaction or undo. Compaction changes only what the model sees. Undo marks messages
+hidden through `session.revert` until the next prompt, which makes it permanent.
+
+Files under `<app dir>` (`~/Library/Application Support/moco`, or `$MOCO_HOME`):
+
+```
+auth.json            API keys, mode 600
+config/              user config, skills, commands, themes
+cache/models.json    refreshed model catalog (an embedded snapshot is the fallback)
+data/moco.db         sessions
+data/snapshots/      content-addressed working-tree snapshots, per project, pruned after idle days
+data/blobs/          attachments, by SHA-256
+data/tool-output/    full text of truncated tool output and background job logs, pruned after a week
+data/logs/           diagnostic log, one file a day
+data/mcp-trust.json  approved project MCP servers, formatters and shells
+data/tui-history     prompt history of the full-screen UI
+```
+
+## 5. Providers
+
+`provider/mod.rs` defines a protocol-neutral request and event model:
+
+- `Request` has the system prompt, `messages`, `tools`, `max_tokens`, `tools_disabled` (keep the tool definitions for the
+  cache but forbid calls), `effort`, an `overlay` from config, and `tail`.
+- `Event` is `TextDelta`, `ReasoningDelta`, `ToolInputStart`, `ToolCall`, `BadToolCall` (input that was not valid JSON, so the
+  model gets a tool error instead of the stream failing), `Native` and `Finish`.
+- Provider-private data (OpenAI reasoning items, Gemini thought signatures, Anthropic thinking blocks) travels as
+  `Block::Native` / `Event::Native`, is stored with the assistant message, and only its own adapter replays it.
+
+One adapter per wire protocol: Anthropic Messages, OpenAI-compatible Chat Completions, OpenAI Responses and Gemini. The last
+two are experimental and have never run against the live services. `provider/registry.rs` builds a client for every catalog
+provider that has a key, wrapped in `Logged`. The catalog (`catalog.rs`) comes from models.dev and gives context limits,
+prices and capabilities; config can add or override providers.
+
+**Prompt caching is a design constraint.** Every request of a turn must extend the previous one byte for byte, because
+`anthropic.rs` sets cache breakpoints on the last tool, the system prompt and the last messages, and a test
+(`every_request_of_a_turn_extends_the_previous_one`) enforces it. That is why system prompt, tool schemas and tool-name
+spelling are stable within a turn. Text that has to change from step to step goes in `Request::tail`, which adapters append
+to the final user message after the breakpoints (see `07-providers.md`).
+
+## 6. Tools and the permission pipeline
+
+A tool implements `Tool` (`name`, `description`, `schema`, `run`). `run` gets a `ToolCtx`: working directory, project root,
+spill directory, cancellation flag, a `Permitter`, and a `Host` for the few things that need engine state (todos, question
+forms, subagents, background jobs). Tools never see the store or the UI directly. MCP tools implement the same trait and are
+fetched from the manager on every request, which is why `Tool::name` returns `&str`.
+
+Every tool that touches something asks first with `ctx.permit(PermReq)` or `ctx.check_external`:
+
+```
+tool -> PermReq{action, resources, save patterns, command?}
+          |
+          v  EnginePermitter::check
+   rules = mode rules + preset + agent rules + user "permissions"   (flat list, last match wins, default ask)
+          |
+   deny (explicit rule) ----------------------------------------------> ToolError::Blocked
+   allow ------------------------------------------------------------> run
+   ask:
+      shell command, only a *default* rule asks, auto mode, not opaque
+        and not on the never-classify list  --> classifier (small model) --> allow: run, with an "auto:" marker
+                                                                         --> anything else: fall through
+      Ui::ask (one prompt at a time, process-wide lock)
+         once -> run      always -> save pattern to permission_saved, run
+         reject -> stop the run          reject with text -> tool error carrying the feedback
+```
+
+Details that matter:
+
+- **Modes.** `manual` (default) asks for everything except reads and planning tools. `auto` allows everything except `.env`
+  reads, web search and unsandboxed shell. In `auto` mode the `careful` preset is added unless the config sets
+  `permission_preset` (`trusted` adds nothing; an explicit `careful` applies to manual mode too).
+- **Hard and soft asks.** A rule written by the user or by the careful preset's always-ask list (`git push`, `rm -rf`,
+  `sudo`) is final. Only an ask that comes from a default rule (`Rule::soft`) may be relaxed by the classifier, and the
+  classifier can only turn ask into allow. Timeouts, errors and garbled replies ask the user.
+- **Paths** are compared with symlinks resolved (`tools/mod.rs::is_internal`), so a symlinked project is one project and a
+  symlink that leads out of it is external. Anything outside the project asks under `external_directory`.
+- **Shell** (`tools/shell.rs`) runs in its own process group so it can be killed whole. `shellparse.rs` splits a command line
+  into permission resources and "always" patterns, and marks opaque constructs (`eval`, `$(...)`, `base64 -d | sh`) so they
+  always go to the user. With `sandbox.enabled` the command runs under `sandbox-exec` with a profile that denies writes outside
+  the project, temp directories and `sandbox.writable`. `unsandboxed: true` asks under the `shell.unsandboxed` action.
+- **Output** is bounded to 2000 lines or 50 KiB; the rest is saved under `data/tool-output/` and the model is told the path.
+- **Edits** (`edit`, `write`, `patch`) write atomically under a per-file lock (`fsio.rs`), then run the configured
+  formatter (`format.rs`). After a step that changed files, configured checks (`check.rs`) run once and their report is added
+  to the tool result.
+
+## 7. Agents, subagents and background jobs
+
+Agents (`agent.rs`) are a prompt, a ruleset and a mode: `build` (everything) and `plan` (read-only, with the Plan reminder in
+the system prompt) are selectable; `general` and `explore` are subagents. Config can add or change agents.
+
+A **subagent** is an inline child session (`parent_id` set, depth at most 3) with the parent's directory and permission mode.
+The `subagent` tool calls `Engine::run_subagent`, which submits the prompt to the child and runs it through the same `run`
+path. The child's events reach the parent's `Ui` wrapped in `UiEvent::Nested`, its prompts go to the same user, and its cost
+rolls up to its ancestors.
+
+**Background work** (`engine/jobs.rs`) needs the engine to be shared: `Engine::share()` returns an `Arc<Engine>` and keeps a
+weak handle so detached threads have an owner. A background shell command writes to a file under `data/tool-output/`; a
+background subagent runs on its own thread with an `Unattended` `Ui` that refuses prompts (the classifier may still answer,
+if its `background` setting allows). When a job ends, its result is queued as a `synthetic` steer message for the owning
+session and the front end is told through the engine's notifier.
+
+## 8. Keeping history under control
+
+- **Compaction** (`compaction.rs`, `engine/compact.rs`). A `compaction` message stores a summary and the id of the first
+  message to keep. The summary is written by the same model, with a prompt of moco's own. `effective()` returns
+  `[summary, kept messages...]`, and a later compaction summarizes the previous summary plus what followed, so there is
+  at most one checkpoint. It runs on `/compact`, when a request nears the model's limit, and once after a provider's
+  context-overflow error.
+- **Snapshots** (`snapshot.rs`) are `git`-free: a manifest of every non-ignored file with its SHA-256 and mode, contents stored
+  once as blobs, only changed files re-hashed. One is taken before every step and its id is stored on the assistant message.
+  `/undo` restores files and hides the messages; `/diff` compares the current tree with the session's first snapshot. A project
+  with too many files turns snapshots off for that session with one notice. Files too large to store are reported as skipped.
+- **Limits** (`engine/limits.rs`). A step allowance per run (the last allowed step forbids tools and adds the `MAX_STEPS`
+  reminder), and cost limits per run and per session checked after each step that is followed by another. An attended UI is
+  asked what to do, an unattended one or `-p` stops the run.
+
+## 9. Extensibility
+
+- **Config** (`config.rs`): `moco.json[c]` files from the user directory, each ancestor of the working directory and
+  `$MOCO_CONFIG`, merged lowest to highest priority, with `{env:NAME}` and `{file:path}` substitution. Objects merge by key,
+  `permissions` and `instructions` arrays concatenate, everything else is replaced. Some settings are read **only** from the
+  user's own files: a provider's `base_url`, `env`, `protocol` and `headers`, and `permission_classifier`. A project config
+  that sets them is ignored with a warning, and a project's `permissions` can only add `deny` rules.
+- **Anything a project config can make moco run** (MCP servers, formatters, checks, the shell executable) must go through
+  the approval in `mcp/trust.rs`, remembered per project directory and exact definition.
+- **Instructions, skills, commands** share one directory list, `skills::config_roots` (`~/.claude`, `~/.agents`, the app config,
+  then `.claude`, `.agents`, `.moco` of each ancestor). `AGENTS.md` (with `CLAUDE.md` as fallback) is rendered into the system
+  prompt.
+- **MCP** (`mcp/`): `client.rs` (stdio) and `http.rs` (Streamable HTTP, with `oauth.rs`) implement one `McpConn` trait.
+  `manager.rs` runs the servers and exposes tools as `<server>_<tool>`, prompts as slash commands and resources through an
+  `mcp-resource` tool and `@` mentions. The HTTP and OAuth paths have been checked only against fake servers.
+
+## 10. Front ends
+
+**`main.rs`** parses arguments, handles the subcommands that need no session (`auth`, `sessions`, `logs`, `models`), then
+loads config, applies the sandbox setting, opens the store, recovers crashed runs, builds the provider map, the MCP manager and
+the `Engine`, and picks a mode:
+
+| Mode | When | What it does |
+|---|---|---|
+| One-shot | `-p "prompt"` | One run, exit status 0 done, 1 failed, 2 usage, 3 stopped by a limit |
+| Line chat | `--plain`, or stdin/stdout is not a terminal | Reads lines, prints streamed text, tool lines and checklists |
+| Full screen | A terminal (default) | `tui::run` |
+
+**The full-screen UI** (`crates/moco/src/tui/`) separates state from effects:
+
+- `app.rs` is a pure model. `App::update(AppEvent) -> Action` and `render(Frame, &mut App)` touch no terminal and no engine,
+  so tests drive them with scripted events and read ratatui's `TestBackend`.
+- `mod.rs` is the event loop. The UI thread owns the terminal. An input thread turns crossterm events into `AppEvent`s. The
+  engine runs on a worker thread per run (`start_run`), inside a `thread::scope`. The worker's `TuiUi` converts each borrowed
+  `UiEvent` to an owned `Ev` and sends it down the channel. `Ui::ask` sends the prompt with a reply channel and blocks the engine
+  thread until the UI thread answers. While a turn runs, or jobs or the sidebar are active, the loop also syncs the inbox and the sidebar (MCP
+  servers, jobs) about every 200 ms. Background-job lines arrive through the engine's notifier.
+- `builtin.rs` implements the slash commands, `keys.rs` the key map, `theme.rs` the colors, `md.rs` Markdown rendering,
+  `diff.rs` the diff viewer, `complete.rs` completion.
+- When a session is opened (start, `/resume`, `/new`, `/fork`), `load_session_view` rebuilds the transcript, costs and todo
+  list from the store.
+- A panic on the worker thread is caught and reported as a failed run, so the UI never waits for a run that is gone.
+
+## 11. Observability
+
+`log.rs` writes a diagnostic log, never to the terminal: `MOCO_LOG` or the `log` config key sets the level (default `warn`,
+per-target levels such as `warn,mcp=trace`), one file a day under `data/logs/`, seven days, 16 MiB a day shared by all moco
+processes, with credentials redacted. Targets are `provider`, `engine`, `tool`, `shell`, `jobs`, `mcp`, `store`, `snapshot`,
+`classifier`, `main` and `log`. `moco logs` shows the tail. Failures that would otherwise be silent (store writes, saved
+permissions) become a one-time notice in the UI through `notice_once`.
+
+## 12. Testing
+
+`cargo test` needs no network. The engine is tested with a scripted fake provider (`provider/fake.rs`) that replays events and
+records every request, and with local fake servers (`provider/testserver.rs`). Integration tests under `crates/moco/tests/`
+drive the real binary against a Python fake LLM server (`fake_llm.py`) and, for the TUI, through a pty (`tui_pty.py`);
+the MCP tests spawn `fake_mcp*.py`. The classifier has a golden set (`crates/moco-core/tests/classifier_cases.jsonl`) checked
+offline for the rules that need no model, and `scripts/eval-classifier.py` measures the model layer against a live provider.
+
+## 13. Rules the design depends on
+
+These are the invariants that are easy to break by accident.
+
+1. **The engine knows nothing about a UI.** New information for a front end becomes a `UiEvent` variant, not a dependency.
+2. **History is reloaded from the store on every step**, and prompts are persisted before they run. State kept only in memory
+   is lost on a crash, so do not rely on it.
+3. **Requests keep a byte-stable prefix within a turn.** Anything that changes mid-turn goes in `Request::tail`, never in the
+   system prompt, the tools or earlier messages.
+4. **Retry only when no tool ran** in the failed attempt, and discard the partial output.
+5. **The classifier can only turn an ask into an allow**, never override a rule, and never sees opaque or dangerous commands.
+6. **Project config is untrusted.** Anything it can make moco execute goes through the approval; credentials and endpoints are
+   read only from the user's own config.
+7. **Tool output is bounded** before the model sees it, and the rest is saved to a file.
+8. **Stored messages are never deleted** by compaction; undo hides them until the next prompt.
+9. **No runtime that 10.14 cannot load:** no Bun, Electron or current Node, no async-await toolchain, no dependency that needs a
+   newer Xcode than 11.3.1.
