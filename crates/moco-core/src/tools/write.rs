@@ -17,7 +17,9 @@ For partial changes, use the edit tool instead.".into()
         let path = ctx.resolve(str_arg(input, "path")?);
         let content = str_arg(input, "content")?;
         ctx.check_external_file(&path)?;
-        ctx.permit("edit", vec![ctx.display(&path)], vec!["*".into()])?;
+        ctx.permit_path("edit", &path, vec!["*".into()])?;
+        // Use what was authorized: the resolved target, so a link swapped in after the check is not followed.
+        let path = real_path(&path);
         // No other call may change this file between the read below and the end of formatting (issue #6).
         let _locks = super::fsio::lock_files([&path]);
         let existing = std::fs::read(&path).ok();

@@ -26,6 +26,13 @@ impl Tool for Glob {
         let limit = opt_u64(input, "limit").unwrap_or(100).max(1) as usize;
         ctx.check_external(&root)?;
         ctx.permit("glob", vec![pattern.to_string()], vec!["*".into()])?;
+        // Listing a directory reached through a link is authorized as `read` of the place it leads to (a rule on
+        // that target applies), then walked at that resolved place.
+        let real = real_path(&root);
+        if real != normalize(&root) && ctx.display(&real) != ctx.display(&root) {
+            ctx.permit_path("read", &root, vec!["*".into()])?;
+        }
+        let root = real;
         let matcher = globset::GlobBuilder::new(pattern)
             .literal_separator(true)
             .build()

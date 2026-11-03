@@ -62,7 +62,9 @@ If a call fails, the error says what is closest in the file: correct the call an
             }
         }
         ctx.check_external_file(&path)?;
-        ctx.permit("edit", vec![ctx.display(&path)], vec!["*".into()])?;
+        ctx.permit_path("edit", &path, vec!["*".into()])?;
+        // Use what was authorized: the resolved target, so a link swapped in after the check is not followed.
+        let path = real_path(&path);
         // From here to the end of formatting no other call may change this file (issue #6).
         let _locks = fsio::lock_files([&path]);
         let bytes = std::fs::read(&path).map_err(|e| ToolError::fail(format!("{}: {e}", path.display())))?;

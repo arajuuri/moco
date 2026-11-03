@@ -264,6 +264,29 @@ impl ToolCtx<'_> {
         self.permitter.check(&PermReq { action: action.into(), resources, save, force_ask: false, command: None, call_id: self.call_id.into() })
     }
 
+    /// `permit` for a file or directory: the resources are the path as given and, when symlinks lead somewhere else
+    /// (a linked final component or a linked parent), the place they lead to. A rule such as `read .env` therefore
+    /// applies to `safe.txt -> .env`, and a deny on the target cannot be bypassed through a link.
+    pub fn permit_path(&self, action: &str, path: &Path, save: Vec<String>) -> Result<(), ToolError> {
+        // The name as given: a link that lives in the project keeps its relative name even when it points outside
+        // (`display` would resolve it and show it absolute); the target is checked as its own resource below.
+        let lexical = normalize(path);
+        let name = [&self.cwd, &self.project_root]
+            .iter()
+            .find_map(|base| lexical.strip_prefix(normalize(base)).ok().filter(|r| !r.as_os_str().is_empty()))
+            .map(|r| r.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.display(path));
+        let mut resources = vec![name];
+        let real = real_path(path);
+        if real != normalize(path) {
+            let target = self.display(&real);
+            if !resources.contains(&target) {
+                resources.push(target);
+            }
+        }
+        self.permit(action, resources, save)
+    }
+
     /// Anything outside the working directory and project root needs `external_directory`.
     /// `dir` is the directory being touched (the parent for a file).
     pub fn check_external(&self, dir: &Path) -> Result<(), ToolError> {
@@ -568,6 +591,79 @@ mod symlink_tests {
         assert_eq!(asked.len(), 2);
         assert_eq!((&asked[0].resources, &asked[0].save), (&asked[1].resources, &asked[1].save));
         let _ = link;
+    }
+
+    fn read_resources(env: &Env) -> Vec<Vec<String>> {
+        env.perm.asked().into_iter().filter(|r| r.action == "read").map(|r| r.resources).collect()
+    }
+
+    #[test]
+    fn a_link_to_a_file_in_the_project_is_authorized_as_its_target() {
+        let env = Env::new();
+        env.file(".env", b"SECRET=1\n");
+        symlink(env.work().join(".env"), env.work().join("safe.txt")).unwrap();
+        let o = read::Read.run(&json!({"path":"safe.txt"}), &env.ctx()).unwrap();
+        assert_eq!(o.text, "1: SECRET=1");
+        assert_eq!(read_resources(&env), [["safe.txt", ".env"]], "both names are checked");
+    }
+
+    #[test]
+    fn a_linked_parent_is_authorized_as_its_target() {
+        let env = Env::new();
+        env.file("secrets/.env", b"S=1\n");
+        symlink(env.work().join("secrets"), env.work().join("docs")).unwrap();
+        read::Read.run(&json!({"path":"docs/.env"}), &env.ctx()).unwrap();
+        assert_eq!(read_resources(&env), [["docs/.env", "secrets/.env"]]);
+    }
+
+    #[test]
+    fn a_link_out_of_the_project_asks_for_the_external_target_too() {
+        let env = Env::new();
+        let outside = env.dir.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("o.txt"), "o").unwrap();
+        symlink(outside.join("o.txt"), env.work().join("l.txt")).unwrap();
+        read::Read.run(&json!({"path":"l.txt"}), &env.ctx()).unwrap();
+        let asked = env.perm.asked();
+        assert_eq!(asked[0].action, "external_directory");
+        assert_eq!(read_resources(&env)[0], ["l.txt".to_string(), real_path(&outside.join("o.txt")).display().to_string()]);
+    }
+
+    #[test]
+    fn edit_write_and_patch_authorize_and_use_the_resolved_target() {
+        let env = Env::new();
+        env.file(".env", b"A=1\n");
+        symlink(env.work().join(".env"), env.work().join("safe.txt")).unwrap();
+        let edit_resources = |env: &Env| env.perm.asked().into_iter().filter(|r| r.action == "edit").map(|r| r.resources).collect::<Vec<_>>();
+        edit::Edit.run(&json!({"path":"safe.txt","oldString":"A=1","newString":"A=2"}), &env.ctx()).unwrap();
+        write::Write.run(&json!({"path":"safe.txt","content":"A=3\n"}), &env.ctx()).unwrap();
+        patch::Patch.run(&json!({"patchText":"*** Begin Patch\n*** Update File: safe.txt\n@@\n-A=3\n+A=4\n*** End Patch"}), &env.ctx()).unwrap();
+        assert_eq!(edit_resources(&env), [["safe.txt", ".env"]; 3]);
+        assert!(std::fs::symlink_metadata(env.work().join("safe.txt")).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(env.work().join(".env")).unwrap(), "A=4\n");
+    }
+
+    #[test]
+    fn grep_and_glob_on_a_linked_root_authorize_its_target() {
+        let env = Env::new();
+        env.file(".env", b"needle\n");
+        env.file("secrets/a.txt", b"needle\n");
+        symlink(env.work().join(".env"), env.work().join("safe.txt")).unwrap();
+        symlink(env.work().join("secrets"), env.work().join("docs")).unwrap();
+        let t = grep::Grep.run(&json!({"pattern":"needle","path":"safe.txt"}), &env.ctx()).unwrap().text;
+        assert!(t.contains("needle"), "{t}");
+        assert_eq!(read_resources(&env), [["safe.txt", ".env"]]);
+        let t = glob::Glob.run(&json!({"pattern":"*.txt","path":"docs"}), &env.ctx()).unwrap().text;
+        assert_eq!(t, "a.txt");
+        assert_eq!(read_resources(&env)[1], ["docs", "secrets"]);
+    }
+
+    #[test]
+    fn a_plain_path_adds_no_extra_resource() {
+        let env = Env::new();
+        env.file("a.txt", b"x");
+        read::Read.run(&json!({"path":"a.txt"}), &env.ctx()).unwrap();
+        assert_eq!(read_resources(&env), [["a.txt"]]);
     }
 }
 
