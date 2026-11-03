@@ -2292,6 +2292,9 @@ mod tests {
                 std::fs::File::options().write(true).open(b.path()).unwrap().set_modified(past).unwrap();
             }
         }
+        // The session was last updated at the end of the run, possibly within this millisecond, which a zero window
+        // still counts as recent. Let the clock move on so the session really is outside the window.
+        std::thread::sleep(Duration::from_millis(5));
         let (manifests, blobs) = f.engine.prune_snapshots(std::slice::from_ref(&pid), Duration::ZERO);
         assert!(manifests >= 3 && blobs >= 3, "{manifests} {blobs}");
         assert_eq!(read_work(&f, "a.txt").as_deref(), Some("v2"));
