@@ -700,6 +700,8 @@ impl Host for EngineHost<'_> {
 
     fn start_background_subagent(&self, req: SubagentRequest) -> Result<String, ToolError> {
         let eng = self.engine.shared()?;
+        // Over the cap is a tool error the model can react to, not a job that starts and fails.
+        eng.check_background_slot(true)?;
         let child = eng.begin_subagent(self.session, &req)?;
         eng.start_subagent_job(self.session, &child, &req.description);
         Ok(child.id)
@@ -976,6 +978,28 @@ mod tests {
         let results = last_user_blocks(&reqs[1]);
         assert_eq!(results.len(), 2);
         assert!(matches!(&results[1], Block::ToolResult { content, .. } if content == "two\n"));
+    }
+
+    #[test]
+    fn cut_off_tool_input_is_a_tool_error_and_earlier_calls_still_run() {
+        let f = fixture(vec![
+            Scripted::Events(vec![
+                Event::ToolCall { id: "a".into(), name: "read".into(), input: json!({"path":"x"}) },
+                Event::BadToolCall { id: "b".into(), name: "write".into(), raw: "{\"path\":\"y\",\"content\":\"abc".into(), error: "EOF while parsing a string".into() },
+                Event::Finish { reason: FinishReason::MaxTokens, usage: Usage::default() },
+            ]),
+            text("smaller parts then"),
+        ]);
+        f.file("x", "one");
+        f.say("go");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        let reqs = f.fake.requests.lock().unwrap();
+        assert_eq!(reqs.len(), 2, "the loop continued after the bad call");
+        let results = last_user_blocks(&reqs[1]);
+        assert_eq!(results.len(), 2);
+        assert!(matches!(&results[0], Block::ToolResult { id, is_error: false, .. } if id == "a"), "{:?}", results[0]);
+        assert!(matches!(&results[1], Block::ToolResult { id, is_error: true, content } if id == "b" && content.contains("max_tokens") && content.contains("smaller parts")), "{:?}", results[1]);
+        assert!(!f.dir.join("work").join("y").exists());
     }
 
     #[test]

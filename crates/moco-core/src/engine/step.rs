@@ -295,6 +295,7 @@ impl Engine {
         let mut finish = None;
         let mut dispatched = false;
         let mut declined = false;
+        let mut bad_calls: Vec<(usize, String)> = vec![];
 
         let stream = std::thread::scope(|s| {
             let mut handles = vec![];
@@ -341,8 +342,25 @@ impl Engine {
                         }),
                     ));
                 }
+                Event::BadToolCall { id, name, raw, error } => {
+                    text_idx = None;
+                    dispatched = true;
+                    // Nothing runs; the model gets a tool error (written once the finish reason is known).
+                    let input = crate::provider::bad_call_input(&raw);
+                    ui.event(&UiEvent::ToolStarted { id: &id, name: &name, input: &input });
+                    parts.push(chat::tool_part(&id, &name, &input));
+                    bad_calls.push((parts.len() - 1, error));
+                    self.store().set_message_parts(msg_id, &parts).log_err("store", "saving a tool call");
+                }
                 Event::Finish { reason, usage } => finish = Some((reason, usage)),
             });
+            let max_tokens = matches!(finish, Some((FinishReason::MaxTokens, _)));
+            for (idx, error) in bad_calls {
+                let name = parts[idx]["name"].as_str().unwrap_or("").to_string();
+                let msg = bad_call_message(&name, &error, max_tokens);
+                let state = self.finish_tool(&name, Err(ToolError::fail(msg)), &spill, ui);
+                parts[idx]["state"] = state;
+            }
             for (idx, h) in handles {
                 let outcome = h.join().unwrap_or_else(|_| Err(ToolError::fail("tool panicked")));
                 declined |= outcome == Err(ToolError::Declined);

@@ -140,28 +140,22 @@ pub struct Parser {
 }
 
 impl Parser {
-    fn flush_calls(&mut self, out: &mut Vec<Event>) -> Result<(), ProviderError> {
+    fn flush_calls(&mut self, out: &mut Vec<Event>) {
         for (idx, t) in std::mem::take(&mut self.tools) {
             let name = t.name.clone();
-            let input = if t.args.trim().is_empty() {
-                json!({})
-            } else {
-                serde_json::from_str(&t.args).map_err(|e| ProviderError::InvalidRequest(format!("model produced invalid tool input JSON for {name}: {e}")))?
-            };
             let id = if t.id.is_empty() { format!("call_{idx}") } else { t.id };
             if !t.started {
                 out.push(Event::ToolInputStart { id: id.clone(), name: name.clone() });
             }
-            out.push(Event::ToolCall { id, name, input });
+            out.push(super::parse_tool_input(id, name, &t.args));
             self.emitted_calls = true;
         }
-        Ok(())
     }
 
     pub fn feed(&mut self, data: &str) -> Result<Vec<Event>, ProviderError> {
         let mut out = vec![];
         if data.trim() == "[DONE]" {
-            self.flush_calls(&mut out)?;
+            self.flush_calls(&mut out);
             out.extend(self.finish_event());
             return Ok(out);
         }
@@ -202,7 +196,7 @@ impl Parser {
             }
         }
         if let Some(r) = choice["finish_reason"].as_str() {
-            self.flush_calls(&mut out)?;
+            self.flush_calls(&mut out);
             if r == "content_filter" {
                 return Err(ProviderError::ContentFilter("response blocked by the provider's content filter".into()));
             }
@@ -349,6 +343,19 @@ mod tests {
         let calls: Vec<_> = ev.iter().filter_map(|e| if let Event::ToolCall { id, name, .. } = e { Some((id.as_str(), name.as_str())) } else { None }).collect();
         assert_eq!(calls, [("call_0", "glob"), ("call_1", "grep")], "ids are synthesized when the server omits them");
         assert!(matches!(ev.last(), Some(Event::Finish { reason: FinishReason::ToolUse, .. })), "{:?}", ev.last());
+    }
+
+    #[test]
+    fn malformed_arguments_become_a_bad_call_without_losing_the_others() {
+        let ev = parse(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","function":{"name":"glob","arguments":"{}"}},{"index":1,"id":"c1","function":{"name":"write","arguments":"{\"content\":\"ab"}}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"length"}]}"#,
+            "[DONE]",
+        ])
+        .expect("malformed arguments are not a stream error");
+        assert!(ev.contains(&Event::ToolCall { id: "c0".into(), name: "glob".into(), input: json!({}) }));
+        assert!(ev.iter().any(|e| matches!(e, Event::BadToolCall { id, name, raw, .. } if id == "c1" && name == "write" && raw == "{\"content\":\"ab")), "{ev:?}");
+        assert!(matches!(ev.last(), Some(Event::Finish { reason: FinishReason::MaxTokens, .. })));
     }
 
     #[test]
