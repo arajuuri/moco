@@ -74,7 +74,7 @@ impl Terminal {
     }
     /// One dim line after a turn: tokens, cost, session cost, context fill.
     fn print_usage(&self) {
-        let r = std::mem::take(&mut *self.run.lock().unwrap());
+        let r = std::mem::take(&mut *moco_core::engine::lock(&self.run));
         if r.steps == 0 {
             return;
         }
@@ -136,7 +136,7 @@ impl Terminal {
             }
             UiEvent::ToolFinished { ok: false, text, .. } => println!("{RED}{pad}  failed: {}{RESET}", text.lines().next().unwrap_or("")),
             UiEvent::StepUsage { usage, cost, .. } => {
-                let mut r = self.run.lock().unwrap();
+                let mut r = moco_core::engine::lock(&self.run);
                 r.usage.input += usage.input;
                 r.usage.output += usage.output;
                 r.usage.cache_read += usage.cache_read;
@@ -145,7 +145,7 @@ impl Terminal {
                 r.priced |= cost.is_some();
                 r.steps += 1;
             }
-            UiEvent::ClassifierUsage { cost, .. } => self.run.lock().unwrap().classifier += cost,
+            UiEvent::ClassifierUsage { cost, .. } => moco_core::engine::lock(&self.run).classifier += cost,
             UiEvent::Retry { attempt, wait, error } => println!("{DIM}{pad}[{agent}] retrying in {}s (attempt {attempt}): {error}{RESET}", wait.as_secs()),
             UiEvent::Notice(n) => eprintln!("{RED}{pad}[{agent}] {n}{RESET}"),
             _ => {}
@@ -211,7 +211,7 @@ impl Ui for Terminal {
             }
             UiEvent::ReasoningDelta(_) | UiEvent::Titled(_) | UiEvent::Delivered => return,
             UiEvent::StepUsage { usage, cost, session_cost, context_tokens, context_limit } => {
-                let mut r = self.run.lock().unwrap();
+                let mut r = moco_core::engine::lock(&self.run);
                 r.usage.input += usage.input;
                 r.usage.output += usage.output;
                 r.usage.cache_read += usage.cache_read;
@@ -225,7 +225,7 @@ impl Ui for Terminal {
                 return;
             }
             UiEvent::ClassifierUsage { cost, session_cost, .. } => {
-                let mut r = self.run.lock().unwrap();
+                let mut r = moco_core::engine::lock(&self.run);
                 r.classifier += cost;
                 r.session_cost = *session_cost;
                 return;
@@ -484,7 +484,7 @@ fn provider_line(p: &ProviderInfo, app_dir: &std::path::Path) -> String {
 /// in the store, so point `MOCO_HOME` at a scratch directory.
 fn eval_classifier_cases(engine: &Engine, file: &str, cwd: &str) {
     let text = std::fs::read_to_string(file).unwrap_or_else(|e| die(&format!("{file}: {e}")));
-    let session = engine.store.lock().unwrap().create_session(cwd, "build").unwrap_or_else(|e| die(&format!("database: {e}")));
+    let session = engine.store().create_session(cwd, "build").unwrap_or_else(|e| die(&format!("database: {e}")));
     let cancel = AtomicBool::new(false);
     for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
         let command = match serde_json::from_str::<serde_json::Value>(line) {
@@ -828,7 +828,7 @@ fn main() {
         let _ = std::io::stdout().flush();
     }));
     // Drop snapshot data that no session active in the last 30 days refers to.
-    let projects = engine.store.lock().unwrap().project_ids().unwrap_or_default();
+    let projects = engine.store().project_ids().unwrap_or_default();
     engine.prune_snapshots(&projects, std::time::Duration::from_secs(30 * 24 * 3600));
 
     install_sigint();
@@ -850,7 +850,7 @@ fn main() {
     };
 
     // Expand @mentions of files, directories, skills and agents, tell the user what was attached, then queue the prompt.
-    let caps_of = |sid: &str| engine.store.lock().unwrap().session(sid).ok().flatten().map(|s| engine.current_media_caps(&s)).unwrap_or_default();
+    let caps_of = |sid: &str| engine.store().session(sid).ok().flatten().map(|s| engine.current_media_caps(&s)).unwrap_or_default();
     let send = |sid: &str, text: &str| -> bool {
         let subagents = engine.subagent_names();
         let caps = caps_of(sid);
@@ -893,7 +893,7 @@ fn main() {
             found_commands.iter().filter(|c| !c.subagent).map(|c| (c.name.clone(), c.description.clone())).collect(),
             manager.clone(),
         );
-        let title = engine.store.lock().unwrap().session(&sid).ok().flatten();
+        let title = engine.store().session(&sid).ok().flatten();
         let model_now = title.as_ref().map(|s| engine.model_ref_for(s)).unwrap_or_default();
         let host = tui::Host { engine: &engine, session_id: sid.clone(), model: model_now, agent: agent_id.clone(), title: title.and_then(|s| s.title), recovered: recovered.contains(&sid), submit: &submit, command: &command, completer: Some(completer), history_path: app_dir.join("data/tui-history"), cwd: cwd_str.clone(), skills: found_skills.iter().map(|k| (k.id.clone(), k.description.clone())).collect(), custom_commands: found_commands.iter().map(|c| (c.name.clone(), c.description.clone())).collect(), manager: manager.clone(), app_dir: app_dir.clone(), tui: cfg.tui.clone() };
         let result = tui::run(host);
@@ -933,7 +933,7 @@ fn main() {
                 eprintln!("{DIM}waiting for {} background job(s)... (Ctrl-C stops them){RESET}", engine.running_jobs());
                 engine.wait_for_jobs(&CANCEL, std::time::Duration::from_secs(6 * 3600));
             }
-            if CANCEL.load(Ordering::Relaxed) || engine.store.lock().unwrap().pending_inbox(&session.id).unwrap_or(0) == 0 {
+            if CANCEL.load(Ordering::Relaxed) || engine.store().pending_inbox(&session.id).unwrap_or(0) == 0 {
                 break;
             }
             ok = matches!(run(&session.id, false), Some(RunOutcome::Idle));
@@ -945,8 +945,8 @@ fn main() {
         std::process::exit(if ok { 0 } else { 1 });
     }
 
-    let title_of = |sid: &str| engine.store.lock().unwrap().session(sid).ok().flatten().and_then(|s| s.title);
-    let current = |sid: &str| engine.store.lock().unwrap().session(sid).ok().flatten().map(|s| engine.model_ref_for(&s)).unwrap_or_default();
+    let title_of = |sid: &str| engine.store().session(sid).ok().flatten().and_then(|s| s.title);
+    let current = |sid: &str| engine.store().session(sid).ok().flatten().map(|s| engine.model_ref_for(&s)).unwrap_or_default();
     println!("{DIM}moco {} | {} | agent {agent_id} | mode {} | {n_sources} config file(s) | /help for commands{RESET}", env!("CARGO_PKG_VERSION"), current(&session.id), engine.permission_mode_of(&session).name());
     if resumed {
         println!("{DIM}session {}: {}{RESET}", short(&session.id), title_of(&session.id).unwrap_or_else(|| "(untitled)".into()));
@@ -962,7 +962,7 @@ fn main() {
         match line {
             "" => {
                 // Enter on an empty line lets the assistant react to background results that arrived while you were idle.
-                if engine.store.lock().unwrap().pending_inbox(&session.id).unwrap_or(0) > 0 {
+                if engine.store().pending_inbox(&session.id).unwrap_or(0) > 0 {
                     run(&session.id, false);
                 }
                 continue;
@@ -1078,7 +1078,7 @@ fn main() {
             l if l == "/sessions" || l.starts_with("/sessions ") => {
                 let which = l.trim_start_matches("/sessions").trim();
                 let (all, archived) = (which == "all", which == "archived");
-                let list = engine.store.lock().unwrap().list_sessions(if all { None } else { Some(&cwd_str) }, archived, 30).unwrap_or_default();
+                let list = engine.store().list_sessions(if all { None } else { Some(&cwd_str) }, archived, 30).unwrap_or_default();
                 print_sessions(&list, all);
                 if !list.is_empty() {
                     println!("{DIM}/resume <number|id> to continue one{}{RESET}", if archived { ", /unarchive <number|id> to restore it" } else { "" });
@@ -1087,7 +1087,7 @@ fn main() {
             }
             l if l.starts_with("/resume") => {
                 let tok = l.trim_start_matches("/resume").trim();
-                let picked = pick_session(&engine.store.lock().unwrap(), tok, &last_list);
+                let picked = pick_session(&engine.store(), tok, &last_list);
                 match picked {
                     _ if tok.is_empty() => println!("usage: /resume <number from /sessions | piece of a session id>"),
                     Err(e) => println!("{e}"),
@@ -1103,7 +1103,7 @@ fn main() {
                 let t = l.trim_start_matches("/rename").trim();
                 if t.is_empty() {
                     println!("usage: /rename <new title>");
-                } else if engine.store.lock().unwrap().set_title(&session.id, t).is_ok() {
+                } else if engine.store().set_title(&session.id, t).is_ok() {
                     println!("{DIM}renamed{RESET}");
                 }
             }
@@ -1124,14 +1124,14 @@ fn main() {
             l if l.starts_with("/archive") || l.starts_with("/unarchive") => {
                 let unarchive = l.starts_with("/unarchive");
                 let tok = l.trim_start_matches("/unarchive").trim_start_matches("/archive").trim();
-                let target = if tok.is_empty() && !unarchive { Ok(session.clone()) } else { pick_session(&engine.store.lock().unwrap(), tok, &last_list) };
+                let target = if tok.is_empty() && !unarchive { Ok(session.clone()) } else { pick_session(&engine.store(), tok, &last_list) };
                 match target {
                     Err(e) => println!("{e}"),
                     Ok(t) => {
-                        engine.store.lock().unwrap().set_archived(&t.id, !unarchive).ok();
+                        engine.store().set_archived(&t.id, !unarchive).ok();
                         println!("{DIM}{} {}{RESET}", if unarchive { "unarchived" } else { "archived" }, short(&t.id));
                         if !unarchive && t.id == session.id {
-                            match engine.store.lock().unwrap().create_session(&cwd_str, &agent_id) {
+                            match engine.store().create_session(&cwd_str, &agent_id) {
                                 Ok(n) => {
                                     session = n;
                                     println!("{DIM}started a new session{RESET}");
@@ -1195,7 +1195,7 @@ fn main() {
                     Err(e) => eprintln!("{RED}store error: {e}{RESET}"),
                 }
             }
-            "/new" => match engine.store.lock().unwrap().create_session(&cwd_str, &agent_id) {
+            "/new" => match engine.store().create_session(&cwd_str, &agent_id) {
                 Ok(s) => {
                     session = s;
                     println!("{DIM}new session{RESET}");
@@ -1209,7 +1209,7 @@ fn main() {
                     println!("{DIM}model: {}{RESET}\nconnected: {}\n/model <filter> searches; /model provider/model switches", current(&session.id), connected.join(", "));
                 } else if let Some((pid, mid)) = arg.split_once('/').filter(|(p, _)| connected.iter().any(|c| c == p)) {
                     let known = engine.catalog().model(pid, mid).is_some();
-                    engine.store.lock().unwrap().set_model(&session.id, Some(arg)).ok();
+                    engine.store().set_model(&session.id, Some(arg)).ok();
                     println!("{DIM}model: {arg}{}{RESET}", if known { "" } else { " (not in the catalog: no price or context limit)" });
                 } else if arg.contains('/') && !arg.contains(' ') && engine.catalog().providers.contains_key(arg.split('/').next().unwrap_or("")) {
                     println!("provider '{}' is not connected; run `moco auth {}`", arg.split('/').next().unwrap_or(""), arg.split('/').next().unwrap_or(""));
@@ -1224,17 +1224,17 @@ fn main() {
             }
             l if l == "/effort" || l.starts_with("/effort ") => {
                 let arg = l.trim_start_matches("/effort").trim();
-                let Some(s) = engine.store.lock().unwrap().session(&session.id).ok().flatten() else { continue };
+                let Some(s) = engine.store().session(&session.id).ok().flatten() else { continue };
                 let info = engine.effort_info(&s);
                 if info.levels.is_empty() {
                     println!("{DIM}{} has no reasoning levels to choose from{RESET}", current(&session.id));
                 } else if arg.is_empty() {
                     println!("{DIM}reasoning effort: {}{}\nlevels: {}\n/effort <level> sets it, /effort default goes back to the provider's default{RESET}", info.desired.as_deref().unwrap_or("default"), if info.desired.is_some() && !info.offered { " (this model does not offer it, so it is not sent)" } else { "" }, info.levels.join(", "));
                 } else if arg == "default" {
-                    engine.store.lock().unwrap().set_variant(&session.id, None).ok();
+                    engine.store().set_variant(&session.id, None).ok();
                     println!("{DIM}reasoning effort: default{RESET}");
                 } else if info.levels.iter().any(|x| x == arg) {
-                    engine.store.lock().unwrap().set_variant(&session.id, Some(arg)).ok();
+                    engine.store().set_variant(&session.id, Some(arg)).ok();
                     println!("{DIM}reasoning effort: {arg}{RESET}");
                 } else {
                     println!("this model offers: {}", info.levels.join(", "));
@@ -1242,12 +1242,12 @@ fn main() {
             }
             l if l == "/mode" || l.starts_with("/mode ") => {
                 let want = l.trim_start_matches("/mode").trim();
-                let fresh = engine.store.lock().unwrap().session(&session.id).ok().flatten().unwrap_or_else(|| session.clone());
+                let fresh = engine.store().session(&session.id).ok().flatten().unwrap_or_else(|| session.clone());
                 let current = engine.permission_mode_of(&fresh);
                 if want.is_empty() {
                     println!("{DIM}permission mode: {} ({}){RESET}", current.name(), current.describe());
                 } else if let Some(m) = permission::PermissionMode::parse(want) {
-                    engine.store.lock().unwrap().set_permission_mode(&session.id, Some(m.name())).ok();
+                    engine.store().set_permission_mode(&session.id, Some(m.name())).ok();
                     println!("{DIM}permission mode: {} ({}){RESET}", m.name(), m.describe());
                 } else {
                     println!("usage: /mode [manual|auto]");
@@ -1258,7 +1258,7 @@ fn main() {
                 match engine.agents().iter().find(|a| a.id == want && a.selectable()) {
                     Some(a) => {
                         agent_id = a.id.clone();
-                        engine.store.lock().unwrap().set_agent(&session.id, &a.id).ok();
+                        engine.store().set_agent(&session.id, &a.id).ok();
                         println!("{DIM}agent: {}{RESET}", a.name);
                     }
                     None => println!("unknown agent; available: {}", engine.agents().iter().filter(|a| a.selectable()).map(|a| a.id.as_str()).collect::<Vec<_>>().join(", ")),
@@ -1284,7 +1284,7 @@ fn main() {
                 let prompt = commands::expand(cmd, args);
                 if cmd.subagent {
                     // Runs in a child session; the result is shown here and recorded in this conversation.
-                    let parent = engine.store.lock().unwrap().session(&session.id).ok().flatten();
+                    let parent = engine.store().session(&session.id).ok().flatten();
                     let Some(parent) = parent else { continue };
                     let subagents = engine.subagent_names();
                     let caps = caps_of(&session.id);
@@ -1298,20 +1298,20 @@ fn main() {
                     match engine.run_subagent(&parent, req, &term, &CANCEL) {
                         Ok(r) => {
                             println!("{}", r.output);
-                            let st = engine.store.lock().unwrap();
+                            let st = engine.store();
                             st.add_message(&session.id, "synthetic", &serde_json::json!({"text": format!("Result of /{} {}:\n\n{}", cmd.name, args.trim(), r.output)})).ok();
                         }
                         Err(e) => eprintln!("{RED}/{} failed: {}{RESET}", cmd.name, e.message()),
                     }
                     // Subagent events carry the child's totals; show this conversation's (children roll up into it).
-                    if let Ok((total, _)) = engine.store.lock().unwrap().usage_totals(&session.id) {
-                        term.run.lock().unwrap().session_cost = total;
+                    if let Ok((total, _)) = engine.store().usage_totals(&session.id) {
+                        moco_core::engine::lock(&term.run).session_cost = total;
                     }
                     term.print_usage();
                 } else {
                     // `agent` and `model` in the command apply to this one prompt only.
                     let (saved_agent, saved_model) = {
-                        let st = engine.store.lock().unwrap();
+                        let st = engine.store();
                         let cur = st.session(&session.id).ok().flatten();
                         if let Some(a) = &cmd.agent {
                             if engine.agents().iter().any(|x| x.id == *a) {
@@ -1328,7 +1328,7 @@ fn main() {
                     if send(&session.id, &prompt) {
                         run(&session.id, false);
                     }
-                    let st = engine.store.lock().unwrap();
+                    let st = engine.store();
                     if let Some(a) = saved_agent {
                         st.set_agent(&session.id, &a).ok();
                     }

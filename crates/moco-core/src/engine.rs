@@ -197,6 +197,34 @@ impl EngineConfig {
     }
 }
 
+/// Lock a mutex, ignoring poisoning: the data stays usable after a panic on another thread.
+pub fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Releases the session claim when dropped, so a panic in a run cannot leave the session claimed.
+struct ClaimGuard<'a> {
+    engine: &'a Engine,
+    sid: &'a str,
+    armed: bool,
+}
+
+impl ClaimGuard<'_> {
+    /// Release now and report the store error, if any.
+    fn release(mut self) -> Result<(), StoreError> {
+        self.armed = false;
+        self.engine.store().release(self.sid)
+    }
+}
+
+impl Drop for ClaimGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.engine.store().release(self.sid);
+        }
+    }
+}
+
 pub struct Engine {
     pub store: Mutex<Store>,
     providers: HashMap<String, Box<dyn Provider>>,
@@ -408,8 +436,9 @@ impl Engine {
         self.cfg.agents_by_mode.get(&mode).map(Vec::as_slice).unwrap_or(&self.cfg.agents)
     }
 
-    fn store(&self) -> std::sync::MutexGuard<'_, Store> {
-        self.store.lock().unwrap_or_else(|e| e.into_inner())
+    /// The session store. Poison-tolerant: a panic on another thread must not take the UI down with it.
+    pub fn store(&self) -> std::sync::MutexGuard<'_, Store> {
+        lock(&self.store)
     }
 
     pub fn spill_dir(&self) -> PathBuf {
@@ -519,6 +548,7 @@ impl Engine {
             crate::log_info!("engine", "run session={session_id} not started: another run holds the claim");
             return Ok(RunOutcome::Busy);
         }
+        let claim = ClaimGuard { engine: self, sid: session_id, armed: true };
         crate::log_info!("engine", "run start session={session_id} resume={resume}");
         let run_started = std::time::Instant::now();
         // Sending a new prompt after /undo makes the undo permanent.
@@ -527,7 +557,7 @@ impl Engine {
             Ok(n) => crate::log_info!("engine", "session={session_id} undo made permanent: {n} message(s) deleted"),
             Err(e) => {
                 crate::log_error!("engine", "session={session_id} could not commit the pending undo: {e}");
-                self.store().release(session_id)?;
+                claim.release()?;
                 return Err(e);
             }
         }
@@ -540,7 +570,12 @@ impl Engine {
             }
             self.drain(session_id, ui, cancel, resume)
         });
-        self.store().release(session_id)?;
+        claim.release()?;
+        // A session deleted from another process mid-run is a failed run, not a crash.
+        let outcome = match outcome {
+            Err(StoreError::SessionGone) => Ok(RunOutcome::Failed("session no longer exists".into())),
+            o => o,
+        };
         let ms = run_started.elapsed().as_millis();
         match &outcome {
             Ok(RunOutcome::Failed(why)) => crate::log_warn!("engine", "run end session={session_id} outcome=failed ms={ms}: {why}"),
@@ -811,6 +846,37 @@ mod tests {
 
     fn last_user_blocks(req: &Request) -> Vec<Block> {
         req.messages.last().unwrap().content.clone()
+    }
+
+    #[test]
+    fn a_panic_in_a_run_still_releases_the_claim() {
+        let f = fixture(vec![text("boom")]);
+        f.say("hi");
+        let ui = TestUi::default();
+        *ui.hook.lock().unwrap() = Some(Box::new(|l| {
+            if l == "text:boom" {
+                panic!("simulated engine panic");
+            }
+        }));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f.engine.run(&f.session.id, &ui, &AtomicBool::new(false), false)));
+        assert!(r.is_err(), "the panic propagates to the caller");
+        assert!(f.engine.store().claim(&f.session.id).unwrap(), "claim released by the guard");
+    }
+
+    #[test]
+    fn a_session_deleted_mid_run_fails_the_run() {
+        let f = fixture(vec![tool_call("t1", "read", json!({"file_path":"a.txt"})), text("never reached")]);
+        f.file("a.txt", "hi");
+        f.say("go");
+        let ui = TestUi::default();
+        let (engine, sid) = (f.engine.clone(), f.session.id.clone());
+        *ui.hook.lock().unwrap() = Some(Box::new(move |l| {
+            if l.starts_with("start:") {
+                engine.store().delete_session_for_test(&sid);
+            }
+        }));
+        let r = f.engine.run(&f.session.id, &ui, &AtomicBool::new(false), false).unwrap();
+        assert_eq!(r, RunOutcome::Failed("session no longer exists".into()));
     }
 
     #[test]

@@ -11,6 +11,9 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    /// The session was deleted (for example by `moco sessions` in another process) while it was in use.
+    #[error("session no longer exists")]
+    SessionGone,
 }
 pub type Result<T> = std::result::Result<T, StoreError>;
 
@@ -276,6 +279,12 @@ impl Store {
                 Ok(Session { id: r.get(0)?, project_id: r.get(1)?, directory: r.get(2)?, agent: r.get(3)?, title: r.get(4)?, model: r.get(5)?, parent_id: r.get(6)?, variant: r.get(7)?, permission_mode: r.get(8)? })
             })
             .optional()?)
+    }
+
+    /// Removes a session the way another process could; for tests of mid-run deletion.
+    #[cfg(test)]
+    pub(crate) fn delete_session_for_test(&self, session_id: &str) {
+        self.conn.execute("delete from session where id=?1", [session_id]).unwrap();
     }
 
     pub fn set_agent(&self, session_id: &str, agent: &str) -> Result<()> {

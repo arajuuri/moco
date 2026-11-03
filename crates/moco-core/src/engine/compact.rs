@@ -20,7 +20,7 @@ impl Engine {
     pub(super) fn compact_inner(&self, sid: &str, trigger: &str, ui: &dyn Ui, cancel: &AtomicBool) -> Result<CompactResult, StoreError> {
         let (session, history) = {
             let st = self.store();
-            (st.session(sid)?.expect("session exists"), st.messages(sid)?)
+            (st.session(sid)?.ok_or(StoreError::SessionGone)?, st.messages(sid)?)
         };
         let agent = agent::find(self.agents_of(&session), &session.agent).or_else(|| self.agents_of(&session).first().cloned()).expect("an agent");
         let (provider, provider_id, model_id) = match self.resolve_model(&session, &agent) {

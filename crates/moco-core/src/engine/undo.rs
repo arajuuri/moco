@@ -71,7 +71,7 @@ impl Engine {
     fn undo_inner(&self, sid: &str) -> Result<UndoResult, StoreError> {
         let (session, msgs, revert) = {
             let st = self.store();
-            (st.session(sid)?.expect("session exists"), st.messages(sid)?, st.revert(sid)?)
+            (st.session(sid)?.ok_or(StoreError::SessionGone)?, st.messages(sid)?, st.revert(sid)?)
         };
         let marker = revert.as_ref().and_then(|r| r["messageId"].as_str()).map(String::from);
         let Some(turn) = msgs.iter().rfind(|m| m.kind == "user" && marker.as_deref().is_none_or(|mk| m.id.as_str() < mk)) else {
@@ -104,7 +104,7 @@ impl Engine {
         let r = (|| {
             let (session, revert) = {
                 let st = self.store();
-                (st.session(sid)?.expect("session exists"), st.revert(sid)?)
+                (st.session(sid)?.ok_or(StoreError::SessionGone)?, st.revert(sid)?)
             };
             let Some(revert) = revert else { return Ok(UndoResult::NothingToUndo) };
             let mut report = UndoReport::default();
@@ -142,7 +142,7 @@ impl Engine {
     pub fn session_diff(&self, sid: &str) -> Result<DiffResult, StoreError> {
         let (session, msgs, last) = {
             let st = self.store();
-            (st.session(sid)?.expect("session exists"), st.messages(sid)?, st.last_snapshot(sid)?)
+            (st.session(sid)?.ok_or(StoreError::SessionGone)?, st.messages(sid)?, st.last_snapshot(sid)?)
         };
         let Some(first) = msgs.iter().filter(|m| m.kind == "assistant").find_map(|m| m.data["snapshot"].as_str().map(String::from)) else {
             return Ok(DiffResult::NoSnapshots);
