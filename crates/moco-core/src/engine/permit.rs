@@ -46,7 +46,7 @@ impl EnginePermitter<'_> {
             return false;
         }
         let parsed = tools::shellparse::parse(command);
-        if classifier::never_classify(&parsed) {
+        if classifier::skip_classifier(command, &parsed) {
             crate::log_debug!("classifier", "session={} skipped (opaque or never-classify list): {}", c.session.id, classifier::sanitize(command, 200));
             return false;
         }
