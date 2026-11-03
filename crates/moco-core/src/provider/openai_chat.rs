@@ -28,7 +28,7 @@ impl OpenAiChat {
 
 pub fn build_body(req: &Request, max_completion_tokens: bool) -> Value {
     let mut messages = vec![json!({"role":"system","content":req.system})];
-    for m in &req.messages {
+    for m in req.messages_with_tail().iter() {
         match m.role {
             Role::User => {
                 // Tool results must directly follow the assistant tool_calls message.

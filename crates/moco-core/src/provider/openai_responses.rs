@@ -34,7 +34,7 @@ impl OpenAiResponses {
 
 pub fn build_body(req: &Request) -> Value {
     let mut input: Vec<Value> = vec![];
-    for m in &req.messages {
+    for m in req.messages_with_tail().iter() {
         match m.role {
             Role::User => {
                 // Tool results are their own items and must follow the calls; the user's content comes after.

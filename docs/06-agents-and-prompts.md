@@ -84,6 +84,7 @@ ${OPENCODE_TOOL_GUIDANCE}
 - shell present: "Prefer dedicated tools over shell commands; fall back to the shell when a tool cannot do what you need." and "Do not chain shell commands with separators like `echo "===="`; or `printf '---'`; the output becomes noisy in a way that makes the user's side of the conversation worse."
 - write present: "Use the write tool to create files or completely replace their content. Prefer using the edit tool for targeted changes."
 - edit present: "Use the edit tool for targeted changes to existing text files. It replaces the exact text in `oldString` with `newString`, and the values must differ. By default, `oldString` must occur exactly once. If it occurs multiple times, include more surrounding context to make it unique or set `replaceAll` to true to replace every occurrence."
+- moco adds (not upstream), when `todowrite` is present: "Use the todowrite tool to plan and track work that takes several steps: create the list at the start, keep at most one item `in_progress` while you work on it, and mark items `completed` as soon as they are done instead of in a batch at the end. Skip it for a single simple step."
 
 ## Model-specific additions (`plugin/optimize.ts`)
 

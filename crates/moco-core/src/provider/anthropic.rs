@@ -31,7 +31,7 @@ fn mark(block: &mut Value) {
     block["cache_control"] = json!({"type": EPHEMERAL});
 }
 
-/// Request body. With `cache` on, up to four cache breakpoints are set: the last tool (covers all tool
+/// Request body. With `cache` on, up to four cache breakpoints are set (`Request::tail` goes after them): the last tool (covers all tool
 /// definitions), the system prompt, the last block of the final message, and the last block of the message that
 /// ended the previous request of an agent loop (so the previous step's cache entry is hit exactly, even if a
 /// step added more content blocks than the cache lookback covers).
@@ -81,6 +81,14 @@ pub fn build_body(req: &Request, cache: bool) -> Value {
             if let Some(last) = messages[idx]["content"].as_array_mut().and_then(|c| c.last_mut()) {
                 mark(last);
             }
+        }
+    }
+    // After the breakpoints, so a tail that changes from step to step never touches what the cache has seen.
+    if let Some(tail) = &req.tail {
+        let block = json!({"type":"text","text":tail});
+        match messages.last_mut().filter(|m| m["role"] == "user").and_then(|m| m["content"].as_array_mut()) {
+            Some(content) => content.push(block),
+            None => messages.push(json!({"role":"user","content":[block]})),
         }
     }
     let mut body = json!({"model":req.model,"max_tokens":req.max_tokens,"stream":true,"messages":messages});
@@ -526,6 +534,29 @@ mod tests {
         assert_eq!(strip(json!(ma)), strip(json!(&mb[..ma.len()])), "the new request extends the old one");
         // The old request's final message is marked in the new request too: the previous cache entry is hit exactly.
         assert!(marked(&mb[ma.len() - 1]["content"][0]));
+    }
+
+    #[test]
+    fn the_tail_goes_after_the_breakpoints_and_never_disturbs_the_cached_prefix() {
+        let plain = build_body(&agent_loop_request(2), true);
+        let mut req = agent_loop_request(2);
+        req.tail = Some("<system-reminder>todo</system-reminder>".into());
+        let with = build_body(&req, true);
+        let (mp, mw) = (plain["messages"].as_array().unwrap(), with["messages"].as_array().unwrap());
+        assert_eq!(mp.len(), mw.len(), "added to the final user message, not as a new one");
+        let last = mw.last().unwrap()["content"].as_array().unwrap();
+        assert_eq!(last.last().unwrap(), &json!({"type":"text","text":"<system-reminder>todo</system-reminder>"}));
+        assert!(!marked(last.last().unwrap()) && marked(&last[last.len() - 2]), "the breakpoint stays on the last block of the history");
+        // Everything but the tail block is what it would be without it, so a changing tail never misses the cache.
+        let mut stripped = with.clone();
+        stripped["messages"].as_array_mut().unwrap().last_mut().unwrap()["content"].as_array_mut().unwrap().pop();
+        assert_eq!(stripped, plain);
+        assert_eq!(with.to_string().matches("cache_control").count(), 4);
+        // A history that ends with the assistant gets a user message of its own.
+        req.messages.push(ChatMessage { role: Role::Assistant, content: vec![Block::Text("hm".into())] });
+        let b = build_body(&req, true);
+        let m = b["messages"].as_array().unwrap();
+        assert_eq!((m.last().unwrap()["role"].clone(), m.len()), (json!("user"), mp.len() + 2));
     }
 
     #[test]

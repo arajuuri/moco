@@ -11,7 +11,7 @@ impl Tool for TodoWrite {
     fn description(&self) -> String {
         "Create and update a todo list for the current session. The user sees it as your working plan. Use it proactively when a task has 3 or more \
 distinct steps. Send the full list on every call; it replaces the previous one. Mark items `in_progress` when you start them and `completed` as soon \
-as they're actually done. Only call it when the list changes."
+as they're actually done. Update it as soon as a step starts or finishes."
             .into()
     }
     fn schema(&self) -> Value {
