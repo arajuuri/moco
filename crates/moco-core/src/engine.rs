@@ -3003,7 +3003,15 @@ mod tests {
         assert!(std::fs::read_dir(&dir).unwrap().count() >= 3);
         // A session active within the window protects its snapshots, however old the files are.
         assert_eq!(f.engine.prune_snapshots(std::slice::from_ref(&pid), Duration::from_secs(3600)), (0, 0));
-        // With a zero window every session counts as stale: old snapshots go (the files on disk never do).
+        // With a zero window every session counts as stale: old snapshots go (the files on disk never do). Blobs
+        // written within the grace period are kept for a capture in progress, so age them past it first.
+        let blobs_dir = f.dir.join("app/data/snapshots").join(&pid).join("blobs");
+        let past = std::time::SystemTime::now() - Duration::from_secs(2 * 3600);
+        for shard in std::fs::read_dir(&blobs_dir).unwrap().filter_map(|e| e.ok()) {
+            for b in std::fs::read_dir(shard.path()).unwrap().filter_map(|e| e.ok()) {
+                std::fs::File::options().write(true).open(b.path()).unwrap().set_modified(past).unwrap();
+            }
+        }
         let (manifests, blobs) = f.engine.prune_snapshots(std::slice::from_ref(&pid), Duration::ZERO);
         assert!(manifests >= 3 && blobs >= 3, "{manifests} {blobs}");
         assert_eq!(read_work(&f, "a.txt").as_deref(), Some("v2"));
