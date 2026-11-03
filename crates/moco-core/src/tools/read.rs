@@ -341,7 +341,13 @@ mod tests {
         // The prompt names the directory with symlinks resolved (on macOS the temp dir is under the /var -> /private/var link).
         assert_eq!(asked[0].resources, [format!("{}/*", crate::tools::real_path(&env.dir).display())]);
         assert_eq!(asked[1].action, "read");
-        assert_eq!(asked[1].resources, [outside.to_string_lossy()]);
+        // The read rule is checked against the path as given and, when a link leads there (macOS /var), its target.
+        let mut expected = vec![outside.to_string_lossy().into_owned()];
+        let real = crate::tools::real_path(&outside);
+        if real != outside {
+            expected.push(real.display().to_string());
+        }
+        assert_eq!(asked[1].resources, expected);
     }
 
     #[test]
