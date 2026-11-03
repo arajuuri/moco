@@ -198,7 +198,7 @@ impl Engine {
 
         let mut retries = 0u32;
         let result = loop {
-            let r = self.attempt(provider, &session, &req, &permitter, ui, cancel, &msg_id, caps, &step_tools);
+            let r = self.attempt(provider, &session, &req, &permitter, ui, cancel, &msg_id, caps, &step_tools, agent.checks);
             match &r.stream {
                 Err(e) if !r.dispatched && !cancel.load(Ordering::Relaxed) => {
                     // Safe to retry: no tool has run, and the partial output is discarded.
@@ -286,7 +286,7 @@ impl Engine {
 
     /// One streaming request. Tools start executing as soon as their call is complete.
     #[allow(clippy::too_many_arguments)]
-    fn attempt(&self, provider: &dyn Provider, session: &Session, req: &Request, permitter: &EnginePermitter, ui: &dyn Ui, cancel: &AtomicBool, msg_id: &str, caps: MediaCaps, step_tools: &[Arc<dyn Tool>]) -> AttemptResult {
+    fn attempt(&self, provider: &dyn Provider, session: &Session, req: &Request, permitter: &EnginePermitter, ui: &dyn Ui, cancel: &AtomicBool, msg_id: &str, caps: MediaCaps, step_tools: &[Arc<dyn Tool>], checks_on: bool) -> AttemptResult {
         let cwd = PathBuf::from(&session.directory);
         let root = project_root_of(&cwd);
         let spill = self.spill_dir();
@@ -361,6 +361,7 @@ impl Engine {
                 let state = self.finish_tool(&name, Err(ToolError::fail(msg)), &spill, ui);
                 parts[idx]["state"] = state;
             }
+            let mut finished = vec![];
             for (idx, h) in handles {
                 let outcome = h.join().unwrap_or_else(|_| Err(ToolError::fail("tool panicked")));
                 declined |= outcome == Err(ToolError::Declined);
@@ -374,12 +375,61 @@ impl Engine {
                         }
                     }
                 }
+                finished.push((idx, name, outcome));
+            }
+            // Once per step, after the whole batch: the checks see every file the step changed.
+            if checks_on {
+                self.run_checks(&session.id, &cwd, cancel, &mut finished);
+            }
+            for (idx, name, outcome) in finished {
                 let state = self.finish_tool(&name, outcome, &spill, ui);
                 parts[idx]["state"] = state;
             }
             res
         });
         AttemptResult { parts, stream, finish, dispatched, declined }
+    }
+
+    /// Run the configured checks on the files this step's edit, write and patch calls changed, and add what they
+    /// report to the output of the last tool that changed a file the check covers. Never fails a tool.
+    fn run_checks(&self, sid: &str, cwd: &std::path::Path, cancel: &AtomicBool, finished: &mut [(usize, String, Result<ToolOutput, ToolError>)]) {
+        if self.cfg.checks.is_empty() || cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        // Each changed file, with the position (in `finished`) of the last call that changed it.
+        let mut changed: Vec<(PathBuf, usize)> = vec![];
+        for (pos, (_, name, outcome)) in finished.iter().enumerate() {
+            let Ok(out) = outcome else { continue };
+            for p in changed_files(name, out, cwd) {
+                match changed.iter_mut().find(|(f, _)| *f == p) {
+                    Some(e) => e.1 = pos,
+                    None => changed.push((p, pos)),
+                }
+            }
+        }
+        if changed.is_empty() {
+            return;
+        }
+        let files: Vec<PathBuf> = changed.iter().map(|(p, _)| p.clone()).collect();
+        for run in self.cfg.checks.run(&files, cwd, cancel) {
+            let key = format!("{sid}\0{}", run.name);
+            let was_failing = {
+                let mut failing = lock(&self.check_failing);
+                let was = failing.contains(&key);
+                match run.verdict {
+                    crate::check::Verdict::Errors(_) => failing.insert(key),
+                    crate::check::Verdict::Passed => failing.remove(&key),
+                    _ => false,
+                };
+                was
+            };
+            crate::log_debug!("check", "{} files={} verdict={}", run.name, run.files.len(), match &run.verdict { crate::check::Verdict::Passed => "passed", crate::check::Verdict::Errors(_) => "errors", crate::check::Verdict::Note(_) => "note", crate::check::Verdict::Cancelled => "cancelled" });
+            let Some(text) = crate::check::note(&run, was_failing) else { continue };
+            let pos = changed.iter().filter(|(p, _)| run.files.contains(p)).map(|(_, pos)| *pos).max();
+            if let Some(Ok(out)) = pos.and_then(|i| finished.get_mut(i)).map(|f| &mut f.2) {
+                out.text.push_str(&format!("\n\n{text}"));
+            }
+        }
     }
 
     fn finish_tool(&self, name: &str, outcome: Result<ToolOutput, ToolError>, spill: &std::path::Path, ui: &dyn Ui) -> Value {
@@ -422,6 +472,16 @@ impl Engine {
                 json!({"status":"error","error":msg})
             }
         }
+    }
+}
+
+/// The files an edit, write or patch call changed (not deleted), as absolute paths.
+fn changed_files(tool: &str, out: &ToolOutput, cwd: &std::path::Path) -> Vec<PathBuf> {
+    let abs = |p: &str| if std::path::Path::new(p).is_absolute() { PathBuf::from(p) } else { cwd.join(p) };
+    match tool {
+        "edit" | "write" => out.metadata["path"].as_str().map(abs).into_iter().collect(),
+        "patch" => out.metadata["files"].as_array().into_iter().flatten().filter_map(|v| v.as_str()).filter_map(|l| l.split_once(' ')).filter(|(op, _)| *op != "D").map(|(_, p)| abs(p)).collect(),
+        _ => vec![],
     }
 }
 

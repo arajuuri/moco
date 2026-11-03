@@ -398,6 +398,26 @@ fn formatters_from(cfg: &config::Config, origins: &std::collections::BTreeMap<St
     (formatters, warnings.into_inner())
 }
 
+/// The checks to run after a step's edits: only what the config names, and project-defined ones only if approved.
+fn checks_from(cfg: &config::Config, origins: &std::collections::BTreeMap<String, std::path::PathBuf>, app_dir: &std::path::Path, cwd: &std::path::Path) -> (moco_core::check::Checks, Vec<String>) {
+    let Some(config::CheckSetting::Checks(map)) = &cfg.checks else { return (Default::default(), vec![]) };
+    let warnings = std::cell::RefCell::new(vec![]);
+    let checks = moco_core::check::Checks::from_config(map, &|name| {
+        let cc = &map[name];
+        let origin = origins.get(name);
+        if origin.is_none_or(|o| trust::origin_is_trusted(o, app_dir)) {
+            return true;
+        }
+        let what = format!("{}   (for {})", cc.command.join(" "), cc.extensions.join(" "));
+        let ok = project_command_allowed(app_dir, origin, "check", name, &what, &trust::fingerprint_check(cwd, name, cc));
+        if !ok {
+            warnings.borrow_mut().push(format!("check '{name}' from {} is off: project-defined commands need your approval (run moco in a terminal, or set MOCO_TRUST_PROJECT_CONFIG=1)", origin.map(|o| tilde(&o.display().to_string())).unwrap_or_default()));
+        }
+        ok
+    });
+    (checks, warnings.into_inner())
+}
+
 fn print_files(r: &UndoReport) {
     let mut lines: Vec<String> = r.restored.iter().map(|p| format!("  restored {p}")).chain(r.deleted.iter().map(|p| format!("  removed {p}"))).collect();
     let extra = lines.len().saturating_sub(15);
@@ -817,6 +837,11 @@ fn main() {
         eprintln!("warning: {w}");
     }
     engine_cfg.formatters = formatters;
+    let (checks, check_warnings) = checks_from(&cfg, &loaded.check_origins, &app_dir, &cwd);
+    for w in &check_warnings {
+        eprintln!("warning: {w}");
+    }
+    engine_cfg.checks = checks;
     engine_cfg.websearch = moco_core::tools::websearch::Settings::from_config(&cfg.websearch, app_dir.clone());
     let n_sources = loaded.sources.len();
     let engine = Engine::with_providers(store, providers, engine_cfg).share();
