@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Drives `moco --tui` in a pseudo terminal: prompt, permission dialog, streamed answer, resize, quit.
 
-Usage: tui_pty.py MOCO CONFIG HOME WORKDIR SCENARIO    (SCENARIO: chat | sigterm)
+Usage: tui_pty.py MOCO CONFIG HOME WORKDIR SCENARIO    (SCENARIO: chat | sigterm | steer | config | mode | panic)
 Exits 0 when everything held; otherwise prints what went wrong and the screen text so far."""
 import fcntl, os, pty, re, select, signal, struct, sys, termios, time
 
 moco, config, home, work, scenario = sys.argv[1:6]
 env = dict(os.environ, MOCO_CONFIG=config, MOCO_HOME=home, TERM="xterm-256color")
+if scenario == "panic":
+    env["MOCO_TEST_PANIC_ON_TEXT"] = "Reading the file."  # the first thing the fake model says
 env.pop("ANTHROPIC_API_KEY", None)
 env.pop("COLORTERM", None)  # no truecolor: #rrggbb theme colors must fall back to the 256-color palette
 
@@ -238,6 +240,25 @@ elif scenario == "mode":
     wait_for(r"permissionmode:auto")
     send(b"\t")
     wait_for(r"permissionmode:manual")
+    send(b"\x04")
+    check_restored(wait_exit())
+elif scenario == "panic":
+    # A panic on the engine worker thread: the run ends with an error, the screen comes back, the session claim is
+    # released (a second prompt runs, and crashes the same way), and moco still exits cleanly.
+    send(b"Read a.txt and tell me what it says.\r")
+    wait_for(r"theenginecrashed:injectedtestpanic")
+    if "storeerror:theenginecrashed" in squashed():
+        fail("the crash is labelled as a store error")
+    pump(0.5)
+    t = raw.decode("utf-8", "replace")
+    if t.rfind("\x1b[?1049h") < t.rfind("\x1b[?1049l"):
+        fail("the alternate screen was not entered again after the panic")
+    send(b"Read a.txt and tell me what it says.\r")
+    end = time.time() + 15
+    while squashed().count("theenginecrashed") < 2:
+        if time.time() > end:
+            fail("the second prompt did not run (claim still held?)")
+        pump(0.1)
     send(b"\x04")
     check_restored(wait_exit())
 elif scenario == "sigterm":

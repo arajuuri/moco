@@ -475,7 +475,7 @@ impl App {
                         self.push_info("stopped: tool call rejected")
                     }
                     Ok(Busy) => self.rows.push(Row::Error("session is busy".into())),
-                    Err(e) => self.rows.push(Row::Error(format!("store error: {e}"))),
+                    Err(e) => self.rows.push(Row::Error(e)), // already says what failed ("store error: ...", "the engine crashed: ...")
                 }
                 self.finish_usage();
             }

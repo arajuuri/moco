@@ -3,7 +3,7 @@ use crossterm::{
     cursor::Show,
     event::{DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle},
+    terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, SetTitle},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io::{self, Stdout};
@@ -41,8 +41,14 @@ pub fn reenter_after_panic(terminal: &mut Terminal<CrosstermBackend<Stdout>>) ->
     if !PANICKED_OFF_MAIN.swap(false, Ordering::SeqCst) {
         return Ok(false);
     }
-    setup(&mut io::stdout())?;
-    terminal.clear()?;
+    let mut out = io::stdout();
+    setup(&mut out)?;
+    // Not `terminal.clear()`: it reads the cursor position from the terminal, which races the input thread for
+    // stdin and fails (or stalls) on terminals that do not answer. Clear the screen ourselves and reset both
+    // buffers so the next draw repaints everything.
+    execute!(out, Clear(ClearType::All))?;
+    terminal.swap_buffers();
+    terminal.swap_buffers();
     Ok(true)
 }
 
