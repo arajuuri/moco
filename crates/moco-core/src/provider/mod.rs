@@ -101,7 +101,33 @@ pub enum Event {
     Native { provider: String, data: Value },
     /// A complete tool call; the loop starts executing it immediately.
     ToolCall { id: String, name: String, input: Value },
+    /// A tool call whose input was not valid JSON (typically cut off at the output token limit). The engine records
+    /// a tool error for it so the model can retry, instead of the whole stream failing. `raw` is the text received.
+    BadToolCall { id: String, name: String, raw: String, error: String },
     Finish { reason: FinishReason, usage: Usage },
+}
+
+/// Keep at most this much of a malformed tool input; it is stored in the session and replayed to the model.
+const BAD_INPUT_KEEP: usize = 2000;
+
+/// The placeholder input stored for a malformed call: `{"_raw": <start of the text received>}`.
+pub fn bad_call_input(raw: &str) -> Value {
+    let mut end = raw.len().min(BAD_INPUT_KEEP);
+    while !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    serde_json::json!({"_raw": &raw[..end]})
+}
+
+/// Parse streamed tool arguments: empty means no arguments, and invalid JSON becomes an `Event::BadToolCall`.
+pub fn parse_tool_input(id: String, name: String, raw: &str) -> Event {
+    if raw.trim().is_empty() {
+        return Event::ToolCall { id, name, input: Value::Object(Default::default()) };
+    }
+    match serde_json::from_str::<Value>(raw) {
+        Ok(input) => Event::ToolCall { id, name, input },
+        Err(e) => Event::BadToolCall { id, name, raw: raw.to_string(), error: e.to_string() },
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

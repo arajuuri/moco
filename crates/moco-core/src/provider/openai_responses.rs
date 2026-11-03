@@ -159,14 +159,13 @@ impl Parser {
                     Some("function_call") => {
                         let (id, name) = (item["call_id"].as_str().unwrap_or("").to_string(), item["name"].as_str().unwrap_or("").to_string());
                         let args = item["arguments"].as_str().unwrap_or("");
-                        let input = if args.trim().is_empty() {
-                            json!({})
-                        } else {
-                            serde_json::from_str(args).map_err(|e| ProviderError::InvalidRequest(format!("model produced invalid tool input JSON for {name}: {e}")))?
-                        };
                         self.calls = true;
-                        out.push(Event::Native { provider: PROVIDER.into(), data: item.clone() });
-                        out.push(Event::ToolCall { id, name, input });
+                        let call = super::parse_tool_input(id, name, args);
+                        // The item's malformed arguments must not be replayed to the service.
+                        if matches!(call, Event::ToolCall { .. }) {
+                            out.push(Event::Native { provider: PROVIDER.into(), data: item.clone() });
+                        }
+                        out.push(call);
                     }
                     Some("reasoning") => out.push(Event::Native { provider: PROVIDER.into(), data: item.clone() }),
                     _ => {}
@@ -305,8 +304,8 @@ mod tests {
         assert!(matches!(end(r#"{"type":"response.failed","response":{"error":{"code":"server_error","message":"oops"}}}"#), Err(ProviderError::Internal { .. })));
         assert!(matches!(end(r#"{"type":"error","code":"invalid_api_key","message":"bad key"}"#), Err(ProviderError::Auth(_))));
         assert!(matches!(end(r#"{"type":"error","code":"insufficient_quota","message":"out of credit"}"#), Err(ProviderError::InvalidRequest(_))), "not retried");
-        let bad = end(r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"c","name":"read","arguments":"{\"a\":"}}"#).unwrap_err();
-        assert!(matches!(bad, ProviderError::InvalidRequest(_)));
+        let bad = end(r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"c","name":"read","arguments":"{\"a\":"}}"#).unwrap();
+        assert!(matches!(bad.as_slice(), [Event::BadToolCall { id, name, raw, .. }] if id == "c" && name == "read" && raw == "{\"a\":"), "{bad:?}");
         assert_eq!(end(r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"c","name":"glob","arguments":""}}"#).unwrap()[1], Event::ToolCall { id: "c".into(), name: "glob".into(), input: json!({}) });
     }
 

@@ -815,6 +815,7 @@ fn main() {
     engine_cfg.websearch = moco_core::tools::websearch::Settings::from_config(&cfg.websearch, app_dir.clone());
     let n_sources = loaded.sources.len();
     let engine = Engine::with_providers(store, providers, engine_cfg).share();
+    engine.set_job_limits(cfg.jobs);
     if let Some(cases) = eval_classifier {
         return eval_classifier_cases(&engine, &cases, &cwd_str);
     }

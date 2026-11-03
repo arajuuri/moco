@@ -219,10 +219,7 @@ impl Parser {
                         out.push(Event::Native { provider: PROVIDER.into(), data: json!({"type": "redacted_thinking", "data": data, "model": self.model}) });
                     }
                     Some(BlockState::Tool { id, name, json }) => {
-                        let input = if json.trim().is_empty() { Value::Object(Default::default()) } else {
-                            serde_json::from_str(&json).map_err(|e| ProviderError::InvalidRequest(format!("model produced invalid tool input JSON for {name}: {e}")))?
-                        };
-                        out.push(Event::ToolCall { id, name, input });
+                        out.push(super::parse_tool_input(id, name, &json));
                     }
                     _ => {}
                 }
@@ -378,6 +375,24 @@ mod tests {
     }
 
     #[test]
+    fn truncated_tool_input_is_a_bad_call_and_earlier_calls_survive() {
+        let ev = parse(&[
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"a","name":"read"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"x\"}"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"b","name":"write"}}"#,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"y\",\"content\":\"abc"}}"#,
+            r#"{"type":"content_block_stop","index":1}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":9}}"#,
+            r#"{"type":"message_stop"}"#,
+        ])
+        .expect("a cut-off tool input is not a stream error");
+        assert!(ev.contains(&Event::ToolCall { id: "a".into(), name: "read".into(), input: json!({"path":"x"}) }));
+        assert!(ev.iter().any(|e| matches!(e, Event::BadToolCall { id, name, raw, .. } if id == "b" && name == "write" && raw.ends_with("\"abc"))), "{ev:?}");
+        assert!(matches!(ev.last(), Some(Event::Finish { reason: FinishReason::MaxTokens, .. })));
+    }
+
+    #[test]
     fn redacted_thinking_and_unsigned_thinking() {
         let ev = parse(&[
             r#"{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"ENC"}}"#,
@@ -449,14 +464,14 @@ mod tests {
     }
 
     #[test]
-    fn invalid_tool_json_is_a_non_retryable_error() {
-        let e = parse(&[
+    fn invalid_tool_json_becomes_a_bad_tool_call() {
+        let ev = parse(&[
             r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t","name":"read"}}"#,
             r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"a\":"}}"#,
             r#"{"type":"content_block_stop","index":0}"#,
         ])
-        .unwrap_err();
-        assert!(matches!(e, ProviderError::InvalidRequest(_)) && !e.retryable());
+        .unwrap();
+        assert!(ev.iter().any(|e| matches!(e, Event::BadToolCall { id, name, raw, .. } if id == "t" && name == "read" && raw == "{\"a\":")), "{ev:?}");
     }
 
     #[test]
