@@ -106,7 +106,14 @@ impl TuiUi {
     fn convert(&self, depth: usize, agent: &str, e: &UiEvent) {
         let ev = match e {
             UiEvent::Nested { agent, inner } => return self.convert(depth + 1, agent, inner),
-            UiEvent::TextDelta(t) => Ev::Text(t.to_string()),
+            UiEvent::TextDelta(t) => {
+                // Fault injection for the pty tests (debug builds only): panic on the engine worker thread when the
+                // model's text contains this marker, to check that the UI survives it.
+                if cfg!(debug_assertions) && std::env::var("MOCO_TEST_PANIC_ON_TEXT").is_ok_and(|m| !m.is_empty() && t.contains(m.as_str())) {
+                    panic!("injected test panic");
+                }
+                Ev::Text(t.to_string())
+            }
             UiEvent::ReasoningDelta(t) => Ev::Reasoning(t.to_string()),
             UiEvent::Delivered => {
                 if depth == 0 {
@@ -249,6 +256,15 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
                 }
             }
         });
+        // Stop the input thread however this closure ends: on an early `?` return the scope would otherwise wait
+        // for it forever and moco would hang instead of exiting with the error.
+        struct StopInput<'a>(&'a AtomicBool);
+        impl Drop for StopInput<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let _stop_input = StopInput(stop);
 
         let start_run = |app: &mut App, sid: &str, resume: bool| {
             app.running = true;
@@ -258,7 +274,7 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
             scope.spawn(move || {
                 // A panic in the engine must still end the run in the UI, or the turn would look endless.
                 let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine.run(&sid, ui, cancel, resume))) {
-                    Ok(r) => r.map_err(|e| e.to_string()),
+                    Ok(r) => r.map_err(|e| format!("store error: {e}")),
                     Err(p) => Err(format!("the engine crashed: {}", panic_message(p.as_ref()))),
                 };
                 let _ = done_tx.send(AppEvent::RunDone(outcome));

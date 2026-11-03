@@ -13,7 +13,12 @@ pub struct Skill {
     pub body: String,
 }
 
+/// The user's home. Unit tests get a directory that does not exist, so skills, commands and instructions installed
+/// in the real `~/.claude` or `~/.agents` cannot leak into discovery tests.
 fn home() -> PathBuf {
+    if cfg!(test) {
+        return std::env::temp_dir().join("moco-test-no-home");
+    }
     PathBuf::from(std::env::var("HOME").unwrap_or_default())
 }
 

@@ -77,3 +77,11 @@ fn configured_theme_keys_and_bell() {
 fn tab_switches_the_permission_mode() {
     scenario("mode");
 }
+
+#[test]
+fn a_panic_on_the_engine_thread_ends_the_run_and_the_ui_carries_on() {
+    if !cfg!(debug_assertions) {
+        return eprintln!("skipped: the panic injection exists only in debug builds");
+    }
+    scenario("panic");
+}
