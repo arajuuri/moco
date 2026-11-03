@@ -52,6 +52,19 @@ fn is_assignment(w: &str) -> bool {
     }
 }
 
+/// Variables that change which executable, library, startup file or helper program runs.
+fn is_risky_assignment(w: &str) -> bool {
+    let k = w.split_once('=').map_or(w, |(k, _)| k);
+    k.starts_with("LD_") || k.starts_with("DYLD_") || k.starts_with("BASH_FUNC_") || k.starts_with("GIT_") || k.starts_with("NPM_CONFIG_")
+        || matches!(
+            k,
+            "PATH" | "BASH_ENV" | "ENV" | "IFS" | "SHELLOPTS" | "BASHOPTS" | "PS4" | "PROMPT_COMMAND" | "CDPATH" | "GLOBIGNORE"
+                | "PYTHONPATH" | "PYTHONSTARTUP" | "PYTHONHOME" | "NODE_OPTIONS" | "NODE_PATH" | "RUBYOPT" | "RUBYLIB"
+                | "PERL5OPT" | "PERL5LIB" | "RUSTC" | "RUSTC_WRAPPER" | "RUSTFLAGS" | "PAGER" | "MANPAGER" | "EDITOR"
+                | "VISUAL" | "LESSOPEN" | "SSH_ASKPASS" | "HOME" | "SHELL"
+        )
+}
+
 pub fn parse(input: &str) -> Parsed {
     let mut parsed = Parsed::default();
     let cs: Vec<char> = input.chars().collect();
@@ -69,12 +82,22 @@ pub fn parse(input: &str) -> Parsed {
     };
     let finish = |words: &mut Vec<(String, String)>, parsed: &mut Parsed| {
         let skip = words.iter().take_while(|(_, v)| is_assignment(v)).count();
-        let rest: Vec<(String, String)> = words.drain(..).skip(skip).collect();
-        if rest.is_empty() {
+        let risky = words.iter().take(skip).any(|(_, v)| is_risky_assignment(v));
+        if risky {
+            parsed.opaque = true;
+        }
+        // Risky assignments stay in the text; harmless ones are dropped as before.
+        let kept = if risky { 0 } else { skip };
+        let all: Vec<(String, String)> = words.drain(..).collect();
+        let text = all.iter().skip(kept).map(|(r, _)| r.as_str()).collect::<Vec<_>>().join(" ");
+        if text.is_empty() {
             return;
         }
-        let text = rest.iter().map(|(r, _)| r.as_str()).collect::<Vec<_>>().join(" ");
-        let w: Vec<String> = rest.into_iter().map(|(_, v)| v).collect();
+        let mut w: Vec<String> = all.into_iter().skip(skip).map(|(_, v)| v).collect();
+        if w.is_empty() {
+            // Assignment-only command (`PATH=./x`): it still changes later commands.
+            w = text.split(' ').map(String::from).collect();
+        }
         let dirs = if matches!(w[0].as_str(), "cd" | "pushd" | "popd" | "chdir") {
             w.get(1).filter(|a| !a.starts_with('-')).cloned().into_iter().collect()
         } else {
@@ -167,6 +190,22 @@ mod tests {
     fn env_assignments() {
         assert!(parse("FOO=bar").commands.is_empty());
         assert_eq!(texts("FOO=bar BAZ=1 cargo test"), ["cargo test"]);
+    }
+
+    #[test]
+    fn risky_env_assignments_are_kept_and_force_ask() {
+        for c in ["PATH=./attacker-bin ls", "LD_PRELOAD=/tmp/x.so ls", "DYLD_INSERT_LIBRARIES=/tmp/x.dylib ls", "FOO=1 PATH=. ls", "BASH_ENV=/tmp/x ls", "PATH='./a' ls", "GIT_SSH_COMMAND=x ls"] {
+            let p = parse(c);
+            assert!(p.opaque, "{c}");
+            assert_eq!(p.commands.len(), 1, "{c}");
+            assert!(p.commands[0].text.contains('='), "{c}: {}", p.commands[0].text);
+            assert_eq!(p.commands[0].words, ["ls"], "{c}");
+        }
+        assert_eq!(texts("PATH=./attacker-bin ls"), ["PATH=./attacker-bin ls"]);
+        // Assignment-only commands persist in the shell, so they are not dropped.
+        assert_eq!(texts("PATH=./x; ls"), ["PATH=./x", "ls"]);
+        assert!(parse("PATH=./x; ls").opaque);
+        assert!(!parse("FOO=bar cargo test").opaque);
     }
 
     #[test]
