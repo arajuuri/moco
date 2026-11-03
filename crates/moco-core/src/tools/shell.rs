@@ -27,6 +27,33 @@ pub(crate) fn kill_group(pid: u32) {
     }
 }
 
+/// Has `child` exited without having been reaped? `waitid(WNOWAIT)` leaves the zombie in place, so its process group id
+/// cannot be reused yet and a signal to the group is safe. `None` when that cannot be told (already reaped, or an error).
+pub(crate) fn exited_unreaped(child: &Child) -> Option<bool> {
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        let r = libc::waitid(libc::P_PID, child.id() as libc::id_t, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT);
+        if r != 0 {
+            return None;
+        }
+        // Left untouched (still zero) when nothing has exited.
+        Some(info.si_signo != 0)
+    }
+}
+
+/// Reap `child` if it has exited, first killing the stragglers in its process group: the group id belongs to us only
+/// until the leader is reaped. Once it is reaped, the group is never signalled again.
+pub(crate) fn try_reap(child: &mut Child) -> std::io::Result<Option<std::process::ExitStatus>> {
+    match exited_unreaped(child) {
+        Some(true) => {
+            kill_group(child.id());
+            child.wait().map(Some)
+        }
+        Some(false) => Ok(None),
+        None => child.try_wait(),
+    }
+}
+
 /// A command whose output file grows past this is killed (1 GiB).
 const MAX_OUTPUT_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 /// Output files up to this size are read whole; bigger ones only from the end.
@@ -149,7 +176,7 @@ fn wait_capped(child: &mut Child, out_path: &Path, timeout: Option<Duration>, st
     let start = Instant::now();
     let (mut timed_out, mut killed, mut over_cap) = (false, false, false);
     let status = loop {
-        match child.try_wait() {
+        match try_reap(child) {
             Ok(Some(s)) => break s,
             Ok(None) => {}
             Err(_) => {
@@ -171,9 +198,6 @@ fn wait_capped(child: &mut Child, out_path: &Path, timeout: Option<Duration>, st
         }
         std::thread::sleep(Duration::from_millis(15));
     };
-    // Reap stragglers left in the process group after the shell exits.
-    kill_group(pid);
-
     let (full, total_lines) = read_output(out_path);
     let (mut text, truncated) = match tail(&full) {
         Some((kept, n, total)) => (format!("[output truncated: showing last {n} of {} lines; full output saved to {}]\n{kept}", total_lines.unwrap_or(total), out_path.display()), true),
@@ -360,6 +384,21 @@ mod tests {
         assert!(t.elapsed() < Duration::from_secs(5), "took {:?}", t.elapsed());
         assert!(o.text.contains("timed out after 300 ms"), "{}", o.text);
         assert_eq!(o.metadata["timeout"], true);
+    }
+
+    #[test]
+    fn stragglers_are_killed_after_the_shell_exits() {
+        let env = Env::new();
+        let pidfile = env.work().join("straggler.pid");
+        let cmd = format!("sleep 30 >/dev/null 2>&1 & echo $! > {}", pidfile.display());
+        run(&env, json!({"command": cmd})).unwrap();
+        let pid: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        // The background sleep is gone (or at most a zombie awaiting init) shortly after the call returns.
+        let t = Instant::now();
+        while unsafe { libc::kill(pid, 0) } == 0 && t.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "the straggler survived");
     }
 
     #[test]

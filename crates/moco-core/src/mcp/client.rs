@@ -1,12 +1,13 @@
 //! JSON-RPC 2.0 over a child process's stdio, as used by MCP servers: one JSON message per line.
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use crate::tools::shell::try_reap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
+use std::sync::mpsc::{channel, sync_channel, RecvTimeoutError, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -128,8 +129,46 @@ pub fn supported(version: &str) -> bool {
     SUPPORTED.contains(&version)
 }
 
+/// The longest line read from a server's stdout; the rest of a longer line is dropped.
+const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+/// Stderr is only kept for diagnosis, so its lines are cut much shorter.
+const MAX_STDERR_LINE_BYTES: usize = 64 * 1024;
+/// Messages waiting for the writer thread; a server that stops reading stdin fills this and is treated as stuck.
+const WRITE_QUEUE: usize = 256;
+
+/// Read one line into `buf` (cleared first, without the newline), keeping at most `max` bytes: the rest of a longer
+/// line is read and dropped, so memory stays bounded. `Ok(None)` at end of file, else whether the line was cut.
+fn read_line_capped(r: &mut impl BufRead, buf: &mut Vec<u8>, max: usize) -> std::io::Result<Option<bool>> {
+    buf.clear();
+    let (mut any, mut cut) = (false, false);
+    loop {
+        let chunk = match r.fill_buf() {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if chunk.is_empty() {
+            return Ok(any.then_some(cut));
+        }
+        any = true;
+        let (line, used, done) = match chunk.iter().position(|b| *b == b'\n') {
+            Some(i) => (&chunk[..i], i + 1, true),
+            None => (chunk, chunk.len(), false),
+        };
+        let room = max.saturating_sub(buf.len());
+        buf.extend_from_slice(&line[..line.len().min(room)]);
+        cut |= line.len() > room;
+        r.consume(used);
+        if done {
+            return Ok(Some(cut));
+        }
+    }
+}
+
 struct Inner {
-    stdin: Mutex<Option<ChildStdin>>,
+    /// Feeds the writer thread, which alone touches the child's stdin: a server that stops reading blocks only that
+    /// thread, never a request's timeout or the reader thread. `None` once shut down.
+    stdin: Mutex<Option<SyncSender<String>>>,
     pending: Pending,
     next: AtomicU64,
     exited: AtomicBool,
@@ -140,12 +179,16 @@ struct Inner {
 
 pub struct Client {
     inner: Arc<Inner>,
+    /// Set by the first `shutdown`, so the later ones (`Drop` after an explicit call) do nothing.
+    shut_down: AtomicBool,
     child: Mutex<Child>,
     pid: u32,
     /// From the `initialize` answer.
     pub info: Mutex<Value>,
 }
 
+/// Signal the process group `pid` leads. Only call this while the leader is still unreaped (see `try_reap`): after
+/// that the id may belong to someone else.
 fn kill_group(pid: u32, sig: libc::c_int) {
     unsafe {
         libc::kill(-(pid as i32), sig);
@@ -153,12 +196,17 @@ fn kill_group(pid: u32, sig: libc::c_int) {
 }
 
 impl Inner {
+    /// Queue `msg` for the writer thread. Never blocks.
     fn write(&self, msg: &Value) -> Result<(), RpcError> {
-        let mut guard = self.stdin.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(stdin) = guard.as_mut() else { return Err(RpcError::Closed(self.tail())) };
+        let guard = self.stdin.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(tx) = guard.as_ref() else { return Err(RpcError::Closed(self.tail())) };
         let mut line = msg.to_string();
         line.push('\n');
-        stdin.write_all(line.as_bytes()).and_then(|_| stdin.flush()).map_err(|_| RpcError::Closed(self.tail()))
+        match tx.try_send(line) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(RpcError::Closed(format!("the server is not reading its input{}", tail_suffix(&self.tail())))),
+            Err(TrySendError::Disconnected(_)) => Err(RpcError::Closed(self.tail())),
+        }
     }
 
     fn tail(&self) -> String {
@@ -196,8 +244,9 @@ impl Client {
             .spawn()
             .map_err(|e| format!("cannot start '{program}': {e}"))?;
         let (stdin, stdout, stderr) = (child.stdin.take(), child.stdout.take().unwrap(), child.stderr.take().unwrap());
+        let (wtx, wrx) = sync_channel::<String>(WRITE_QUEUE);
         let inner = Arc::new(Inner {
-            stdin: Mutex::new(stdin),
+            stdin: Mutex::new(stdin.is_some().then_some(wtx)),
             pending: Arc::new(Mutex::new(HashMap::new())),
             next: AtomicU64::new(1),
             exited: AtomicBool::new(false),
@@ -206,9 +255,25 @@ impl Client {
         });
         let pid = child.id();
 
+        if let Some(mut stdin) = stdin {
+            let wr = inner.clone();
+            std::thread::spawn(move || {
+                while let Ok(line) = wrx.recv() {
+                    if stdin.write_all(line.as_bytes()).and_then(|_| stdin.flush()).is_err() {
+                        // Close the queue so later writes fail at once, and fail what is waiting.
+                        wr.stdin.lock().unwrap_or_else(|e| e.into_inner()).take();
+                        wr.fail_all();
+                        return;
+                    }
+                }
+            });
+        }
+
         let err_inner = inner.clone();
         std::thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            let (mut reader, mut buf) = (BufReader::new(stderr), Vec::new());
+            while let Ok(Some(_)) = read_line_capped(&mut reader, &mut buf, MAX_STDERR_LINE_BYTES) {
+                let line = String::from_utf8_lossy(&buf).into_owned();
                 let mut t = err_inner.stderr_tail.lock().unwrap_or_else(|e| e.into_inner());
                 if t.len() >= 20 {
                     t.pop_front();
@@ -220,9 +285,14 @@ impl Client {
 
         let rd = inner.clone();
         std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let (mut reader, mut buf) = (BufReader::new(stdout), Vec::new());
+            while let Ok(Some(cut)) = read_line_capped(&mut reader, &mut buf, MAX_LINE_BYTES) {
+                if cut {
+                    crate::log_warn!("mcp", "dropped a line over {MAX_LINE_BYTES} bytes from the server");
+                    continue;
+                }
                 // Servers sometimes log to stdout; anything that is not a JSON object is ignored.
-                let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
+                let Ok(msg) = serde_json::from_slice::<Value>(&buf) else { continue };
                 if !msg.is_object() {
                     continue;
                 }
@@ -252,7 +322,7 @@ impl Client {
             rd.fail_all();
         });
 
-        Ok(Arc::new(Client { inner, child: Mutex::new(child), pid, info: Mutex::new(Value::Null) }))
+        Ok(Arc::new(Client { inner, shut_down: AtomicBool::new(false), child: Mutex::new(child), pid, info: Mutex::new(Value::Null) }))
     }
 
     pub fn is_alive(&self) -> bool {
@@ -321,13 +391,17 @@ impl Client {
         Ok(res)
     }
 
-    /// Stop the server: close its stdin (a well-behaved server exits), then terminate its process group.
+    /// Stop the server: close its stdin (a well-behaved server exits), then terminate its process group. The group is
+    /// only signalled while its leader is unreaped, and only by the first call.
     pub fn shutdown(&self) {
+        if self.shut_down.swap(true, Ordering::SeqCst) {
+            return;
+        }
         self.inner.stdin.lock().unwrap_or_else(|e| e.into_inner()).take();
         let mut child = self.child.lock().unwrap_or_else(|e| e.into_inner());
         for _ in 0..10 {
-            if matches!(child.try_wait(), Ok(Some(_))) {
-                kill_group(self.pid, libc::SIGKILL); // stragglers in the group
+            // Kills the stragglers in the group, then reaps the leader.
+            if matches!(try_reap(&mut child), Ok(Some(_))) {
                 return;
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -346,5 +420,50 @@ fn tail_suffix(t: &str) -> String {
 impl Drop for Client {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_lines_are_cut_and_the_next_line_is_intact() {
+        let data = format!("{}\nshort\nlast", "x".repeat(100));
+        let mut r = std::io::Cursor::new(data.into_bytes());
+        let mut buf = Vec::new();
+        assert_eq!(read_line_capped(&mut r, &mut buf, 10).unwrap(), Some(true));
+        assert_eq!(buf, b"xxxxxxxxxx");
+        assert_eq!(read_line_capped(&mut r, &mut buf, 10).unwrap(), Some(false));
+        assert_eq!(buf, b"short");
+        assert_eq!(read_line_capped(&mut r, &mut buf, 10).unwrap(), Some(false));
+        assert_eq!(buf, b"last");
+        assert_eq!(read_line_capped(&mut r, &mut buf, 10).unwrap(), None);
+    }
+
+    fn spawn(script: &str) -> Arc<Client> {
+        let cmd = ["sh".to_string(), "-c".to_string(), script.to_string()];
+        Client::spawn(&cmd, Path::new("/"), &BTreeMap::new(), Arc::new(|_, _| {})).unwrap()
+    }
+
+    #[test]
+    fn a_server_that_never_reads_cannot_stop_the_timeout() {
+        // Never reads stdin; a request bigger than the pipe buffer used to block in write_all forever.
+        let c = spawn("sleep 30");
+        let big = "x".repeat(1024 * 1024);
+        let t = Instant::now();
+        let r = c.request("x", json!({"big": big}), Duration::from_millis(300), None);
+        assert_eq!(r, Err(RpcError::Timeout));
+        assert!(t.elapsed() < Duration::from_secs(5), "took {:?}", t.elapsed());
+        c.shutdown();
+    }
+
+    #[test]
+    fn shutdown_is_idempotent() {
+        let c = spawn("sleep 30 & exec sleep 30");
+        let t = Instant::now();
+        c.shutdown();
+        c.shutdown();
+        assert!(t.elapsed() < Duration::from_secs(5));
     }
 }
