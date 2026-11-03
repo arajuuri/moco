@@ -34,6 +34,13 @@ impl Tool for Grep {
         let limit = opt_u64(input, "limit").unwrap_or(100).max(1) as usize;
         ctx.check_external(&root)?;
         ctx.permit("grep", vec![pattern.to_string()], vec!["*".into()])?;
+        // The search reads file contents: a root reached through a link (`safe.txt -> .env`, a linked directory) is
+        // authorized as `read` of what it leads to, then searched at that resolved place.
+        let real = real_path(&root);
+        if real != normalize(&root) && ctx.display(&real) != ctx.display(&root) {
+            ctx.permit_path("read", &root, vec!["*".into()])?;
+        }
+        let root = real;
         let src = if opt_bool(input, "literal").unwrap_or(false) { regex::escape(pattern) } else { pattern.to_string() };
         let re = RegexBuilder::new(&src)
             .case_insensitive(!opt_bool(input, "caseSensitive").unwrap_or(true))

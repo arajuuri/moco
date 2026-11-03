@@ -28,7 +28,9 @@ Prefer one larger read over many small slices, and use grep to find specific con
         } else {
             ctx.check_external_file(&path)?;
         }
-        ctx.permit("read", vec![ctx.display(&path)], vec!["*".into()])?;
+        ctx.permit_path("read", &path, vec!["*".into()])?;
+        // Use what was authorized: the resolved target, so a link swapped in after the check is not followed.
+        let path = real_path(&path);
 
         let offset = opt_u64(input, "offset").unwrap_or(1).max(1) as usize;
         let limit = opt_u64(input, "limit").unwrap_or(2000).clamp(1, 2000) as usize;

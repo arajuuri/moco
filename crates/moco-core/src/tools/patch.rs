@@ -204,10 +204,13 @@ impl Tool for Patch {
                 let abs = ctx.resolve(p);
                 ctx.check_external_file(&abs)?;
                 resources.push(ctx.display(&abs));
+                // A link in the path (final component or parent) is authorized as what it leads to as well.
+                resources.push(ctx.display(&real_path(&abs)));
                 files.push(abs);
             }
         }
-        resources.dedup();
+        let mut seen = std::collections::HashSet::new();
+        resources.retain(|r| seen.insert(r.clone()));
         ctx.permit("edit", resources, vec!["*".into()])?;
         // Every file this patch touches is ours until it is written and formatted (issue #6). Taken after the
         // prompt, which can take minutes, and before the first read.
@@ -236,7 +239,7 @@ impl Tool for Patch {
         for op in &ops {
             match op {
                 Op::Add { path, lines } => {
-                    let abs = ctx.resolve(path);
+                    let abs = real_path(&ctx.resolve(path));
                     if read(&staged, &abs)?.is_some() {
                         return Err(ToolError::fail(format!("Add File {path}: the file already exists; use Update File")));
                     }
@@ -248,7 +251,7 @@ impl Tool for Patch {
                     summary.push(format!("A {path}"));
                 }
                 Op::Delete { path } => {
-                    let abs = ctx.resolve(path);
+                    let abs = real_path(&ctx.resolve(path));
                     if read(&staged, &abs)?.is_none() {
                         return Err(ToolError::fail(format!("Delete File {path}: no such file")));
                     }
@@ -256,7 +259,7 @@ impl Tool for Patch {
                     summary.push(format!("D {path}"));
                 }
                 Op::Update { path, move_to, hunks } => {
-                    let abs = ctx.resolve(path);
+                    let abs = real_path(&ctx.resolve(path));
                     let bytes = read(&staged, &abs)?.ok_or_else(|| ToolError::fail(format!("Update File {path}: no such file")))?;
                     let (bom, body) = match bytes.strip_prefix(&BOM) {
                         Some(r) => (true, r),
@@ -268,7 +271,7 @@ impl Tool for Patch {
                     out.extend_from_slice(new_text.as_bytes());
                     match move_to {
                         Some(dest) => {
-                            let dest_abs = ctx.resolve(dest);
+                            let dest_abs = real_path(&ctx.resolve(dest));
                             if dest_abs != abs && read(&staged, &dest_abs)?.is_some() {
                                 return Err(ToolError::fail(format!("Move to {dest}: the destination already exists")));
                             }
