@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +82,9 @@ pub struct Snapshots {
     root: PathBuf,
     pub max_files: usize,
     pub max_file_bytes: u64,
+    /// Prune never deletes blobs (or temp files) modified more recently than this, so it cannot remove the blobs
+    /// of a capture in another process that has not written its manifest yet.
+    pub blob_grace: Duration,
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -91,13 +95,38 @@ fn sha(bytes: &[u8]) -> String {
     hex(&Sha256::digest(bytes))
 }
 
+/// Temp name unique per process and per call, so threads (a session and a background subagent share one store)
+/// never write the same temp file.
+fn tmp_path(path: &Path) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(format!(".moco-tmp-{}-{}", std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed)));
+    path.with_file_name(name)
+}
+
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    let tmp = tmp_path(path);
     std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
+/// Write a content-addressed file (blob or manifest). If the write fails but the content is already there
+/// (another writer got there first), that is success.
+fn write_addressed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    match write_atomic(path, bytes) {
+        Err(e) if !path.exists() => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// Set a file's mtime to now so prune treats it as recently used. False if the file is gone.
+fn touch(path: &Path) -> bool {
+    std::fs::File::options().write(true).open(path).and_then(|f| f.set_modified(SystemTime::now())).is_ok()
 }
 
 fn is_binary(b: &[u8]) -> bool {
@@ -111,7 +140,7 @@ fn safe_rel(p: &str) -> bool {
 
 impl Snapshots {
     pub fn new(root: PathBuf) -> Self {
-        Snapshots { root, max_files: 50_000, max_file_bytes: 2 * 1024 * 1024 }
+        Snapshots { root, max_files: 50_000, max_file_bytes: 2 * 1024 * 1024, blob_grace: Duration::from_secs(3600) }
     }
 
     fn blob_path(&self, hash: &str) -> PathBuf {
@@ -127,13 +156,21 @@ impl Snapshots {
         serde_json::from_str(&text).map_err(|e| SnapError::Io(format!("snapshot {id}: {e}")))
     }
 
+    /// Like `manifest`, and marks it as recently used.
+    fn manifest_in_use(&self, id: &str) -> Result<Manifest, SnapError> {
+        let m = self.manifest(id)?;
+        touch(&self.manifest_path(id));
+        Ok(m)
+    }
+
     fn blob(&self, hash: &str) -> Result<Vec<u8>, SnapError> {
         std::fs::read(self.blob_path(hash)).map_err(|_| SnapError::Missing(format!("file content {}", &hash[..12])))
     }
 
     /// Snapshot `dir` as it is now. `prev` (an earlier snapshot of the same directory) lets unchanged files skip hashing.
     pub fn capture(&self, dir: &Path, prev: Option<&str>) -> Result<String, SnapError> {
-        let prev = prev.and_then(|p| self.manifest(p).ok()).unwrap_or_default();
+        // Using a snapshot counts as use: a resumed old session keeps its manifests from being pruned by age.
+        let prev = prev.and_then(|p| self.manifest_in_use(p).ok()).unwrap_or_default();
         let mut files = BTreeMap::new();
         let walker = WalkBuilder::new(dir)
             .hidden(false)
@@ -166,8 +203,9 @@ impl Snapshots {
                     let Ok(bytes) = std::fs::read(entry.path()) else { continue };
                     let h = sha(&bytes);
                     let bp = self.blob_path(&h);
-                    if !bp.exists() {
-                        write_atomic(&bp, &bytes)?;
+                    // An existing blob is refreshed so a concurrent prune cannot take it before our manifest lands.
+                    if !touch(&bp) {
+                        write_addressed(&bp, &bytes)?;
                     }
                     h
                 }
@@ -180,13 +218,13 @@ impl Snapshots {
         }
         let id = sha(id_src.as_bytes());
         let manifest = Manifest { files };
-        write_atomic(&self.manifest_path(&id), serde_json::to_string(&manifest).map_err(|e| SnapError::Io(e.to_string()))?.as_bytes())?;
+        write_addressed(&self.manifest_path(&id), serde_json::to_string(&manifest).map_err(|e| SnapError::Io(e.to_string()))?.as_bytes())?;
         Ok(id)
     }
 
     /// Files that differ between two snapshots, with unified diffs.
     pub fn diff(&self, from: &str, to: &str) -> Result<Vec<FileDiff>, SnapError> {
-        let (a, b) = (self.manifest(from)?, self.manifest(to)?);
+        let (a, b) = (self.manifest_in_use(from)?, self.manifest_in_use(to)?);
         let mut paths: Vec<&String> = a.files.keys().chain(b.files.keys()).collect();
         paths.sort();
         paths.dedup();
@@ -229,7 +267,7 @@ impl Snapshots {
     /// Make `dir` match snapshot `id`. The current state is captured first (`before`) so the restore can be undone.
     /// `hint` is a recent snapshot of the directory, used to avoid re-hashing unchanged files.
     pub fn restore(&self, dir: &Path, id: &str, hint: Option<&str>) -> Result<RestoreReport, SnapError> {
-        let target = self.manifest(id)?;
+        let target = self.manifest_in_use(id)?;
         if let Some(bad) = target.files.keys().find(|p| !safe_rel(p)) {
             return Err(SnapError::Io(format!("refusing to restore unsafe path {bad:?}")));
         }
@@ -270,6 +308,7 @@ impl Snapshots {
     }
 
     /// Delete snapshots older than `max_age` that are not in `keep`, then blobs no remaining snapshot refers to.
+    /// Blobs modified within `blob_grace` are kept even if unreferenced (they may belong to a capture in progress).
     /// Returns (manifests removed, blobs removed).
     pub fn prune(&self, keep: &HashSet<String>, max_age: Duration) -> (usize, usize) {
         let mut removed_manifests = 0;
@@ -294,7 +333,8 @@ impl Snapshots {
                 if let Ok(blobs) = std::fs::read_dir(shard.path()) {
                     for b in blobs.filter_map(|e| e.ok()) {
                         let hash = format!("{prefix}{}", b.file_name().to_string_lossy());
-                        if !live.contains(&hash) && std::fs::remove_file(b.path()).is_ok() {
+                        let fresh = b.metadata().and_then(|m| m.modified()).ok().and_then(|t| SystemTime::now().duration_since(t).ok()).is_none_or(|age| age < self.blob_grace);
+                        if !fresh && !live.contains(&hash) && std::fs::remove_file(b.path()).is_ok() {
                             removed_blobs += 1;
                         }
                     }
@@ -474,9 +514,47 @@ mod tests {
         t.put("a.txt", "v2");
         let s2 = t.cap(Some(&s1));
         assert_eq!(t.snaps.prune(&HashSet::new(), Duration::from_secs(3600)), (0, 0), "nothing is old enough");
+        assert_eq!(t.snaps.prune(&HashSet::from([s2.clone()]), Duration::ZERO), (1, 0), "the orphan blob is inside the grace period");
+        let mut t = t;
+        t.snaps.blob_grace = Duration::ZERO;
         let (m, b) = t.snaps.prune(&HashSet::from([s2.clone()]), Duration::ZERO);
-        assert_eq!((m, b), (1, 1), "s1 and its blob go; s2 is kept");
+        assert_eq!((m, b), (0, 1), "the blob goes once the grace period is over (s1 went above); s2 is kept");
         assert!(t.snaps.manifest(&s1).is_err() && t.snaps.manifest(&s2).is_ok());
         assert_eq!(t.snaps.restore(&t.dir(), &s2, None).unwrap().restored.len(), 0);
+    }
+
+    #[test]
+    fn concurrent_captures_of_new_content_do_not_collide() {
+        let t = Tree::new();
+        for i in 0..40 {
+            t.put(&format!("f{i}.txt"), &format!("content {i}"));
+        }
+        std::thread::scope(|s| {
+            let hs: Vec<_> = (0..8).map(|_| s.spawn(|| t.snaps.capture(&t.dir(), None))).collect();
+            let ids: Vec<_> = hs.into_iter().map(|h| h.join().unwrap().unwrap()).collect();
+            assert!(ids.windows(2).all(|w| w[0] == w[1]));
+        });
+    }
+
+    #[test]
+    fn prune_spares_fresh_blobs_and_snapshots_in_use() {
+        let mut t = Tree::new();
+        t.snaps.blob_grace = Duration::from_millis(300);
+        t.put("a.txt", "v1");
+        let s1 = t.cap(None);
+        std::thread::sleep(Duration::from_millis(400));
+        // A capture in progress re-uses the old blob (its manifest is not written yet): the blob is refreshed.
+        let bp = t.snaps.blob_path(&sha(b"v1"));
+        assert!(touch(&bp));
+        t.snaps.prune(&HashSet::new(), Duration::from_millis(200));
+        assert!(t.snaps.manifest(&s1).is_err(), "old unreferenced manifest goes");
+        assert!(bp.exists(), "a blob touched within the grace period survives");
+        // Using a snapshot (restore, diff, capture with prev) marks it as in use.
+        t.put("a.txt", "v2");
+        let s2 = t.cap(None);
+        std::thread::sleep(Duration::from_millis(400));
+        t.snaps.restore(&t.dir(), &s2, None).unwrap();
+        t.snaps.prune(&HashSet::new(), Duration::from_millis(200));
+        assert!(t.snaps.manifest(&s2).is_ok(), "a snapshot in use is not pruned by age");
     }
 }
