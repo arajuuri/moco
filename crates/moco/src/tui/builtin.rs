@@ -63,9 +63,48 @@ fn files(app: &mut App, r: &UndoReport) {
 
 /// Switch the session's permission mode, from `/mode` or Tab, and say what it now means.
 pub fn set_permission_mode(engine: &Engine, sid: &str, app: &mut App, mode: PermissionMode) {
-    engine.store.lock().unwrap().set_permission_mode(sid, Some(mode.name())).ok();
-    app.permission_mode = mode;
-    app.push_info(format!("permission mode: {} ({})", mode.name(), mode.describe()));
+    let stored = engine.store.lock().unwrap().set_permission_mode(sid, Some(mode.name()));
+    if stored_ok(app, "the permission mode", stored) {
+        app.permission_mode = mode;
+        app.push_info(format!("permission mode: {} ({})", mode.name(), mode.describe()));
+    }
+}
+
+/// `true` when a change to the session was stored. Otherwise the user gets an error row saying what was not saved,
+/// instead of the success message the caller would have printed.
+pub fn stored_ok<T>(app: &mut App, what: &str, r: Result<T, moco_core::store::StoreError>) -> bool {
+    match r {
+        Ok(_) => true,
+        Err(e) => {
+            moco_core::log_warn!("store", "saving {what} failed: {e}");
+            err(app, format!("{what} could not be saved: {e}"));
+            false
+        }
+    }
+}
+
+/// Choose the model for the session and report it (`note` is appended to the message).
+pub fn choose_model(engine: &Engine, sid: &str, app: &mut App, model: &str, note: &str) {
+    let r = engine.store.lock().unwrap().set_model(sid, Some(model));
+    if stored_ok(app, "the model choice", r) {
+        app.push_info(format!("model: {model}{note}"));
+    }
+}
+
+/// Choose the reasoning effort (`None` = the provider's default) and report it.
+pub fn choose_effort(engine: &Engine, sid: &str, app: &mut App, level: Option<&str>) {
+    let r = engine.store.lock().unwrap().set_variant(sid, level);
+    if stored_ok(app, "the reasoning effort", r) {
+        app.push_info(format!("reasoning effort: {}", level.unwrap_or("default")));
+    }
+}
+
+/// Choose the agent (`label` is its display name) and report it.
+pub fn choose_agent(engine: &Engine, sid: &str, app: &mut App, id: &str, label: &str) {
+    let r = engine.store.lock().unwrap().set_agent(sid, id);
+    if stored_ok(app, "the agent choice", r) {
+        app.push_info(format!("agent: {label}"));
+    }
 }
 
 fn err(app: &mut App, msg: impl Into<String>) {
@@ -143,8 +182,7 @@ pub fn run(host: &Host, app: &mut App, sid: &str, agent: &str, name: &str, args:
             let current = engine.store.lock().unwrap().session(sid).ok().flatten().map(|s| engine.model_ref_for(&s)).unwrap_or_default();
             if let Some((pid, _)) = args.split_once('/').filter(|(p, _)| connected.iter().any(|c| c == p) && !args.contains(' ')) {
                 let known = engine.catalog().model(pid, &args[pid.len() + 1..]).is_some();
-                engine.store.lock().unwrap().set_model(sid, Some(args)).ok();
-                app.push_info(format!("model: {args}{}", if known { "" } else { " (not in the catalog: no price or context limit)" }));
+                choose_model(engine, sid, app, args, if known { "" } else { " (not in the catalog: no price or context limit)" });
             } else {
                 let items = model_items(host, &current);
                 if items.is_empty() {
@@ -160,12 +198,10 @@ pub fn run(host: &Host, app: &mut App, sid: &str, agent: &str, name: &str, args:
             if info.levels.is_empty() {
                 app.push_info("this model has no reasoning levels to choose from");
             } else if args == "default" {
-                engine.store.lock().unwrap().set_variant(sid, None).ok();
-                app.push_info("reasoning effort: default");
+                choose_effort(engine, sid, app, None);
             } else if !args.is_empty() {
                 if info.levels.iter().any(|l| l == args) {
-                    engine.store.lock().unwrap().set_variant(sid, Some(args)).ok();
-                    app.push_info(format!("reasoning effort: {args}"));
+                    choose_effort(engine, sid, app, Some(args));
                 } else {
                     err(app, format!("this model offers: {}", info.levels.join(", ")));
                 }
@@ -191,8 +227,7 @@ pub fn run(host: &Host, app: &mut App, sid: &str, agent: &str, name: &str, args:
             let selectable: Vec<_> = engine.agents().iter().filter(|a| a.selectable()).collect();
             match selectable.iter().find(|a| a.id == args) {
                 Some(a) => {
-                    engine.store.lock().unwrap().set_agent(sid, &a.id).ok();
-                    app.push_info(format!("agent: {}", a.name));
+                    choose_agent(engine, sid, app, &a.id, &a.name);
                 }
                 None if args.is_empty() => {
                     let items = selectable.iter().map(|a| PickItem { label: a.id.clone(), detail: format!("{}{}", a.description, if a.id == agent { "  (current)" } else { "" }), value: a.id.clone() }).collect();
@@ -484,6 +519,55 @@ pub fn history_rows(messages: &[Message], hidden_from: Option<&str>) -> Vec<Row>
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn engine_with_session() -> (Engine, String) {
+        use moco_core::provider::fake::FakeProvider;
+        let store = moco_core::store::Store::open_memory().unwrap();
+        let sid = store.create_session("/tmp", "build").unwrap().id;
+        let cfg = moco_core::engine::EngineConfig::new("test-model", std::env::temp_dir().join("moco-builtin-test"));
+        (Engine::new(store, Box::new(FakeProvider::new(vec![])), cfg), sid)
+    }
+
+    fn rows_text(app: &App) -> Vec<String> {
+        app.rows.iter().map(|r| match r {
+            Row::Error(t) => format!("error: {t}"),
+            Row::Info(t) => format!("info: {t}"),
+            _ => String::new(),
+        }).collect()
+    }
+
+    #[test]
+    fn a_failing_set_model_shows_an_error_and_not_the_success_message() {
+        let (engine, sid) = engine_with_session();
+        let mut app = App::new("test-model", "build");
+        choose_model(&engine, &sid, &mut app, "anthropic/x", "");
+        assert_eq!(rows_text(&app), ["info: model: anthropic/x"]);
+
+        engine.store().exec_for_test("create trigger no_model before update of model on session begin select raise(abort, 'disk full'); end");
+        let mut app = App::new("test-model", "build");
+        choose_model(&engine, &sid, &mut app, "anthropic/y", "");
+        let rows = rows_text(&app);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].starts_with("error: the model choice could not be saved") && rows[0].contains("disk full"), "{rows:?}");
+        assert!(!rows.iter().any(|r| r.contains("model: anthropic/y")));
+    }
+
+    #[test]
+    fn failing_effort_agent_and_mode_changes_do_not_report_success() {
+        let (engine, sid) = engine_with_session();
+        engine.store().exec_for_test(
+            "create trigger no_variant before update of variant on session begin select raise(abort, 'disk full'); end;
+             create trigger no_agent before update of agent on session begin select raise(abort, 'disk full'); end;
+             create trigger no_mode before update of permission_mode on session begin select raise(abort, 'disk full'); end",
+        );
+        let mut app = App::new("test-model", "build");
+        choose_effort(&engine, &sid, &mut app, Some("high"));
+        choose_agent(&engine, &sid, &mut app, "plan", "Plan");
+        set_permission_mode(&engine, &sid, &mut app, PermissionMode::Auto);
+        let rows = rows_text(&app);
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert!(rows.iter().all(|r| r.starts_with("error: ") && r.contains("could not be saved")), "{rows:?}");
+    }
 
     fn msg(id: &str, kind: &str, data: serde_json::Value) -> Message {
         Message { id: id.into(), session_id: "s".into(), kind: kind.into(), data }

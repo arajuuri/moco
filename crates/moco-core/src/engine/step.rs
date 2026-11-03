@@ -45,10 +45,12 @@ struct AttemptResult {
 impl Engine {
     pub(super) fn drain(&self, sid: &str, ui: &dyn Ui, cancel: &AtomicBool, resume: bool) -> Result<RunOutcome, StoreError> {
         let (mut continuing, mut step) = (resume, 0u32);
+        let _budget = self.limits_begin(sid);
         loop {
             let delivered = self.store().deliver(sid, !continuing)?;
             if !delivered.is_empty() {
                 step = 0; // new user input resets the step allowance
+                self.limits_new_input(sid); // and the cost allowance of the run
                 ui.event(&UiEvent::Delivered);
             }
             if !continuing && delivered.is_empty() {
@@ -100,7 +102,7 @@ impl Engine {
         let eff = compaction::effective(&history);
         let mut messages = self.chat(&eff);
         let mut reminders = vec![];
-        let max_steps_hit = agent.steps.is_some_and(|n| step >= n);
+        let max_steps_hit = agent::effective_steps(&agent, self.cfg.limits.max_steps).is_some_and(|n| step >= n);
         if max_steps_hit {
             reminders.push(agent::MAX_STEPS.to_string());
         }
@@ -173,6 +175,7 @@ impl Engine {
                 }
             }
         }
+        let tools_disabled = p.req.tools_disabled;
         let Prepared { session, agent, req, provider, provider_id, model_id, tools: step_tools, .. } = p;
         let (provider_id, model_id) = (provider_id.as_str(), model_id.as_str());
         let caps = self.media_caps(provider_id, model_id);
@@ -192,13 +195,14 @@ impl Engine {
             ui,
             declined: &declined,
             ask_lock: &self.prompt_lock,
+            notified: &self.notified,
             // Manual mode is fully manual: the classifier only ever works in auto mode.
             classify: self.cfg.classifier.as_ref().filter(|_| self.permission_mode_of(&session) == PermissionMode::Auto).filter(|s| s.background || !ui.unattended()).map(|settings| classify::ClassifyCtx { engine: self, session: &session, settings, cancel }),
         };
 
         let mut retries = 0u32;
         let result = loop {
-            let r = self.attempt(provider, &session, &req, &permitter, ui, cancel, &msg_id, caps, &step_tools);
+            let r = self.attempt(provider, &session, &req, &permitter, ui, cancel, &msg_id, caps, &step_tools, agent.checks);
             match &r.stream {
                 Err(e) if !r.dispatched && !cancel.load(Ordering::Relaxed) => {
                     // Safe to retry: no tool has run, and the partial output is discarded.
@@ -253,10 +257,13 @@ impl Engine {
             let cost = model.and_then(|m| catalog::cost(m, usage));
             let context_tokens = usage.input + usage.cache_read + usage.cache_write + usage.output;
             let session_cost = {
-                let st = self.store();
-                st.add_usage(sid, cost.unwrap_or(0.0), usage).log_err("store", "recording token usage");
-                st.usage_totals(sid).map(|t| t.0).unwrap_or(0.0)
+                let recorded = self.store().add_usage(sid, cost.unwrap_or(0.0), usage);
+                self.store_warn(ui, "usage", "token usage and cost could not be recorded, so the session totals will be too low", recorded);
+                self.store().usage_totals(sid).map(|t| t.0).unwrap_or(0.0)
             };
+            if cost.is_none() {
+                self.note_unpriced_for_limits(ui, &format!("{provider_id}/{model_id}"));
+            }
             data["cost"] = json!(cost);
             crate::log_debug!("engine", "usage session={sid} step={step} model={provider_id}/{model_id} input={} output={} cache_read={} cache_write={} cost={} session_cost={session_cost:.4}", usage.input, usage.output, usage.cache_read, usage.cache_write, cost.map_or("unpriced".to_string(), |c| format!("{c:.4}")));
             ui.event(&UiEvent::StepUsage { usage: *usage, cost, session_cost, context_tokens, context_limit: model.map(|m| m.limit.context).filter(|l| *l > 0) });
@@ -276,17 +283,30 @@ impl Engine {
                 if matches!(result.finish, Some((FinishReason::MaxTokens, _))) && tool_calls == 0 {
                     ui.event(&UiEvent::Notice("response stopped at the output token limit"));
                 }
-                if tool_calls > 0 { StepOutcome::Continue } else { StepOutcome::Done }
+                if tool_calls > 0 && tools_disabled {
+                    // The step allowance is used up and the model called tools anyway: don't let it go on.
+                    let n = agent::effective_steps(&agent, self.cfg.limits.max_steps).unwrap_or(step);
+                    StepOutcome::Stop(RunOutcome::LimitReached { what: format!("The step limit ({n}) was reached and the model kept calling tools") })
+                } else if tool_calls > 0 {
+                    StepOutcome::Continue
+                } else {
+                    StepOutcome::Done
+                }
             }
         };
         self.store().update_message(&msg_id, &data)?;
+        // The cost limits: only a step that is followed by another one can be stopped (a finished turn is over anyway).
+        let outcome = match outcome {
+            StepOutcome::Continue => self.check_limits(sid, ui).map_or(StepOutcome::Continue, StepOutcome::Stop),
+            o => o,
+        };
         crate::log_debug!("engine", "step end session={sid} step={step} tool_calls={tool_calls} next={}", match &outcome { StepOutcome::Continue => "continue".to_string(), StepOutcome::Done => "done".to_string(), StepOutcome::Stop(o) => format!("stop:{o:?}") });
         Ok(outcome)
     }
 
     /// One streaming request. Tools start executing as soon as their call is complete.
     #[allow(clippy::too_many_arguments)]
-    fn attempt(&self, provider: &dyn Provider, session: &Session, req: &Request, permitter: &EnginePermitter, ui: &dyn Ui, cancel: &AtomicBool, msg_id: &str, caps: MediaCaps, step_tools: &[Arc<dyn Tool>]) -> AttemptResult {
+    fn attempt(&self, provider: &dyn Provider, session: &Session, req: &Request, permitter: &EnginePermitter, ui: &dyn Ui, cancel: &AtomicBool, msg_id: &str, caps: MediaCaps, step_tools: &[Arc<dyn Tool>], checks_on: bool) -> AttemptResult {
         let cwd = PathBuf::from(&session.directory);
         let root = project_root_of(&cwd);
         let spill = self.spill_dir();
@@ -323,7 +343,8 @@ impl Engine {
                     ui.event(&UiEvent::ToolStarted { id: &id, name: &name, input: &input });
                     parts.push(chat::tool_part(&id, &name, &input));
                     let idx = parts.len() - 1;
-                    self.store().set_message_parts(msg_id, &parts).log_err("store", "saving a tool call");
+                    let saved = self.store().set_message_parts(msg_id, &parts);
+                    self.store_warn(ui, "parts", "a tool call could not be saved, so this session may not resume cleanly after a crash", saved);
                     let tool = step_tools.iter().find(|t| t.name() == name).map(|t| t.as_ref());
                     let (cwd, root, spill) = (cwd.clone(), root.clone(), spill.clone());
                     handles.push((
@@ -350,7 +371,8 @@ impl Engine {
                     ui.event(&UiEvent::ToolStarted { id: &id, name: &name, input: &input });
                     parts.push(chat::tool_part(&id, &name, &input));
                     bad_calls.push((parts.len() - 1, error));
-                    self.store().set_message_parts(msg_id, &parts).log_err("store", "saving a tool call");
+                    let saved = self.store().set_message_parts(msg_id, &parts);
+                    self.store_warn(ui, "parts", "a tool call could not be saved, so this session may not resume cleanly after a crash", saved);
                 }
                 Event::Finish { reason, usage } => finish = Some((reason, usage)),
             });
@@ -361,6 +383,7 @@ impl Engine {
                 let state = self.finish_tool(&name, Err(ToolError::fail(msg)), &spill, ui);
                 parts[idx]["state"] = state;
             }
+            let mut finished = vec![];
             for (idx, h) in handles {
                 let outcome = h.join().unwrap_or_else(|_| Err(ToolError::fail("tool panicked")));
                 declined |= outcome == Err(ToolError::Declined);
@@ -368,18 +391,67 @@ impl Engine {
                 if let (true, Ok(out)) = (name == "read", &outcome) {
                     // Reading a file pulls in AGENTS.md files between it and the working directory.
                     if let Some(p) = out.metadata["path"].as_str() {
-                        let st = self.store();
                         for ins in instructions::discover_between(std::path::Path::new(p), &cwd) {
-                            st.add_instruction(&session.id, &ins.to_string_lossy()).log_err("store", "remembering an instruction file");
+                            let added = self.store().add_instruction(&session.id, &ins.to_string_lossy());
+                            self.store_warn(ui, "instruction", "an AGENTS.md file the model read could not be remembered, so its instructions may be dropped on the next step", added);
                         }
                     }
                 }
+                finished.push((idx, name, outcome));
+            }
+            // Once per step, after the whole batch: the checks see every file the step changed.
+            if checks_on {
+                self.run_checks(&session.id, &cwd, cancel, &mut finished);
+            }
+            for (idx, name, outcome) in finished {
                 let state = self.finish_tool(&name, outcome, &spill, ui);
                 parts[idx]["state"] = state;
             }
             res
         });
         AttemptResult { parts, stream, finish, dispatched, declined }
+    }
+
+    /// Run the configured checks on the files this step's edit, write and patch calls changed, and add what they
+    /// report to the output of the last tool that changed a file the check covers. Never fails a tool.
+    fn run_checks(&self, sid: &str, cwd: &std::path::Path, cancel: &AtomicBool, finished: &mut [(usize, String, Result<ToolOutput, ToolError>)]) {
+        if self.cfg.checks.is_empty() || cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        // Each changed file, with the position (in `finished`) of the last call that changed it.
+        let mut changed: Vec<(PathBuf, usize)> = vec![];
+        for (pos, (_, name, outcome)) in finished.iter().enumerate() {
+            let Ok(out) = outcome else { continue };
+            for p in changed_files(name, out, cwd) {
+                match changed.iter_mut().find(|(f, _)| *f == p) {
+                    Some(e) => e.1 = pos,
+                    None => changed.push((p, pos)),
+                }
+            }
+        }
+        if changed.is_empty() {
+            return;
+        }
+        let files: Vec<PathBuf> = changed.iter().map(|(p, _)| p.clone()).collect();
+        for run in self.cfg.checks.run(&files, cwd, cancel) {
+            let key = format!("{sid}\0{}", run.name);
+            let was_failing = {
+                let mut failing = lock(&self.check_failing);
+                let was = failing.contains(&key);
+                match run.verdict {
+                    crate::check::Verdict::Errors(_) => failing.insert(key),
+                    crate::check::Verdict::Passed => failing.remove(&key),
+                    _ => false,
+                };
+                was
+            };
+            crate::log_debug!("check", "{} files={} verdict={}", run.name, run.files.len(), match &run.verdict { crate::check::Verdict::Passed => "passed", crate::check::Verdict::Errors(_) => "errors", crate::check::Verdict::Note(_) => "note", crate::check::Verdict::Cancelled => "cancelled" });
+            let Some(text) = crate::check::note(&run, was_failing) else { continue };
+            let pos = changed.iter().filter(|(p, _)| run.files.contains(p)).map(|(_, pos)| *pos).max();
+            if let Some(Ok(out)) = pos.and_then(|i| finished.get_mut(i)).map(|f| &mut f.2) {
+                out.text.push_str(&format!("\n\n{text}"));
+            }
+        }
     }
 
     fn finish_tool(&self, name: &str, outcome: Result<ToolOutput, ToolError>, spill: &std::path::Path, ui: &dyn Ui) -> Value {
@@ -422,6 +494,16 @@ impl Engine {
                 json!({"status":"error","error":msg})
             }
         }
+    }
+}
+
+/// The files an edit, write or patch call changed (not deleted), as absolute paths.
+fn changed_files(tool: &str, out: &ToolOutput, cwd: &std::path::Path) -> Vec<PathBuf> {
+    let abs = |p: &str| if std::path::Path::new(p).is_absolute() { PathBuf::from(p) } else { cwd.join(p) };
+    match tool {
+        "edit" | "write" => out.metadata["path"].as_str().map(abs).into_iter().collect(),
+        "patch" => out.metadata["files"].as_array().into_iter().flatten().filter_map(|v| v.as_str()).filter_map(|l| l.split_once(' ')).filter(|(op, _)| *op != "D").map(|(_, p)| abs(p)).collect(),
+        _ => vec![],
     }
 }
 

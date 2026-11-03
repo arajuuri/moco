@@ -15,6 +15,8 @@ pub struct Agent {
     pub steps: Option<u32>,
     /// Default reasoning effort for this agent (a variant name); a session's own choice wins.
     pub effort: Option<String>,
+    /// Run the configured `checks` after this agent's edits (see `check.rs`).
+    pub checks: bool,
     pub permissions: Vec<Rule>,
 }
 
@@ -100,6 +102,7 @@ pub fn builtin_for(mode: PermissionMode) -> Vec<Agent> {
             model: None,
             steps: None,
             effort: None,
+            checks: true,
             permissions: build,
         },
         Agent {
@@ -111,6 +114,7 @@ pub fn builtin_for(mode: PermissionMode) -> Vec<Agent> {
             model: None,
             steps: None,
             effort: None,
+            checks: false,
             permissions: plan,
         },
         Agent {
@@ -122,6 +126,7 @@ pub fn builtin_for(mode: PermissionMode) -> Vec<Agent> {
             model: None,
             steps: None,
             effort: None,
+            checks: true,
             permissions: general,
         },
         Agent {
@@ -133,6 +138,7 @@ pub fn builtin_for(mode: PermissionMode) -> Vec<Agent> {
             model: None,
             steps: None,
             effort: None,
+            checks: false,
             permissions: explore,
         },
     ]
@@ -158,6 +164,11 @@ pub fn advertised(agent: &Agent, tool: &dyn Tool) -> bool {
 pub const PLAN_REMINDER: &str = "<system-reminder>\nYou are in Plan mode. Discuss the plan with the user directly in the conversation. \
 Do not modify any files. Use read-only tools to explore.\n\nYou remain in Plan mode until the user switches agents. \
 If the user asks you to implement changes, do not do so. Tell them they need to switch agents.\n</system-reminder>";
+
+/// The step allowance of a run: the agent's own `steps`, else the configured default (`limits.maxSteps`).
+pub fn effective_steps(agent: &Agent, default: Option<u32>) -> Option<u32> {
+    agent.steps.or(default)
+}
 
 pub const MAX_STEPS: &str = "CRITICAL - MAXIMUM STEPS REACHED
 

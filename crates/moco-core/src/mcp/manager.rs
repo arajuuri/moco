@@ -240,7 +240,7 @@ impl Manager {
     /// Forget the stored tokens of a remote server and disconnect it.
     pub fn logout(self: &Arc<Self>, name: &str) -> Result<bool, String> {
         let url = self.lock().iter().find(|s| s.spec.name == name).and_then(|s| s.spec.config.url.clone()).ok_or_else(|| format!("no remote MCP server '{name}'"))?;
-        let removed = oauth::remove(&self.app_dir, &url);
+        let removed = oauth::remove(&self.app_dir, &url)?;
         self.reconnect(name);
         Ok(removed)
     }

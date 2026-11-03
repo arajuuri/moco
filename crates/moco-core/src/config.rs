@@ -25,6 +25,8 @@ pub struct AgentConfig {
     pub mode: Option<String>,
     pub permissions: Vec<Rule>,
     pub disabled: bool,
+    /// `false` keeps the `checks` from running after this agent's edits (`plan` and `explore` never run them).
+    pub checks: Option<bool>,
 }
 
 /// Extra request customization: headers for the HTTP request and a JSON object merged into the body
@@ -97,6 +99,30 @@ pub struct FormatterConfig {
 pub enum FormatterSetting {
     Flag(bool),
     Formatters(BTreeMap<String, FormatterConfig>),
+}
+
+/// `checks.<name>`: a command run once per step after the model changed files it covers (a compiler, linter or
+/// type-checker); its errors go back to the model in the same tool result.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct CheckConfig {
+    /// Program and arguments. `$FILES` is replaced by the changed files it covers (one argument each); without it the
+    /// command runs as written (a whole-project check) and its output is filtered to the changed files first.
+    pub command: Vec<String>,
+    /// File extensions it covers, with or without the dot, case-insensitive.
+    pub extensions: Vec<String>,
+    /// Milliseconds before the check is killed (default 60000).
+    pub timeout: Option<u64>,
+    pub environment: BTreeMap<String, String>,
+    pub disabled: bool,
+}
+
+/// `checks` is either `false` (no checks at all) or a map of checks by name.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum CheckSetting {
+    Flag(bool),
+    Checks(BTreeMap<String, CheckConfig>),
 }
 
 /// `mcp.servers.<name>.oauth` for a remote server: how to sign in. All fields are optional; a server that supports
@@ -193,6 +219,7 @@ pub struct CommandConfig {
 #[serde(default)]
 pub struct Config {
     pub formatter: Option<FormatterSetting>,
+    pub checks: Option<CheckSetting>,
     pub mcp: McpConfig,
     pub tui: TuiConfig,
     pub websearch: Option<WebSearchSetting>,
@@ -224,6 +251,8 @@ pub struct Config {
     pub sandbox: crate::sandbox::SandboxConfig,
     /// Caps on concurrently running background jobs (apply with `Engine::set_job_limits`).
     pub jobs: JobLimits,
+    /// Spending guardrails (see `Limits`); all off unless set.
+    pub limits: Limits,
     pub permissions: Vec<Rule>,
     pub agents: BTreeMap<String, AgentConfig>,
     /// Extra instruction files (paths, `~/` allowed; relative paths resolve against the working directory).
@@ -242,6 +271,28 @@ pub struct JobLimits {
 impl Default for JobLimits {
     fn default() -> Self {
         JobLimits { max_shells: 8, max_subagents: 4 }
+    }
+}
+
+/// `limits`: spending guardrails, `{"maxCostPerRun": 2.0, "maxCostPerSession": 20.0, "maxSteps": 100}`. Costs are in
+/// USD and come from the model catalog; a model without a price cannot be limited by cost (the engine says so once).
+#[derive(Debug, Clone, Copy, PartialEq, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Limits {
+    /// One user prompt until the session is idle again, subagents included.
+    #[serde(alias = "max_cost_per_run")]
+    pub max_cost_per_run: Option<f64>,
+    /// Everything the session (and its subagents) has cost so far.
+    #[serde(alias = "max_cost_per_session")]
+    pub max_cost_per_session: Option<f64>,
+    /// Steps per run for agents without a `steps` of their own.
+    #[serde(alias = "max_steps")]
+    pub max_steps: Option<u32>,
+}
+
+impl Limits {
+    pub fn has_cost_limit(&self) -> bool {
+        self.max_cost_per_run.is_some() || self.max_cost_per_session.is_some()
     }
 }
 
@@ -342,6 +393,8 @@ pub struct Loaded {
     pub mcp_origins: BTreeMap<String, PathBuf>,
     /// The same for `formatter.<name>`: a project's formatter is a command to run, so it must be vetted like an MCP server.
     pub formatter_origins: BTreeMap<String, PathBuf>,
+    /// The same for `checks.<name>`.
+    pub check_origins: BTreeMap<String, PathBuf>,
     /// The config file that set `shell` last: a project's is an executable to run, so it must be vetted too.
     pub shell_origin: Option<PathBuf>,
 }
@@ -574,6 +627,12 @@ pub fn load(app_dir: &Path, cwd: &Path) -> Loaded {
                 for name in v["formatter"].as_object().into_iter().flat_map(|o| o.keys()) {
                     out.formatter_origins.insert(name.clone(), path.clone());
                 }
+                for name in v["checks"].as_object().into_iter().flat_map(|o| o.keys()) {
+                    out.check_origins.insert(name.clone(), path.clone());
+                }
+                if v["checks"].is_boolean() {
+                    out.check_origins.clear();
+                }
                 if v.get("shell").is_some_and(|s| !s.is_null()) {
                     out.shell_origin = Some(path.clone());
                 }
@@ -642,6 +701,7 @@ pub fn resolve_agents_in(cfg: &Config, mode: crate::permission::PermissionMode) 
             a.description = ac.description.clone().unwrap_or_else(|| a.description.clone());
             a.steps = ac.steps.or(a.steps);
             a.effort = ac.effort.clone().or(a.effort.take());
+            a.checks = ac.checks.unwrap_or(a.checks);
             a.mode = ac.mode.as_deref().and_then(agent::Mode::parse).unwrap_or(a.mode);
         } else if !ac.disabled {
             agents.push(Agent {
@@ -653,6 +713,7 @@ pub fn resolve_agents_in(cfg: &Config, mode: crate::permission::PermissionMode) 
                 steps: ac.steps,
                 effort: ac.effort.clone(),
                 model: ac.model.clone(),
+                checks: ac.checks.unwrap_or(true),
                 permissions: crate::permission::mode_rules(mode),
             });
         }
@@ -968,6 +1029,28 @@ mod tests {
         assert_eq!(evaluate("shell", "git status", &build.permissions), Effect::Allow, "agent rule beats the global one");
         assert_eq!(agents[3].system.as_deref(), Some("Be brief."));
         assert_eq!(evaluate("edit", "x", &agents[3].permissions), Effect::Ask);
+    }
+
+    #[test]
+    fn limits_accept_camel_and_snake_case_and_default_to_off() {
+        assert_eq!(serde_json::from_value::<Config>(json!({})).unwrap().limits, Limits::default());
+        let l = serde_json::from_value::<Config>(json!({"limits": {"maxCostPerRun": 2.0, "maxCostPerSession": 20, "maxSteps": 100}})).unwrap().limits;
+        assert_eq!((l.max_cost_per_run, l.max_cost_per_session, l.max_steps), (Some(2.0), Some(20.0), Some(100)));
+        let l = serde_json::from_value::<Config>(json!({"limits": {"max_cost_per_run": 1.5}})).unwrap().limits;
+        assert_eq!((l.max_cost_per_run, l.max_steps, l.has_cost_limit()), (Some(1.5), None, true));
+    }
+
+    #[test]
+    fn checks_setting_and_the_per_agent_switch() {
+        let cfg: Config = serde_json::from_value(json!({"checks": {"rust": {"command": ["cargo", "check"], "extensions": [".rs"], "timeout": 5000}}, "agents": {"build": {"checks": false}}})).unwrap();
+        let Some(CheckSetting::Checks(m)) = &cfg.checks else { panic!() };
+        assert_eq!(m["rust"].timeout, Some(5000));
+        assert_eq!(serde_json::from_value::<Config>(json!({"checks": false})).unwrap().checks, Some(CheckSetting::Flag(false)));
+        let agents = resolve_agents(&cfg);
+        let on = |id: &str| agents.iter().find(|a| a.id == id).unwrap().checks;
+        assert!(!on("build"), "switched off in config");
+        assert!(!on("plan") && !on("explore"), "read-only agents never run checks");
+        assert!(on("general"));
     }
 
     #[test]

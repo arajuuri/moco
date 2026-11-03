@@ -8,7 +8,6 @@
 use super::*;
 use serde_json::{json, Map};
 use std::collections::{BTreeMap, HashMap};
-use std::time::Duration;
 
 pub const PROVIDER: &str = "gemini";
 
@@ -29,7 +28,7 @@ impl Gemini {
             api_key,
             base_url: base_url.trim_end_matches('/').to_string(),
             headers,
-            agent: ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(20)).timeout_read(Duration::from_secs(120)).build(),
+            agent: new_agent(),
         }
     }
 }

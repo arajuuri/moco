@@ -5,7 +5,7 @@ use moco_core::catalog::{Catalog, ProviderInfo};
 use moco_core::mcp::{self, oauth::LoginIo, trust, Manager, ServerSpec};
 use moco_core::tools::SubagentRequest;
 use moco_core::{commands, compaction, mentions, skills};
-use moco_core::engine::{CompactResult, DiffResult, Engine, UndoReport, UndoResult, EngineConfig, PermissionPrompt, Reply, RunOutcome, Ui, UiEvent};
+use moco_core::engine::{CompactResult, DiffResult, Engine, LimitChoice, UndoReport, UndoResult, EngineConfig, PermissionPrompt, Reply, RunOutcome, Ui, UiEvent};
 use moco_core::provider::registry;
 use moco_core::provider::Usage;
 use moco_core::tools::{Question, Todo};
@@ -54,6 +54,8 @@ struct RunUsage {
 struct Terminal {
     mid_line: AtomicBool,
     run: Mutex<RunUsage>,
+    /// `-p`: nobody is asked whether to go on past a spending limit; the run stops instead.
+    oneshot: bool,
 }
 
 impl Terminal {
@@ -260,6 +262,19 @@ impl Ui for Terminal {
         let _ = std::io::stdout().flush();
     }
 
+    fn ask_limit(&self, what: &str) -> LimitChoice {
+        if self.oneshot {
+            return LimitChoice::Stop;
+        }
+        self.newline_if_needed();
+        println!("{what}.");
+        match self.read_line("  [c] continue  [u] continue without the limit  [s] stop: ").as_deref().map(str::trim) {
+            Some("c") | Some("continue") => LimitChoice::Continue,
+            Some("u") => LimitChoice::ContinueUnlimited,
+            _ => LimitChoice::Stop,
+        }
+    }
+
     fn ask(&self, p: &PermissionPrompt) -> Reply {
         self.newline_if_needed();
         println!("Permission needed: {} {}", p.action, p.resources.join(", "));
@@ -398,6 +413,26 @@ fn formatters_from(cfg: &config::Config, origins: &std::collections::BTreeMap<St
     (formatters, warnings.into_inner())
 }
 
+/// The checks to run after a step's edits: only what the config names, and project-defined ones only if approved.
+fn checks_from(cfg: &config::Config, origins: &std::collections::BTreeMap<String, std::path::PathBuf>, app_dir: &std::path::Path, cwd: &std::path::Path) -> (moco_core::check::Checks, Vec<String>) {
+    let Some(config::CheckSetting::Checks(map)) = &cfg.checks else { return (Default::default(), vec![]) };
+    let warnings = std::cell::RefCell::new(vec![]);
+    let checks = moco_core::check::Checks::from_config(map, &|name| {
+        let cc = &map[name];
+        let origin = origins.get(name);
+        if origin.is_none_or(|o| trust::origin_is_trusted(o, app_dir)) {
+            return true;
+        }
+        let what = format!("{}   (for {})", cc.command.join(" "), cc.extensions.join(" "));
+        let ok = project_command_allowed(app_dir, origin, "check", name, &what, &trust::fingerprint_check(cwd, name, cc));
+        if !ok {
+            warnings.borrow_mut().push(format!("check '{name}' from {} is off: project-defined commands need your approval (run moco in a terminal, or set MOCO_TRUST_PROJECT_CONFIG=1)", origin.map(|o| tilde(&o.display().to_string())).unwrap_or_default()));
+        }
+        ok
+    });
+    (checks, warnings.into_inner())
+}
+
 fn print_files(r: &UndoReport) {
     let mut lines: Vec<String> = r.restored.iter().map(|p| format!("  restored {p}")).chain(r.deleted.iter().map(|p| format!("  removed {p}"))).collect();
     let extra = lines.len().saturating_sub(15);
@@ -412,6 +447,22 @@ fn print_files(r: &UndoReport) {
     let n = r.skipped.iter().map(|s| s.path.as_str()).collect::<std::collections::BTreeSet<_>>().len();
     if n > 0 {
         println!("{DIM}{n} file(s) could not be restored (too large or unreadable){RESET}");
+    }
+}
+
+/// Exit status of `-p` when a spending limit stopped the run.
+const EXIT_LIMIT: i32 = 3;
+
+/// `true` when a change to the session was stored. A failure is logged and printed, so the caller can skip its
+/// success message (the change did not happen) instead of reporting what was never saved.
+fn stored<T>(what: &str, r: Result<T, moco_core::store::StoreError>) -> bool {
+    match r {
+        Ok(_) => true,
+        Err(e) => {
+            moco_core::log_warn!("store", "saving {what} failed: {e}");
+            eprintln!("{RED}{what} could not be saved: {e}{RESET}");
+            false
+        }
     }
 }
 
@@ -653,6 +704,7 @@ fn main() {
     let mut agent_id: Option<String> = None;
     let mut permission_mode_arg: Option<String> = None;
     let mut eval_classifier: Option<String> = None;
+    let (mut max_cost, mut max_steps) = (None::<f64>, None::<u32>);
     let mut args = raw.drain(..);
     while let Some(a) = args.next() {
         let mut value = |flag: &str| args.next().unwrap_or_else(|| die(&format!("{flag} needs a value")));
@@ -662,6 +714,14 @@ fn main() {
             "--agent" => agent_id = Some(value("--agent")),
             "--permission-mode" => permission_mode_arg = Some(value("--permission-mode")),
             "--effort" => effort_arg = Some(value("--effort")),
+            "--max-cost" => {
+                let v = value("--max-cost");
+                max_cost = Some(v.trim_start_matches('$').parse::<f64>().ok().filter(|c| c.is_finite() && *c >= 0.0).unwrap_or_else(|| die(&format!("--max-cost needs an amount in USD, not {v}"))));
+            }
+            "--max-steps" => {
+                let v = value("--max-steps");
+                max_steps = Some(v.parse::<u32>().ok().filter(|n| *n > 0).unwrap_or_else(|| die(&format!("--max-steps needs a positive number, not {v}"))));
+            }
             "--dir" => dir = Some(value("--dir")),
             "--session" | "-s" => session_arg = Some(value("--session")),
             "--prompt" | "-p" => prompt = Some(value("--prompt")),
@@ -675,7 +735,7 @@ fn main() {
             }
             "--help" | "-h" => {
                 println!(
-                    "usage: moco [--continue | --session ID] [--model PROVIDER/MODEL] [--agent ID] [--permission-mode manual|auto] [--effort LEVEL] [--dir PATH] [-p PROMPT] [--plain] [--version]\n       moco sessions [--all] [--archived] | rename ID TITLE | archive ID | unarchive ID\n       moco models [FILTER] [--refresh]\n       moco auth PROVIDER\n       moco logs [--follow] [--lines N] [--path]\n\nlogging: MOCO_LOG=error|warn|info|debug|trace (default warn; `warn,mcp=trace` sets one target) or the `log` config key.\n         Files: <data dir>/data/logs/moco-YYYY-MM-DD.log (7 days kept). Nothing is ever printed to the terminal."
+                    "usage: moco [--continue | --session ID] [--model PROVIDER/MODEL] [--agent ID] [--permission-mode manual|auto] [--effort LEVEL] [--dir PATH] [-p PROMPT [--max-cost USD] [--max-steps N]] [--plain] [--version]\n       -p exit status: 0 done, 1 failed, 2 usage error, 3 stopped by a spending limit (--max-cost, --max-steps or the `limits` config)\n       moco sessions [--all] [--archived] | rename ID TITLE | archive ID | unarchive ID\n       moco models [FILTER] [--refresh]\n       moco auth PROVIDER\n       moco logs [--follow] [--lines N] [--path]\n\nlogging: MOCO_LOG=error|warn|info|debug|trace (default warn; `warn,mcp=trace` sets one target) or the `log` config key.\n         Files: <data dir>/data/logs/moco-YYYY-MM-DD.log (7 days kept). Nothing is ever printed to the terminal."
                 );
                 return;
             }
@@ -704,7 +764,10 @@ fn main() {
     for w in &loaded.warnings {
         eprintln!("warning: config: {w}");
     }
-    let cfg = loaded.config;
+    let mut cfg = loaded.config;
+    // `--max-cost` is the limit for one run (a `-p` prompt); `--max-steps` replaces the default step limit.
+    cfg.limits.max_cost_per_run = max_cost.or(cfg.limits.max_cost_per_run);
+    cfg.limits.max_steps = max_steps.or(cfg.limits.max_steps);
     moco_core::log::configure(cfg.log.as_deref());
     moco_core::log_info!("main", "start dir={} sources={}", cwd_str, loaded.sources.len());
     if let (Some(sh), None) = (&cfg.shell, std::env::var_os("MOCO_SHELL")) {
@@ -760,26 +823,28 @@ fn main() {
         None => store.create_session(&cwd_str, &agent_id).unwrap_or_else(|e| die(&e.to_string())),
     };
     if agent_explicit {
-        store.set_agent(&session.id, &agent_id).ok();
+        stored("the --agent choice", store.set_agent(&session.id, &agent_id));
     } else if resumed && agents.iter().any(|a| a.id == session.agent && a.selectable()) {
         agent_id = session.agent.clone(); // a resumed session keeps its own agent
     }
     if let Some(m) = flag_mode {
-        store.set_permission_mode(&session.id, Some(m.name())).ok();
-        session.permission_mode = Some(m.name().into());
+        if stored("the permission mode", store.set_permission_mode(&session.id, Some(m.name()))) {
+            session.permission_mode = Some(m.name().into());
+        }
     }
     // An explicit --model / MOCO_MODEL applies to this session; otherwise a resumed session keeps its own.
     let explicit_model = std::env::args().any(|a| a == "--model" || a == "-m") || std::env::var("MOCO_MODEL").is_ok();
     if explicit_model {
-        store.set_model(&session.id, Some(&model)).ok();
+        stored("the --model choice", store.set_model(&session.id, Some(&model)));
         session.model = Some(model.clone());
     }
 
     if let Some(e) = &effort_arg {
-        store.set_variant(&session.id, Some(e)).ok();
+        stored("the --effort choice", store.set_variant(&session.id, Some(e)));
     }
     let mut engine_cfg = EngineConfig::new(&model, app_dir.clone());
     engine_cfg.effort = cfg.effort.clone();
+    engine_cfg.limits = cfg.limits;
     engine_cfg.agents = agents;
     engine_cfg.permission_mode = default_mode;
     engine_cfg.agents_by_mode = mode_agents;
@@ -817,6 +882,11 @@ fn main() {
         eprintln!("warning: {w}");
     }
     engine_cfg.formatters = formatters;
+    let (checks, check_warnings) = checks_from(&cfg, &loaded.check_origins, &app_dir, &cwd);
+    for w in &check_warnings {
+        eprintln!("warning: {w}");
+    }
+    engine_cfg.checks = checks;
     engine_cfg.websearch = moco_core::tools::websearch::Settings::from_config(&cfg.websearch, app_dir.clone());
     let n_sources = loaded.sources.len();
     let engine = Engine::with_providers(store, providers, engine_cfg).share();
@@ -845,7 +915,7 @@ fn main() {
     }
 
     install_sigint();
-    let term = Terminal { mid_line: AtomicBool::new(false), run: Mutex::new(RunUsage::default()) };
+    let term = Terminal { mid_line: AtomicBool::new(false), run: Mutex::new(RunUsage::default()), oneshot: prompt.is_some() };
     let run = |sid: &str, resume: bool| {
         CANCEL.store(false, Ordering::Relaxed);
         let outcome = engine.run(sid, &term, &CANCEL, resume);
@@ -855,6 +925,7 @@ fn main() {
             Ok(RunOutcome::Interrupted) => println!("{DIM}interrupted{RESET}"),
             Ok(RunOutcome::Declined) => println!("{DIM}stopped: tool call rejected{RESET}"),
             Ok(RunOutcome::Failed(_)) => {} // already reported via Notice
+            Ok(RunOutcome::LimitReached { what }) => eprintln!("{RED}stopped: {what}. Raise it with --max-cost / --max-steps or the `limits` config.{RESET}"),
             Ok(RunOutcome::Busy) => eprintln!("session is busy"),
             Err(e) => eprintln!("{RED}store error: {e}{RESET}"),
         }
@@ -939,7 +1010,8 @@ fn main() {
         if !send(&session.id, &text) {
             die("could not queue the prompt");
         }
-        let mut ok = matches!(run(&session.id, false), Some(RunOutcome::Idle));
+        let mut last = run(&session.id, false);
+        let mut ok = matches!(last, Some(RunOutcome::Idle));
         // Background jobs started during the run: wait for them and let the assistant report what they produced.
         while ok && !CANCEL.load(Ordering::Relaxed) {
             if engine.running_jobs() > 0 {
@@ -949,13 +1021,19 @@ fn main() {
             if CANCEL.load(Ordering::Relaxed) || engine.store().pending_inbox(&session.id).unwrap_or(0) == 0 {
                 break;
             }
-            ok = matches!(run(&session.id, false), Some(RunOutcome::Idle));
+            last = run(&session.id, false);
+            ok = matches!(last, Some(RunOutcome::Idle));
         }
         engine.kill_all_jobs();
         if let Some(m) = &manager {
             m.shutdown(); // process::exit skips destructors, and the servers must not be left running
         }
-        std::process::exit(if ok { 0 } else { 1 });
+        // 0 done, 1 failed or stopped, 3 stopped by a spending limit (2 is a usage error, see `die`).
+        std::process::exit(match last {
+            _ if ok => 0,
+            Some(RunOutcome::LimitReached { .. }) => EXIT_LIMIT,
+            _ => 1,
+        });
     }
 
     let title_of = |sid: &str| engine.store().session(sid).ok().flatten().and_then(|s| s.title);
@@ -1141,7 +1219,9 @@ fn main() {
                 match target {
                     Err(e) => println!("{e}"),
                     Ok(t) => {
-                        engine.store().set_archived(&t.id, !unarchive).ok();
+                        if !stored(if unarchive { "unarchiving" } else { "archiving" }, engine.store().set_archived(&t.id, !unarchive)) {
+                            continue;
+                        }
                         println!("{DIM}{} {}{RESET}", if unarchive { "unarchived" } else { "archived" }, short(&t.id));
                         if !unarchive && t.id == session.id {
                             match engine.store().create_session(&cwd_str, &agent_id) {
@@ -1222,8 +1302,9 @@ fn main() {
                     println!("{DIM}model: {}{RESET}\nconnected: {}\n/model <filter> searches; /model provider/model switches", current(&session.id), connected.join(", "));
                 } else if let Some((pid, mid)) = arg.split_once('/').filter(|(p, _)| connected.iter().any(|c| c == p)) {
                     let known = engine.catalog().model(pid, mid).is_some();
-                    engine.store().set_model(&session.id, Some(arg)).ok();
-                    println!("{DIM}model: {arg}{}{RESET}", if known { "" } else { " (not in the catalog: no price or context limit)" });
+                    if stored("the model choice", engine.store().set_model(&session.id, Some(arg))) {
+                        println!("{DIM}model: {arg}{}{RESET}", if known { "" } else { " (not in the catalog: no price or context limit)" });
+                    }
                 } else if arg.contains('/') && !arg.contains(' ') && engine.catalog().providers.contains_key(arg.split('/').next().unwrap_or("")) {
                     println!("provider '{}' is not connected; run `moco auth {}`", arg.split('/').next().unwrap_or(""), arg.split('/').next().unwrap_or(""));
                 } else {
@@ -1244,11 +1325,13 @@ fn main() {
                 } else if arg.is_empty() {
                     println!("{DIM}reasoning effort: {}{}\nlevels: {}\n/effort <level> sets it, /effort default goes back to the provider's default{RESET}", info.desired.as_deref().unwrap_or("default"), if info.desired.is_some() && !info.offered { " (this model does not offer it, so it is not sent)" } else { "" }, info.levels.join(", "));
                 } else if arg == "default" {
-                    engine.store().set_variant(&session.id, None).ok();
-                    println!("{DIM}reasoning effort: default{RESET}");
+                    if stored("the reasoning effort", engine.store().set_variant(&session.id, None)) {
+                        println!("{DIM}reasoning effort: default{RESET}");
+                    }
                 } else if info.levels.iter().any(|x| x == arg) {
-                    engine.store().set_variant(&session.id, Some(arg)).ok();
-                    println!("{DIM}reasoning effort: {arg}{RESET}");
+                    if stored("the reasoning effort", engine.store().set_variant(&session.id, Some(arg))) {
+                        println!("{DIM}reasoning effort: {arg}{RESET}");
+                    }
                 } else {
                     println!("this model offers: {}", info.levels.join(", "));
                 }
@@ -1260,8 +1343,9 @@ fn main() {
                 if want.is_empty() {
                     println!("{DIM}permission mode: {} ({}){RESET}", current.name(), current.describe());
                 } else if let Some(m) = permission::PermissionMode::parse(want) {
-                    engine.store().set_permission_mode(&session.id, Some(m.name())).ok();
-                    println!("{DIM}permission mode: {} ({}){RESET}", m.name(), m.describe());
+                    if stored("the permission mode", engine.store().set_permission_mode(&session.id, Some(m.name()))) {
+                        println!("{DIM}permission mode: {} ({}){RESET}", m.name(), m.describe());
+                    }
                 } else {
                     println!("usage: /mode [manual|auto]");
                 }
@@ -1271,8 +1355,9 @@ fn main() {
                 match engine.agents().iter().find(|a| a.id == want && a.selectable()) {
                     Some(a) => {
                         agent_id = a.id.clone();
-                        engine.store().set_agent(&session.id, &a.id).ok();
-                        println!("{DIM}agent: {}{RESET}", a.name);
+                        if stored("the agent choice", engine.store().set_agent(&session.id, &a.id)) {
+                            println!("{DIM}agent: {}{RESET}", a.name);
+                        }
                     }
                     None => println!("unknown agent; available: {}", engine.agents().iter().filter(|a| a.selectable()).map(|a| a.id.as_str()).collect::<Vec<_>>().join(", ")),
                 }
@@ -1312,7 +1397,7 @@ fn main() {
                         Ok(r) => {
                             println!("{}", r.output);
                             let st = engine.store();
-                            st.add_message(&session.id, "synthetic", &serde_json::json!({"text": format!("Result of /{} {}:\n\n{}", cmd.name, args.trim(), r.output)})).ok();
+                            stored("the command's result in the conversation (the model will not see it)", st.add_message(&session.id, "synthetic", &serde_json::json!({"text": format!("Result of /{} {}:\n\n{}", cmd.name, args.trim(), r.output)})));
                         }
                         Err(e) => eprintln!("{RED}/{} failed: {}{RESET}", cmd.name, e.message()),
                     }
@@ -1328,13 +1413,13 @@ fn main() {
                         let cur = st.session(&session.id).ok().flatten();
                         if let Some(a) = &cmd.agent {
                             if engine.agents().iter().any(|x| x.id == *a) {
-                                st.set_agent(&session.id, a).ok();
+                                stored("the command's agent", st.set_agent(&session.id, a));
                             } else {
                                 println!("unknown agent '{a}' in /{name}; using the current one");
                             }
                         }
                         if let Some(m) = &cmd.model {
-                            st.set_model(&session.id, Some(m)).ok();
+                            stored("the command's model", st.set_model(&session.id, Some(m)));
                         }
                         (cur.as_ref().map(|c| c.agent.clone()), cur.and_then(|c| c.model))
                     };
@@ -1343,10 +1428,10 @@ fn main() {
                     }
                     let st = engine.store();
                     if let Some(a) = saved_agent {
-                        st.set_agent(&session.id, &a).ok();
+                        stored("the agent of this session (it stays switched after the command)", st.set_agent(&session.id, &a));
                     }
                     if cmd.model.is_some() {
-                        st.set_model(&session.id, saved_model.as_deref()).ok();
+                        stored("the model of this session (it stays switched after the command)", st.set_model(&session.id, saved_model.as_deref()));
                     }
                 }
             }

@@ -14,6 +14,8 @@ enum State {
     Stopped,
     Finished,
     Failed(String),
+    /// A spending limit stopped a background subagent (what was exceeded).
+    LimitReached(String),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -40,6 +42,9 @@ pub(super) struct Jobs {
     limits: Mutex<crate::config::JobLimits>,
 }
 
+/// Waits before the second and third attempt to queue a job's result.
+const TELL_BACKOFF: [Duration; 2] = [Duration::from_millis(100), Duration::from_millis(300)];
+
 /// `list` shows this many finished jobs; older ones stay inspectable by id (up to `KEEP_FINISHED`).
 const LISTED_FINISHED: usize = 60;
 const KEEP_FINISHED: usize = 1000;
@@ -54,6 +59,7 @@ fn describe(state: &State) -> String {
         State::Stopped => "stopped".into(),
         State::Finished => "finished".into(),
         State::Failed(e) => format!("failed: {e}"),
+        State::LimitReached(what) => format!("stopped at a spending limit: {what}"),
     }
 }
 
@@ -166,9 +172,25 @@ impl Engine {
         }
     }
 
-    /// Queue `text` for the session as a message the model will see.
-    fn tell_session(&self, sid: &str, text: &str, description: &str) {
-        self.store().enqueue(sid, None, Mode::Steer, "synthetic", &json!({"text": text, "description": description})).log_err("store", "queueing a background job's result");
+    /// Queue `text` for the session as a message the model will see. A busy database (another moco process holding
+    /// a write lock) is retried a few times; if it still fails the user is told through the notifier, with `lost` (what
+    /// the model will not hear about, ideally the job id and where its output is) so the result is not lost silently.
+    fn tell_session(&self, sid: &str, text: &str, description: &str, lost: &str) {
+        let data = json!({"text": text, "description": description});
+        let mut last = None;
+        for (attempt, wait) in std::iter::once(Duration::ZERO).chain(TELL_BACKOFF).enumerate() {
+            std::thread::sleep(wait);
+            match self.store().enqueue(sid, None, Mode::Steer, "synthetic", &data) {
+                Ok(_) => return,
+                Err(e) => {
+                    crate::log_warn!("store", "queueing a background job's result failed (attempt {}): {e}", attempt + 1);
+                    last = Some(e);
+                }
+            }
+        }
+        if let Some(e) = last {
+            self.notify(&format!("warning: the model was not told that {lost}: {e}"));
+        }
     }
 
     pub fn background_jobs(&self, session: Option<&str>) -> Vec<JobInfo> {
@@ -322,12 +344,14 @@ impl Engine {
         crate::log_info!("jobs", "finish shell job={id} session={sid} {what} ms={ran_ms}");
         self.set_state(id, state.clone());
         let output = if f.text.trim().is_empty() { "(no output)".to_string() } else { f.text.clone() };
+        let out_path = self.jobs_lock().iter().find(|j| j.id == id).and_then(|j| j.out.as_ref().map(|p| p.display().to_string())).unwrap_or_else(|| "an unknown file".into());
         // Whoever stopped it knows; everything else is news for the model.
         if state != State::Stopped {
             self.tell_session(
                 sid,
                 &format!("Background command finished (shell ID: {id}): {what}.\nCommand: {command}\n\n{output}"),
                 &format!("background shell {id} {what}"),
+                &format!("background shell {id} {what} (its output is in {out_path})"),
             );
         }
         self.notify(&format!("background {id} `{}` {what}", command.lines().next().unwrap_or("").chars().take(60).collect::<String>()));
@@ -344,7 +368,7 @@ impl Engine {
             crate::log_warn!("jobs", "subagent job={} refused: {msg}", child.id);
             let failed = Job { id: child.id.clone(), kind: Kind::Subagent, session_id: parent.id.clone(), title: description.to_string(), started: Instant::now(), state: State::Failed(msg.clone()), out: None, stop };
             let _ = self.register(failed);
-            self.tell_session(&parent.id, &format!("Background subagent not started (sessionID: {}, task: {description}): {msg}", child.id), &format!("background subagent {} refused", child.id));
+            self.tell_session(&parent.id, &format!("Background subagent not started (sessionID: {}, task: {description}): {msg}", child.id), &format!("background subagent {} refused", child.id), &format!("background subagent {} was refused ({description})", child.id));
             return;
         }
         let (eng, parent_id, child, description) = (self.clone(), parent.id.clone(), child.clone(), description.to_string());
@@ -353,12 +377,17 @@ impl Engine {
             let (state, text) = match result {
                 Ok(r) => (State::Finished, format!("Background subagent finished (sessionID: {}, task: {description}):\n\n{}", child.id, r.output)),
                 Err(ToolError::Interrupted) => (State::Stopped, String::new()),
+                Err(e) if e.message().starts_with(limits::SUBAGENT_STOPPED) => {
+                    let what = e.message().trim_start_matches(limits::SUBAGENT_STOPPED).to_string();
+                    let text = format!("Background subagent stopped at a spending limit (sessionID: {}, task: {description}): {what}. Its work so far is kept in that session. Tell the user; do not start it again unless they agree.", child.id);
+                    (State::LimitReached(what), text)
+                }
                 Err(e) => (State::Failed(e.message()), format!("Background subagent failed (sessionID: {}, task: {description}): {}", child.id, e.message())),
             };
             crate::log_info!("jobs", "finish subagent job={} session={parent_id} {}", child.id, describe(&state));
             eng.set_state(&child.id, state.clone());
             if state != State::Stopped {
-                eng.tell_session(&parent_id, &text, &format!("background subagent {} {}", child.id, describe(&state)));
+                eng.tell_session(&parent_id, &text, &format!("background subagent {} {}", child.id, describe(&state)), &format!("background subagent {} {} (its work is in session {})", child.id, describe(&state), child.id));
             }
             eng.notify(&format!("background subagent {description} {}", describe(&state)));
         });
@@ -373,7 +402,22 @@ impl Engine {
             return Err("interrupted".into());
         }
         let shown = if f.text.trim().is_empty() { "(no output)".to_string() } else { f.text };
-        self.store().add_message(sid, "synthetic", &json!({"text": format!("The user ran this command themselves:\n$ {command}\n\n{shown}"), "description": "user shell command"})).log_err("store", "recording the user's own command");
+        let data = json!({"text": format!("The user ran this command themselves:\n$ {command}\n\n{shown}"), "description": "user shell command"});
+        let mut last = None;
+        for wait in std::iter::once(Duration::ZERO).chain(TELL_BACKOFF) {
+            std::thread::sleep(wait);
+            match self.store().add_message(sid, "synthetic", &data) {
+                Ok(_) => {
+                    last = None;
+                    break;
+                }
+                Err(e) => last = Some(e),
+            }
+        }
+        if let Some(e) = last {
+            crate::log_warn!("store", "recording the user's own command failed: {e}");
+            self.notify(&format!("warning: the model will not know you ran `{}`: {e}", command.lines().next().unwrap_or("").chars().take(60).collect::<String>()));
+        }
         Ok(shown)
     }
 }
@@ -391,6 +435,73 @@ mod tests {
         let eng = Engine::new(store, Box::new(FakeProvider::new(vec![])), EngineConfig::new("test-model", dir.join("app"))).share();
         eng.set_job_limits(limits);
         (eng, session, dir)
+    }
+
+    fn collect_notices(eng: &Engine) -> Arc<Mutex<Vec<String>>> {
+        let seen = Arc::new(Mutex::new(vec![]));
+        let s = seen.clone();
+        eng.set_notifier(Arc::new(move |l: &str| s.lock().unwrap().push(l.to_string())));
+        seen
+    }
+
+    #[test]
+    fn a_job_result_survives_a_store_that_fails_a_couple_of_times() {
+        let (eng, s, dir) = engine(crate::config::JobLimits::default());
+        let notices = collect_notices(&eng);
+        eng.store().exec_for_test("alter table session_inbox rename to session_inbox_away");
+        // The first attempt (at once) and the second (after 100 ms) fail; the third (after 400 ms) finds the table back.
+        let fixer = {
+            let eng = eng.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(250));
+                eng.store().exec_for_test("alter table session_inbox_away rename to session_inbox");
+            })
+        };
+        eng.tell_session(&s.id, "Background command finished", "background shell shl_x exited", "background shell shl_x exited (its output is in /tmp/x.txt)");
+        fixer.join().unwrap();
+        assert_eq!(eng.store().pending_inbox(&s.id).unwrap(), 1, "the result reached the inbox");
+        assert!(notices.lock().unwrap().is_empty(), "no warning when a retry worked: {:?}", notices.lock().unwrap());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_job_result_that_cannot_be_queued_is_reported_with_the_job_id_and_output_path() {
+        let (eng, s, dir) = engine(crate::config::JobLimits::default());
+        let notices = collect_notices(&eng);
+        eng.store().exec_for_test("alter table session_inbox rename to session_inbox_away");
+        eng.tell_session(&s.id, "Background command finished", "background shell shl_x exited", "background shell shl_x exited (its output is in /tmp/x.txt)");
+        let n = notices.lock().unwrap().clone();
+        assert_eq!(n.len(), 1, "{n:?}");
+        assert!(n[0].contains("shl_x") && n[0].contains("/tmp/x.txt") && n[0].contains("not told"), "{}", n[0]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_finished_shell_job_reports_its_output_path_when_the_store_is_broken() {
+        let (eng, s, dir) = engine(crate::config::JobLimits::default());
+        let notices = collect_notices(&eng);
+        eng.store().exec_for_test("alter table session_inbox rename to session_inbox_away");
+        let (id, out) = eng.start_shell_job(&s, "echo hi", &dir.join("work"), None, true).unwrap();
+        let end = Instant::now() + Duration::from_secs(10);
+        while notices.lock().unwrap().len() < 2 && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let n = notices.lock().unwrap().clone();
+        assert!(n.iter().any(|l| l.contains(&id) && l.contains(&out.display().to_string()) && l.contains("not told")), "{n:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_user_command_the_model_cannot_be_told_about_is_reported() {
+        let (eng, s, dir) = engine(crate::config::JobLimits::default());
+        let notices = collect_notices(&eng);
+        eng.store().exec_for_test("alter table message rename to message_away");
+        // `run_user_command` first reads the session, which still works; only the message insert fails.
+        let shown = eng.run_user_command(&s.id, "echo hi", &AtomicBool::new(false)).unwrap();
+        assert!(shown.contains("hi"));
+        let n = notices.lock().unwrap().clone();
+        assert!(n.len() == 1 && n[0].contains("will not know") && n[0].contains("echo hi"), "{n:?}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
