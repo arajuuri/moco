@@ -3,7 +3,6 @@
 use super::*;
 use serde_json::json;
 use std::collections::BTreeMap;
-use std::time::Duration;
 
 pub struct OpenAiChat {
     pub api_key: Option<String>,
@@ -22,7 +21,7 @@ impl OpenAiChat {
             api_key,
             base_url: base_url.trim_end_matches('/').to_string(),
             headers,
-            agent: ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(20)).timeout_read(Duration::from_secs(120)).build(),
+            agent: new_agent(),
         }
     }
 }

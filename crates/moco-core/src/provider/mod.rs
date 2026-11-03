@@ -268,6 +268,16 @@ pub(crate) fn log_http_error(provider: &str, status: u16, retry_after: Option<u6
     crate::log_debug!("provider", "http-error {provider} status={status} retry_after={} body={}", retry_after.map_or("-".into(), |s| format!("{s}s")), &body[..cut]);
 }
 
+/// Connect timeout of the shared HTTP agent.
+pub(crate) const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// Read timeout of the shared HTTP agent (also bounds a stalled stream).
+pub(crate) const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The HTTP agent every adapter uses, so timeouts are configured in one place.
+pub(crate) fn new_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new().timeout_connect(CONNECT_TIMEOUT).timeout_read(READ_TIMEOUT).build()
+}
+
 /// Map a transport failure from `ureq` to a neutral error (shared by the adapters).
 pub(crate) fn transport_error(t: ureq::Transport) -> ProviderError {
     let kind = match t.kind() {
@@ -390,6 +400,19 @@ pub(crate) fn read_sse(mut lines: Lines, cancel: &AtomicBool, mut on_data: impl 
                 return Ok(());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod agent_tests {
+    use super::*;
+
+    #[test]
+    fn shared_agent_timeouts() {
+        assert_eq!(CONNECT_TIMEOUT, std::time::Duration::from_secs(20));
+        assert_eq!(READ_TIMEOUT, std::time::Duration::from_secs(120));
+        // ureq exposes no getters, so just check the agent builds and can prepare a request.
+        let _ = new_agent().post("http://127.0.0.1:1/");
     }
 }
 
