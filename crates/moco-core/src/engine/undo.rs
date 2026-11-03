@@ -9,6 +9,14 @@ fn describe_undo(r: &Result<UndoResult, StoreError>) -> String {
     }
 }
 
+/// `UndoReport` has no field for these yet (that needs an engine.rs and front-end change), so they are logged.
+fn log_skipped(sid: &str, skipped: &[crate::snapshot::Skipped]) {
+    if !skipped.is_empty() {
+        let list: Vec<String> = skipped.iter().map(|s| format!("{} ({})", s.path, s.reason)).collect();
+        crate::log_warn!("engine", "undo session={sid}: {} file(s) not covered by the snapshot were not restored: {}", skipped.len(), list.join(", "));
+    }
+}
+
 impl Engine {
     /// Capture the working tree before a step. Best effort: a failure disables snapshots for the session with one notice.
     pub(super) fn take_snapshot(&self, session: &Session, ui: &dyn Ui) -> Option<String> {
@@ -84,6 +92,7 @@ impl Engine {
             let hint = self.store().last_snapshot(sid)?;
             match self.snaps(&session).restore(std::path::Path::new(&session.directory), &snap, hint.as_deref()) {
                 Ok(r) => {
+                    log_skipped(sid, &r.skipped);
                     report.restored = r.restored;
                     report.deleted = r.deleted;
                     report.files_restored = true;
@@ -111,6 +120,7 @@ impl Engine {
             if let (true, Some(redo)) = (self.cfg.snapshots, revert["redo"].as_str()) {
                 match self.snaps(&session).restore(std::path::Path::new(&session.directory), redo, None) {
                     Ok(r) => {
+                        log_skipped(sid, &r.skipped);
                         report.restored = r.restored;
                         report.deleted = r.deleted;
                         report.files_restored = true;
