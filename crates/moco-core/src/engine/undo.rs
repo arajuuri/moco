@@ -9,7 +9,7 @@ fn describe_undo(r: &Result<UndoResult, StoreError>) -> String {
     }
 }
 
-/// `UndoReport` has no field for these yet (that needs an engine.rs and front-end change), so they are logged.
+/// Also reported to the user through `UndoReport::skipped`; the log keeps the file names.
 fn log_skipped(sid: &str, skipped: &[crate::snapshot::Skipped]) {
     if !skipped.is_empty() {
         let list: Vec<String> = skipped.iter().map(|s| format!("{} ({})", s.path, s.reason)).collect();
@@ -54,10 +54,20 @@ impl Engine {
 
     /// Remove old snapshot data that no recent session refers to. Returns (manifests, blobs) removed.
     pub fn prune_snapshots(&self, project_ids: &[String], max_age: Duration) -> (usize, usize) {
+        self.prune_snapshots_protecting(project_ids, max_age, &[])
+    }
+
+    /// Like `prune_snapshots`, and also keeps every snapshot of the `protect` sessions (ones being resumed), however old.
+    pub fn prune_snapshots_protecting(&self, project_ids: &[String], max_age: Duration, protect: &[String]) -> (usize, usize) {
         let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0) - max_age.as_millis() as i64;
         let mut total = (0, 0);
         for pid in project_ids {
-            let keep = self.store().live_snapshots(pid, since).unwrap_or_default();
+            let mut keep = self.store().live_snapshots(pid, since).unwrap_or_default();
+            for sid in protect {
+                if let Ok(msgs) = self.store().messages(sid) {
+                    keep.extend(msgs.iter().filter(|m| m.kind == "assistant").filter_map(|m| m.data["snapshot"].as_str().map(String::from)));
+                }
+            }
             let (m, b) = Snapshots::new(self.cfg.app_dir.join("data/snapshots").join(pid)).prune(&keep, max_age);
             total = (total.0 + m, total.1 + b);
         }
@@ -95,6 +105,7 @@ impl Engine {
                     log_skipped(sid, &r.skipped);
                     report.restored = r.restored;
                     report.deleted = r.deleted;
+                    report.skipped = r.skipped;
                     report.files_restored = true;
                     redo = redo.or(Some(r.before)); // the state before the first undo is what redo returns to
                 }
@@ -123,6 +134,7 @@ impl Engine {
                         log_skipped(sid, &r.skipped);
                         report.restored = r.restored;
                         report.deleted = r.deleted;
+                        report.skipped = r.skipped;
                         report.files_restored = true;
                     }
                     Err(e) => return Ok(UndoResult::Failed(e.to_string())),

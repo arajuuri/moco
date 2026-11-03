@@ -54,6 +54,11 @@ fn files(app: &mut App, r: &UndoReport) {
     for f in &r.deleted {
         app.push_info(format!("  removed {f}"));
     }
+    // A modified file is listed twice (old and new version), so count paths.
+    let n = r.skipped.iter().map(|s| s.path.as_str()).collect::<std::collections::BTreeSet<_>>().len();
+    if n > 0 {
+        app.push_info(format!("{n} file(s) could not be restored (too large or unreadable)"));
+    }
 }
 
 /// Switch the session's permission mode, from `/mode` or Tab, and say what it now means.

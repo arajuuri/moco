@@ -260,6 +260,8 @@ pub struct UndoReport {
     pub hidden_messages: usize,
     /// False when the turn has no snapshot (or snapshots are off): only the conversation was rolled back.
     pub files_restored: bool,
+    /// Files that changed but are not covered by the snapshot (too large or unreadable), so were not restored.
+    pub skipped: Vec<crate::snapshot::Skipped>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
