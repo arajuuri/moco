@@ -88,7 +88,7 @@ pub fn parse(input: &str) -> Parsed {
         }
         // Risky assignments stay in the text; harmless ones are dropped as before.
         let kept = if risky { 0 } else { skip };
-        let all: Vec<(String, String)> = words.drain(..).collect();
+        let all: Vec<(String, String)> = std::mem::take(words);
         let text = all.iter().skip(kept).map(|(r, _)| r.as_str()).collect::<Vec<_>>().join(" ");
         if text.is_empty() {
             return;
