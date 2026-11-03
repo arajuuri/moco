@@ -44,7 +44,7 @@ impl Engine {
     /// rules are not consulted: they are the user's, not part of what is being measured.
     pub fn evaluate_command(&self, session: &Session, command: &str, cancel: &AtomicBool) -> Evaluation {
         let parsed = crate::tools::shellparse::parse(command);
-        if classifier::never_classify(&parsed) {
+        if classifier::skip_classifier(command, &parsed) {
             return Evaluation { stage: "rules", verdict: Verdict::Ask { reason: "opaque, or on the never-classify list".into() } };
         }
         let Some(settings) = &self.cfg.classifier else { return Evaluation { stage: "off", verdict: Verdict::Ask { reason: "the classifier is off".into() } } };
