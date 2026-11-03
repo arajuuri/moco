@@ -51,6 +51,10 @@ pub struct Request {
     pub model: String,
     pub system: String,
     pub messages: Vec<ChatMessage>,
+    /// Text for the end of the final user message, added by the adapter after the prompt-cache breakpoints. It may
+    /// differ from step to step without invalidating the cache of `system`, `tools` and `messages`, which is why
+    /// request-time reminders go here and not into `messages`.
+    pub tail: Option<String>,
     pub tools: Vec<ToolDef>,
     pub max_tokens: u32,
     /// Keep tool definitions (prompt-cache prefix) but forbid calling them.
@@ -64,7 +68,22 @@ pub struct Request {
 
 impl Default for Request {
     fn default() -> Self {
-        Request { model: String::new(), system: String::new(), messages: vec![], tools: vec![], max_tokens: 16_000, tools_disabled: false, effort: None, overlay: Overlay::default() }
+        Request { model: String::new(), system: String::new(), messages: vec![], tail: None, tools: vec![], max_tokens: 16_000, tools_disabled: false, effort: None, overlay: Overlay::default() }
+    }
+}
+
+impl Request {
+    /// `messages` with `tail` as a last text block of the final user message (a new user message if the history ends
+    /// with the assistant). For adapters whose caching is automatic and prefix-based; Anthropic's marks the
+    /// breakpoints first (see `anthropic::build_body`).
+    pub fn messages_with_tail(&self) -> std::borrow::Cow<'_, [ChatMessage]> {
+        let Some(tail) = &self.tail else { return std::borrow::Cow::Borrowed(&self.messages) };
+        let mut messages = self.messages.clone();
+        match messages.last_mut().filter(|m| m.role == Role::User) {
+            Some(m) => m.content.push(Block::Text(tail.clone())),
+            None => messages.push(ChatMessage { role: Role::User, content: vec![Block::Text(tail.clone())] }),
+        }
+        std::borrow::Cow::Owned(messages)
     }
 }
 
@@ -399,6 +418,58 @@ pub(crate) fn read_sse(mut lines: Lines, cancel: &AtomicBool, mut on_data: impl 
             if on_data(data.trim_start())? {
                 return Ok(());
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tail_tests {
+    use super::*;
+
+    fn request(tail: Option<&str>, messages: Vec<ChatMessage>) -> Request {
+        Request { model: "m".into(), system: "sys".into(), messages, tail: tail.map(String::from), ..Default::default() }
+    }
+    fn user(t: &str) -> ChatMessage {
+        ChatMessage { role: Role::User, content: vec![Block::Text(t.into())] }
+    }
+    fn results() -> ChatMessage {
+        ChatMessage { role: Role::User, content: vec![Block::ToolResult { id: "t1".into(), content: "out".into(), is_error: false }] }
+    }
+    fn call() -> ChatMessage {
+        ChatMessage { role: Role::Assistant, content: vec![Block::ToolUse { id: "t1".into(), name: "read".into(), input: serde_json::json!({}) }] }
+    }
+
+    #[test]
+    fn the_tail_ends_the_final_user_message_and_leaves_the_history_alone() {
+        let history = vec![user("go"), call(), results()];
+        let r = request(Some("TAIL"), history.clone());
+        let m = r.messages_with_tail();
+        assert_eq!(m.len(), 3);
+        assert_eq!(m[2].content.last(), Some(&Block::Text("TAIL".into())));
+        assert_eq!(&m[..2], &history[..2]);
+        assert_eq!(r.messages, history, "the request itself is not changed");
+        // A history that ends with the assistant gets a message of its own.
+        let m = request(Some("TAIL"), vec![user("go"), call()]).messages_with_tail().into_owned();
+        assert_eq!((m.len(), m[2].role), (3, Role::User));
+        assert!(matches!(request(None, history).messages_with_tail(), std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn every_adapter_sends_the_tail_once_and_no_tail_changes_nothing() {
+        let history = vec![user("go"), call(), results()];
+        let bodies = |tail: Option<&str>| {
+            let r = request(tail, history.clone());
+            [
+                anthropic::build_body(&r, true).to_string(),
+                openai_chat::build_body(&r, false).to_string(),
+                openai_responses::build_body(&r).to_string(),
+                gemini::build_body(&r).to_string(),
+            ]
+        };
+        let (with, without) = (bodies(Some("TAIL-TEXT")), bodies(None));
+        for (i, (w, wo)) in with.iter().zip(&without).enumerate() {
+            assert_eq!(w.matches("TAIL-TEXT").count(), 1, "adapter {i}: {w}");
+            assert!(!wo.contains("TAIL-TEXT"), "adapter {i}");
         }
     }
 }

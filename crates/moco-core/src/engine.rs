@@ -2396,6 +2396,65 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_stored_todo_list_is_shown_to_the_model_while_it_has_open_items() {
+        let todo = |c: &str, s: &str| crate::tools::Todo { content: c.into(), status: s.into() };
+        let steps = || vec![tool_call("t1", "read", json!({"path":"a.txt"})), tool_call("t2", "glob", json!({"pattern":"*.txt"})), text("done")];
+        for agent in ["build", "plan"] {
+            // Open items: every request of the turn carries the list, identical each time, and it is not a stored message.
+            let f = fixture(steps());
+            f.engine.store().set_agent(&f.session.id, agent).unwrap();
+            f.engine.store().set_todos(&f.session.id, &[todo("write tests", "in_progress"), todo("ship", "pending"), todo("plan", "completed")]).unwrap();
+            f.file("a.txt", "x\n");
+            f.say("go on");
+            assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+            let reqs = f.fake.requests.lock().unwrap();
+            assert_eq!(reqs.len(), 3);
+            let tail = reqs[0].tail.clone().unwrap_or_else(|| panic!("{agent}: no reminder"));
+            assert!(tail.contains("- [in_progress] write tests\n- [pending] ship\n- [completed] plan\n"), "{tail}");
+            for w in reqs.windows(2) {
+                assert_eq!(w[1].tail.as_deref(), Some(tail.as_str()), "{agent}: an unchanged list gives the same tail");
+                assert_eq!(w[0].system, w[1].system, "{agent}: system prompt");
+                assert_eq!(w[0].tools, w[1].tools, "{agent}: tools");
+                assert_eq!(&w[1].messages[..w[0].messages.len()], &w[0].messages[..], "{agent}: earlier messages");
+            }
+            assert!(!reqs.iter().any(|r| all_text(r).contains("todo list")), "{agent}: the reminder is not in the messages");
+            assert!(!f.msgs().iter().any(|m| m.data.to_string().contains("system-reminder")), "{agent}: the reminder is never stored");
+        }
+        // An empty list, and one with nothing left to do, add nothing.
+        let f = fixture(steps());
+        f.file("a.txt", "x\n");
+        f.say("go");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        assert!(f.fake.requests.lock().unwrap().iter().all(|r| r.tail.is_none()));
+        let f = fixture(steps());
+        f.engine.store().set_todos(&f.session.id, &[todo("a", "completed"), todo("b", "cancelled")]).unwrap();
+        f.file("a.txt", "x\n");
+        f.say("go");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        assert!(f.fake.requests.lock().unwrap().iter().all(|r| r.tail.is_none()));
+    }
+
+    #[test]
+    fn a_todowrite_in_the_turn_changes_only_the_tail() {
+        let f = fixture(vec![
+            tool_call("t1", "read", json!({"path":"a.txt"})),
+            tool_call("t2", "todowrite", json!({"todos":[{"content":"a","status":"in_progress"}]})),
+            tool_call("t3", "glob", json!({"pattern":"*.txt"})),
+            tool_call("t4", "todowrite", json!({"todos":[{"content":"a","status":"completed"}]})),
+            text("done"),
+        ]);
+        f.file("a.txt", "x\n");
+        f.say("go");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        let reqs = f.fake.requests.lock().unwrap();
+        let tails: Vec<bool> = reqs.iter().map(|r| r.tail.as_deref().is_some_and(|t| t.contains("[in_progress] a"))).collect();
+        assert_eq!(tails, [false, false, true, true, false], "no list, then the list, then finished");
+        for w in reqs.windows(2) {
+            assert_eq!(&w[1].messages[..w[0].messages.len()], &w[0].messages[..], "the cached prefix never changes");
+        }
+    }
+
     fn write_call(id: &str, path: &str, content: &str) -> Event {
         Event::ToolCall { id: id.into(), name: "write".into(), input: json!({"path": path, "content": content}) }
     }

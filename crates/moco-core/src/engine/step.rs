@@ -136,10 +136,14 @@ impl Engine {
             system.push('\n');
         }
         let (effort, overlay) = self.request_extras(&session, &agent, &provider_id, &model_id);
+        // The stored list, so the model sees it even when its own todowrite calls are far back or were compacted
+        // away. In `tail`, after the cached prefix, so it can change without a cache miss.
+        let tail = if advertised.iter().any(|t| t.name() == "todowrite") { agent::todo_reminder(&self.store().todos(sid)?) } else { None };
         let req = Request {
             model: model_id.clone(),
             system,
             messages,
+            tail,
             tools: advertised.iter().map(|t| ToolDef { name: t.name().into(), description: t.description(), schema: t.schema() }).collect(),
             max_tokens: self.cfg.max_tokens,
             tools_disabled: max_steps_hit,

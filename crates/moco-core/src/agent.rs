@@ -161,6 +161,23 @@ pub fn advertised(agent: &Agent, tool: &dyn Tool) -> bool {
     crate::permission::evaluate(action_for(tool.name()), "*", &agent.permissions) != Effect::Deny
 }
 
+/// What the model is reminded of when the stored todo list has open items; `None` for an empty or finished list, so
+/// sessions that do not use todos see no change. Built per request from the store and never saved as a message.
+pub fn todo_reminder(todos: &[crate::tools::Todo]) -> Option<String> {
+    if todos.iter().all(|t| t.status == "completed" || t.status == "cancelled") {
+        return None;
+    }
+    let mut s = String::from("<system-reminder>\nYour todo list for this session has open items. The current list:\n");
+    for t in todos {
+        s.push_str(&format!("- [{}] {}\n", t.status, t.content));
+    }
+    s.push_str(
+        "\nKeep it current with the todowrite tool: set an item to `in_progress` when you start it and to `completed` as soon as it is done. \
+Send the full list on every call. Ignore this reminder if it does not apply to the current request.\n</system-reminder>",
+    );
+    Some(s)
+}
+
 pub const PLAN_REMINDER: &str = "<system-reminder>\nYou are in Plan mode. Discuss the plan with the user directly in the conversation. \
 Do not modify any files. Use read-only tools to explore.\n\nYou remain in Plan mode until the user switches agents. \
 If the user asks you to implement changes, do not do so. Tell them they need to switch agents.\n</system-reminder>";
@@ -222,6 +239,9 @@ pub fn system_prompt(agent: &Agent, tools: &[&dyn Tool], env: &EnvInfo) -> Strin
     }
     if has("edit") {
         guidance.push("- Use the edit tool for targeted changes to existing text files. It replaces the exact text in `oldString` with `newString`, and the values must differ. By default, `oldString` must occur exactly once. If it occurs multiple times, include more surrounding context to make it unique or set `replaceAll` to true to replace every occurrence. To change several places in one file, pass `edits`, a list of replacements applied in order and all-or-nothing, in one call.".to_string());
+    }
+    if has("todowrite") {
+        guidance.push("- Use the todowrite tool to plan and track work that takes several steps: create the list at the start, keep at most one item `in_progress` while you work on it, and mark items `completed` as soon as they are done instead of in a batch at the end. Skip it for a single simple step.".to_string());
     }
     let mut s = String::from(
         "You are an AI agent running in moco, a coding agent harness. Help the user accomplish their goals using the tools you have available.\n\n\
@@ -326,6 +346,31 @@ mod tests {
             assert_eq!(n[at - 1], "webfetch", "{id}: it sits right after webfetch");
             assert_eq!(crate::permission::evaluate("websearch", "some query", &find(&builtin(), id).unwrap().permissions), Effect::Ask, "{id}");
         }
+    }
+
+    #[test]
+    fn prompt_asks_for_a_todo_list_only_when_todowrite_is_there() {
+        let tools = crate::tools::all(vec![], vec![], None);
+        let env = EnvInfo { cwd: "/w", platform: "macos", date: "2026-10-31", instructions: "", skills: "" };
+        for id in ["build", "plan"] {
+            let advertised: Vec<&dyn Tool> = tools.iter().map(|t| t.as_ref()).filter(|t| advertised(&find(&builtin(), id).unwrap(), *t)).collect();
+            let p = system_prompt(&find(&builtin(), id).unwrap(), &advertised, &env);
+            assert!(p.contains("Use the todowrite tool to plan and track") && p.contains("`in_progress`") && p.contains("`completed` as soon as"), "{id}: {p}");
+        }
+        let without: Vec<&dyn Tool> = tools.iter().filter(|t| t.name() != "todowrite").map(|t| t.as_ref()).collect();
+        assert!(!system_prompt(&find(&builtin(), "build").unwrap(), &without, &env).contains("todowrite"));
+    }
+
+    #[test]
+    fn todo_reminder_lists_the_whole_list_and_only_while_something_is_open() {
+        use crate::tools::Todo;
+        let t = |c: &str, s: &str| Todo { content: c.into(), status: s.into() };
+        assert_eq!(todo_reminder(&[]), None);
+        assert_eq!(todo_reminder(&[t("a", "completed"), t("b", "cancelled")]), None);
+        let r = todo_reminder(&[t("a", "completed"), t("b", "in_progress"), t("c", "pending")]).unwrap();
+        assert!(r.starts_with("<system-reminder>\n") && r.ends_with("</system-reminder>"), "{r}");
+        assert!(r.contains("- [completed] a\n- [in_progress] b\n- [pending] c\n"), "the full list, in order: {r}");
+        assert!(r.contains("todowrite"));
     }
 
     #[test]

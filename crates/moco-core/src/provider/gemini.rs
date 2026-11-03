@@ -98,7 +98,7 @@ pub fn build_body(req: &Request) -> Value {
     // Function results are matched by name; calls only carry our own ids.
     let names: HashMap<&str, &str> = req.messages.iter().flat_map(|m| &m.content).filter_map(|b| if let Block::ToolUse { id, name, .. } = b { Some((id.as_str(), name.as_str())) } else { None }).collect();
     let mut contents: Vec<Value> = vec![];
-    for m in &req.messages {
+    for m in req.messages_with_tail().iter() {
         match m.role {
             Role::User => {
                 let (mut responses, mut rest): (Vec<Value>, Vec<Value>) = (vec![], vec![]);
