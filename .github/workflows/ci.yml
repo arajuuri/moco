@@ -27,7 +27,9 @@ jobs:
 
   # Tests on macOS: symlinks under /var -> /private/var, case-insensitive file systems, process groups and
   # sandbox-exec behave differently from Linux. This runner is newer than Mojave, so the Mojave machine run stays a manual check.
+  # Temporarily disabled to avoid macOS runner costs.
   macos-test:
+    if: false
     runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
@@ -36,6 +38,7 @@ jobs:
       - run: cargo test --workspace # python3 is preinstalled; the fake MCP/LLM servers need it
 
   macos-minos:
+    if: false
     runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
