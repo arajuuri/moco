@@ -14,8 +14,8 @@ pub(super) struct EnginePermitter<'a> {
     pub(super) notified: &'a Mutex<HashSet<String>>,
     /// Present when the command classifier is on for this step.
     pub(super) classify: Option<classify::ClassifyCtx<'a>>,
-    /// The saved rules as last read; cleared after a save (see `saved`).
-    pub(super) cache: Mutex<Option<Vec<Rule>>>,
+    /// The saved rules as last read, with the `store::SAVED_PERMISSIONS_GEN` they were read at (see `saved`).
+    pub(super) cache: Mutex<Option<(u64, Vec<Rule>)>>,
 }
 
 impl EnginePermitter<'_> {
@@ -23,16 +23,21 @@ impl EnginePermitter<'_> {
     /// asks again as if nothing had been saved.
     fn saved(&self) -> Vec<Rule> {
         // Read once per step instead of from SQLite (under the shared store lock) on every check. Only a successful
-        // read is cached, so a failure keeps being retried and reported as before.
+        // read is cached, so a failure keeps being retried and reported as before. A save or removal in this process
+        // (an "always" answer, `/permissions remove`) bumps the generation and so drops the copy; a `moco permissions`
+        // run from another process takes effect at the next step.
         let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(rules) = cache.as_ref() {
-            return rules.clone();
+        let gen = crate::store::SAVED_PERMISSIONS_GEN.load(Ordering::Relaxed);
+        if let Some((at, rules)) = cache.as_ref() {
+            if *at == gen {
+                return rules.clone();
+            }
         }
         let r = self.store.lock().unwrap_or_else(|e| e.into_inner()).saved_permissions(&self.project_id);
         let ok = r.is_ok();
         let rules = notice_once(self.notified, self.ui, "saved-permissions-read", "saved permissions could not be read, so you may be asked again for things you answered \"always\" to", r).unwrap_or_default();
         if ok {
-            *cache = Some(rules.clone());
+            *cache = Some((gen, rules.clone()));
         }
         rules
     }
@@ -115,5 +120,40 @@ impl Permitter for EnginePermitter<'_> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Records what it was asked and refuses, so a request that is no longer allowed shows up as a prompt.
+    #[derive(Default)]
+    struct Refuse(Mutex<Vec<String>>);
+    impl Ui for Refuse {
+        fn event(&self, _: &UiEvent) {}
+        fn ask(&self, p: &PermissionPrompt) -> Reply {
+            self.0.lock().unwrap().push(p.resources.join(" "));
+            Reply::Reject(Some("no".into()))
+        }
+    }
+
+    #[test]
+    fn a_saved_rule_removed_during_a_step_stops_allowing_at_once() {
+        let dir = std::env::temp_dir().join(crate::id::new_id("moco-permit"));
+        let store = Store::open(&dir.join("moco.db")).unwrap();
+        let project_id = store.project_for(&dir.to_string_lossy()).unwrap();
+        store.save_permission(&project_id, "shell", "osascript *").unwrap();
+        let store = Mutex::new(store);
+        let (ui, declined, ask_lock, notified) = (Refuse::default(), AtomicBool::new(false), Mutex::new(()), Mutex::new(HashSet::new()));
+        let p = EnginePermitter { rules: vec![], project_id: project_id.clone(), store: &store, ui: &ui, declined: &declined, ask_lock: &ask_lock, notified: &notified, classify: None, cache: Mutex::new(None) };
+        let req = PermReq { action: "shell".into(), resources: vec!["osascript -e 'beep'".into()], save: vec!["osascript *".into()], force_ask: false, command: None, call_id: "t1".into() };
+
+        assert!(p.check(&req).is_ok(), "the saved rule allows it");
+        assert!(ui.0.lock().unwrap().is_empty());
+        // `/permissions remove` from the front end, while the step (and its cached copy of the rules) is still alive.
+        crate::saved_permissions::manage(&store.lock().unwrap(), &project_id, "/permissions", "remove 1").unwrap();
+        assert!(matches!(p.check(&req), Err(ToolError::Corrected(_))), "asked again, and the test UI refused");
+        assert_eq!(ui.0.lock().unwrap().as_slice(), ["osascript -e 'beep'"]);
     }
 }

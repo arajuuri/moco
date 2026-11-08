@@ -18,6 +18,10 @@ pub enum StoreError {
 }
 pub type Result<T> = std::result::Result<T, StoreError>;
 
+/// Bumped whenever this process saves or removes a saved permission, so a copy of the saved rules cached for a step
+/// (`engine/permit.rs`) is dropped at once instead of outliving a `/permissions remove` made while the step runs.
+pub static SAVED_PERMISSIONS_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// `directory` with symlinks resolved (as far as it exists), so every spelling of a directory is one project.
 fn canonical_dir(directory: &str) -> String {
     crate::tools::real_path(Path::new(directory)).to_string_lossy().into_owned()
@@ -216,14 +220,11 @@ impl Store {
     /// reachable under two names (a symlinked parent) is one project: the symlink-free name is the one stored, and a
     /// project recorded earlier under the name as given is still found.
     pub fn project_for(&self, directory: &str) -> Result<String> {
-        let given = directory;
-        let directory = canonical_dir(given);
-        let directory = directory.as_str();
-        for d in [directory, given] {
-            if let Some(id) = self.conn.query_row("select id from project where directory=?1", [d], |r| r.get(0)).optional()? {
-                return Ok(id);
-            }
+        if let Some(id) = self.find_project(directory)? {
+            return Ok(id);
         }
+        let directory = canonical_dir(directory);
+        let directory = directory.as_str();
         let id = new_id("prj");
         let name = Path::new(directory).file_name().map(|n| n.to_string_lossy().into_owned());
         self.conn.execute(
@@ -231,6 +232,17 @@ impl Store {
             params![id, directory, name, now_ms()],
         )?;
         Ok(id)
+    }
+
+    /// The project of `directory` if moco has been used there, without creating one (see `project_for`).
+    pub fn find_project(&self, directory: &str) -> Result<Option<String>> {
+        let canonical = canonical_dir(directory);
+        for d in [canonical.as_str(), directory] {
+            if let Some(id) = self.conn.query_row("select id from project where directory=?1", [d], |r| r.get(0)).optional()? {
+                return Ok(Some(id));
+            }
+        }
+        Ok(None)
     }
 
     pub fn create_session(&self, directory: &str, agent: &str) -> Result<Session> {
@@ -746,7 +758,27 @@ impl Store {
             "insert or ignore into permission_saved(project_id, action, resource) values (?1,?2,?3)",
             params![project_id, action, resource],
         )?;
+        SAVED_PERMISSIONS_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Forget one saved "always allow" rule. `false` if there was no such rule.
+    pub fn remove_saved_permission(&self, project_id: &str, action: &str, resource: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "delete from permission_saved where project_id=?1 and action=?2 and resource=?3",
+            params![project_id, action, resource],
+        )?;
+        SAVED_PERMISSIONS_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::log_info!("store", "saved permission removed project={project_id} action={action} resource={resource} found={}", n > 0);
+        Ok(n > 0)
+    }
+
+    /// Forget every saved "always allow" rule of a project. Returns how many there were.
+    pub fn clear_saved_permissions(&self, project_id: &str) -> Result<usize> {
+        let n = self.conn.execute("delete from permission_saved where project_id=?1", [project_id])?;
+        SAVED_PERMISSIONS_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::log_info!("store", "saved permissions cleared project={project_id} count={n}");
+        Ok(n)
     }
 
     pub fn saved_permissions(&self, project_id: &str) -> Result<Vec<Rule>> {

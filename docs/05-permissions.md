@@ -40,6 +40,8 @@ Outcomes: `allow` -> proceed. `deny` -> tool fails with `BlockedError` (message 
 - `reject` without message: fail with `DeclinedError` (stops the run of this tool batch). With message: `CorrectedError{feedback}`, model sees it as the tool error and continues. Rejection applies to **all** pending requests of that session.
 - On shutdown all pending requests are rejected.
 
+**Removing saved rules (moco).** Upstream has no way to take an "always" back. In moco, `/permissions` lists the project's saved rules with numbers, `/permissions remove <n>` (or `remove <action> <pattern>`) forgets one and `/permissions clear` forgets all of them. `moco permissions [--dir DIR] [remove N | remove ACTION PATTERN | clear]` does the same without a session, for the current directory's project or `DIR`'s, and never creates a project. A removal takes effect at the next permission check of a running step in the same process (the step's copy of the saved rules is dropped, `store::SAVED_PERMISSIONS_GEN`); one made by another moco process takes effect from that session's next step. Saved rules are appended after the configured ones, so a configured `ask` cannot narrow a saved `allow`: remove the broad saved rule, then answer "always" to the narrower request or add an `allow` rule for exactly what you want.
+
 ## Permission modes (moco)
 
 moco has two modes. The default is `manual`. The mode sets the starting rules of every agent (built-in and config-defined); your own `permissions` rules come after it and win.

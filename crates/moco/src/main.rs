@@ -643,6 +643,38 @@ fn main() {
             }
             return;
         }
+        Some("permissions") => {
+            const USAGE: &str = "usage: moco permissions [--dir DIR] [remove N | remove ACTION PATTERN | clear]";
+            let mut rest: Vec<&str> = raw.iter().skip(1).map(String::as_str).collect();
+            let mut dir = std::env::current_dir().unwrap_or_default();
+            if let Some(i) = rest.iter().position(|a| *a == "--dir") {
+                let Some(d) = rest.get(i + 1) else { die(USAGE) };
+                dir = std::path::PathBuf::from(d);
+                rest.drain(i..i + 2);
+            }
+            // Only the first word: a pattern such as `rm -rf *` has dashes of its own.
+            if let Some(bad) = rest.first().filter(|a| a.starts_with('-')) {
+                die(&format!("unknown option {bad}; {USAGE}"));
+            }
+            let dir_str = dir.to_string_lossy().into_owned();
+            let store = Store::open(&app_dir.join("data/moco.db")).unwrap_or_else(|e| die(&format!("database: {e}")));
+            let Some(project) = store.find_project(&dir_str).unwrap_or_else(|e| die(&format!("database: {e}"))) else {
+                println!("no saved \"always allow\" rules: moco has not been used in {}", tilde(&dir_str));
+                return;
+            };
+            if rest.is_empty() {
+                let rules = store.saved_permissions(&project).unwrap_or_else(|e| die(&format!("database: {e}")));
+                for l in moco_core::saved_permissions::listing(&rules, "moco permissions") {
+                    println!("{l}");
+                }
+            } else {
+                match moco_core::saved_permissions::manage(&store, &project, "moco permissions", &rest.join(" ")) {
+                    Ok(lines) => lines.iter().for_each(|l| println!("{l}")),
+                    Err(e) => die(&e.to_string()),
+                }
+            }
+            return;
+        }
         Some("logs") => {
             let rest: Vec<&str> = raw.iter().skip(1).map(String::as_str).collect();
             let follow = rest.iter().any(|a| matches!(*a, "--follow" | "-f"));
@@ -738,15 +770,15 @@ fn main() {
             }
             "--help" | "-h" => {
                 println!(
-                    "usage: moco [--continue | --session ID] [--model PROVIDER/MODEL] [--agent ID] [--permission-mode manual|auto] [--effort LEVEL] [--dir PATH] [-p PROMPT [--max-cost USD] [--max-steps N]] [--plain] [--version]\n       -p exit status: 0 done, 1 failed, 2 usage error, 3 stopped by a spending limit (--max-cost, --max-steps or the `limits` config)\n       moco sessions [--all] [--archived] | rename ID TITLE | archive ID | unarchive ID\n       moco models [FILTER] [--refresh]\n       moco auth PROVIDER\n       moco logs [--follow] [--lines N] [--path]\n\nlogging: MOCO_LOG=error|warn|info|debug|trace (default warn; `warn,mcp=trace` sets one target) or the `log` config key.\n         Files: <data dir>/data/logs/moco-YYYY-MM-DD.log (7 days kept). Nothing is ever printed to the terminal."
+                    "usage: moco [--continue | --session ID] [--model PROVIDER/MODEL] [--agent ID] [--permission-mode manual|auto] [--effort LEVEL] [--dir PATH] [-p PROMPT [--max-cost USD] [--max-steps N]] [--plain] [--version]\n       -p exit status: 0 done, 1 failed, 2 usage error, 3 stopped by a spending limit (--max-cost, --max-steps or the `limits` config)\n       moco sessions [--all] [--archived] | rename ID TITLE | archive ID | unarchive ID\n       moco models [FILTER] [--refresh]\n       moco auth PROVIDER\n       moco logs [--follow] [--lines N] [--path]\n       moco permissions [--dir DIR] [remove N | remove ACTION PATTERN | clear]\n\nlogging: MOCO_LOG=error|warn|info|debug|trace (default warn; `warn,mcp=trace` sets one target) or the `log` config key.\n         Files: <data dir>/data/logs/moco-YYYY-MM-DD.log (7 days kept). Nothing is ever printed to the terminal."
                 );
                 return;
             }
             other => die(&format!("unknown argument {other}")),
         }
     }
-    // Only a run that starts a session logs. `--help`, `--version`, `logs`, `models`, `auth` and `sessions` never touch
-    // the log directory, so `moco logs` cannot create the file it is about to show.
+    // Only a run that starts a session logs. `--help`, `--version` and the subcommands (`logs`, `models`, `auth`,
+    // `sessions`, `permissions`) never touch the log directory, so `moco logs` cannot create the file it is about to show.
     moco_core::log::init(&app_dir);
     if let Some(w) = auth::permissions_warning(&app_dir) {
         eprintln!("warning: {w}");
@@ -1082,14 +1114,18 @@ fn main() {
                     Err(e) => eprintln!("{RED}{e}{RESET}"),
                 }
             }
-            "/permissions" => match engine.permissions_report(&session.id) {
-                Ok(lines) => {
-                    for l in lines {
-                        println!("{DIM}{l}{RESET}");
+            l if l == "/permissions" || l.starts_with("/permissions ") => {
+                let args = l.trim_start_matches("/permissions").trim();
+                let r = if args.is_empty() { engine.permissions_report(&session.id).map_err(|e| e.to_string()) } else { engine.manage_saved_permissions(&session.id, args).map_err(|e| e.to_string()) };
+                match r {
+                    Ok(lines) => {
+                        for l in lines {
+                            println!("{DIM}{l}{RESET}");
+                        }
                     }
+                    Err(e) => eprintln!("{RED}{e}{RESET}"),
                 }
-                Err(e) => eprintln!("{RED}{e}{RESET}"),
-            },
+            }
             l if l == "/jobs" || l.starts_with("/jobs ") => {
                 let arg = l.trim_start_matches("/jobs").trim();
                 if let Some(id) = arg.strip_prefix("output") {
@@ -1167,7 +1203,7 @@ fn main() {
                 }
             }
             "/help" => println!(
-                "/model [FILTER|PROVIDER/MODEL]  show, search or switch the model\n/agent <id>                     switch agent\n/mode [manual|auto]             ask before acting (manual, the default) or run tools without asking (auto)\n/effort [level|default]          reasoning effort for models that offer levels\n/compact                        summarize older messages to free up context\n/sessions [all|archived]       list sessions (/resume <n|id> to continue one)\n/rename <title>                 name this session\n/fork [N]                       copy this conversation into a new session\n/archive [n|id]                 hide a session from the list (/unarchive to restore)\n/undo, /redo                    undo the last turn's file changes and messages, or bring them back\n/diff                           changes in the working tree since this session started\n/new                            start a new session\n/jobs                           background commands and subagents (output <id>, kill <id>)\n/permissions                    what the classifier allowed automatically, and the saved always-allow rules\n!<command>                      run a shell command yourself; the assistant is told\n/skills, /commands, /mcp       list skills, custom slash commands (also MCP prompts) and MCP servers (@name mentions a skill, agent or file)\n/exit                           quit (Ctrl-C interrupts a running turn)"
+                "/model [FILTER|PROVIDER/MODEL]  show, search or switch the model\n/agent <id>                     switch agent\n/mode [manual|auto]             ask before acting (manual, the default) or run tools without asking (auto)\n/effort [level|default]          reasoning effort for models that offer levels\n/compact                        summarize older messages to free up context\n/sessions [all|archived]       list sessions (/resume <n|id> to continue one)\n/rename <title>                 name this session\n/fork [N]                       copy this conversation into a new session\n/archive [n|id]                 hide a session from the list (/unarchive to restore)\n/undo, /redo                    undo the last turn's file changes and messages, or bring them back\n/diff                           changes in the working tree since this session started\n/new                            start a new session\n/jobs                           background commands and subagents (output <id>, kill <id>)\n/permissions                    what the classifier allowed automatically, and the saved always-allow rules\n/permissions remove <n>|clear   forget one saved always-allow rule (or <action> <pattern>), or all of them\n!<command>                      run a shell command yourself; the assistant is told\n/skills, /commands, /mcp       list skills, custom slash commands (also MCP prompts) and MCP servers (@name mentions a skill, agent or file)\n/exit                           quit (Ctrl-C interrupts a running turn)"
             ),
             l if l == "/sessions" || l.starts_with("/sessions ") => {
                 let which = l.trim_start_matches("/sessions").trim();
