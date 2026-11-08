@@ -93,6 +93,8 @@ Not done: the automatic check that is meant to replace the prompt in auto mode.
 5. If parsing fails: treat the whole command as one resource.
 Simplification for v1: split on `;`, `&&`, `||`, `|`, newline with a quote-aware splitter, and treat `$()`/backticks as unparsed (ask).
 
+Heredocs (moco, `tools/shellparse.rs`): `<<WORD`, `<<'WORD'`, `<<"WORD"` and `<<-WORD` are input to the command they belong to, not commands. The body, up to the delimiter line, is appended to that command's resource text, so `osascript *` covers `osascript <<'EOF' ...`, a deny rule can still match text in the body, and "always" saves no patterns for body lines. The classifier sees the whole command, and `bash <<EOF` still never reaches it (shells are on the never-classify list). These cases are opaque (always ask) because the shell might read them differently: a body with no delimiter line, a delimiter that is missing or uses `$`, and in an unquoted body `$(...)`, backticks, or a line ending in `\` (bash and sh join it with the next line before comparing it with the delimiter, so `EO\` + `F` ends the body). `<<<` is a here-string and has no body.
+
 ## UI contract
 
 Pending request shows action, resources, tool preview (for edit: the diff; for shell: command and cwd), and buttons Allow once / Allow always / Reject (with optional feedback text). Command palette lists pending permissions across sessions.

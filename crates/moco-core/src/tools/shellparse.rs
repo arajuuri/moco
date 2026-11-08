@@ -1,6 +1,11 @@
 //! v1 shell command scanning (docs/05-permissions.md "Simplification for v1"): quote-aware split on
 //! `;`, `&&`, `||`, `|`, `&`, newline. Command substitution (`$(...)`, backticks, `<(...)`) and
 //! unterminated quotes are not parsed: they mark the result `opaque`, which forces an ask.
+//!
+//! Heredocs (`<<WORD`, `<<'WORD'`, `<<"WORD"`, `<<-WORD`) are input to the command that owns them, not commands: the
+//! body is consumed up to the delimiter line and appended to that command's text, so `osascript *` covers
+//! `osascript <<'EOF' ...`. Anything where this parser and the shell could disagree about where the body ends is
+//! opaque instead of guessed.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Command {
@@ -65,8 +70,62 @@ fn is_risky_assignment(w: &str) -> bool {
         )
 }
 
+/// A `<<` seen on the current line whose body starts after the line's newline.
+struct Heredoc {
+    delimiter: String,
+    /// `<<-`: leading tabs are stripped from body lines and the delimiter line.
+    strip_tabs: bool,
+    /// Any quoting in the delimiter makes the body literal; otherwise the shell expands `$(...)` and backticks in it.
+    quoted: bool,
+    /// Index in `Parsed::commands` of the command the body belongs to.
+    owner: usize,
+}
+
+/// Reads a heredoc delimiter word starting at `cs[j]`: `(end, unquoted delimiter, quoted)`, or `None` when it is
+/// missing or not something to guess about (unterminated quotes, `$'...'`, expansions).
+fn heredoc_delimiter(cs: &[char], mut j: usize) -> Option<(usize, String, bool)> {
+    let (mut word, mut quoted) = (String::new(), false);
+    while j < cs.len() {
+        match cs[j] {
+            ' ' | '\t' | '\n' | ';' | '&' | '|' | '<' | '>' | '(' | ')' => break,
+            '\'' => {
+                quoted = true;
+                let close = (j + 1..cs.len()).find(|&k| cs[k] == '\'')?;
+                word.extend(&cs[j + 1..close]);
+                j = close;
+            }
+            '"' => {
+                quoted = true;
+                j += 1;
+                loop {
+                    match cs.get(j)? {
+                        '"' => break,
+                        '\\' if matches!(cs.get(j + 1), Some('"' | '\\' | '$' | '`')) => {
+                            word.push(cs[j + 1]);
+                            j += 1;
+                        }
+                        '$' | '`' => return None,
+                        c => word.push(*c),
+                    }
+                    j += 1;
+                }
+            }
+            '\\' => {
+                quoted = true;
+                word.push(*cs.get(j + 1)?);
+                j += 1;
+            }
+            '$' | '`' => return None,
+            c => word.push(c),
+        }
+        j += 1;
+    }
+    (!word.is_empty()).then_some((j, word, quoted))
+}
+
 pub fn parse(input: &str) -> Parsed {
     let mut parsed = Parsed::default();
+    let mut heredocs: Vec<Heredoc> = vec![];
     let cs: Vec<char> = input.chars().collect();
     let mut raw_words: Vec<(String, String)> = vec![]; // (raw, unquoted)
     let (mut raw, mut val) = (String::new(), String::new());
@@ -127,10 +186,53 @@ pub fn parse(input: &str) -> Parsed {
                 '`' => { parsed.opaque = true; in_word = true; raw.push(c); val.push(c); }
                 '$' if cs.get(i + 1) == Some(&'(') => { parsed.opaque = true; in_word = true; raw.push(c); val.push(c); }
                 '<' | '>' if cs.get(i + 1) == Some(&'(') => { parsed.opaque = true; in_word = true; raw.push(c); val.push(c); }
+                '<' if cs.get(i + 1) == Some(&'<') && cs.get(i + 2) != Some(&'<') => {
+                    // A heredoc operator is its own word, except for a file descriptor in front of it (`0<<EOF`).
+                    if !raw.chars().all(|c| c.is_ascii_digit()) {
+                        flush_word(&mut raw, &mut val, &mut in_word, &mut raw_words);
+                    }
+                    let strip_tabs = cs.get(i + 2) == Some(&'-');
+                    let mut j = i + 2 + usize::from(strip_tabs);
+                    while matches!(cs.get(j), Some(' ' | '\t')) {
+                        j += 1;
+                    }
+                    let op = if strip_tabs { "<<-" } else { "<<" };
+                    in_word = true;
+                    raw.push_str(op);
+                    val.push_str(op);
+                    match heredoc_delimiter(&cs, j) {
+                        Some((end, delimiter, quoted)) => {
+                            raw.extend(&cs[j..end]);
+                            val.push_str(&delimiter);
+                            flush_word(&mut raw, &mut val, &mut in_word, &mut raw_words);
+                            heredocs.push(Heredoc { delimiter, strip_tabs, quoted, owner: parsed.commands.len() });
+                            i = end;
+                            continue;
+                        }
+                        // No delimiter we can be sure of: leave the rest to the normal scan, and ask.
+                        None => {
+                            parsed.opaque = true;
+                            i += 2 + usize::from(strip_tabs);
+                            continue;
+                        }
+                    }
+                }
+                '<' if cs.get(i + 1) == Some(&'<') => {
+                    // `<<<` here-string: an ordinary word follows.
+                    in_word = true;
+                    raw.push_str("<<<");
+                    val.push_str("<<<");
+                    i += 3;
+                    continue;
+                }
                 ' ' | '\t' | '\r' => flush_word(&mut raw, &mut val, &mut in_word, &mut raw_words),
                 '\n' | ';' => {
                     flush_word(&mut raw, &mut val, &mut in_word, &mut raw_words);
                     finish(&mut raw_words, &mut parsed);
+                    if c == '\n' && !heredocs.is_empty() {
+                        i = read_heredoc_bodies(&cs, i + 1, std::mem::take(&mut heredocs), &mut parsed);
+                        continue;
+                    }
                 }
                 '&' | '|' => {
                     // `2>&1` and `>&2` are redirections, not separators.
@@ -158,7 +260,59 @@ pub fn parse(input: &str) -> Parsed {
     }
     flush_word(&mut raw, &mut val, &mut in_word, &mut raw_words);
     finish(&mut raw_words, &mut parsed);
+    if !heredocs.is_empty() {
+        // `cat <<EOF` with no body at all: the shell reads to end of input. Nothing to guess from, so ask.
+        parsed.opaque = true;
+    }
     parsed
+}
+
+/// Consumes the bodies of `heredocs`, in order, from the line starting at `cs[start]`, appends each body and its
+/// delimiter line to the owning command's text, and returns where scanning resumes.
+fn read_heredoc_bodies(cs: &[char], start: usize, heredocs: Vec<Heredoc>, parsed: &mut Parsed) -> usize {
+    let mut pos = start;
+    for h in heredocs {
+        let body_start = pos;
+        let mut terminated = false;
+        while pos < cs.len() {
+            let end = (pos..cs.len()).find(|&k| cs[k] == '\n').unwrap_or(cs.len());
+            let line: String = cs[pos..end].iter().collect();
+            let next = (end + 1).min(cs.len());
+            let compared = if h.strip_tabs { line.trim_start_matches('\t') } else { line.as_str() };
+            if compared == h.delimiter {
+                terminated = true;
+                append_body(parsed, h.owner, &cs[body_start..end]);
+                pos = next;
+                break;
+            }
+            if !h.quoted {
+                // The shell expands substitutions in an unquoted body. It also joins a line ending in a backslash
+                // with the next one before comparing it with the delimiter, so `EO\` + `F` would end the body
+                // there; rather than replicate that, ask.
+                if line.contains("$(") || line.contains('`') || line.ends_with('\\') {
+                    parsed.opaque = true;
+                }
+            }
+            pos = next;
+        }
+        if !terminated {
+            // Runs to the end of the input: the shell accepts that with a warning; we ask instead.
+            parsed.opaque = true;
+            append_body(parsed, h.owner, &cs[body_start..cs.len()]);
+            return cs.len();
+        }
+    }
+    pos
+}
+
+fn append_body(parsed: &mut Parsed, owner: usize, body: &[char]) {
+    match parsed.commands.get_mut(owner) {
+        Some(c) => {
+            c.text.push('\n');
+            c.text.extend(body);
+        }
+        None => parsed.opaque = true,
+    }
 }
 
 #[cfg(test)]
@@ -222,6 +376,72 @@ mod tests {
         let p = parse("cd /tmp/x && ls; pushd ../y; cd -");
         let dirs: Vec<_> = p.commands.iter().flat_map(|c| c.dirs.clone()).collect();
         assert_eq!(dirs, ["/tmp/x", "../y"]);
+    }
+
+    #[test]
+    fn a_heredoc_body_belongs_to_its_command() {
+        // Issue #84: every body line used to be a command of its own.
+        let cmd = "osascript <<'EOF' 2>&1\ntell application \"System Events\" to tell process \"Chess\"\n  set g to group 1 of window 1\n  click button \"white knight, b1\" of g\nend tell\nEOF";
+        let p = parse(cmd);
+        assert!(!p.opaque);
+        assert_eq!(p.commands.len(), 1, "{:?}", p.commands);
+        assert_eq!(p.commands[0].text, cmd, "the body is part of the resource, so rules and the prompt see it");
+        assert_eq!(p.commands[0].words, ["osascript", "<<EOF", "2>&1"]);
+        assert_eq!(save_pattern(&p.commands[0].words), "osascript *");
+        assert!(crate::wildcard::matches(&p.commands[0].text, "osascript *"), "a saved `osascript *` covers it");
+
+        // An apostrophe in the body is data, not an unterminated quote.
+        let p = parse("python3 <<'PY'\nprint(\"don't\")\nPY");
+        assert!(!p.opaque);
+        assert_eq!(p.commands[0].words, ["python3", "<<PY"]);
+
+        // Commands around it are still found: before on the same line, after the delimiter line, and in a pipe.
+        assert_eq!(
+            texts("cd x && cat <<EOF > out.txt\nhello\nEOF\nls; git commit -F - <<\"MSG\"\nfix: y\nMSG\necho done"),
+            ["cd x", "cat <<EOF > out.txt\nhello\nEOF", "ls", "git commit -F - <<\"MSG\"\nfix: y\nMSG", "echo done"]
+        );
+        assert_eq!(texts("cat <<EOF | grep a\na\nb\nEOF"), ["cat <<EOF\na\nb\nEOF", "grep a"]);
+        assert_eq!(texts("cat << \\EOF\nrm -rf /\nEOF"), ["cat <<\\EOF\nrm -rf /\nEOF"], "space after << and a backslash-quoted word");
+    }
+
+    #[test]
+    fn heredoc_variants() {
+        // <<- strips leading tabs from body and delimiter lines.
+        assert_eq!(texts("cat <<-EOF\n\tbody\n\tEOF\nls"), ["cat <<-EOF\n\tbody\n\tEOF", "ls"]);
+        // Two heredocs on one line take their bodies in order, even for different commands.
+        assert_eq!(texts("cat <<A; cat <<B\none\nA\ntwo\nB\nls"), ["cat <<A\none\nA", "cat <<B\ntwo\nB", "ls"]);
+        assert_eq!(texts("diff /dev/fd/3 - <<A 3<<B\n1\nA\n2\nB"), ["diff /dev/fd/3 - <<A 3<<B\n1\nA\n2\nB"]);
+        // `<<<` is a here-string: no body follows.
+        assert_eq!(texts("grep x <<< \"$v\"\nls"), ["grep x <<< \"$v\"", "ls"]);
+        // A delimiter line with anything else on it does not end the body (the shell agrees).
+        let p = parse("cat <<EOF\nEOF \nrm -rf x\nEOF\nls");
+        assert_eq!(p.commands.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(), ["cat <<EOF\nEOF \nrm -rf x\nEOF", "ls"]);
+        // A quoted body is literal; an unquoted one expands substitutions.
+        assert!(!parse("cat <<'EOF'\n$(id) `id`\nEOF").opaque);
+        assert!(!parse("cat <<\"EOF\"\n$(id)\nEOF").opaque);
+        assert!(!parse("cat <<EOF\n$HOME ${USER}\nEOF").opaque, "plain variables are fine");
+        assert!(parse("cat <<EOF\n$(id)\nEOF").opaque);
+        assert!(parse("cat <<EOF\n`id`\nEOF").opaque);
+    }
+
+    #[test]
+    fn heredocs_the_shell_could_read_differently_are_opaque() {
+        for c in [
+            // No delimiter line: the body runs to the end of input.
+            "cat <<EOF\nrm -rf x",
+            "cat <<EOF",
+            // In an unquoted body the shell joins `EO\` and `F` into the delimiter, ending the body early; a parser that
+            // did not would take the following lines as data and hide them.
+            "cat <<EOF\nEO\\\nF\nrm -rf x\nEOF",
+            // No usable delimiter.
+            "cat <<",
+            "cat << ;ls",
+            "cat <<'EOF\nx\nEOF",
+            "cat <<$X\nx\n$X",
+            "cat <<$'E'\nx\nE",
+        ] {
+            assert!(parse(c).opaque, "{c:?}");
+        }
     }
 
     #[test]

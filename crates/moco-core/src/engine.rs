@@ -1256,6 +1256,25 @@ mod tests {
     }
 
     #[test]
+    fn a_heredoc_body_needs_no_permission_of_its_own() {
+        // Issue #84: each body line was its own resource, so a saved `cat *` still asked, and "always" saved junk
+        // rules such as `tell *` for the body lines.
+        let cmd = "cat <<'EOF'\ntell application \"Chess\"\n  don't click here\nend tell\nEOF";
+        let script = vec![tool_call("t1", "shell", json!({"command": cmd})), tool_call("t2", "shell", json!({"command": "printf x | cat <<'EOF'\nset g to 1\nEOF"})), text("done")];
+        let f = fixture_cfg(script, |c| c.agents = crate::agent::builtin_for(PermissionMode::Manual));
+        f.engine.store().save_permission(&f.session.project_id, "shell", "cat *").unwrap();
+        f.say("go");
+        // One prompt, for `printf`; nothing for the body lines.
+        let ui = TestUi::replying(vec![Reply::Always]);
+        assert_eq!(f.run(&ui), RunOutcome::Idle);
+        assert_eq!(ui.asked.lock().unwrap().as_slice(), ["shell printf x,cat <<'EOF'\nset g to 1\nEOF"]);
+        let reqs = f.fake.requests.lock().unwrap();
+        assert!(matches!(&last_user_blocks(&reqs[1])[0], Block::ToolResult { content, is_error: false, .. } if content.contains("don't click here")), "{:?}", last_user_blocks(&reqs[1]));
+        let saved: Vec<String> = f.engine.store().saved_permissions(&f.session.project_id).unwrap().into_iter().map(|r| r.resource).collect();
+        assert_eq!(saved, ["cat *", "printf *"], "no rules for body lines");
+    }
+
+    #[test]
     fn a_long_streamed_answer_is_stored_exactly_and_parts_survive_around_tool_calls() {
         let deltas: Vec<String> = (0..5000).map(|i| format!("w{i} ")).collect();
         let expected: String = deltas.concat();
