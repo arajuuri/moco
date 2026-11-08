@@ -167,7 +167,7 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
     let (mut terminal, _guard) = term::enter()?;
     let (tx, rx) = channel::<AppEvent>();
     let cancel = AtomicBool::new(false);
-    let stop = AtomicBool::new(false);
+    let stop = Arc::new(AtomicBool::new(false));
     let ui = TuiUi { tx: Mutex::new(tx.clone()) };
 
     let notify_tx = Mutex::new(tx.clone());
@@ -226,11 +226,21 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
     app.rows.insert(0, app::Row::Banner { title: format!("moco {}", env!("CARGO_PKG_VERSION")), model: host.model.clone(), agent: host.agent.clone(), cwd: crate::tilde(&host.cwd) });
 
     std::thread::scope(|scope| -> std::io::Result<()> {
-        // Terminal events. Polls with a timeout so it can stop when the UI loop ends.
+        // Terminal events. Polls with a timeout so it can stop when the UI loop ends. Deliberately not a scoped
+        // thread: if crossterm ever fails to return (it spins on a hung-up tty, issue #87), the UI must still be able
+        // to restore the terminal and let the process exit instead of waiting for this thread forever.
         let key_tx = tx.clone();
-        let stop = &stop;
-        scope.spawn(move || {
-            while !stop.load(Ordering::Relaxed) {
+        let stop_input = stop.clone();
+        std::thread::Builder::new().name("tui-input".into()).spawn(move || {
+            let tty = term::input_tty();
+            while !stop_input.load(Ordering::Relaxed) {
+                // Never hand a dead terminal to crossterm. Ending the UI here also covers a hangup that brings no
+                // SIGHUP (the terminal is not our controlling one).
+                if tty.as_ref().map_or(false, |(fd, _)| term::tty_gone(*fd)) {
+                    SIGNALLED.store(true, Ordering::Relaxed);
+                    let _ = key_tx.send(AppEvent::Tick);
+                    break;
+                }
                 match event::poll(Duration::from_millis(100)) {
                     Ok(true) => {
                         let ev = match event::read() {
@@ -250,16 +260,15 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
                     Err(_) => break,
                 }
             }
-        });
-        // Stop the input thread however this closure ends: on an early `?` return the scope would otherwise wait
-        // for it forever and moco would hang instead of exiting with the error.
+        })?;
+        // Stop the input thread however this closure ends, including an early `?` return.
         struct StopInput<'a>(&'a AtomicBool);
         impl Drop for StopInput<'_> {
             fn drop(&mut self) {
                 self.0.store(true, Ordering::Relaxed);
             }
         }
-        let _stop_input = StopInput(stop);
+        let _stop_input = StopInput(&stop);
 
         let start_run = |app: &mut App, sid: &str, resume: bool| {
             app.running = true;
