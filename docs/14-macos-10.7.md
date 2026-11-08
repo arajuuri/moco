@@ -31,7 +31,8 @@ The back-port traits keep call sites identical to `main`, which keeps merges sma
 ## Building
 
 Lion can't build moco itself: rustup and current `rustup-init` binaries need 10.12+, and Lion's system curl can't
-negotiate TLS 1.2. Build on a newer Intel Mac (the Mojave machine with Xcode 11.3.1 works for this) and copy the binary
+negotiate TLS 1.2. Build on a newer Intel Mac (Mojave with the Xcode 11 Command Line Tools works; a release
+build takes about 15 minutes there) and copy the binary
 over:
 
 ```
@@ -71,13 +72,33 @@ Verified on Linux with Rust 1.73.0:
 - clippy passes with `-D warnings`.
 - The macOS-only code compiles there too, because it is gated with `cfg!` rather than `#[cfg]`, apart from one sandbox test.
 
-**Not yet verified on Lion:**
-- An actual `x86_64-apple-darwin` build with a 10.7 deployment target. The Xcode 11 SDK should accept 10.7; watch for
-  missing `crt1.10.6.o`-style startup objects at link time.
-- That the binary starts on Lion, i.e. no 10.8+ symbol in the dependencies' C code (bundled SQLite, ring).
-- The Seatbelt profile under Lion's `sandbox-exec`. It only uses `version 1`, `allow default`, `deny file-write*`,
-  `subpath`/`literal` and `network-outbound` filters. All of those should exist on 10.7, but `(remote unix-socket)` is
-  the most likely to differ.
-- Terminal.app on Lion: 256 colours are supported; check true colour (`Color::Rgb`) themes and the Unicode glyphs
-  (`MOCO_ASCII=1` is the fallback).
+Verified with a release build made on Mojave 10.14.6 (Apple clang 11.0.0, 10.14 SDK, `MACOSX_DEPLOYMENT_TARGET=10.7`):
+- The 10.14 SDK links for 10.7 without problems; `crt1.10.6.o` is still in the SDK.
+- `otool -l` reports `LC_VERSION_MIN_MACOSX` version 10.7. `otool -L` lists only `libSystem` and `libiconv`.
+- Every one of the binary's 207 undefined symbols (`nm -u`) is exported by Lion's `/usr/lib/system/*.dylib`,
+  `libSystem` or `libiconv`, so the bundled SQLite and ring use nothing newer than 10.7.
+
+Verified on Lion 10.7.5 (11G63) with that binary:
+- It starts: `--version`, `--help`, `models` and `sessions` work, and the SQLite store opens and migrates.
+- HTTPS works: `moco models --refresh` downloads the catalog, and `-p` reaches the Anthropic API (checked with a dummy
+  key, which gets `invalid x-api-key`). TLS is rustls/ring with the roots compiled in (`webpki-roots`), so Lion's old
+  keychain and system TLS do not matter.
+- moco's exact Seatbelt profile works under Lion's `sandbox-exec`, `(remote unix-socket)` included: writes outside the
+  allowed subpaths are refused, `/tmp` is writable, and outbound network is blocked.
+- The TUI over an SSH pty (`TERM=xterm-256color`) draws the header, input box and spinner with Unicode box-drawing
+  glyphs, sends a message, shows the error and exits cleanly.
+
+The same binary also runs on Mojave 10.14.6 (`--version`, `models --refresh`, `-p` against the API). macOS 10.8 to
+10.13 should work for the same reasons (minimum OS 10.7, nothing newer linked, OS-independent TLS) but are untested.
+
+**Not yet verified:**
+- A real session with a valid API key that runs tools on Lion.
+- Lion's Terminal.app itself, as opposed to an SSH pty: true colour (`Color::Rgb`) themes and the glyphs (`MOCO_ASCII=1`
+  is the fallback).
+- `cargo test` on Lion: the fake LLM/MCP servers need `python3`, and Lion has only Python 2.7.
+- macOS 10.7.0 to 10.7.4 and 10.8 to 10.13.
 - `sw_vers` reports "Mac OS X 10.7.x", while `sysinfo` labels it "macOS 10.7.x". This is cosmetic.
+
+Running this build and a `main` build against the same data directory is not safe: `Store::init` only applies
+migrations newer than the recorded one and does not refuse a schema newer than it knows. Give each build its own
+`MOCO_HOME` if both are installed on one machine.
