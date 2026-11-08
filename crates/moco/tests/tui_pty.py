@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Drives `moco --tui` in a pseudo terminal: prompt, permission dialog, streamed answer, resize, quit.
 
-Usage: tui_pty.py MOCO CONFIG HOME WORKDIR SCENARIO    (SCENARIO: chat | sigterm | steer | config | mode | newsession | panic)
+Usage: tui_pty.py MOCO CONFIG HOME WORKDIR SCENARIO    (SCENARIO: chat | sigterm | hangup | hangup-idle | steer | config | mode | newsession | panic)
 Exits 0 when everything held; otherwise prints what went wrong and the screen text so far."""
 import fcntl, os, pty, re, select, signal, struct, sys, termios, time
 
@@ -275,6 +275,27 @@ elif scenario == "sigterm":
     os.kill(pid, signal.SIGTERM)
     status = wait_exit()
     check_restored(status)
+elif scenario in ("hangup", "hangup-idle"):
+    # The terminal goes away under moco, as when an SSH connection drops: close the pty master. moco must exit
+    # instead of spinning in crossterm's reader on the dead tty (issue #87). "hangup" drops it while a permission
+    # dialog blocks a run, "hangup-idle" at an empty prompt.
+    if scenario == "hangup":
+        send(b"Read a.txt and tell me what it says.\r")
+        wait_for(r"permissionneeded:read")
+    else:
+        wait_for(r"fake/mbuildmanual")
+    os.close(fd)
+    end = time.time() + 8
+    while time.time() < end:
+        done, status = os.waitpid(pid, os.WNOHANG)
+        if done:
+            break
+        time.sleep(0.1)
+    else:
+        cpu = os.popen("ps -o %%cpu= -p %d" % pid).read().strip()
+        os.kill(pid, signal.SIGKILL)
+        print("FAIL: moco was still running 8 s after its terminal hung up (cpu %s%%)" % cpu)
+        sys.exit(1)
 else:
     fail("unknown scenario")
 print("ok")

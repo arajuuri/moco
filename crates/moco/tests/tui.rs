@@ -64,6 +64,16 @@ fn sigterm_while_a_dialog_is_open_restores_the_terminal() {
 }
 
 #[test]
+fn a_hung_up_terminal_ends_moco_during_a_dialog() {
+    scenario("hangup");
+}
+
+#[test]
+fn a_hung_up_terminal_ends_moco_at_an_idle_prompt() {
+    scenario("hangup-idle");
+}
+
+#[test]
 fn prompts_typed_during_a_turn_are_steered_or_queued_and_delivered() {
     scenario("steer");
 }
