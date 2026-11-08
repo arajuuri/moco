@@ -37,7 +37,7 @@ questions. There is no HTTP/SSE boundary, no plugin system and no LSP (see "Deli
                                       +------------------------------------------------+
 ```
 
-Targets: macOS 10.7 through 10.14 on Intel, one binary built with Xcode 11.3.1, Rust 1.73 and a 10.7 deployment target
+Targets: macOS 10.7 through 10.14 on Intel, one binary built with Xcode 11.3.1, Rust 1.78 and a 10.7 deployment target
 (`14-macos-10.7.md`). That rules out anything that needs a newer OS or async runtime
 tooling, so the code is synchronous Rust on OS threads. HTTP is `ureq`, the database is bundled SQLite (`rusqlite`).
 
@@ -334,4 +334,4 @@ These are the invariants that are easy to break by accident.
 7. **Tool output is bounded** before the model sees it, and the rest is saved to a file.
 8. **Stored messages are never deleted** by compaction; undo hides them until the next prompt.
 9. **No runtime that 10.7 cannot load:** no Bun, Electron or current Node, no async-await toolchain, no dependency that needs a
-   newer Xcode than 11.3.1 or Rust than 1.73, and no symbol newer than 10.7.
+   newer Xcode than 11.3.1 or Rust than 1.78, and no symbol newer than 10.7.

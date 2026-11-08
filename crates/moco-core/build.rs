@@ -1,5 +1,5 @@
 //! Records which build this is (issue #94): `git describe` turned into a version such as `0.1.0-12-g1a2b3c4d5e`,
-//! plus the target and minimum macOS. No dependencies: crates such as `vergen` may not build on Rust 1.73.
+//! plus the target and minimum macOS. No dependencies: crates such as `vergen` may not build on Rust 1.78.
 //! The rules are in `src/describe.rs`; "Versions and releases" in CONTRIBUTING.md is the practice.
 use std::path::{Path, PathBuf};
 use std::process::Command;

@@ -8,5 +8,5 @@ resolver = "2"
 # CONTRIBUTING.md). Every build shows `git describe` on top of it (crates/moco-core/build.rs).
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.73"
+rust-version = "1.78"
 publish = false
