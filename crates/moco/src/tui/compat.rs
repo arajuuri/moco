@@ -1,5 +1,5 @@
-//! ratatui 0.26+ conveniences back-ported onto ratatui 0.25, the last release that builds with Rust 1.73 (the last
-//! toolchain that targets macOS 10.7). Call sites stay as on `main`; bring them into scope with `use super::compat::*;`.
+//! ratatui 0.26+ conveniences back-ported onto ratatui 0.25, the last release that builds with Rust 1.73 (moco's
+//! toolchain until #100; ratatui has not been upgraded since). Call sites stay as on `main`; bring them into scope with `use super::compat::*;`.
 #![allow(dead_code)]
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;

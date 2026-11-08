@@ -26,7 +26,7 @@ pins Electron 44 (macOS 12+). Nothing in this repo's runtime stack can be made t
 | `11-usage.md`                 | User reference for the app as built: commands, config, storage     |
 | `12-tui-plan.md`              | Plan and status of the full-screen terminal UI                     |
 | `13-architecture.md`          | The code as built: modules, run lifecycle, storage, invariants     |
-| `14-macos-10.7.md`            | Supporting 10.7 (Lion): Rust 1.73 pins, back-ports, building, tests |
+| `14-macos-10.7.md`            | Supporting 10.7 (Lion): Rust 1.78 and its libc shim, pins, back-ports, building, tests |
 
 ## Scope
 

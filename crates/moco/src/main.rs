@@ -1,9 +1,12 @@
 //! moco: terminal chat (full screen on a terminal; line based with --plain, with -p or when piped).
 #![allow(clippy::type_complexity)]
-#![allow(unstable_name_collisions)] // compat.rs back-ports std methods for Rust 1.73 (macOS 10.7)
+#![allow(unstable_name_collisions)] // compat.rs back-ports std methods newer than the pinned Rust 1.78 (issue #100)
 #![allow(clippy::format_collect, clippy::needless_borrow, clippy::search_is_some, clippy::single_char_pattern)] // clippy 1.73 lints that later clippy (main) dropped or made opt-in
+#![allow(clippy::assigning_clones, clippy::blocks_in_conditions, clippy::needless_borrows_for_generic_args)] // clippy 1.78 lints that newer clippy does not raise on this code
 use moco_core::compat::*;
 mod tui;
+#[cfg(target_os = "macos")]
+mod libc_shim; // getentropy and clock_gettime for macOS 10.7 (issue #100)
 use moco_core::catalog::{Catalog, ProviderInfo};
 use moco_core::mcp::{self, oauth::LoginIo, trust, Manager, ServerSpec};
 use moco_core::tools::SubagentRequest;

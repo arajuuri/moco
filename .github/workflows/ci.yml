@@ -29,7 +29,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.73.0 # keep in sync with rust-toolchain.toml
+      - uses: dtolnay/rust-toolchain@1.78.0 # keep in sync with rust-toolchain.toml
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
@@ -57,7 +57,7 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: "10.7"
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.73.0 # keep in sync with rust-toolchain.toml
+      - uses: dtolnay/rust-toolchain@1.78.0 # keep in sync with rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }} # PR runs reuse main's cache instead of storing their own
