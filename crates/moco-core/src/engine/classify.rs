@@ -128,7 +128,7 @@ impl Engine {
         };
         crate::log_info!(
             "classifier",
-            "session={} decision={decision} model_verdict={} risk={} model={model_ref} ms={ms} tokens_in={} tokens_out={} cost={cost:.5} reason={why} command={shown}",
+            "session={} decision={decision} model_verdict={} risk={} model={model_ref} ms={ms} input={} output={} cost={cost:.5} reason={why} command={shown}",
             session.id,
             if said.is_empty() { "-" } else { &said },
             if risk.is_empty() { "-" } else { &risk },
