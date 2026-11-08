@@ -26,6 +26,7 @@ pub mod mentions;
 pub mod permission;
 pub mod provider;
 pub mod sandbox;
+pub mod saved_permissions;
 pub mod skills;
 pub mod snapshot;
 pub mod store;

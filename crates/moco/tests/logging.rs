@@ -16,7 +16,7 @@ fn moco(home: &PathBuf, args: &[&str]) -> std::process::Output {
 #[test]
 fn read_only_commands_do_not_create_a_log_or_its_directory() {
     let h = home("readonly");
-    for args in [&["--help"][..], &["--version"], &["logs"], &["logs", "--path"], &["sessions"], &["models", "nosuchmodel"]] {
+    for args in [&["--help"][..], &["--version"], &["logs"], &["logs", "--path"], &["sessions"], &["permissions"], &["models", "nosuchmodel"]] {
         let out = moco(&h, args);
         assert!(out.status.success(), "moco {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
         assert!(!h.join("data/logs").exists(), "moco {args:?} created the log directory");

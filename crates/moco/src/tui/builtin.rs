@@ -38,7 +38,7 @@ pub const NAMES: &[(&str, &str)] = &[
     ("theme", "pick a color theme"),
     ("queue", "send a prompt after the current turn, or manage waiting prompts"),
     ("jobs", "background commands and subagents"),
-    ("permissions", "what the classifier allowed automatically, and the saved always-allow rules"),
+    ("permissions", "classifier allows and saved always-allow rules (remove <n>, clear)"),
     ("skills", "list skills"),
     ("commands", "list custom commands"),
     ("mcp", "MCP servers"),
@@ -385,13 +385,13 @@ pub fn run(host: &Host, app: &mut App, sid: &str, agent: &str, name: &str, args:
                 }
             }
         }
-        "permissions" => match engine.permissions_report(sid) {
+        "permissions" => match if args.is_empty() { engine.permissions_report(sid).map_err(|e| e.to_string()) } else { engine.manage_saved_permissions(sid, args).map_err(|e| e.to_string()) } {
             Ok(lines) => {
                 for l in lines {
                     app.push_info(l);
                 }
             }
-            Err(e) => err(app, e.to_string()),
+            Err(e) => err(app, e),
         },
         "jobs" => {
             if args.is_empty() {

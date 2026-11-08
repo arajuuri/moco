@@ -65,6 +65,7 @@ tooling, so the code is synchronous Rust on OS threads. HTTP is `ureq`, the data
 | | `tools/*.rs` | `read write edit patch glob grep shell jobs webfetch websearch todowrite question subagent skill` |
 | | `tools/shellparse.rs`, `tools/fsio.rs` | Command line to permission resources; atomic writes and per-file locks |
 | Safety | `permission.rs`, `wildcard.rs` | Rule model, modes, presets, evaluation |
+| | `saved_permissions.rs` | Listing and removing saved "always allow" rules (`/permissions`, `moco permissions`) |
 | | `sandbox.rs` | macOS Seatbelt wrapper for `shell` |
 | Agents | `agent.rs` | Built-in agents, the system prompt, reminders |
 | Extensions | `config.rs`, `instructions.rs`, `skills.rs`, `commands.rs`, `mentions.rs` | Config merge, `AGENTS.md`, skills, slash commands, `@` mentions |

@@ -34,6 +34,7 @@ By hand: `MACOSX_DEPLOYMENT_TARGET=10.7 CARGO_TARGET_DIR=<a directory outside th
 | `moco auth PROVIDER` | Store an API key |
 | `moco sessions [--all] [--archived]` | List sessions; `rename ID TITLE`, `archive ID`, `unarchive ID`; `export ID [--md\|--json\|--jsonl] [--children] [--include-hidden] [-o FILE]` writes a transcript (Markdown by default, to stdout without `-o`; read-only, safe while the session runs). Exports are **not redacted**: pasted keys and tool output appear as stored |
 | `moco logs [--follow] [--lines N] [--path]` | Show the end of the newest log file, follow it, or print the log directory (see "Logging") |
+| `moco permissions [--dir DIR]` | List the "always allow" rules saved for this directory's project (or `DIR`'s), numbered; `remove N`, `remove ACTION PATTERN` (quote the pattern: `remove shell 'osascript *'`) or `clear` forgets one or all of them. Works while a session runs; that session stops using a removed rule from its next step |
 
 ## Inside the chat
 
@@ -52,6 +53,8 @@ By hand: `MACOSX_DEPLOYMENT_TARGET=10.7 CARGO_TARGET_DIR=<a directory outside th
 | `/mcp`, `/mcp reconnect <name>` | Show the MCP servers and their state, or restart one |
 | `/mcp auth <name>`, `/mcp logout <name>` | Sign in to a remote MCP server (OAuth), or forget its stored sign-in |
 | `/jobs`, `/jobs output <id>`, `/jobs kill <id>` | Background commands and subagents: list, read output so far, stop |
+| `/permissions` | What the classifier allowed automatically in this session, and the numbered "always allow" rules saved for the project |
+| `/permissions remove <n>`, `/permissions remove <action> <pattern>`, `/permissions clear` | Forget one saved "always allow" rule (by its number in `/permissions`, or e.g. `remove shell osascript *`), or all of them for the project; the next matching request asks again |
 | `!<command>` | Run a shell command yourself, right now; the assistant is told what you ran |
 | (empty line) | Let the assistant react to a background result that arrived while you were idle |
 | `/<name> [args]` | Run a custom command (built in: `/init`, `/review`) |
@@ -59,7 +62,7 @@ By hand: `MACOSX_DEPLOYMENT_TARGET=10.7 CARGO_TARGET_DIR=<a directory outside th
 
 `Ctrl-C` interrupts a running turn (running commands are killed); `Ctrl-D` at the prompt quits.
 
-The status line shows the session's permission mode (`manual`, or `auto` in a warning colour). **Permission prompts** show the action and what it touches: `y` allow once, `a` allow always (saved for this project with a pattern such as `git push *`), `n` reject and stop, or type feedback to reject and tell the model why. In the default `manual` mode, anything that changes files, runs a command, or fetches from the web asks; reads and searches do not. In `auto` mode everything is allowed except reading `.env` files and web searches. Your own rules (below) apply in both modes. The `question` tool shows a numbered form; Enter dismisses it.
+The status line shows the session's permission mode (`manual`, or `auto` in a warning colour). **Permission prompts** show the action and what it touches: `y` allow once, `a` allow always (saved for this project with a pattern such as `git push *`; `/permissions` lists these and `/permissions remove <n>` forgets one), `n` reject and stop, or type feedback to reject and tell the model why. In the default `manual` mode, anything that changes files, runs a command, or fetches from the web asks; reads and searches do not. In `auto` mode everything is allowed except reading `.env` files and web searches. Your own rules (below) apply in both modes. The `question` tool shows a numbered form; Enter dismisses it.
 
 ## Other providers and protocols
 

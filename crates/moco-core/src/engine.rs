@@ -564,11 +564,18 @@ impl Engine {
         if auto.len() > 50 {
             out.push(format!("  ... {} older not shown", auto.len() - 50));
         }
-        out.push(format!("saved \"always allow\" rules for this project: {}", saved.len()));
-        for r in &saved {
-            out.push(format!("  {:<20} {}", r.action, r.resource));
-        }
+        out.extend(crate::saved_permissions::listing(&saved, "/permissions"));
         Ok(out)
+    }
+
+    /// `/permissions remove <n> | remove <action> <pattern> | clear`: forget saved "always allow" rules of the
+    /// session's project. Takes effect at the next permission check, also in a step that is running.
+    pub fn manage_saved_permissions(&self, sid: &str, args: &str) -> Result<Vec<String>, crate::saved_permissions::Error> {
+        let st = self.store();
+        let Some(session) = st.session(sid)? else {
+            return Err(crate::saved_permissions::Error::Usage(format!("session {sid} was not found (it may have been deleted from another moco process)")));
+        };
+        crate::saved_permissions::manage(&st, &session.project_id, "/permissions", args)
     }
 
     pub fn app_dir(&self) -> &std::path::Path {
