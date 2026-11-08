@@ -2,10 +2,21 @@
 # so enabling it needs a one-off `cargo fmt` commit first.
 name: ci
 
+# Docs-only changes run nothing. If a required status check is ever added for `main`, these filters would leave it
+# pending on such PRs; switch to a job-level check then.
 on:
   push:
     branches: [main]
+    paths-ignore: ["docs/**", "**/*.md", "LICENSE*", "NOTICE"]
   pull_request:
+    paths-ignore: ["docs/**", "**/*.md", "LICENSE*", "NOTICE"]
+  # Run the macOS job for any branch: `gh workflow run ci.yml --ref <branch>`.
+  workflow_dispatch:
+
+# A new push to a PR cancels its running checks. Runs on `main` are never cancelled, so every merge gets a result.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -26,37 +37,40 @@ jobs:
       - run: cargo test --locked --workspace # python3 is preinstalled; the fake MCP/LLM servers need it
 
   # Tests on macOS: symlinks under /var -> /private/var, case-insensitive file systems, process groups and
-  # sandbox-exec behave differently from Linux. This runner is newer than Mojave, so the Mojave machine run stays a manual check.
-  # Temporarily disabled to avoid macOS runner costs.
-  macos-test:
-    if: false
+  # sandbox-exec behave differently from Linux. This runner is newer than Mojave, so the Mojave machine run stays a
+  # manual check.
+  #
+  # macOS minutes cost far more than Linux ones, so this is one job that compiles once: the tests are built with the
+  # Lion deployment target, and the deployment-target and link checks (docs/14-macos-10.7.md) run on the `moco`
+  # binary that `cargo test` builds for the integration tests. Those properties come from the target, the linker
+  # and the dependencies, not the profile, so the release build (`scripts/install.sh`) is not compiled here.
+  # It runs on pushes to `main` and on manual dispatch, not on every PR push.
+  #
+  # The 10.7 check has not yet run on this runner (earlier runs predate the Lion target). If its newer Xcode cannot
+  # produce LC_VERSION_MIN_MACOSX 10.7, the check fails rather than passing a binary Lion cannot load.
+  #
+  # Disabled to avoid macOS runner costs: remove `false &&` to turn it on.
+  macos:
+    if: false && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: macos-15-intel
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "10.7"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.73.0 # keep in sync with rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }} # PR runs reuse main's cache instead of storing their own
       - run: cargo test --locked --workspace # python3 is preinstalled; the fake MCP/LLM servers need it
-
-  macos-minos:
-    if: false
-    runs-on: macos-15-intel
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.73.0 # keep in sync with rust-toolchain.toml
-      - uses: Swatinem/rust-cache@v2
-      - name: Build with the Lion deployment target
-        run: cargo build --release
-        env:
-          MACOSX_DEPLOYMENT_TARGET: "10.7"
-      - name: Check minos <= 10.7
+      - name: Check minos <= 10.7 and nothing newer than Lion is linked
         run: |
-          for bin in target/release/moco; do
-            otool -l "$bin" | grep -A3 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX'
-            minos=$(otool -l "$bin" | awk '/LC_BUILD_VERSION/{f=1} f&&$1=="minos"{print $2; exit}')
-            if [ -z "$minos" ]; then
-              minos=$(otool -l "$bin" | awk '/LC_VERSION_MIN_MACOSX/{f=1} f&&$1=="version"{print $2; exit}')
-            fi
-            echo "$bin minos=$minos"
-            [ -n "$minos" ] || { echo "no minos found"; exit 1; }
-            [ "$(printf '%s\n10.7\n' "$minos" | sort -V | tail -1)" = "10.7" ] || { echo "minos $minos > 10.7"; exit 1; }
-          done
+          bin=target/debug/moco
+          otool -l "$bin" | grep -A3 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX'
+          minos=$(otool -l "$bin" | awk '/LC_VERSION_MIN_MACOSX/{f=1} f&&$1=="version"{print $2; exit}')
+          [ -n "$minos" ] || { echo "no LC_VERSION_MIN_MACOSX: Lion's loader cannot start a binary without it"; exit 1; }
+          [ "$(printf '%s\n10.7\n' "$minos" | sort -V | tail -1)" = "10.7" ] || { echo "minos $minos > 10.7"; exit 1; }
+          echo "minos=$minos"
+          libs=$(otool -L "$bin" | tail -n +2 | awk '{print $1}' | grep -vE '^/usr/lib/(libSystem\.B|libiconv\.2)\.dylib$' || true)
+          [ -z "$libs" ] || { echo "links more than libSystem and libiconv:"; echo "$libs"; exit 1; }
+          newer=$(nm -u "$bin" | grep -E 'getentropy|clock_gettime|os_unfair_lock|ulock' || true)
+          [ -z "$newer" ] || { echo "uses symbols newer than 10.7:"; echo "$newer"; exit 1; }
