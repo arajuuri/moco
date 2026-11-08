@@ -405,7 +405,7 @@ pub fn probe(server_url: &str, headers: &std::collections::BTreeMap<String, Stri
     for (k, v) in headers {
         req = req.set(k, v);
     }
-    let body = json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":super::client::OFFERED,"capabilities":{},"clientInfo":{"name":"moco","version":env!("CARGO_PKG_VERSION")}}});
+    let body = json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":super::client::OFFERED,"capabilities":{},"clientInfo":{"name":"moco","version":crate::version::RELEASE}}});
     match req.send_string(&body.to_string()) {
         Err(ureq::Error::Status(401, r)) => r.header("www-authenticate").map(String::from),
         _ => None,

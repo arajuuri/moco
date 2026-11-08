@@ -72,6 +72,7 @@ tooling, so the code is synchronous Rust on OS threads. HTTP is `ureq`, the data
 | | `mcp/{client,http,oauth,manager,trust}.rs` | MCP over stdio and Streamable HTTP, OAuth, tool/prompt/resource exposure, project approval |
 | | `format.rs`, `check.rs` | Formatter and check hooks run after edits |
 | Misc | `log.rs`, `truncate.rs`, `id.rs`, `sysinfo.rs`, `markdown.rs` | Diagnostic log, output bounds, ids, host description, frontmatter |
+| | `version.rs`, `describe.rs`, `build.rs` | The build's version from `git describe` (or `MOCO_GIT_DESCRIBE`), commit, target and minimum macOS |
 
 ## 3. The life of a prompt
 

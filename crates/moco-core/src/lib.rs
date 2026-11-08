@@ -35,4 +35,5 @@ pub mod sysinfo;
 pub mod title;
 pub mod tools;
 pub mod truncate;
+pub mod version;
 pub mod wildcard;

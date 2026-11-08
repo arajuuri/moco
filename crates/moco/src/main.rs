@@ -765,7 +765,10 @@ fn main() {
             "--tui" => want_tui = Some(true),
             "--plain" => want_tui = Some(false),
             "--version" | "-V" => {
-                println!("moco {}", env!("CARGO_PKG_VERSION"));
+                println!("moco {}", moco_core::version::VERSION);
+                for line in moco_core::version::details() {
+                    println!("{line}");
+                }
                 return;
             }
             "--help" | "-h" => {
@@ -1073,7 +1076,7 @@ fn main() {
 
     let title_of = |sid: &str| engine.store().session(sid).ok().flatten().and_then(|s| s.title);
     let current = |sid: &str| engine.store().session(sid).ok().flatten().map(|s| engine.model_ref_for(&s)).unwrap_or_default();
-    println!("{DIM}moco {} | {} | agent {agent_id} | mode {} | {n_sources} config file(s) | /help for commands{RESET}", env!("CARGO_PKG_VERSION"), current(&session.id), engine.permission_mode_of(&session).name());
+    println!("{DIM}moco {} | {} | agent {agent_id} | mode {} | {n_sources} config file(s) | /help for commands{RESET}", moco_core::version::VERSION, current(&session.id), engine.permission_mode_of(&session).name());
     if resumed {
         println!("{DIM}session {}: {}{RESET}", short(&session.id), title_of(&session.id).unwrap_or_else(|| "(untitled)".into()));
     }

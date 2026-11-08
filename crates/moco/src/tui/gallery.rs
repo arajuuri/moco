@@ -38,7 +38,7 @@ fn conversation(theme: Theme) -> App {
     let mut a = App::new("anthropic/claude-sonnet-5-5", "build");
     a.theme = theme;
     a.title = Some("Fix the failing parser test".into());
-    a.rows.push(Row::Banner { title: "moco 0.0.0".into(), model: "anthropic/claude-sonnet-5-5".into(), agent: "build".into(), cwd: "~/Development/parser".into() });
+    a.rows.push(Row::Banner { title: "moco 0.1.0".into(), model: "anthropic/claude-sonnet-5-5".into(), agent: "build".into(), cwd: "~/Development/parser".into() });
     a.push_user("The parser test `handles_nested_quotes` fails. Can you find out why and fix it?");
     ev(&mut a, 0, "", Ev::Reasoning("The test name suggests the tokenizer mishandles escaped quotes inside a quoted string. Let me look at the test first, then the tokenizer.".into()));
     ev(&mut a, 0, "", Ev::Text("I'll start by running the test and reading the tokenizer.".into()));
@@ -133,7 +133,7 @@ fn gallery() {
 
         let mut a = App::new("anthropic/claude-sonnet-5-5", "build");
         a.theme = theme;
-        a.rows.push(Row::Banner { title: "moco 0.0.0".into(), model: "anthropic/claude-sonnet-5-5".into(), agent: "build".into(), cwd: "~/Development/parser".into() });
+        a.rows.push(Row::Banner { title: "moco 0.1.0".into(), model: "anthropic/claude-sonnet-5-5".into(), agent: "build".into(), cwd: "~/Development/parser".into() });
         scenes.insert(format!("{tname}-empty"), dump(&mut a, 100, 24));
     }
     std::fs::write(std::path::Path::new(&dir).join("scenes.json"), serde_json::Value::Object(scenes).to_string()).unwrap();

@@ -374,7 +374,7 @@ impl Client {
         let res = self
             .request(
                 "initialize",
-                json!({"protocolVersion": OFFERED, "capabilities": {}, "clientInfo": {"name": "moco", "version": env!("CARGO_PKG_VERSION")}}),
+                json!({"protocolVersion": OFFERED, "capabilities": {}, "clientInfo": {"name": "moco", "version": crate::version::RELEASE}}),
                 timeout,
                 None,
             )

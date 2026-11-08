@@ -39,6 +39,8 @@ over:
 ```
 rustup toolchain install 1.73.0          # rust-toolchain.toml selects it inside the repo
 MACOSX_DEPLOYMENT_TARGET=10.7 CARGO_TARGET_DIR=$HOME/moco-target-107 cargo build --release --locked
+# In a copy without .git, also pass MOCO_GIT_DESCRIBE (CONTRIBUTING.md "Versions and releases"), or the
+# version reads 0.1.0-unknown.
 otool -l $HOME/moco-target-107/release/moco | grep -A3 -E 'LC_VERSION_MIN_MACOSX|LC_BUILD_VERSION'   # must say 10.7
 ```
 
