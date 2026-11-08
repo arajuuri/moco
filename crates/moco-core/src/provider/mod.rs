@@ -222,7 +222,7 @@ impl Provider for Logged {
         let started = std::time::Instant::now();
         crate::log_debug!(
             "provider",
-            "request provider={} model={} messages={} tools={} approx_tokens={} effort={}",
+            "request provider={} model={} messages={} tools={} approx_input={} effort={}",
             self.id,
             req.model,
             req.messages.len(),

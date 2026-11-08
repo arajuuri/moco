@@ -2143,9 +2143,11 @@ mod tests {
         let sid = &f.session.id;
         let lines = classifier_log(sid, "INFO");
         assert_eq!(lines.len(), 2, "one line per decision, the repeat included: {lines:?}");
-        for part in ["decision=allow", "model_verdict=allow", "risk=read-only", "model=anthropic/claude-haiku-5-5", " ms=", "tokens_in=", "tokens_out=", "cost=", "reason=because", "command=echo hi"] {
+        for part in ["decision=allow", "model_verdict=allow", "risk=read-only", "model=anthropic/claude-haiku-5-5", " ms=", " input=10 output=5 ", "cost=", "reason=because", "command=echo hi"] {
             assert!(lines[0].contains(part), "{part} missing from {}", lines[0]);
         }
+        // Issue #71: `tokens_in=` matched the secret-assignment rule, so the counts were logged as `[redacted]`.
+        assert!(!lines[0].contains("[redacted]"), "nothing in a classifier line about `echo hi` is secret: {}", lines[0]);
         assert!(lines[1].contains("decision=allow cached=true") && lines[1].contains("command=echo hi"), "{}", lines[1]);
         assert!(!classifier_log(sid, "DEBUG").is_empty(), "the raw reply is kept at debug: {:?}", crate::log::capture::global_lines(&format!("session={sid}")));
 

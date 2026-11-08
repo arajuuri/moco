@@ -617,6 +617,23 @@ mod tests {
     }
 
     #[test]
+    fn moco_s_own_usage_counts_are_not_redacted() {
+        // Issue #71: `tokens_in=`, `tokens_out=` and `approx_tokens=` matched the secret-assignment rule (any name with
+        // `token` in it), so the counts were logged as `[redacted]`. The keys were renamed rather than the rule relaxed:
+        // a numeric value can still be a credential.
+        for line in [
+            "session=ses_1 decision=allow model_verdict=allow risk=read-only model=a/b ms=12 input=1234 output=56 cost=0.00100 reason=x command=ls",
+            "request provider=anthropic model=m messages=3 tools=13 approx_input=40961 effort=-",
+            "done model=m first_byte_ms=210 total_ms=1500 finish=EndTurn input=10 output=5 cache_read=7 cache_write=0",
+            "usage session=ses_1 step=2 model=anthropic/m input=10 output=5 cache_read=7 cache_write=0 cost=0.0001",
+        ] {
+            assert_eq!(redact(line), line);
+        }
+        assert_eq!(redact("TOKEN=123456 ./run"), "TOKEN=[redacted] ./run");
+        assert_eq!(redact("tokens_in=10"), "tokens_in=[redacted]", "why the old key names could not stay");
+    }
+
+    #[test]
     fn shell_commands_lose_their_credentials_but_not_their_meaning() {
         for (before, secret) in [
             ("export GITHUB_TOKEN=ghp_abcdef123456 && gh api user", "ghp_abcdef123456"),
