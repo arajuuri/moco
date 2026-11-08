@@ -1,6 +1,7 @@
 //! A small Markdown renderer for assistant text: headings, lists, quotes, fenced code, tables, inline
 //! code/bold/italic/links. Line breaks in the source are kept (chat replies rely on them). No dependencies;
 //! unknown or half-written syntax (the reply is still streaming) falls back to plain text.
+use moco_core::compat::*;
 use super::glyphs::Glyphs;
 use super::theme::Theme;
 use ratatui::prelude::*;

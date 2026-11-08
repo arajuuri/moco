@@ -2,19 +2,26 @@
 name = "moco-core"
 version = "0.0.0"
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 
+# macos-10.7 branch: versions are held to what builds with Rust 1.73 and runs on macOS 10.7 (docs/14-macos-10.7.md).
+# `rust-version` makes Cargo's resolver prefer compatible releases (`CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback`
+# with a newer cargo), but several crates under-declare it, hence the explicit caps below.
 [dependencies]
 fastrand = "2"
-rusqlite = { version = "*", features = ["bundled"] }
+rusqlite = { version = "~0.31", features = ["bundled"] } # 0.32+ uses c"" literals (1.77) and #[expect] (1.81)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-globset = "0.4"
-ignore = "0.4"
+globset = ">=0.4.14, <=0.4.15" # 0.4.16+ is edition 2024
+ignore = ">=0.4.22, <=0.4.23" # 0.4.24+ is edition 2024
 libc = "0.2"
 regex = "1"
 ureq = "2"
 sha2 = "0.10"
 similar = "2"
 base64 = "0.22"
+# Not used directly: caps ring's getrandom. 0.2.11+ calls getentropy(), which only exists on 10.12+, so the binary would
+# not start on Lion; 0.2.10 looks it up at run time and falls back to /dev/urandom.
+getrandom = "=0.2.10"

@@ -1,5 +1,7 @@
 //! The TUI model: state, the pure `update` function and `render`. No terminal or engine in here,
 //! so tests drive it with scripted events and read ratatui's test buffer.
+use moco_core::compat::*;
+use super::compat::*;
 use crate::human;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use moco_core::engine::Reply;
@@ -1382,7 +1384,7 @@ impl App {
                 for l in md::render(s, width.saturating_sub(M.len()), t, g) {
                     let mut spans = vec![Span::raw(M)];
                     spans.extend(l.spans);
-                    out.push(Line::from(spans).style(l.style));
+                    out.push(Line::from(spans));
                 }
             }
             Row::Reasoning(s) => match self.level {
@@ -2168,7 +2170,7 @@ mod tests {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         t.draw(|f| render(f, app)).unwrap();
         let b = t.backend().buffer();
-        (0..h).map(|y| (0..w).map(|x| b[(x, y)].symbol().to_string()).collect::<String>().trim_end().to_string()).collect()
+        (0..h).map(|y| (0..w).map(|x| b.get(x, y).symbol().to_string()).collect::<String>().trim_end().to_string()).collect()
     }
 
     #[test]

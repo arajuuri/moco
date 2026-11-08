@@ -1,3 +1,4 @@
+use crate::compat::*;
 use super::*;
 use ignore::WalkBuilder;
 use regex::RegexBuilder;
@@ -145,7 +146,7 @@ mod tests {
     fn a_huge_single_line_is_searched_by_its_start_and_the_next_lines_still_count() {
         let env = Env::new();
         let mut data = b"needle ".to_vec();
-        data.extend(std::iter::repeat_n(b'x', 300_000));
+        data.extend(std::iter::repeat(b'x').take(300_000));
         data.extend_from_slice(b"\nsecond needle\n");
         env.file("min.js", &data);
         let t = run(&env, json!({"pattern":"needle"})).unwrap();

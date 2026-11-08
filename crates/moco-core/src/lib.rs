@@ -1,11 +1,14 @@
 //! moco engine: UI-independent core (docs/00-overview.md).
 #![allow(clippy::type_complexity)]
+#![allow(unstable_name_collisions)] // compat.rs back-ports std methods for Rust 1.73 (macOS 10.7)
+#![allow(clippy::format_collect, clippy::needless_borrow, clippy::search_is_some, clippy::single_char_pattern)] // clippy 1.73 lints that later clippy (main) dropped or made opt-in
 pub mod agent;
 pub mod auth;
 pub mod blobs;
 pub mod catalog;
 pub mod classifier;
 pub mod commands;
+pub mod compat;
 pub mod chat;
 pub mod check;
 pub mod compaction;

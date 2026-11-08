@@ -131,7 +131,7 @@ impl Theme {
 
     /// Subtle diff backgrounds that only truecolor can express; they fill whole lines.
     pub fn truecolor(mut self, light: bool) -> Theme {
-        let rgb = |r, g, b| Color::Rgb(r, g, b);
+        let rgb = Color::Rgb;
         if light {
             self.added = st().fg(rgb(24, 84, 44)).bg(rgb(214, 242, 220));
             self.removed = st().fg(rgb(124, 32, 36)).bg(rgb(252, 222, 222));

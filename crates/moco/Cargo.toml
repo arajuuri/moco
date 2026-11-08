@@ -2,14 +2,15 @@
 name = "moco"
 version = "0.0.0"
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
 libc = "0.2"
 moco-core = { path = "../moco-core" }
 serde_json = "1"
-ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
-crossterm = "0.29"
+ratatui = { version = "0.25", default-features = false, features = ["crossterm"] } # 0.26+ needs Rust 1.74; API gaps in tui/compat.rs
+crossterm = "0.27"
 unicode-width = "0.2"
-ignore = "0.4"
+ignore = ">=0.4.22, <=0.4.23" # 0.4.24+ is edition 2024
 similar = "2"

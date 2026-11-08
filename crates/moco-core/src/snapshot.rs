@@ -4,6 +4,7 @@
 //! file contents stored once as blobs. Capturing walks the tree (honoring `.gitignore`, skipping `.git`) and
 //! re-hashes only files whose size or mtime changed since the previous snapshot. Restoring writes back changed
 //! files and deletes files that did not exist; ignored files are never touched. Self-contained: no `git` needed.
+use crate::compat::*;
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

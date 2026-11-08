@@ -4,6 +4,7 @@
 //! plays the authorization server; not verified against real services.
 //!
 //! Tokens and registered clients live in `<app dir>/mcp-auth.json` (mode 0600), keyed by the server's URL.
+use crate::compat::*;
 use crate::config::OAuthConfig;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
