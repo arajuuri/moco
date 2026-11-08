@@ -58,6 +58,8 @@ pub enum AppEvent {
     Questions { questions: Vec<Question>, reply: Sender<Option<Vec<Vec<String>>>> },
     /// A background operation (compaction, ...) finished with a message for the transcript.
     OpDone(Result<String, String>),
+    /// A suggested next message arrived for the turn numbered `turn` (see `App::suggest_turn`).
+    Suggestion { turn: u64, text: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,8 +224,10 @@ pub enum Action {
     Palette,
     /// Set the session's reasoning effort (`None` = the provider's default).
     SetEffort(Option<String>),
-    /// Set the session's permission mode (Tab, or `/mode`).
+    /// Set the session's permission mode (Shift-Tab, or `/mode`).
     SetPermissionMode(PermissionMode),
+    /// A turn ended normally: ask for a suggested next message, tagged with `turn`.
+    Suggest { turn: u64 },
     /// An entry was chosen in a picker.
     Picked { kind: PickKind, value: String },
     /// Ctrl-D on an entry of a queue or job picker.
@@ -293,7 +297,7 @@ pub struct App {
     pub viewer: Option<Viewer>,
     pub model: String,
     pub agent: String,
-    /// Shown in the status line; Tab switches it.
+    /// Shown in the status line; Shift-Tab switches it.
     pub permission_mode: PermissionMode,
     pub title: Option<String>,
     pub session_cost: f64,
@@ -331,6 +335,12 @@ pub struct App {
     /// `Some` once the terminal has reported focus changes.
     pub focused: Option<bool>,
     pub away_after: std::time::Duration,
+    /// Ask for a suggested next message after each turn (`tui.suggestions`, default on).
+    pub suggestions: bool,
+    /// The suggested next message, shown as ghost text in an empty composer; Tab takes it (issue #66).
+    pub suggestion: Option<String>,
+    /// Numbers the turns, so a suggestion that arrives after the user moved on is dropped.
+    pub suggest_turn: u64,
     pub history: Vec<String>,
     hist: Option<usize>,
     draft: String,
@@ -389,6 +399,9 @@ impl App {
             last_input: std::time::Instant::now(),
             focused: None,
             away_after: std::time::Duration::from_secs(8),
+            suggestions: true,
+            suggestion: None,
+            suggest_turn: 0,
             history: vec![],
             hist: None,
             draft: String::new(),
@@ -404,6 +417,12 @@ impl App {
         }
     }
 
+    /// Drop the shown suggestion and any still on its way (a new turn starts, the session changes).
+    pub fn clear_suggestion(&mut self) {
+        self.suggestion = None;
+        self.suggest_turn += 1;
+    }
+
     pub fn push_info(&mut self, s: impl Into<String>) {
         self.rows.push(Row::Info(s.into()));
     }
@@ -414,6 +433,15 @@ impl App {
     }
 
     pub fn update(&mut self, ev: AppEvent) -> Action {
+        let action = self.update_inner(ev);
+        // Typing, pasting or recalling history dismisses the suggestion; it does not come back.
+        if !self.input.is_empty() {
+            self.suggestion = None;
+        }
+        action
+    }
+
+    fn update_inner(&mut self, ev: AppEvent) -> Action {
         match ev {
             AppEvent::Key(k) => {
                 self.last_input = std::time::Instant::now();
@@ -471,6 +499,7 @@ impl App {
                 self.retry = None;
                 self.dialogs.clear(); // a dialog whose run is gone cannot be answered
                 self.forms.clear();
+                let finished = matches!(outcome, Ok(Idle));
                 match outcome {
                     Ok(Idle) => self.attention = Some("done".into()),
                     Ok(Failed(_)) => self.attention = Some("the turn failed".into()),
@@ -487,6 +516,15 @@ impl App {
                     Err(e) => self.rows.push(Row::Error(e)), // already says what failed ("store error: ...", "the engine crashed: ...")
                 }
                 self.finish_usage();
+                if finished && self.suggestions {
+                    self.clear_suggestion();
+                    return Action::Suggest { turn: self.suggest_turn };
+                }
+            }
+            AppEvent::Suggestion { turn, text } => {
+                if turn == self.suggest_turn && self.input.is_empty() && !self.running {
+                    self.suggestion = Some(text);
+                }
             }
         }
         Action::None
@@ -898,11 +936,14 @@ impl App {
             KeyCode::Tab => {
                 if self.popup.is_some() {
                     self.accept_completion();
-                } else {
-                    // Tab switches the permission mode (the fixed key; completion takes it while its popup is open).
-                    return Action::SetPermissionMode(self.permission_mode.toggled());
+                } else if let Some(s) = self.suggestion.take().filter(|_| self.input.is_empty() && !self.running) {
+                    // Take the suggested next message as typed text: it can be edited, and only Enter sends it.
+                    self.input = s;
+                    self.cursor = self.len_chars();
                 }
             }
+            // Shift-Tab switches the permission mode (a fixed key, as in other coding CLIs).
+            KeyCode::BackTab => return Action::SetPermissionMode(self.permission_mode.toggled()),
             KeyCode::Enter => {
                 if let Some(p) = &self.popup {
                     // Enter accepts the highlighted candidate, unless it is already what was typed.
@@ -2090,8 +2131,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
             (Line::from(vec![Span::styled(" message ", t.accent.add_modifier(Modifier::BOLD))]), t.accent)
         };
         let mut block = Block::bordered().border_set(g.border).title(title).border_style(border);
+        let suggestion = app.suggestion.as_deref().filter(|_| app.input.is_empty() && !app.running);
         if app.input.is_empty() && !app.running {
-            let hint = format!(" Enter send {} {} newline ", g.sep, app.keymap.label(KeyAction::Newline));
+            let hint = match suggestion {
+                Some(_) => format!(" Tab take suggestion {} type to ignore ", g.sep),
+                None => format!(" Enter send {} {} newline ", g.sep, app.keymap.label(KeyAction::Newline)),
+            };
             block = block.title_bottom(Line::from(Span::styled(hint, t.dim)).alignment(Alignment::Right));
         }
         let inner = block.inner(bottom);
@@ -2103,7 +2148,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
         for (n, &(a, b)) in comp_lines.iter().enumerate().skip(top).take(shown) {
             let marker = if n == 0 { Span::styled(format!("{} ", g.prompt), t.accent.add_modifier(Modifier::BOLD)) } else { Span::raw("  ") };
             let text: String = chars[a..b].iter().collect();
-            if app.input.is_empty() && n == 0 && !app.running {
+            if let (Some(sug), 0) = (suggestion, n) {
+                // Ghost text: the suggested next message, until Tab takes it or typing replaces it.
+                rows.push(Line::from(vec![marker, Span::styled(sug.to_string(), t.dim.add_modifier(Modifier::ITALIC))]));
+            } else if app.input.is_empty() && n == 0 && !app.running {
                 rows.push(Line::from(vec![marker, Span::styled("Ask anything. / for commands, @ to mention a file", t.dim)]));
             } else {
                 rows.push(Line::from(vec![marker, Span::raw(text)]));
@@ -2423,15 +2471,64 @@ mod tests {
     }
 
     #[test]
-    fn tab_switches_the_permission_mode_and_the_status_line_shows_it() {
+    fn shift_tab_switches_the_permission_mode_and_the_status_line_shows_it() {
         let mut a = App::new("m", "build");
         assert_eq!(a.permission_mode, PermissionMode::Manual, "manual is the default");
         assert!(screen(&mut a, 100, 4).last().unwrap().contains(" manual "));
-        assert_eq!(press(&mut a, KeyCode::Tab), Action::SetPermissionMode(PermissionMode::Auto));
+        assert_eq!(press(&mut a, KeyCode::Tab), Action::None, "plain Tab no longer switches it (issue #66)");
+        assert_eq!(press(&mut a, KeyCode::BackTab), Action::SetPermissionMode(PermissionMode::Auto));
         // The app shows the mode the engine confirms (set by the event loop).
         a.permission_mode = PermissionMode::Auto;
         assert!(screen(&mut a, 100, 4).last().unwrap().contains(" auto "));
-        assert_eq!(press(&mut a, KeyCode::Tab), Action::SetPermissionMode(PermissionMode::Manual));
+        assert_eq!(press(&mut a, KeyCode::BackTab), Action::SetPermissionMode(PermissionMode::Manual));
+    }
+
+    #[test]
+    fn a_suggested_next_message_is_ghost_text_until_tab_takes_it_or_typing_replaces_it() {
+        use moco_core::engine::RunOutcome;
+        let mut a = App::new("m", "build");
+        a.running = true;
+        // A finished turn asks for a suggestion; one for an older turn is dropped.
+        let Action::Suggest { turn } = a.update(AppEvent::RunDone(Ok(RunOutcome::Idle))) else { panic!("a finished turn asks for a suggestion") };
+        a.update(AppEvent::Suggestion { turn: turn - 1, text: "Stale".into() });
+        assert_eq!(a.suggestion, None);
+        a.update(AppEvent::Suggestion { turn, text: "Run the tests".into() });
+        let shown = screen(&mut a, 70, 8).join("\n");
+        assert!(shown.contains("Run the tests") && shown.contains("Tab take suggestion"), "{shown}");
+        assert!(!shown.contains("Ask anything"), "the suggestion replaces the usual placeholder");
+        // Enter on the empty box does what it always did; the suggestion is never sent on its own.
+        assert_eq!(press(&mut a, KeyCode::Enter), Action::Poke);
+        // Tab takes it as typed text, which Enter then sends.
+        assert_eq!(press(&mut a, KeyCode::Tab), Action::None);
+        assert_eq!((a.input.as_str(), a.cursor), ("Run the tests", 13));
+        assert_eq!(a.suggestion, None);
+        type_str(&mut a, " now");
+        assert_eq!(press(&mut a, KeyCode::Enter), Action::Submit { text: "Run the tests now".into(), shown: "Run the tests now".into() });
+
+        // Typing instead dismisses it for good, even after the box is cleared again.
+        a.update(AppEvent::Suggestion { turn, text: "Commit the changes".into() });
+        assert!(a.suggestion.is_some());
+        type_str(&mut a, "x");
+        assert_eq!(a.suggestion, None);
+        press(&mut a, KeyCode::Backspace);
+        assert!(!screen(&mut a, 70, 8).join("\n").contains("Commit the changes"));
+        // A suggestion arriving while the user is typing is not shown.
+        type_str(&mut a, "draft");
+        a.update(AppEvent::Suggestion { turn, text: "Commit the changes".into() });
+        assert_eq!(a.suggestion, None);
+
+        // A new turn or session drops one still on its way.
+        a.input.clear();
+        a.cursor = 0;
+        a.clear_suggestion();
+        a.update(AppEvent::Suggestion { turn, text: "Too late".into() });
+        assert_eq!(a.suggestion, None);
+        // Only a turn that ended normally asks, and only when suggestions are on.
+        for outcome in [RunOutcome::Interrupted, RunOutcome::Declined, RunOutcome::Failed("x".into())] {
+            assert_eq!(a.update(AppEvent::RunDone(Ok(outcome))), Action::None);
+        }
+        a.suggestions = false;
+        assert_eq!(a.update(AppEvent::RunDone(Ok(RunOutcome::Idle))), Action::None);
     }
 
     #[test]

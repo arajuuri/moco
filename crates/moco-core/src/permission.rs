@@ -90,7 +90,7 @@ impl PermissionMode {
             PermissionMode::Auto => "runs tools without asking, except where your permission rules ask",
         }
     }
-    /// The mode Tab switches to.
+    /// The mode Shift-Tab switches to.
     pub fn toggled(self) -> PermissionMode {
         match self {
             PermissionMode::Manual => PermissionMode::Auto,

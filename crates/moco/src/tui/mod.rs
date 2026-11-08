@@ -167,6 +167,8 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
     let (mut terminal, _guard) = term::enter()?;
     let (tx, rx) = channel::<AppEvent>();
     let cancel = AtomicBool::new(false);
+    // Stops suggestion requests still running when the UI closes (the scope waits for their threads).
+    let suggest_cancel = AtomicBool::new(false);
     let stop = Arc::new(AtomicBool::new(false));
     let ui = TuiUi { tx: Mutex::new(tx.clone()) };
 
@@ -197,6 +199,7 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
     if let Some(n) = host.tui.away_after {
         app.away_after = Duration::from_secs(n);
     }
+    app.suggestions = host.tui.suggestions.unwrap_or(true);
     app.glyphs = glyphs::choose(host.tui.ascii.unwrap_or(false));
     let bell = host.tui.bell.unwrap_or(true);
     if let Some(completer) = host.completer.take() {
@@ -272,6 +275,7 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
 
         let start_run = |app: &mut App, sid: &str, resume: bool| {
             app.running = true;
+            app.clear_suggestion();
             cancel.store(false, Ordering::Relaxed);
             let done_tx = tx.clone();
             let (ui, cancel, sid) = (&ui, &cancel, sid.to_string());
@@ -423,6 +427,16 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
                             _ => {}
                         },
                         Action::SetPermissionMode(mode) => builtin::set_permission_mode(engine, &sid, &mut app, mode),
+                        // Not when a prompt that was waiting has already started the next turn.
+                        Action::Suggest { turn } if !app.running => {
+                            let (tx, sid, suggest_cancel) = (tx.clone(), sid.clone(), &suggest_cancel);
+                            scope.spawn(move || {
+                                if let Some(text) = engine.suggest_next(&sid, suggest_cancel) {
+                                    let _ = tx.send(AppEvent::Suggestion { turn, text });
+                                }
+                            });
+                        }
+                        Action::Suggest { .. } => {}
                         Action::SetEffort(level) => {
                             builtin::choose_effort(engine, &sid, &mut app, level.as_deref());
                             refresh_status(&mut app, &sid);
@@ -490,7 +504,7 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
                                     use keys::KeyAction as K;
                                     let km = &app.keymap;
                                     let help = format!(
-                                        "Enter sends, {} adds a line, Up/Down move or browse history, Tab completes / and @ (or switches the permission mode when no completion is open), {} opens the command palette, {} interrupts (Ctrl-C too), {}/{} scroll, {} follows the output, {} cycles the detail level, {} quits. Leader {}: {}. !command runs a shell command. Commands: /model /agent /mode /sessions /resume /new /rename /fork /archive /undo /redo /diff /compact /queue /jobs /theme /skills /commands /mcp /exit.",
+                                        "Enter sends, {} adds a line, Up/Down move or browse history, Tab completes / and @ (or takes the suggested next message), Shift-Tab switches the permission mode, {} opens the command palette, {} interrupts (Ctrl-C too), {}/{} scroll, {} follows the output, {} cycles the detail level, {} quits. Leader {}: {}. !command runs a shell command. Commands: /model /agent /mode /sessions /resume /new /rename /fork /archive /undo /redo /diff /compact /queue /jobs /theme /skills /commands /mcp /exit.",
                                         km.label(K::Newline),
                                         km.label(K::Palette),
                                         km.label(K::Interrupt),
@@ -603,6 +617,7 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
 
         // Leaving: stop a running turn and wait for it, so nothing keeps writing into a restored terminal.
         cancel.store(true, Ordering::Relaxed);
+        suggest_cancel.store(true, Ordering::Relaxed);
         stop.store(true, Ordering::Relaxed);
         app.dialogs.clear(); // dropping the senders rejects whatever the run was waiting on
         app.forms.clear();
@@ -624,6 +639,7 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
 /// Replaces what the UI shows (transcript, costs, sidebar todo list) with the stored state of session `sid`. A session
 /// without a stored list clears the previous session's list.
 fn load_session_view(st: &moco_core::store::Store, app: &mut App, sid: &str) {
+    app.clear_suggestion();
     let messages = st.messages(sid).unwrap_or_default();
     let revert = st.revert(sid).ok().flatten();
     let hidden = revert.as_ref().and_then(|r| r["messageId"].as_str().map(String::from));

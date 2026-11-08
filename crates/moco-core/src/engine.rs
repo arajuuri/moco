@@ -22,6 +22,7 @@ mod compact;
 mod permit;
 use permit::EnginePermitter;
 mod step;
+mod suggest;
 mod title;
 mod undo;
 
@@ -1272,6 +1273,40 @@ mod tests {
         assert!(matches!(&last_user_blocks(&reqs[1])[0], Block::ToolResult { content, is_error: false, .. } if content.contains("don't click here")), "{:?}", last_user_blocks(&reqs[1]));
         let saved: Vec<String> = f.engine.store().saved_permissions(&f.session.project_id).unwrap().into_iter().map(|r| r.resource).collect();
         assert_eq!(saved, ["cat *", "printf *"], "no rules for body lines");
+    }
+
+    #[test]
+    fn the_next_action_is_suggested_from_the_last_turn_by_the_small_model() {
+        let f = fixture(vec![text("I added the migration. Next I would run it against the dev database.")]);
+        f.engine.store().set_todos(&f.session.id, &[Todo { content: "Write the migration".into(), status: "completed".into() }, Todo { content: "Update the README".into(), status: "pending".into() }]).unwrap();
+        f.say("add a users migration");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        let before = f.engine.store().usage_totals(&f.session.id).unwrap();
+        f.fake.script_suggestions(vec![text("\"Run the migration on the dev database\"")]);
+        let cancel = AtomicBool::new(false);
+        assert_eq!(f.engine.suggest_next(&f.session.id, &cancel).as_deref(), Some("Run the migration on the dev database"));
+        let reqs = f.fake.suggestion_requests.lock().unwrap();
+        let Block::Text(sent) = &reqs[0].messages[0].content[0] else { panic!("text expected") };
+        assert!(sent.contains("add a users migration") && sent.contains("run it against the dev database"), "{sent}");
+        assert!(sent.contains("- Update the README") && !sent.contains("Write the migration"), "only open to-dos: {sent}");
+        let small = f.engine.small_model_ref(&f.session);
+        assert_eq!(reqs[0].model, config::split_model(&small).1, "the small model");
+        drop(reqs);
+        assert!(f.engine.store().usage_totals(&f.session.id).unwrap() != before, "the call's usage is added to the session");
+        assert_eq!(f.fake.calls(), 1, "the main conversation saw no extra request");
+
+        // No clear next step, a failure, or a cancel: no suggestion.
+        f.fake.script_suggestions(vec![text("NONE")]);
+        assert_eq!(f.engine.suggest_next(&f.session.id, &cancel), None);
+        f.fake.script_suggestions(vec![Scripted::Fail(vec![], ProviderError::Auth("no".into()))]);
+        assert_eq!(f.engine.suggest_next(&f.session.id, &cancel), None);
+        f.fake.script_suggestions(vec![text("Run the tests")]);
+        assert_eq!(f.engine.suggest_next(&f.session.id, &AtomicBool::new(true)), None);
+        // A session with no reply yet has nothing to suggest from, and asks no model.
+        let fresh = f.engine.store().create_session(f.dir.join("work").to_str().unwrap(), "build").unwrap();
+        let asked = f.fake.suggestion_requests.lock().unwrap().len();
+        assert_eq!(f.engine.suggest_next(&fresh.id, &cancel), None);
+        assert_eq!(f.fake.suggestion_requests.lock().unwrap().len(), asked);
     }
 
     #[test]

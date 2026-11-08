@@ -290,6 +290,11 @@ the `Engine`, and picks a mode:
   `UiEvent` to an owned `Ev` and sends it down the channel. `Ui::ask` sends the prompt with a reply channel and blocks the engine
   thread until the UI thread answers. While a turn runs, or jobs or the sidebar are active, the loop also syncs the inbox and the sidebar (MCP
   servers, jobs) about every 200 ms. Background-job lines arrive through the engine's notifier.
+- After a turn ends normally (`RunDone(Idle)`), the app returns `Action::Suggest`, and the loop asks
+  `Engine::suggest_next` (`engine/suggest.rs`, prompt in `suggest.rs`) on a scoped thread for one short next message
+  from the small model. It arrives as `AppEvent::Suggestion` tagged with `App::suggest_turn`, so one for an older turn
+  (a new run, `/new`, `/resume`) is dropped. It is drawn as ghost text in an empty composer; Tab copies it into the input,
+  any input dismisses it, and it is never sent by itself. `tui.suggestions: false` turns it off.
 - `builtin.rs` implements the slash commands, `keys.rs` the key map, `theme.rs` the colors, `md.rs` Markdown rendering,
   `diff.rs` the diff viewer, `complete.rs` completion.
 - When a session is opened (start, `/resume`, `/new`, `/fork`), `load_session_view` rebuilds the transcript, costs and todo

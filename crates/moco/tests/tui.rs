@@ -29,7 +29,7 @@ fn scenario(name: &str) {
                "tui": {},
                "snapshots": false }}"#,
             port.trim(),
-            if matches!(name, "steer" | "newsession") { "allow" } else { "ask" },
+            if matches!(name, "steer" | "newsession" | "suggest") { "allow" } else { "ask" },
             if name == "config" { r#"{ "theme": "neon", "keys": { "palette": "f2" }, "away_after": 0, "sidebar": true }"# } else { "{}" }
         ),
     )
@@ -89,7 +89,12 @@ fn a_prompt_after_new_runs_in_the_new_session() {
 }
 
 #[test]
-fn tab_switches_the_permission_mode() {
+fn a_suggested_next_message_is_shown_and_taken_with_tab() {
+    scenario("suggest");
+}
+
+#[test]
+fn shift_tab_switches_the_permission_mode() {
     scenario("mode");
 }
 

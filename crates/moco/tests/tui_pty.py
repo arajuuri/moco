@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Drives `moco --tui` in a pseudo terminal: prompt, permission dialog, streamed answer, resize, quit.
 
-Usage: tui_pty.py MOCO CONFIG HOME WORKDIR SCENARIO    (SCENARIO: chat | sigterm | hangup | hangup-idle | steer | config | mode | newsession | panic)
+Usage: tui_pty.py MOCO CONFIG HOME WORKDIR SCENARIO    (SCENARIO: chat | sigterm | hangup | hangup-idle | steer | config | mode | suggest | newsession | panic)
 Exits 0 when everything held; otherwise prints what went wrong and the screen text so far."""
-import fcntl, os, pty, re, select, signal, struct, sys, termios, time
+import fcntl, json, os, pty, re, select, signal, struct, sys, termios, time
 
 moco, config, home, work, scenario = sys.argv[1:6]
 env = dict(os.environ, MOCO_CONFIG=config, MOCO_HOME=home, TERM="xterm-256color")
@@ -242,12 +242,36 @@ elif scenario == "newsession":
     send(b"\x04")
     check_restored(wait_exit())
 elif scenario == "mode":
-    # Tab switches the permission mode; the transcript confirms each switch.
+    # Shift-Tab (ESC [ Z) switches the permission mode; the transcript confirms each switch. Plain Tab no longer does.
     wait_for(r"fake/mbuildmanual")  # the status line starts in manual
     send(b"\t")
+    pump(0.5)
+    if "permissionmode:" in squashed():
+        fail("plain Tab switched the permission mode")
+    send(b"\x1b[Z")
     wait_for(r"permissionmode:auto")
-    send(b"\t")
+    send(b"\x1b[Z")
     wait_for(r"permissionmode:manual")
+    send(b"\x04")
+    check_restored(wait_exit())
+elif scenario == "suggest":
+    # After a turn the composer shows a suggested next message as ghost text (issue #66). It is never sent on its own;
+    # Tab takes it as typed text and Enter sends it. (The hint line is not checked: ratatui redraws only the cells
+    # that changed, so a replaced hint never appears whole in the output.)
+    import sqlite3
+    def user_texts():
+        rows = sqlite3.connect(os.path.join(home, "data", "moco.db")).execute("select data from message where type='user'").fetchall()
+        return [json.loads(r[0]).get("text") for r in rows]
+    send(b"Read a.txt and tell me what it says.\r")
+    wait_for(r"Thefilesays:ONE-LINE-OF-TEXT")
+    wait_for(r"Runthetests")
+    pump(1.0)
+    if "Run the tests" in user_texts():
+        fail("the suggestion was sent without Tab and Enter")
+    send(b"\t")
+    pump(0.3)
+    send(b"\r")
+    wait_for_response("Run the tests")
     send(b"\x04")
     check_restored(wait_exit())
 elif scenario == "panic":

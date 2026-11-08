@@ -22,6 +22,9 @@ pub struct FakeProvider {
     pub classifier_requests: Mutex<Vec<Request>>,
     /// Makes classifier calls slow (until cancelled), to test the timeout.
     classifier_delay: Mutex<Option<std::time::Duration>>,
+    /// Next-action suggestions (recognized by their system prompt), kept apart the same way.
+    suggestions: Mutex<std::collections::VecDeque<Scripted>>,
+    pub suggestion_requests: Mutex<Vec<Request>>,
     /// Requests whose first user message contains a marker get their own script (for work on other threads, such as
     /// background subagents, whose request order against the main conversation is otherwise a race).
     routes: Mutex<Vec<(String, std::collections::VecDeque<Scripted>)>>,
@@ -29,7 +32,7 @@ pub struct FakeProvider {
 
 impl FakeProvider {
     pub fn new(script: Vec<Scripted>) -> Self {
-        FakeProvider { script: Mutex::new(script.into()), requests: Mutex::new(vec![]), titles: Mutex::new(Default::default()), title_requests: Mutex::new(vec![]), routes: Mutex::new(vec![]), routed_requests: Mutex::new(vec![]), verdicts: Mutex::new(Default::default()), classifier_requests: Mutex::new(vec![]), classifier_delay: Mutex::new(None) }
+        FakeProvider { script: Mutex::new(script.into()), requests: Mutex::new(vec![]), titles: Mutex::new(Default::default()), title_requests: Mutex::new(vec![]), routes: Mutex::new(vec![]), routed_requests: Mutex::new(vec![]), verdicts: Mutex::new(Default::default()), classifier_requests: Mutex::new(vec![]), classifier_delay: Mutex::new(None), suggestions: Mutex::new(Default::default()), suggestion_requests: Mutex::new(vec![]) }
     }
     /// Queue more responses (for multi-turn tests where later script entries depend on earlier results).
     pub fn extend(&self, more: Vec<Scripted>) {
@@ -48,6 +51,10 @@ impl FakeProvider {
     pub fn script_verdicts(&self, more: Vec<Scripted>) {
         self.verdicts.lock().unwrap().extend(more);
     }
+    /// Queue replies for next-action suggestions; an empty queue answers with nothing.
+    pub fn script_suggestions(&self, more: Vec<Scripted>) {
+        self.suggestions.lock().unwrap().extend(more);
+    }
     pub fn delay_classifier(&self, d: std::time::Duration) {
         *self.classifier_delay.lock().unwrap() = Some(d);
     }
@@ -59,6 +66,16 @@ impl FakeProvider {
 impl Provider for FakeProvider {
     fn stream(&self, req: &Request, cancel: &AtomicBool, on_event: &mut dyn FnMut(Event)) -> Result<(), ProviderError> {
         let is_title = req.system == crate::title::SYSTEM;
+        if req.system == crate::suggest::SYSTEM {
+            self.suggestion_requests.lock().unwrap().push(req.clone());
+            let (events, err) = match self.suggestions.lock().unwrap().pop_front() {
+                Some(Scripted::Events(e)) => (e, None),
+                Some(Scripted::Fail(e, err)) => (e, Some(err)),
+                None => return Ok(()),
+            };
+            events.into_iter().for_each(&mut *on_event);
+            return err.map_or(Ok(()), Err);
+        }
         if req.system == crate::classifier::SYSTEM {
             self.classifier_requests.lock().unwrap().push(req.clone());
             let delay = *self.classifier_delay.lock().unwrap();

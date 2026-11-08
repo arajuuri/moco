@@ -30,6 +30,7 @@ pub mod saved_permissions;
 pub mod skills;
 pub mod snapshot;
 pub mod store;
+pub mod suggest;
 pub mod sysinfo;
 pub mod title;
 pub mod tools;
