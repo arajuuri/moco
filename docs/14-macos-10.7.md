@@ -31,10 +31,9 @@ The back-port traits keep call sites written in the newer style, so dropping 10.
 
 ## Building
 
-Lion can't build moco itself: rustup and current `rustup-init` binaries need 10.12+, and Lion's system curl can't
-negotiate TLS 1.2. Build on a newer Intel Mac (Mojave with the Xcode 11 Command Line Tools works; a release
-build takes about 15 minutes there) and copy the binary
-over:
+The supported build is Rust 1.73 through rustup on a newer Intel Mac (Mojave with the Xcode 11 Command Line Tools
+works), with the binary copied to Lion. A clean release build on the Mojave test VM takes 19m22s with 1 vCPU and
+9m24s with 2 (2026-11-08):
 
 ```
 rustup toolchain install 1.73.0          # rust-toolchain.toml selects it inside the repo
@@ -47,6 +46,27 @@ otool -l $HOME/moco-target-107/release/moco | grep -A3 -E 'LC_VERSION_MIN_MACOSX
 Before copying the binary, also check that it links nothing newer than Lion has. `otool -L` should list only
 `libSystem` and `libiconv`. `nm -u <binary> | grep -E 'getentropy|clock_gettime|os_unfair_lock|ulock'` should print
 nothing (all of those need 10.12+).
+
+### Building on Lion with MacPorts
+
+rustup can't run on Lion (`rustup-init` needs 10.12+, and Lion's system curl can't negotiate TLS 1.2), but MacPorts
+builds a toolchain from source that can. On the Lion test machine (2026-11-08) these ports are installed: `rust`
+1.78.0, `cargo` 0.79.0, `clang-16`, `legacy-support`, `cctools` and `ld64`. Unchanged moco source builds with them:
+
+```
+export PATH=/opt/local/bin:/opt/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin
+export MACOSX_DEPLOYMENT_TARGET=10.7 CARGO_TARGET_DIR=$HOME/moco-target-lion
+export CC=clang-mp-16 CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER=clang-mp-16
+# MacPorts' Rust std calls functions newer than 10.7 (getentropy, ...); MacPorts' static library supplies them.
+export RUSTFLAGS="-C link-arg=-Wl,/opt/local/lib/libMacportsLegacySupport.a"
+cargo build --release --locked     # pass MOCO_GIT_DESCRIBE too in a copy without .git
+```
+
+A clean release build took 15m17s on the 1-vCPU Lion VM. The result passes the same checks as the Mojave
+build: `LC_VERSION_MIN_MACOSX` 10.7, `otool -L` lists only `libSystem` and `libiconv`, and the `nm -u` check prints
+nothing. Without rustup, `rust-toolchain.toml` is ignored and the compiler is 1.78, not 1.73. A Lion build therefore
+does not prove that the code still compiles on 1.73; the Linux 1.73 checks and the Mojave build still do that.
+The Lion test VM doesn't boot with 2 vCPUs (tried 2026-11-08), so it stays at 1.
 
 ## Regenerating the lockfile
 
@@ -98,8 +118,8 @@ The same binary also runs on Mojave 10.14.6 (`--version`, `models --refresh`, `-
 **Not yet verified:**
 - Lion's Terminal.app itself, as opposed to an SSH pty: true colour (`Color::Rgb`) themes and the glyphs (`MOCO_ASCII=1`
   is the fallback).
-- `cargo test` on Lion: it cannot build moco (no rustup). MacPorts `python3` is now installed, so the fake LLM/MCP
-  servers would run if a test build were copied there.
+- `cargo test` on Lion. It should now be possible with the MacPorts toolchain ("Building on Lion with MacPorts"), and
+  MacPorts `python3` runs the fake LLM/MCP servers, but nobody has run it yet.
 - macOS 10.7.0 to 10.7.4 and 10.8 to 10.13.
 - `sw_vers` reports "Mac OS X 10.7.x", while `sysinfo` labels it "macOS 10.7.x". This is cosmetic.
 
