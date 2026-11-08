@@ -1,4 +1,5 @@
 //! The built-in slash commands of the full-screen UI, and the transcript of a stored session.
+use moco_core::compat::*;
 use super::app::{App, PickItem, PickKind, Picker, Row, ToolState};
 use super::Host;
 use moco_core::engine::{DiffResult, Engine, UndoReport, UndoResult};

@@ -11,7 +11,7 @@ pub fn new_id(prefix: &str) -> String {
     let floor = ms << 12;
     // Strictly increasing even within one millisecond or if the clock steps back.
     let ts = LAST
-        .try_update(Ordering::SeqCst, Ordering::SeqCst, |last| Some(if floor > last { floor } else { last + 1 }))
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |last| Some(if floor > last { floor } else { last + 1 }))
         .map(|prev| if floor > prev { floor } else { prev + 1 })
         .unwrap();
     let rand: String = (0..14).map(|_| BASE62[fastrand::usize(..BASE62.len())] as char).collect();

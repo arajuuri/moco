@@ -1,4 +1,5 @@
 //! Snapshots, undo/redo and session diffs.
+use crate::compat::*;
 use super::*;
 
 fn describe_undo(r: &Result<UndoResult, StoreError>) -> String {

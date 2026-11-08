@@ -1,5 +1,8 @@
 //! moco: terminal chat (full screen on a terminal; line based with --plain, with -p or when piped).
 #![allow(clippy::type_complexity)]
+#![allow(unstable_name_collisions)] // compat.rs back-ports std methods for Rust 1.73 (macOS 10.7)
+#![allow(clippy::format_collect, clippy::needless_borrow, clippy::search_is_some, clippy::single_char_pattern)] // clippy 1.73 lints that later clippy (main) dropped or made opt-in
+use moco_core::compat::*;
 mod tui;
 use moco_core::catalog::{Catalog, ProviderInfo};
 use moco_core::mcp::{self, oauth::LoginIo, trust, Manager, ServerSpec};

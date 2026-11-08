@@ -1,6 +1,8 @@
 //! Full-screen terminal UI (ratatui + crossterm). One UI thread owns the terminal and an event
 //! channel; the engine runs on a worker thread and talks to the UI through `TuiUi`.
+use moco_core::compat::*;
 mod app;
+mod compat;
 mod builtin;
 mod complete;
 mod diff;

@@ -3,6 +3,7 @@
 //! `run` claims the session, then repeats: deliver inbox items allowed at this boundary, run one step
 //! (one LLM call, tools executing concurrently as their calls complete), continue while the step
 //! produced tool calls. History is reloaded from the store on every step.
+use crate::compat::*;
 use crate::agent::{self, Agent};
 use crate::snapshot::{FileDiff, Snapshots};
 use crate::{blobs, catalog, classifier, compaction, config, instructions, skills};

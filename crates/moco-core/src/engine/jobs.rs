@@ -1,6 +1,7 @@
 //! Background jobs: shell commands and subagents that keep running after the tool call that started them returned.
 //! When one ends, its result is queued as a synthetic message in the owning session (delivered at the next step
 //! boundary of a running turn, or with the next prompt), and the UI is told through the notifier.
+use crate::compat::*;
 use super::*;
 use crate::tools::{shell, JobInfo};
 use std::path::Path;

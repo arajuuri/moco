@@ -1,4 +1,5 @@
 //! Anthropic Messages API (`POST {base}/v1/messages`, SSE).
+use crate::compat::*;
 use super::*;
 use serde_json::json;
 use std::collections::HashMap;

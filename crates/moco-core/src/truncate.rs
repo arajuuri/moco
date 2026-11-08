@@ -1,4 +1,5 @@
 //! Bound tool output before the model sees it: 2000 lines / 50 KiB, full text spilled to a file.
+use crate::compat::*;
 use std::path::{Path, PathBuf};
 
 pub const MAX_LINES: usize = 2000;

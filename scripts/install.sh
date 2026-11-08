@@ -1,5 +1,6 @@
 #!/bin/bash
-# Build moco from this source tree and install it. Written for macOS 10.14 (Mojave, bash 3.2) and works on Linux.
+# Build moco from this source tree and install it. Written for macOS (bash 3.2) and works on Linux.
+# macos-10.7 branch: the binary targets macOS 10.7 (Lion). See docs/14-macos-10.7.md.
 #
 #   scripts/install.sh                  build and install to ~/.local/bin/moco
 #   scripts/install.sh --add-to-path    also put ~/.local/bin on your PATH (edits your shell profile, once)
@@ -86,12 +87,16 @@ if [ "$OS" = "Darwin" ]; then
   VERSION="$(sw_vers -productVersion 2>/dev/null || echo 0)"
   say "macOS ${VERSION}, ${ARCH}"
   MAJOR="${VERSION%%.*}"; REST="${VERSION#*.}"; MINOR="${REST%%.*}"
-  if [ "$MAJOR" = "10" ] && [ "${MINOR:-0}" -lt 14 ]; then
-    die "moco needs macOS 10.14 or newer (this is ${VERSION})"
+  if [ "$MAJOR" = "10" ] && [ "${MINOR:-0}" -lt 7 ]; then
+    die "moco needs macOS 10.7 or newer (this is ${VERSION})"
+  fi
+  if [ "$MAJOR" = "10" ] && [ "${MINOR:-0}" -lt 12 ]; then
+    say "note: rustup and the system curl do not work on macOS ${VERSION}; if the build below fails, build on a newer Mac"
+    say "      (this script there, or see docs/14-macos-10.7.md) and copy the binary over: it runs on 10.7 and newer"
   fi
   [ "$ARCH" = "x86_64" ] || say "note: moco is built and tested on Intel Macs; on ${ARCH} it runs through Rosetta only if you build for x86_64"
 else
-  say "${OS}, ${ARCH} (not macOS: the 10.14 deployment target and its check are skipped)"
+  say "${OS}, ${ARCH} (not macOS: the 10.7 deployment target and its check are skipped)"
 fi
 
 # A compiler and linker: on macOS they come with the Xcode command line tools.
@@ -125,7 +130,7 @@ say "$(cargo --version)"
 step "Building moco (a few minutes the first time)"
 say "build cache: ${TARGET_DIR}"
 mkdir -p "$TARGET_DIR"
-if [ "$OS" = "Darwin" ]; then export MACOSX_DEPLOYMENT_TARGET=10.14; fi
+if [ "$OS" = "Darwin" ]; then export MACOSX_DEPLOYMENT_TARGET=10.7; fi
 export CARGO_TARGET_DIR="$TARGET_DIR"
 LOCKED=""
 [ -f "${SRC}/Cargo.lock" ] && LOCKED="--locked"
@@ -137,9 +142,9 @@ if [ "$OS" = "Darwin" ] && command -v otool >/dev/null 2>&1; then
   MINOS="$(otool -l "$BUILT" | awk '/LC_BUILD_VERSION/{f=1} f&&/minos/{print $2; exit} /LC_VERSION_MIN_MACOSX/{g=1} g&&/version/{print $2; exit}')"
   say "built for macOS ${MINOS:-unknown} and newer"
   case "${MINOS:-}" in
-    10.14|10.13|10.12|10.11|10.10|10.9) ;;
+    10.7|10.6|10.5) ;;
     "") say "warning: could not read the deployment target of the binary" ;;
-    *) die "the binary needs macOS ${MINOS}, which is newer than 10.14: it would not start on Mojave" ;;
+    *) die "the binary needs macOS ${MINOS}, which is newer than 10.7: it would not start on Lion" ;;
   esac
 fi
 

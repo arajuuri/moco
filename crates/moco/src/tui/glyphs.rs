@@ -5,7 +5,7 @@ use ratatui::symbols::border::{self, Set};
 #[derive(Debug, Clone, Copy)]
 pub struct Glyphs {
     pub ascii: bool,
-    pub border: Set<'static>,
+    pub border: Set,
     pub user_bar: &'static str,
     pub quote_bar: &'static str,
     pub bullet: &'static str,
