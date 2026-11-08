@@ -1,13 +1,14 @@
-# macOS 10.7 (Lion) branch
+# macOS 10.7 (Lion) support
 
-The `macos-10.7` branch builds moco for **macOS 10.7 (Lion), Intel x86_64**. `main` targets 10.14. This file records what
-the branch changes and why, how to build it, and what still needs checking on a real Lion machine.
+moco supports **macOS 10.7 (Lion) through 10.14 (Mojave), Intel x86_64**, with one binary built for a 10.7 deployment
+target. This was built on the `macos-10.7` branch and merged into `main` (#82). This file records what supporting 10.7
+changed and why, how to build, and what still needs checking on a real Lion machine.
 
-## Why it needs a branch
+## Why Rust 1.73
 
 Rust 1.74 raised the minimum macOS for `std` and the compiler to 10.12, so **Rust 1.73.0 is the last toolchain that
-targets 10.7**. `main` pins a much newer Rust and dependencies that need it, so the branch pins 1.73 and works backwards
-from there.
+targets 10.7**. Before #82 `main` pinned a much newer Rust and dependencies that need it, so moco pins 1.73 and works
+backwards from there.
 
 ## What changed
 
@@ -22,10 +23,10 @@ from there.
 | std back-ports | `crates/moco-core/src/compat.rs`: `Option::is_none_or`, `Option`/`Result::inspect`, `Result::inspect_err`, unsigned `is_multiple_of`, `File::set_modified` (via `futimes`; `futimens` needs 10.13) | Methods added after 1.73 |
 | ratatui back-ports | `crates/moco/src/tui/compat.rs`: `Frame::area`/`set_cursor_position`, `Layout::vertical`/`horizontal`, `Block::bordered`/`title_bottom`, `Line::style` | Methods added after 0.25 |
 | Small edits | `AtomicU64::try_update` to `fetch_update`, `iter::repeat_n` to `repeat().take()`, `Buffer[(x, y)]` to `Buffer::get(x, y)` (tests), `Set<'static>` to `Set` | No back-port possible or needed |
-| Lints | `unstable_name_collisions` and four clippy 1.73 lints that later clippy dropped or made opt-in are allowed at crate level | Keeps the code identical to `main` |
+| Lints | `unstable_name_collisions` and four clippy 1.73 lints that later clippy dropped or made opt-in are allowed at crate level | Keeps code written for newer clippy unchanged |
 | `scripts/install.sh` | Deployment target 10.7; minos check accepts 10.7 or older | |
 
-The back-port traits keep call sites identical to `main`, which keeps merges small. Files that use them start with
+The back-port traits keep call sites written in the newer style, so dropping 10.7 later means deleting the back-ports. Files that use them start with
 `use crate::compat::*;` (front end: `use moco_core::compat::*;`, plus `use super::compat::*;` in `tui/`).
 
 ## Building
@@ -58,10 +59,9 @@ cargo +1.73.0 build --locked && cargo +1.73.0 test --locked
 If a crate fails on 1.73 despite the resolver, it is under-declaring its `rust-version`. Cap it in `Cargo.toml` with a
 comment saying why.
 
-## Merging `main`
+## Writing code for 1.73
 
-Expect conflicts in `Cargo.toml`, `Cargo.lock` and `rust-toolchain.toml`: keep this branch's side. New code from `main`
-may use std or ratatui APIs newer than 1.73 / 0.25. Prefer adding a back-port to the relevant `compat.rs` over editing
+Code and examples written for newer Rust or ratatui may use APIs newer than 1.73 / 0.25. Prefer adding a back-port to the relevant `compat.rs` over editing
 the call site, then run `cargo build`, `cargo test` and `cargo clippy --workspace --all-targets -- -D warnings`.
 
 ## Verified, and not yet verified

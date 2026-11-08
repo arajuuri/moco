@@ -1,6 +1,7 @@
 # moco: clean-room spec derived from opencode (upstream commit 6c24ec9532)
 
-Goal: a native coding-agent application that runs on **macOS 10.14 (Mojave)** with a feature set similar to opencode.
+Goal: a native coding-agent application that runs on **macOS 10.14 (Mojave)** with a feature set similar to opencode. Since #82 the same binary also
+supports **10.7 (Lion)** (`14-macos-10.7.md`).
 opencode is MIT licensed, so these documents describe its behavior closely, including prompts and schemas,
 with source file references so each statement can be re-checked. The implementer should still write new code and should
 keep the MIT notice for any text copied verbatim (system prompts, tool descriptions).
@@ -25,7 +26,7 @@ pins Electron 44 (macOS 12+). Nothing in this repo's runtime stack can be made t
 | `11-usage.md`                 | User reference for the app as built: commands, config, storage     |
 | `12-tui-plan.md`              | Plan and status of the full-screen terminal UI                     |
 | `13-architecture.md`          | The code as built: modules, run lifecycle, storage, invariants     |
-| `14-macos-10.7.md`            | The `macos-10.7` branch: Rust 1.73 pins, back-ports, building for Lion |
+| `14-macos-10.7.md`            | Supporting 10.7 (Lion): Rust 1.73 pins, back-ports, building, tests |
 
 ## Scope
 

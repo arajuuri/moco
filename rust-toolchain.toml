@@ -1,5 +1,5 @@
-# macos-10.7 branch: Rust 1.73 is the last release whose std and compiler target macOS 10.7 (Lion); 1.74 raised the minimum to 10.12.
-# Don't bump it here. Keep the version in .github/workflows/*.yml in sync.
+# moco supports macOS 10.7 (Lion) through 10.14. Rust 1.73 is the last release whose std and compiler target 10.7;
+# 1.74 raised the minimum to 10.12. Don't bump it while 10.7 is supported. Keep the version in .github/workflows/*.yml in sync.
 [toolchain]
 channel = "1.73.0"
 components = ["clippy"]

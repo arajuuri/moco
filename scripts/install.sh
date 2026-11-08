@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build moco from this source tree and install it. Written for macOS (bash 3.2) and works on Linux.
-# macos-10.7 branch: the binary targets macOS 10.7 (Lion). See docs/14-macos-10.7.md.
+# The binary targets macOS 10.7 (Lion) and runs on 10.7 through 10.14. See docs/14-macos-10.7.md.
 #
 #   scripts/install.sh                  build and install to ~/.local/bin/moco
 #   scripts/install.sh --add-to-path    also put ~/.local/bin on your PATH (edits your shell profile, once)

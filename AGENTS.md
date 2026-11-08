@@ -1,8 +1,6 @@
 # AGENTS.md
 
-> **`macos-10.7` branch:** this branch targets **macOS 10.7 (Lion)** with Rust **1.73.0** (the last toolchain for 10.7) and older dependencies (ratatui 0.25, rusqlite 0.31). Where this file says 10.14 or Rust 1.99, read `docs/14-macos-10.7.md` first: it lists the pins, the `compat.rs` back-ports (use them instead of newer std/ratatui APIs), how to build with `MACOSX_DEPLOYMENT_TARGET=10.7`, and how to merge `main`.
-
-moco is a native coding agent for **macOS 10.14 (Mojave), Intel x86_64**: a clean-room Rust reimplementation of opencode (upstream commit `6c24ec9532`, MIT). `docs/` is the specification; read `docs/00-overview.md`, then `docs/10-roadmap.md` (phases, results, what is left). `docs/13-architecture.md` describes the code as built (modules, run lifecycle, storage, invariants); keep it in step with structural changes. Phases 0 to 2 are done and Phase 3 (extensibility) is being built slice by slice. Source paths cited in the docs are relative to an opencode checkout, not this repo.
+moco is a native coding agent for **macOS 10.7 (Lion) through 10.14 (Mojave), Intel x86_64**. One binary, built with `MACOSX_DEPLOYMENT_TARGET=10.7` and Rust **1.73.0** (the last toolchain that targets 10.7), runs on both. `docs/14-macos-10.7.md` lists the resulting pins (ratatui 0.25, rusqlite 0.31...) and the `compat.rs` back-ports. moco is a clean-room Rust reimplementation of opencode (upstream commit `6c24ec9532`, MIT). `docs/` is the specification; read `docs/00-overview.md`, then `docs/10-roadmap.md` (phases, results, what is left). `docs/13-architecture.md` describes the code as built (modules, run lifecycle, storage, invariants); keep it in step with structural changes. Phases 0 to 2 are done and Phase 3 (extensibility) is being built slice by slice. Source paths cited in the docs are relative to an opencode checkout, not this repo.
 
 ## Commands
 
@@ -11,21 +9,22 @@ cargo test                          # whole workspace; no network (scripted fake
 cargo test -p moco-core wildcard    # filter by test name (substring); -p moco for the front end
 cargo test -p moco --test protocols # one integration test file (also: --test tui)
 cargo build --release               # target/release/moco
-scripts/install.sh                  # build for 10.14 and install to ~/.local/bin (--uninstall, --help)
+scripts/install.sh                  # build for 10.7+ and install to ~/.local/bin (--uninstall, --help)
 moco -p "prompt"                    # one-shot; bare `moco` is the interactive TUI (--plain for line chat); --continue resumes
 ```
 
 - CI runs workspace clippy/tests on Linux and checks the macOS binary's deployment target. Clippy and rustfmt are not installed on the Mojave machine; don't reformat files wholesale.
 - Integration tests in `crates/moco/tests/` and the MCP tests need `python3` (fake LLM/MCP servers, a pty driver). Without it, some skip silently and the MCP tests fail.
 - **Set `CARGO_TARGET_DIR` outside the repo** (`$HOME/moco-target` on the Mac, `/home/ubuntu/.cache/moco-target` on Linux). On the Linux dev box the repo is an sshfs mount of the Mac's disk, so a shared `target/` breaks intermittently and mixes Linux and macOS artifacts.
-- Mojave test machine: `ssh claude@semis-mac-pro.lan` (10.14.6, Xcode 11.3.1, rustup). Build there with `MACOSX_DEPLOYMENT_TARGET=10.14` and check `otool -l <binary> | grep minos`, which must say 10.14. Run `cargo test` on both Linux and the Mac for changes touching processes, paths or files. Do real-API experiments in a scratch directory outside the synced repo.
+- Mojave test machine: `ssh claude@semis-mac-pro.lan` (10.14.6, Xcode 11.3.1, rustup). Build there with `MACOSX_DEPLOYMENT_TARGET=10.7` and check `otool -l <binary> | grep -A3 LC_VERSION_MIN_MACOSX`, which must say 10.7 (the other link checks are in `docs/14-macos-10.7.md`). Run `cargo test` on both Linux and the Mac for changes touching processes, paths or files.
+- Lion test machine: `ssh claude@claudes-lion.lan` (10.7.5). It cannot build moco (no rustup, no TLS 1.2 curl) or run `cargo test` (no `python3`), so copy the binary built on Mojave there and check that it starts and that the changed feature works. Do this for changes that touch OS calls, new dependencies or the TUI. Do real-API experiments in a scratch directory outside the synced repo.
 - Credentials: the provider's env var (e.g. `ANTHROPIC_API_KEY`) or `~/Library/Application Support/moco/auth.json` (`{"anthropic": {"key": "..."}}`, mode 600). `MOCO_HOME` moves the data directory; **always point it at a temp dir** when experimenting with auth, sessions or the catalog cache. Other overrides: `MOCO_CONFIG`, `MOCO_MODEL`, `MOCO_SHELL`, `MOCO_ASCII`, `MOCO_LOG` (diagnostic log level, written to `data/logs/`, see `docs/11-usage.md`). Subcommands: `moco auth|models|sessions|logs`.
 - **Classifier evaluation**: `crates/moco-core/tests/classifier_cases.jsonl` is the golden set (command, expected `allow`/`ask`, category) and `cargo test -p moco-core --test classifier_cases` checks it against the rules that need no model. `scripts/eval-classifier.py` runs it against the configured model through the hidden `moco --eval-classifier FILE` and reports false allows (target: none for destructive, injection and opaque commands) and extra asks. It costs tokens and needs a provider key; it records a session, so it uses a scratch `MOCO_HOME`. Rerun it when you change the classifier prompt, the never-classify list or the model.
 - `scripts/update-catalog-snapshot.py` regenerates `crates/moco-core/src/catalog_snapshot.json`. `scripts/tui-gallery.py` renders `tui/gallery.rs` sample screens to PNG (`MOCO_GALLERY=dir`) so you can look at a TUI change.
 
 ## Workflow
 
-- The Rust toolchain is pinned in `rust-toolchain.toml` (and in `.github/workflows/*.yml`); bump it deliberately in its own PR. Run `cargo clippy --workspace --all-targets -- -D warnings` on the Linux box before pushing (`rustup component add clippy`); CI treats warnings as errors.
+- The Rust toolchain is pinned to 1.73.0 in `rust-toolchain.toml` (and in `.github/workflows/*.yml`). Don't bump it while 10.7 is supported: 1.74 raised the minimum macOS to 10.12. New dependencies and dependency updates must build on 1.73 (see "Regenerating the lockfile" in `docs/14-macos-10.7.md`). Run `cargo clippy --workspace --all-targets -- -D warnings` on the Linux box before pushing (`rustup component add clippy`); CI treats warnings as errors.
 - Before finishing a PR, fetch `origin/main` and integrate it. If a file you touched changed on main, resolve the conflict keeping both sides' intent and re-run the tests.
 - One PR per issue. Don't start an issue that touches the same files as an open PR; wait for that PR to merge or build on its branch.
 - If CI fails on a lint or error that is also on main, fix it once on main instead of in each PR, so PRs don't pile up duplicate fixes.
@@ -51,7 +50,8 @@ Things that take several files to understand:
 
 ## Pitfalls
 
-- Nothing from upstream's runtime (Bun, Electron, current Node, Go 1.21+) loads on 10.14. No SwiftUI/Combine/async-await. Keep dependencies buildable with Xcode 11.3.1 and a 10.14 deployment target.
+- Nothing from upstream's runtime (Bun, Electron, current Node, Go 1.21+) loads on 10.7 or 10.14. No SwiftUI/Combine/async-await. Keep dependencies buildable with Xcode 11.3.1, Rust 1.73 and a 10.7 deployment target, and don't link symbols newer than 10.7 (e.g. `getentropy`, `clock_gettime`, `os_unfair_lock`; checked by `nm -u`).
+- std and ratatui APIs newer than Rust 1.73 / ratatui 0.25 don't compile. Use or extend the back-ports in `crates/moco-core/src/compat.rs` and `crates/moco/src/tui/compat.rs` rather than rewriting call sites.
 - Don't build upstream's HTTP/SSE client-server API, plugin system, LSP or event sourcing (see "Deliberately dropped" in `docs/10-roadmap.md`).
 - Tests that find processes with `pgrep -f` must build the pattern from the process id (`uniq()`), or they match the command line that launched them.
 - `docs/` quotes upstream prompts and tool descriptions verbatim. Keep `LICENSE-opencode` and `NOTICE` intact, keep the MIT notice in any file that copies substantial upstream text, and don't reuse upstream names or logos.
