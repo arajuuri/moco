@@ -346,6 +346,9 @@ pub struct TuiConfig {
     pub sidebar: Option<Value>,
     /// Draw with plain ASCII instead of box-drawing and check-mark characters (also `MOCO_ASCII=1`).
     pub ascii: Option<bool>,
+    /// After a turn, show a suggested next message as ghost text in the message box (Tab takes it). Costs one
+    /// small-model call per finished turn. Default on.
+    pub suggestions: Option<bool>,
 }
 
 /// `permission_classifier`: let a cheap model approve routine shell commands that would otherwise ask

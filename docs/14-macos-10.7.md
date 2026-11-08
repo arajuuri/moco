@@ -87,15 +87,17 @@ Verified on Lion 10.7.5 (11G63) with that binary:
   allowed subpaths are refused, `/tmp` is writable, and outbound network is blocked.
 - The TUI over an SSH pty (`TERM=xterm-256color`) draws the header, input box and spinner with Unicode box-drawing
   glyphs, sends a message, shows the error and exits cleanly.
+- A real session with a valid Anthropic key (2026-11-08, TUI in auto mode): it read and edited a file, ran
+  `python3 -m unittest` through the shell tool, and showed the suggested next message after each turn.
 
 The same binary also runs on Mojave 10.14.6 (`--version`, `models --refresh`, `-p` against the API). macOS 10.8 to
 10.13 should work for the same reasons (minimum OS 10.7, nothing newer linked, OS-independent TLS) but are untested.
 
 **Not yet verified:**
-- A real session with a valid API key that runs tools on Lion.
 - Lion's Terminal.app itself, as opposed to an SSH pty: true colour (`Color::Rgb`) themes and the glyphs (`MOCO_ASCII=1`
   is the fallback).
-- `cargo test` on Lion: the fake LLM/MCP servers need `python3`, and Lion has only Python 2.7.
+- `cargo test` on Lion: it cannot build moco (no rustup). MacPorts `python3` is now installed, so the fake LLM/MCP
+  servers would run if a test build were copied there.
 - macOS 10.7.0 to 10.7.4 and 10.8 to 10.13.
 - `sw_vers` reports "Mac OS X 10.7.x", while `sysinfo` labels it "macOS 10.7.x". This is cosmetic.
 

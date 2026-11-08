@@ -23,7 +23,7 @@ pub enum Effect {
 pub const NAMES: &[(&str, &str)] = &[
     ("model", "pick the model"),
     ("agent", "pick the agent"),
-    ("mode", "ask before acting (manual) or run tools without asking (auto); Tab switches"),
+    ("mode", "ask before acting (manual) or run tools without asking (auto); Shift-Tab switches"),
     ("effort", "set the reasoning effort"),
     ("sessions", "list and resume sessions"),
     ("new", "start a new session"),
@@ -62,7 +62,7 @@ fn files(app: &mut App, r: &UndoReport) {
     }
 }
 
-/// Switch the session's permission mode, from `/mode` or Tab, and say what it now means.
+/// Switch the session's permission mode, from `/mode` or Shift-Tab, and say what it now means.
 pub fn set_permission_mode(engine: &Engine, sid: &str, app: &mut App, mode: PermissionMode) {
     let stored = engine.store.lock().unwrap().set_permission_mode(sid, Some(mode.name()));
     if stored_ok(app, "the permission mode", stored) {
@@ -216,7 +216,7 @@ pub fn run(host: &Host, app: &mut App, sid: &str, agent: &str, name: &str, args:
         "mode" => {
             if args.is_empty() {
                 let current = engine.store.lock().unwrap().session(sid).ok().flatten().map(|s| engine.permission_mode_of(&s)).unwrap_or_default();
-                app.push_info(format!("permission mode: {} ({}). Tab switches it.", current.name(), current.describe()));
+                app.push_info(format!("permission mode: {} ({}). Shift-Tab switches it.", current.name(), current.describe()));
             } else {
                 match PermissionMode::parse(args) {
                     Some(m) => set_permission_mode(engine, sid, app, m),

@@ -30,6 +30,10 @@ def sse(handler, chunks, event_lines=False):
 
 
 def responses(handler, body):
+    if "next message a user might send" in body.get("instructions", ""):  # the TUI's suggested next message
+        return sse(handler, [
+            {"type": "response.output_text.delta", "delta": "Run the tests"},
+            {"type": "response.completed", "response": {"status": "completed", "usage": {"input_tokens": 40, "output_tokens": 4}}}], True)
     if "short titles" in body.get("instructions", ""):
         return sse(handler, [
             {"type": "response.output_text.delta", "delta": "Fake protocol test"},

@@ -47,7 +47,7 @@ Outcomes: `allow` -> proceed. `deny` -> tool fails with `BlockedError` (message 
 moco has two modes. The default is `manual`. The mode sets the starting rules of every agent (built-in and config-defined); your own `permissions` rules come after it and win.
 
 **Choosing a mode.** Each session has its own mode, shown in the status line as `manual` or `auto`:
-- Full-screen chat: Tab switches it (when no completion popup is open). `/mode [manual|auto]` does the same, and `/mode` alone shows it.
+- Full-screen chat: Shift-Tab switches it. `/mode [manual|auto]` does the same, and `/mode` alone shows it.
 - Plain chat: `/mode [manual|auto]`.
 - `--permission-mode manual|auto` sets it for this session and is the default for new ones. `permission_mode` in config sets the default when no flag is given.
 
