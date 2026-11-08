@@ -4,6 +4,9 @@ exclude = ["spike"]
 resolver = "2"
 
 [workspace.package]
+# The release number: bump it only for a release, then tag that commit `vX.Y.Z` ("Versions and releases" in
+# CONTRIBUTING.md). Every build shows `git describe` on top of it (crates/moco-core/build.rs).
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.73"
 publish = false

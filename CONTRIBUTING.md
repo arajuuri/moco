@@ -92,6 +92,56 @@ Move an issue to In progress when work starts, not when it is merely planned.
 - Say in the PR description which checks were run and on which machine (Mojave and/or Linux),
   and which were not.
 
+## Versions and releases
+
+moco's version has two parts: a **release number** that changes rarely, and the **commit** of every other build, so
+merges do not use up version numbers and any binary can still be traced to its source.
+
+How to read a version (`moco --version`, the chat header, the first line of each log file):
+
+| Version | Meaning |
+|---|---|
+| `0.1.0` | Built exactly at the release tag `v0.1.0`, from a clean tree. |
+| `0.1.0-12-g1a2b3c4d5e` | Built 12 commits after `v0.1.0`, at commit `1a2b3c4d5e` (`git describe` style). |
+| `0.1.0-12-g1a2b3c4d5e*` | The same, with uncommitted changes to tracked files. `moco --version` says so in words too. |
+| `0.1.0-g1a2b3c4d5e` | At commit `1a2b3c4d5e`, before any release tag exists. |
+| `0.1.0-unknown` | Built without git information: a copy with no `.git` and no `MOCO_GIT_DESCRIBE`. |
+
+`moco --version` also prints the commit, whether there were uncommitted changes, the target and the minimum macOS.
+To strict semver tools `0.1.0-12-g...` reads as a pre-release of 0.1.0; it is only a display string, and
+`Cargo.toml` always holds the plain release number.
+
+**What counts as a release:** a deliberate, named point on `main`, not every merge.
+
+- Release when a build is installed on the test machines for ongoing use, or when a batch of merged issues changes
+  how moco behaves for users (a new feature, a changed key, a changed default).
+- Bump the minor number (`0.1.0` -> `0.2.0`) for features and user-visible changes, the patch number
+  (`0.2.0` -> `0.2.1`) for releases that only fix things. Below 1.0 there is no compatibility promise.
+
+**How to release:**
+
+1. In a PR, set `version` in `[workspace.package]` (root `Cargo.toml`) to the new number and update `Cargo.lock`
+   (`cargo build --locked` fails until you do). Merge it.
+2. Tag the merge commit on a clean, up-to-date `main` and push the tag:
+   ```bash
+   git switch main && git pull && git status --short   # must print nothing
+   git tag -a v0.2.0 -m "moco 0.2.0" && git push origin v0.2.0
+   ```
+3. Builds of that commit now report `0.2.0`. A build of a tagged commit whose `Cargo.toml` number differs prints a
+   Cargo warning.
+
+Only tags of the form `vX.Y.Z` count (`git describe --match 'v[0-9]*'`); other tags are ignored.
+
+**Builds without `.git`** (a copy synced to the Mojave machine, a tarball) cannot ask git. Pass the describe output
+of the real checkout:
+
+```bash
+MOCO_GIT_DESCRIBE="$(git describe --tags --match 'v[0-9]*' --long --dirty --abbrev=10 --always)"
+```
+
+Otherwise they report `<release>-unknown`. The build never fails for lack of git. The rules are in
+`crates/moco-core/build.rs` and `crates/moco-core/src/describe.rs`.
+
 ## Size and estimate
 
 Two fields on the project, both set on every issue that still has work left.

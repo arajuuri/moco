@@ -228,7 +228,7 @@ impl Inner {
 
     fn handshake(&self, timeout: Duration) -> Result<Value, RpcError> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
-        let body = json!({"jsonrpc":"2.0","id":id,"method":"initialize","params":{"protocolVersion":OFFERED,"capabilities":{},"clientInfo":{"name":"moco","version":env!("CARGO_PKG_VERSION")}}});
+        let body = json!({"jsonrpc":"2.0","id":id,"method":"initialize","params":{"protocolVersion":OFFERED,"capabilities":{},"clientInfo":{"name":"moco","version":crate::version::RELEASE}}});
         *lock(&self.version) = None;
         let res = self.exchange(id, &body, timeout)?;
         let version = res["protocolVersion"].as_str().unwrap_or("").to_string();

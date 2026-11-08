@@ -267,7 +267,7 @@ fn one_line(msg: &str) -> String {
 pub fn header() -> String {
     let kernel = crate::sysinfo::kernel();
     let product = if cfg!(target_os = "macos") { crate::sysinfo::product() } else { None };
-    format!("moco {} ({}-{}) os=\"{}\" kernel=\"{kernel}\" pid={}", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH, product.unwrap_or_else(|| std::env::consts::OS.to_string()), std::process::id())
+    format!("moco {} ({}-{}) os=\"{}\" kernel=\"{kernel}\" pid={}", crate::version::VERSION, std::env::consts::OS, std::env::consts::ARCH, product.unwrap_or_else(|| std::env::consts::OS.to_string()), std::process::id())
 }
 
 /// An open day file with the rules for rotating and capping it.

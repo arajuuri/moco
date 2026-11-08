@@ -118,7 +118,7 @@ def check_restored(status, code_ok=True):
         fail("the cursor was not shown again")
 
 
-wait_for(r"moco0\.0\.0")
+wait_for(r"moco\d+\.\d+\.\d+")
 if scenario == "config":
     send(b"\x1bOQ")  # F2 is the configured palette key
     wait_for(r"commands·\d+")

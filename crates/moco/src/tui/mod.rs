@@ -226,7 +226,7 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
     };
     load_rows(&mut app, &sid);
     refresh_status(&mut app, &sid);
-    app.rows.insert(0, app::Row::Banner { title: format!("moco {}", env!("CARGO_PKG_VERSION")), model: host.model.clone(), agent: host.agent.clone(), cwd: crate::tilde(&host.cwd) });
+    app.rows.insert(0, app::Row::Banner { title: format!("moco {}", moco_core::version::VERSION), model: host.model.clone(), agent: host.agent.clone(), cwd: crate::tilde(&host.cwd) });
 
     std::thread::scope(|scope| -> std::io::Result<()> {
         // Terminal events. Polls with a timeout so it can stop when the UI loop ends. Deliberately not a scoped

@@ -157,7 +157,7 @@ cp "$BUILT" "$TMP" || die "cannot write to ${BIN_DIR}"
 chmod 755 "$TMP"
 mv -f "$TMP" "$DEST"
 "$DEST" --version >/dev/null 2>&1 || die "the installed binary does not run"
-say "installed: $("$DEST" --version)"
+say "installed: $("$DEST" --version | head -1)"
 
 # ---- PATH -------------------------------------------------------------------------------------
 
