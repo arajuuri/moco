@@ -4,14 +4,14 @@ moco is a coding agent for the terminal. This is the reference for the app as bu
 
 ## Install
 
-On the Mac (Mojave or newer, Intel), from a checkout of this repository:
+On the Mac (Intel; building needs Mojave or another 10.12+ release, and the binary runs on 10.7 and newer), from a checkout of this repository:
 
 ```
 scripts/install.sh --add-to-path
 ```
-It checks the system, builds a release binary for macOS 10.14 into `~/.cache/moco/target` (the Xcode command line tools must be installed: `xcode-select --install`; if Rust is missing it offers to install it with rustup), verifies the binary's minimum macOS version, installs it to `~/.local/bin/moco` and, with `--add-to-path`, adds that directory to `~/.bash_profile` (or `~/.zprofile` for zsh) once. Open a new terminal afterwards, or `export PATH="$HOME/.local/bin:$PATH"`. Other options: `--prefix /usr/local` (installs to `/usr/local/bin`; you need write access), `--target-dir DIR` for the build cache, `--yes` to never ask. Running it again after a `git pull` updates the install. `scripts/install.sh --uninstall` removes the binary and keeps your sessions and keys (`--purge` removes those too). `moco --version` prints the version.
+It checks the system, builds a release binary for macOS 10.7 and newer into `~/.cache/moco/target` (the Xcode command line tools must be installed: `xcode-select --install`; if Rust is missing it offers to install it with rustup), verifies the binary's minimum macOS version, installs it to `~/.local/bin/moco` and, with `--add-to-path`, adds that directory to `~/.bash_profile` (or `~/.zprofile` for zsh) once. Open a new terminal afterwards, or `export PATH="$HOME/.local/bin:$PATH"`. Other options: `--prefix /usr/local` (installs to `/usr/local/bin`; you need write access), `--target-dir DIR` for the build cache, `--yes` to never ask. Running it again after a `git pull` updates the install. `scripts/install.sh --uninstall` removes the binary and keeps your sessions and keys (`--purge` removes those too). `moco --version` prints the version.
 
-By hand: `MACOSX_DEPLOYMENT_TARGET=10.14 CARGO_TARGET_DIR=<a directory outside the repo> cargo build --release`, then check `otool -l moco | grep minos` (must say 10.14). The binary needs no runtime besides the system libraries.
+By hand: `MACOSX_DEPLOYMENT_TARGET=10.7 CARGO_TARGET_DIR=<a directory outside the repo> cargo build --release --locked`, then check `otool -l moco | grep -A3 LC_VERSION_MIN_MACOSX` (must say 10.7). Lion itself can't build moco; build on a newer Mac and copy the binary over (`docs/14-macos-10.7.md`). The binary needs no runtime besides the system libraries.
 
 ## First run
 
