@@ -22,6 +22,3 @@ ureq = "2"
 sha2 = "0.10"
 similar = "2"
 base64 = "0.22"
-# Not used directly: caps ring's getrandom. 0.2.11+ calls getentropy(), which only exists on 10.12+, so the binary would
-# not start on Lion; 0.2.10 looks it up at run time and falls back to /dev/urandom.
-getrandom = "=0.2.10"
