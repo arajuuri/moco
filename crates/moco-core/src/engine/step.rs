@@ -96,6 +96,10 @@ impl Engine {
             let st = self.store();
             (st.session(sid)?.ok_or(StoreError::SessionGone)?, st.messages(sid)?)
         };
+        self.prepare_with(sid, step, ui, session, history)
+    }
+
+    fn prepare_with(&self, sid: &str, step: u32, ui: &dyn Ui, session: Session, history: Vec<crate::store::Message>) -> Result<std::result::Result<Prepared<'_>, StepOutcome>, StoreError> {
         let agents = self.agents_of(&session);
         let agent = agent::find(agents, &session.agent).or_else(|| agents.first().cloned()).expect("at least one agent is configured");
         let all_tools = self.current_tools();
@@ -164,9 +168,10 @@ impl Engine {
         if let (true, Some(limit)) = (self.cfg.compaction.auto, p.limit) {
             let size = compaction::context_size(&p.eff, compaction::estimate_request(&p.req));
             if size > self.cfg.compaction.threshold(limit) && !self.auto_failed.lock().unwrap().contains(sid) {
-                match self.compact_with(sid, "auto", p.session.clone(), std::mem::take(&mut p.history), ui, cancel)? {
+                match self.compact_with(sid, "auto", p.session.clone(), &mut p.history, ui, cancel)? {
                     CompactResult::Compacted { .. } => {
-                        p = match self.prepare(sid, step, ui)? {
+                        let session = self.store().session(sid)?.ok_or(StoreError::SessionGone)?;
+                        p = match self.prepare_with(sid, step, ui, session, std::mem::take(&mut p.history))? {
                             Ok(p) => p,
                             Err(outcome) => return Ok(outcome),
                         }

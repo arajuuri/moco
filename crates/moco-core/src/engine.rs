@@ -1727,6 +1727,46 @@ mod tests {
     }
 
     #[test]
+    fn compaction_updates_loaded_history_to_match_persistence() {
+        let f = fixture_cfg(vec![text(SUMMARY), text(SUMMARY)], |c| c.compaction.keep = 1000);
+        seed(&f, 4);
+        let mut history = f.msgs();
+        let cancel = AtomicBool::new(false);
+        let ui = TestUi::default();
+        for round in 0..2 {
+            assert!(matches!(
+                f.engine.compact_with(&f.session.id, "auto", f.session.clone(), &mut history, &ui, &cancel).unwrap(),
+                CompactResult::Compacted { .. }
+            ));
+            assert_eq!(history, f.msgs(), "the cached checkpoint must be identical to the stored one");
+            let before = history.clone();
+            assert_eq!(
+                f.engine.compact_with(&f.session.id, "auto", f.session.clone(), &mut history, &ui, &cancel).unwrap(),
+                CompactResult::NothingToCompact
+            );
+            assert_eq!(history, before);
+            if round == 0 {
+                seed(&f, 4);
+                history = f.msgs();
+            }
+        }
+    }
+
+    #[test]
+    fn failed_compaction_leaves_loaded_history_unchanged() {
+        for error in [ProviderError::Auth("bad key".into()), ProviderError::Interrupted] {
+            let f = fixture_cfg(vec![Scripted::Fail(vec![], error)], |c| c.compaction.keep = 1000);
+            seed(&f, 4);
+            let mut history = f.msgs();
+            let before = history.clone();
+            let outcome = f.engine.compact_with(&f.session.id, "auto", f.session.clone(), &mut history, &TestUi::default(), &AtomicBool::new(false)).unwrap();
+            assert!(matches!(outcome, CompactResult::Failed(_) | CompactResult::Interrupted));
+            assert_eq!(history, before);
+            assert_eq!(history, f.msgs());
+        }
+    }
+
+    #[test]
     fn auto_compaction_summarizes_the_past_and_keeps_the_tail() {
         let f = fixture_cfg(vec![text(SUMMARY), text("the answer")], |c| small_window(c, 3000, 1000));
         seed(&f, 4);
