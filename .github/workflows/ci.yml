@@ -63,14 +63,4 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }} # PR runs reuse main's cache instead of storing their own
       - run: cargo test --locked --workspace # python3 is preinstalled; the fake MCP/LLM servers need it
       - name: Check minos <= 10.7 and nothing newer than Lion is linked
-        run: |
-          bin=target/debug/moco
-          otool -l "$bin" | grep -A3 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX'
-          minos=$(otool -l "$bin" | awk '/LC_VERSION_MIN_MACOSX/{f=1} f&&$1=="version"{print $2; exit}')
-          [ -n "$minos" ] || { echo "no LC_VERSION_MIN_MACOSX: Lion's loader cannot start a binary without it"; exit 1; }
-          [ "$(printf '%s\n10.7\n' "$minos" | sort -V | tail -1)" = "10.7" ] || { echo "minos $minos > 10.7"; exit 1; }
-          echo "minos=$minos"
-          libs=$(otool -L "$bin" | tail -n +2 | awk '{print $1}' | grep -vE '^/usr/lib/(libSystem\.B|libiconv\.2)\.dylib$' || true)
-          [ -z "$libs" ] || { echo "links more than libSystem and libiconv:"; echo "$libs"; exit 1; }
-          newer=$(nm -u "$bin" | grep -E 'getentropy|clock_gettime|os_unfair_lock|ulock' || true)
-          [ -z "$newer" ] || { echo "uses symbols newer than 10.7:"; echo "$newer"; exit 1; }
+        run: scripts/check-macos-binary.sh target/debug/moco

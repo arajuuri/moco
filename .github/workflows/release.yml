@@ -1,0 +1,103 @@
+# Release: tag `main`, build the macOS binary at that tag, and publish it as a GitHub release.
+#
+#   gh workflow run release.yml --ref main
+#
+# The version is `version` in `[workspace.package]` (root `Cargo.toml`); bump it in a PR first ("Versions and
+# releases" in CONTRIBUTING.md). The job tags the commit `vX.Y.Z` *before* building, so `git describe` makes the
+# binary report exactly `X.Y.Z`, and pushes the tag only after the build and the 10.7 checks pass: a failed run leaves
+# no tag behind. Running it again for a commit that already has its tag rebuilds and replaces the release files; a
+# tag that exists on another commit stops the run (bump the version instead).
+#
+# The 10.7 checks have not yet run on this runner (see the `macos` job in ci.yml). If its Xcode cannot produce a
+# binary with LC_VERSION_MIN_MACOSX 10.7, the run fails and nothing is published.
+name: release
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write # push the tag, create the release
+
+env:
+  CARGO_TERM_COLOR: always
+  MACOSX_DEPLOYMENT_TARGET: "10.7"
+
+jobs:
+  macos:
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # git describe needs the history and the tags
+      - uses: dtolnay/rust-toolchain@1.78.0 # keep in sync with rust-toolchain.toml
+
+      - name: Tag the commit (locally)
+        id: tag
+        run: |
+          version=$(awk '/^\[workspace.package\]/{f=1; next} /^\[/{f=0} f && /^version *=/{gsub(/.*= *"|".*/, ""); print; exit}' Cargo.toml)
+          echo "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::bad [workspace.package] version '$version'"; exit 1; }
+          tag="v$version"
+          if existing=$(git rev-parse -q --verify "refs/tags/$tag^{commit}"); then
+            [ "$existing" = "$GITHUB_SHA" ] || { echo "::error::$tag already tags $existing, not $GITHUB_SHA: bump [workspace.package] version first"; exit 1; }
+            echo "$tag already tags this commit; rebuilding its release"
+            echo "new=false" >> "$GITHUB_OUTPUT"
+          else
+            git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              tag -a "$tag" -m "moco $version" "$GITHUB_SHA"
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - run: cargo build --release --locked -p moco
+
+      - name: Check the binary
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          scripts/check-macos-binary.sh target/release/moco
+          target/release/moco --version
+          first=$(target/release/moco --version | head -1)
+          [ "$first" = "moco $VERSION" ] || { echo "::error::binary reports '$first', expected 'moco $VERSION'"; exit 1; }
+
+      - name: Package
+        id: pkg
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          name="moco-$VERSION-macos-x86_64"
+          mkdir -p "dist/$name"
+          cp target/release/moco README.md LICENSE-opencode NOTICE "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
+          cat "dist/$name.tar.gz.sha256"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: |
+            dist/${{ steps.pkg.outputs.name }}.tar.gz
+            dist/${{ steps.pkg.outputs.name }}.tar.gz.sha256
+
+      - name: Push the tag and publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          VERSION: ${{ steps.tag.outputs.version }}
+          NAME: ${{ steps.pkg.outputs.name }}
+          NEW: ${{ steps.tag.outputs.new }}
+        run: |
+          [ "$NEW" = false ] || git push origin "refs/tags/$TAG"
+          files=("dist/$NAME.tar.gz" "dist/$NAME.tar.gz.sha256")
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${files[@]}" --clobber
+          else
+            gh release create "$TAG" "${files[@]}" --verify-tag --title "moco $VERSION" \
+              --notes "moco $VERSION for macOS 10.7 (Lion) through 10.14 (Mojave), Intel x86_64. Unpack and put \`moco\` on your PATH, or build from source with \`scripts/install.sh\`."
+          fi

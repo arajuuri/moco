@@ -122,13 +122,18 @@ To strict semver tools `0.1.0-12-g...` reads as a pre-release of 0.1.0; it is on
 
 1. In a PR, set `version` in `[workspace.package]` (root `Cargo.toml`) to the new number and update `Cargo.lock`
    (`cargo build --locked` fails until you do). Merge it.
-2. Tag the merge commit on a clean, up-to-date `main` and push the tag:
+2. Run the release workflow on `main`:
    ```bash
-   git switch main && git pull && git status --short   # must print nothing
-   git tag -a v0.2.0 -m "moco 0.2.0" && git push origin v0.2.0
+   gh workflow run release.yml --ref main
    ```
+   It tags the head of `main` `v0.2.0` (from the `Cargo.toml` number), builds the macOS binary at that tag (so it
+   reports exactly `0.2.0`), runs the 10.7 checks (`scripts/check-macos-binary.sh`), and only then pushes the tag and
+   publishes a GitHub release with `moco-0.2.0-macos-x86_64.tar.gz` and its SHA-256. A failed run leaves no tag. If
+   `v0.2.0` already tags another commit, the run stops: bump the version. Running it again on the tagged commit
+   rebuilds and replaces the release files. Download with `gh release download v0.2.0`.
 3. Builds of that commit now report `0.2.0`. A build of a tagged commit whose `Cargo.toml` number differs prints a
-   Cargo warning.
+   Cargo warning. Tagging by hand (`git tag -a v0.2.0 -m "moco 0.2.0" && git push origin v0.2.0` on a clean,
+   up-to-date `main`) still works but publishes no binary.
 
 Only tags of the form `vX.Y.Z` count (`git describe --match 'v[0-9]*'`); other tags are ignored.
 
