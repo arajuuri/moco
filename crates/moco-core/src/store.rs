@@ -627,8 +627,13 @@ impl Store {
     }
 
     pub fn messages(&self, session_id: &str) -> Result<Vec<Message>> {
-        let mut stmt = self.conn.prepare("select id, session_id, type, data from message where session_id=?1 order by id")?;
-        let rows = stmt.query_map([session_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?)))?;
+        self.messages_after(session_id, "")
+    }
+
+    /// Messages newer than an already loaded history (ids are time-ordered; an empty id selects everything).
+    pub(crate) fn messages_after(&self, session_id: &str, after: &str) -> Result<Vec<Message>> {
+        let mut stmt = self.conn.prepare("select id, session_id, type, data from message where session_id=?1 and id>?2 order by id")?;
+        let rows = stmt.query_map(params![session_id, after], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?)))?;
         let mut out = vec![];
         for row in rows {
             let (id, session_id, kind, data) = row?;

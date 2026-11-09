@@ -91,7 +91,10 @@ This is the path every request takes, from keystroke to stored answer.
    the run returns `Idle`. A title job runs alongside the first turn of an untitled session on its own thread and is cancelled
    shortly after the turn ends.
 4. **Prepare** (`step.rs::prepare`). The history is reloaded from the store on every step. There is no in-memory
-   conversation. `compaction::effective` cuts it at the latest checkpoint, `chat::to_chat` rebuilds provider messages, and
+   conversation across steps. Auto-compaction reuses that loaded history and queries only newer messages (the
+   checkpoint and any user shell results written while summarizing) before rebuilding the request.
+   `compaction::effective` cuts it at the latest checkpoint,
+   `chat::to_chat` rebuilds provider messages, and
    `agent::system_prompt` builds the system prompt (base text, tool guidance, agent text, `AGENTS.md`, skills, working
    directory, platform, date). The advertised tools are the built-in ones the agent may use plus the current MCP tools.
    Request-time reminders are added here and never stored: the step-limit notice, and the open todo list as `Request::tail`.

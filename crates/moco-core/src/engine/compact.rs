@@ -34,18 +34,18 @@ impl Engine {
             let st = self.store();
             (st.session(sid)?.ok_or(StoreError::SessionGone)?, st.messages(sid)?)
         };
-        self.compact_with(sid, trigger, session, history, ui, cancel)
+        self.compact_with(sid, trigger, session, &history, ui, cancel)
     }
 
     /// `compact_inner` on a session and history the caller has just loaded (the step loop's `prepare` did, so
     /// auto-compaction does not parse the whole history a second time).
-    pub(super) fn compact_with(&self, sid: &str, trigger: &str, session: Session, history: Vec<crate::store::Message>, ui: &dyn Ui, cancel: &AtomicBool) -> Result<CompactResult, StoreError> {
+    pub(super) fn compact_with(&self, sid: &str, trigger: &str, session: Session, history: &[crate::store::Message], ui: &dyn Ui, cancel: &AtomicBool) -> Result<CompactResult, StoreError> {
         let agent = agent::find(self.agents_of(&session), &session.agent).or_else(|| self.agents_of(&session).first().cloned()).expect("an agent");
         let (provider, provider_id, model_id) = match self.resolve_model(&session, &agent) {
             Ok(r) => r,
             Err(e) => return Ok(CompactResult::Failed(e)),
         };
-        let eff = compaction::effective(&history);
+        let eff = compaction::effective(history);
         let Some(k) = compaction::choose_cut(&eff, self.cfg.compaction.keep) else { return Ok(CompactResult::NothingToCompact) };
         let keep_from = eff[k].id.clone();
         let update = compaction::has_checkpoint(&eff);

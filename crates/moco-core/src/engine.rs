@@ -1727,6 +1727,46 @@ mod tests {
     }
 
     #[test]
+    fn auto_compaction_keeps_messages_persisted_during_summarization() {
+        let f = fixture_cfg(vec![text(SUMMARY), text("the answer")], |c| small_window(c, 3000, 1000));
+        seed(&f, 4);
+        f.say("next question");
+        let ui = TestUi::default();
+        let (engine, sid) = (f.engine.clone(), f.session.id.clone());
+        *ui.hook.lock().unwrap() = Some(Box::new(move |l| {
+            let text = if l.starts_with("status:compacting ") {
+                "command result before checkpoint"
+            } else if l.starts_with("status:compacted:") {
+                "command result after checkpoint"
+            } else {
+                return;
+            };
+            engine.store().add_message(&sid, "synthetic", &json!({"text": text})).unwrap();
+        }));
+        assert_eq!(f.run(&ui), RunOutcome::Idle);
+        let reqs = f.fake.requests.lock().unwrap();
+        let t = all_text(&reqs[1]);
+        for expected in ["SUMMARY-BODY", "next question", "command result before checkpoint", "command result after checkpoint"] {
+            assert!(t.contains(expected), "{t}");
+        }
+    }
+
+    #[test]
+    fn incremental_history_matches_a_full_reload() {
+        let f = fixture_cfg(vec![text(SUMMARY), text(SUMMARY)], |c| c.compaction.keep = 1000);
+        seed(&f, 4);
+        for _ in 0..2 {
+            let mut history = f.msgs();
+            let after = history.last().unwrap().id.clone();
+            assert!(matches!(f.engine.compact_with(&f.session.id, "auto", f.session.clone(), &history, &TestUi::default(), &AtomicBool::new(false)).unwrap(), CompactResult::Compacted { .. }));
+            history.extend(f.engine.store().messages_after(&f.session.id, &after).unwrap());
+            assert_eq!(history, f.msgs());
+            assert!(f.engine.store().messages_after(&f.session.id, &history.last().unwrap().id).unwrap().is_empty());
+            seed(&f, 4);
+        }
+    }
+
+    #[test]
     fn auto_compaction_summarizes_the_past_and_keeps_the_tail() {
         let f = fixture_cfg(vec![text(SUMMARY), text("the answer")], |c| small_window(c, 3000, 1000));
         seed(&f, 4);
