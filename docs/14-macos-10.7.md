@@ -28,7 +28,7 @@ minimum from about 1.86); #99 has the measurements.
 | ratatui / crossterm | 0.30 / 0.29 down to 0.25 / 0.27 | ratatui 0.26+ needs Rust 1.74 (no longer a limit since #100; not yet upgraded) |
 | rusqlite | 0.41 down to 0.31 | 0.32+ uses C string literals (1.77); some versions under-declare their MSRV |
 | ignore / globset | Capped at 0.4.23 / 0.4.15 | Newer releases are edition 2024 and declare no MSRV |
-| getrandom (via ring) | Pinned to 0.2.10 | 0.2.11+ calls `getentropy()` directly. That symbol exists only on 10.12+, so dyld would refuse to start the binary on Lion. 0.2.10 looks it up at run time and falls back to `/dev/urandom` |
+| getrandom (via ring) | Uses the `getentropy` shim in the binary | 0.2.11+ calls `getentropy()` directly. The shim forwards to the system function on 10.12+ and falls back to `/dev/urandom` on Lion |
 | std back-ports | `crates/moco-core/src/compat.rs`: `Option::is_none_or`, unsigned `is_multiple_of` | Methods added after 1.78 (the 1.73 back-ports of `inspect`, `inspect_err` and `File::set_modified` went with #100) |
 | ratatui back-ports | `crates/moco/src/tui/compat.rs`: `Frame::area`/`set_cursor_position`, `Layout::vertical`/`horizontal`, `Block::bordered`/`title_bottom`, `Line::style` | Methods added after 0.25 |
 | Small edits | `AtomicU64::try_update` to `fetch_update`, `iter::repeat_n` to `repeat().take()`, `Buffer[(x, y)]` to `Buffer::get(x, y)` (tests), `Set<'static>` to `Set` | No back-port possible or needed |
