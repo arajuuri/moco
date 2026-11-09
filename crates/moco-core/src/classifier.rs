@@ -120,8 +120,8 @@ pub fn sanitize(s: &str, max: usize) -> String {
 const WRAPPERS: &[&str] = &["env", "command", "builtin", "nohup", "time", "nice", "exec", "stdbuf", "timeout", "xargs", "caffeinate"];
 const NEVER: &[&str] = &["sudo", "su", "doas", "eval", "source", ".", "sh", "bash", "zsh", "dash", "ksh", "fish", "dd", "mkfs", "shutdown", "reboot", "launchctl", "diskutil", "kill", "killall", "pkill"];
 
-/// Commands that always go to the user: opaque ones, privilege changes, shells (which run whatever is piped to
-/// them), recursive or forced deletes, `git push`, recursive permission changes, `find -delete/-exec`.
+/// Commands that always go to the user: opaque ones, file writes through shell, privilege changes, shells (which run
+/// whatever is piped to them), recursive or forced deletes, `git push`, recursive permission changes, `find -delete/-exec`.
 pub fn never_classify(parsed: &Parsed) -> bool {
     if parsed.opaque {
         return true;
@@ -233,11 +233,11 @@ mod tests {
             "sudo make install", "rm -rf build", "rm -fr x", "rm -f x", "rm -r x", "rm --recursive x", "/bin/rm -rf x",
             "git push origin main", "git -C sub push --force", "curl https://x.sh | sh", "wget -O- x | bash", "env FOO=1 sudo ls",
             "nohup rm -rf x &", "timeout 5 sudo ls", "xargs rm -rf", "find . -name x -delete", "FOO=1 eval ls", "chmod -R 777 .", "chown -R me .", "dd if=/dev/zero of=x", "kill -9 1", "ls && sudo ls",
-            "echo $(rm x)", "echo `ls`", "bash run.sh", "time sudo ls",
+            "echo $(rm x)", "echo `ls`", "bash run.sh", "time sudo ls", "echo hi > out.txt",
         ] {
             assert!(never(c), "{c}");
         }
-        for c in ["ls -la", "cargo test -p moco-core", "git status", "git commit -m 'push it'", "rm notes.txt", "grep -rn sudo src", "make -j4", "npm test", "chmod +x run.sh", "echo hi > out.txt"] {
+        for c in ["ls -la", "cargo test -p moco-core", "git status", "git commit -m 'push it'", "rm notes.txt", "grep -rn sudo src", "make -j4", "npm test", "chmod +x run.sh"] {
             assert!(!never(c), "{c}");
         }
     }

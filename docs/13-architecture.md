@@ -196,7 +196,7 @@ tool -> PermReq{action, resources, save patterns, command?}
    deny (explicit rule) ----------------------------------------------> ToolError::Blocked
    allow ------------------------------------------------------------> run
    ask:
-      shell command, only a *default* rule asks, auto mode, not opaque
+      shell command, only a *default* rule asks, auto mode, not opaque or a recognized file write
         and not on the never-classify list  --> classifier (small model) --> allow: run, with an "auto:" marker
                                                                          --> anything else: fall through
       Ui::ask (one prompt at a time, process-wide lock)
@@ -215,9 +215,10 @@ Details that matter:
 - **Paths** are compared with symlinks resolved (`tools/mod.rs::is_internal`), so a symlinked project is one project and a
   symlink that leads out of it is external. Anything outside the project asks under `external_directory`.
 - **Shell** (`tools/shell.rs`) runs in its own process group so it can be killed whole. `shellparse.rs` splits a command line
-  into permission resources and "always" patterns, and marks opaque constructs (`eval`, `$(...)`, `base64 -d | sh`) so they
-  always go to the user. With `sandbox.enabled` the command runs under `sandbox-exec` with a profile that denies writes outside
-  the project, temp directories and `sandbox.writable`. `unsandboxed: true` asks under the `shell.unsandboxed` action.
+  into permission resources and "always" patterns, and forces a prompt for opaque constructs (`eval`, `$(...)`, `base64 -d | sh`)
+  and obvious file writes (in-place `sed`/`perl`, Python `open(..., 'w')`, and output redirections except `/dev/null`). With
+  `sandbox.enabled` the command runs under `sandbox-exec` with a profile that denies writes outside the project, temp directories
+  and `sandbox.writable`. `unsandboxed: true` asks under the `shell.unsandboxed` action.
 - **Output** is bounded to 2000 lines or 50 KiB; the rest is saved under `data/tool-output/` and the model is told the path.
 - **Edits** (`edit`, `write`, `patch`) write atomically under a per-file lock (`fsio.rs`), then run the configured
   formatter (`format.rs`). After a step that changed files, configured checks (`check.rs`) run once and their report is added
@@ -332,7 +333,7 @@ These are the invariants that are easy to break by accident.
 3. **Requests keep a byte-stable prefix within a turn.** Anything that changes mid-turn goes in `Request::tail`, never in the
    system prompt, the tools or earlier messages.
 4. **Retry only when no tool ran** in the failed attempt, and discard the partial output.
-5. **The classifier can only turn an ask into an allow**, never override a rule, and never sees opaque or dangerous commands.
+5. **The classifier can only turn an ask into an allow**, never override a rule, and never sees opaque, dangerous, or obvious shell file-writing commands.
 6. **Project config is untrusted.** Anything it can make moco execute goes through the approval; credentials and endpoints are
    read only from the user's own config.
 7. **Tool output is bounded** before the model sees it, and the rest is saved to a file.

@@ -70,6 +70,152 @@ fn is_risky_assignment(w: &str) -> bool {
         )
 }
 
+fn has_output_redirection(words: &[(String, String)]) -> bool {
+    for (i, (raw, _)) in words.iter().enumerate() {
+        let cs: Vec<char> = raw.chars().collect();
+        let (mut quote, mut escaped) = (None, false);
+        for (j, c) in cs.iter().enumerate() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if *c == '\\' && quote != Some('\'') {
+                escaped = true;
+                continue;
+            }
+            match quote {
+                Some(q) if *c == q => quote = None,
+                Some(_) => {}
+                None if *c == '\'' || *c == '"' => quote = Some(*c),
+                None if *c == '>' => {
+                    let mut end = j + 1;
+                    while cs.get(end) == Some(&'>') {
+                        end += 1;
+                    }
+                    if cs.get(end) == Some(&'|') {
+                        end += 1;
+                    }
+                    if cs.get(end) == Some(&'&') && cs.get(end + 1).is_some_and(char::is_ascii_digit) {
+                        continue;
+                    }
+                    let suffix: String = cs[end..].iter().collect();
+                    let target = if suffix.is_empty() {
+                        words.get(i + 1).map(|(_, v)| v.as_str()).unwrap_or("")
+                    } else {
+                        suffix.trim_matches(['\'', '"'])
+                    };
+                    if target != "/dev/null" {
+                        return true;
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+    false
+}
+
+fn is_in_place_writer(words: &[String]) -> bool {
+    let Some(program) = words.first().and_then(|w| std::path::Path::new(w).file_name()).and_then(|s| s.to_str()) else { return false };
+    if program != "sed" && program != "perl" {
+        return false;
+    }
+    words.iter().skip(1).any(|w| {
+        w == "--in-place" || w == "-i" || w == "-pi" || w == "-ip" || w.starts_with("-i") || w.starts_with("-pi") || w.starts_with("-ip")
+    })
+}
+
+fn is_python(program: &str) -> bool {
+    let name = std::path::Path::new(program).file_name().and_then(|s| s.to_str()).unwrap_or(program);
+    name == "python" || name.strip_prefix("python").is_some_and(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit() || c == '.'))
+}
+
+fn python_opens_for_write(source: &str) -> bool {
+    let cs: Vec<char> = source.chars().collect();
+    let mut i = 0;
+    while i + 4 <= cs.len() {
+        if cs[i..i + 4] != ['o', 'p', 'e', 'n'] || (i > 0 && (cs[i - 1].is_ascii_alphanumeric() || cs[i - 1] == '_')) {
+            i += 1;
+            continue;
+        }
+        let mut start = i + 4;
+        while cs.get(start).is_some_and(|c| c.is_whitespace()) {
+            start += 1;
+        }
+        if cs.get(start) != Some(&'(') {
+            i += 4;
+            continue;
+        }
+        let (mut depth, mut quote, mut escaped, mut commas) = (1usize, None, false, 0usize);
+        let mut arg = start + 1;
+        let mut mode = String::new();
+        for j in start + 1..cs.len() {
+            let c = cs[j];
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if c == '\\' && quote.is_some() {
+                escaped = true;
+                continue;
+            }
+            if let Some(q) = quote {
+                if c == q {
+                    quote = None;
+                }
+                continue;
+            }
+            if c == '\'' || c == '"' {
+                quote = Some(c);
+            } else if matches!(c, '(' | '[' | '{') {
+                depth += 1;
+            } else if matches!(c, ')' | ']' | '}') {
+                depth -= 1;
+                if depth == 0 {
+                    if commas == 1 {
+                        mode.extend(&cs[arg..j]);
+                    }
+                    break;
+                }
+            } else if c == ',' && depth == 1 {
+                if commas == 1 {
+                    mode.extend(&cs[arg..j]);
+                    break;
+                }
+                commas += 1;
+                arg = j + 1;
+            }
+        }
+        let mode = mode.trim();
+        let mode = mode.split_once('=').filter(|(key, _)| key.trim() == "mode").map_or(mode, |(_, value)| value.trim());
+        let mode = if mode.len() >= 2
+            && matches!(mode.chars().next(), Some('\'' | '"'))
+            && mode.chars().next() == mode.chars().last()
+        {
+            &mode[1..mode.len() - 1]
+        } else {
+            mode
+        };
+        if matches!(mode.chars().next(), Some('w' | 'a' | 'x')) || mode.contains('+') {
+            return true;
+        }
+        i = start + 1;
+    }
+    false
+}
+
+fn python_writes(command: &Command) -> bool {
+    if !command.words.first().is_some_and(|w| is_python(w)) {
+        return false;
+    }
+    let mut source = command.words.iter().skip(1).cloned().collect::<Vec<_>>().join(" ");
+    if let Some((_, body)) = command.text.split_once('\n') {
+        source.push('\n');
+        source.push_str(body);
+    }
+    python_opens_for_write(&source)
+}
+
 /// A `<<` seen on the current line whose body starts after the line's newline.
 struct Heredoc {
     delimiter: String,
@@ -147,6 +293,7 @@ pub fn parse(input: &str) -> Parsed {
         }
         // Risky assignments stay in the text; harmless ones are dropped as before.
         let kept = if risky { 0 } else { skip };
+        let has_redirect = has_output_redirection(words);
         let all: Vec<(String, String)> = std::mem::take(words);
         let text = all.iter().skip(kept).map(|(r, _)| r.as_str()).collect::<Vec<_>>().join(" ");
         if text.is_empty() {
@@ -162,6 +309,9 @@ pub fn parse(input: &str) -> Parsed {
         } else {
             vec![]
         };
+        if has_redirect || is_in_place_writer(&w) {
+            parsed.opaque = true;
+        }
         parsed.commands.push(Command { text, words: w, dirs });
     };
 
@@ -262,6 +412,9 @@ pub fn parse(input: &str) -> Parsed {
     finish(&mut raw_words, &mut parsed);
     if !heredocs.is_empty() {
         // `cat <<EOF` with no body at all: the shell reads to end of input. Nothing to guess from, so ask.
+        parsed.opaque = true;
+    }
+    if parsed.commands.iter().any(python_writes) {
         parsed.opaque = true;
     }
     parsed
@@ -453,5 +606,29 @@ mod tests {
         assert_eq!(pat("ls -la /tmp"), "ls *");
         assert_eq!(pat("git"), "git *");
         assert_eq!(pat("aws s3 ls"), "aws s3 ls *");
+    }
+
+    #[test]
+    fn obvious_file_writes_force_a_prompt_but_program_execution_does_not() {
+        for c in [
+            "sed -i 's/old/new/' file.txt",
+            "perl -pi -e 's/old/new/' file.txt",
+            "python3 -c \"open('file.txt', 'w').write('x')\"",
+            "python3 <<'PY'\nopen('file.txt', 'w').write('x')\nPY",
+            "printf x > file.txt",
+            "printf x >>file.txt",
+            "printf x 2>file.txt",
+        ] {
+            assert!(parse(c).opaque, "{c}");
+        }
+        for c in [
+            "python3 script.py",
+            "cargo test",
+            "printf x > /dev/null",
+            "printf '>'",
+            "printf x 2>&1",
+        ] {
+            assert!(!parse(c).opaque, "{c}");
+        }
     }
 }

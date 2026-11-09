@@ -366,6 +366,8 @@ mod tests {
         assert_eq!(req.resources, ["git status", "npm run dev -- --x"]);
         assert_eq!(req.save, ["git status *", "npm run dev *"]);
         assert!(!req.force_ask);
+        run(&env, json!({"command": r#"python3 -c "open('created.txt', 'w').write('x')""#})).unwrap();
+        assert!(env.perm.asked().last().unwrap().force_ask, "a saved python pattern must not bypass the prompt for a file write");
         run(&env, json!({"command":"echo $(id)"})).ok();
         assert!(env.perm.asked().last().unwrap().force_ask);
     }

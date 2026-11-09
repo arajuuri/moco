@@ -91,7 +91,7 @@ Prefer one larger read over many small slices, and use grep to find specific con
             out.push_str(&format!("{}: ", i + 1));
             if line.chars().count() > MAX_LINE {
                 out.extend(line.chars().take(MAX_LINE));
-                out.push_str("... (line truncated to 2000 chars)");
+                out.push_str("... (line truncated to 2000 chars; use shell with `sed -n '<line>p' <path>` to inspect the full line)");
             } else {
                 out.push_str(line);
             }
@@ -154,7 +154,7 @@ fn read_streaming(path: &Path, len: u64, offset: usize, limit: usize, ctx: &Tool
         out.push_str(&format!("{n}: "));
         if cut || line.chars().count() > MAX_LINE {
             out.extend(line.chars().take(MAX_LINE));
-            out.push_str("... (line truncated to 2000 chars)");
+            out.push_str("... (line truncated to 2000 chars; use shell with `sed -n '<line>p' <path>` to inspect the full line)");
         } else {
             out.push_str(line);
         }
@@ -257,7 +257,7 @@ mod tests {
         assert!(t.starts_with("500000: line-0500000\n500001: line-0500001\n\n[showing lines 500000-500001;"), "{t}");
         assert!(t.contains("offset=500002") && t.contains("grep"), "{t}");
         let t = run(&env, json!({"path":"big.log","offset":1000001})).unwrap().text;
-        assert!(t.starts_with("1000001: yyy") && t.ends_with("... (line truncated to 2000 chars)"), "{}", &t[..40]);
+        assert!(t.starts_with("1000001: yyy") && t.ends_with("... (line truncated to 2000 chars; use shell with `sed -n '<line>p' <path>` to inspect the full line)"), "{}", &t[..40]);
         assert!(run(&env, json!({"path":"big.log","offset":2000000})).unwrap_err().message().contains("beyond the end"));
     }
 
@@ -267,7 +267,8 @@ mod tests {
         env.file("b.txt", b"\xef\xbb\xbfhi\r\nyo\r\n");
         assert_eq!(run(&env, json!({"path":"b.txt"})).unwrap().text, "1: hi\n2: yo");
         env.file("c.txt", "x".repeat(2500).as_bytes());
-        assert!(run(&env, json!({"path":"c.txt"})).unwrap().text.ends_with("... (line truncated to 2000 chars)"));
+        let t = run(&env, json!({"path":"c.txt"})).unwrap().text;
+        assert!(t.ends_with("... (line truncated to 2000 chars; use shell with `sed -n '<line>p' <path>` to inspect the full line)"));
     }
 
     fn png_bytes(w: u32, h: u32) -> Vec<u8> {
