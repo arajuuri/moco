@@ -289,6 +289,8 @@ fn wait_capped(child: &mut Child, out_path: &Path, timeout: Option<Duration>, st
             None => std::thread::sleep(POLL_INTERVAL.min(left)),
         }
     };
+    // Close the kqueue now rather than at the end of the function. Off macOS `ExitWatch` has no `Drop`, hence the allow.
+    #[allow(clippy::drop_non_drop)]
     drop(watch);
     let (full, total_lines) = read_output(out_path);
     let (mut text, truncated) = match tail(&full) {

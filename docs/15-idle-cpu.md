@@ -93,10 +93,10 @@ reader), in code this change does not touch, and it should be filed and fixed se
 
 ## Not done, and not checked
 
-- **Linux and Mojave:** not built or tested. The non-macOS `ExitWatch` stub (an uninhabited enum) is written to avoid
-  dead-code warnings, but `cargo clippy --workspace --all-targets -- -D warnings` has not run. Run it on Linux, and `cargo test`
-  on Mojave, before merging. The release binary's `nm -u` and `otool -l` link checks from `14-macos-10.7.md` were not run either.
-  `kqueue` and `kevent` exist on 10.7 and the Lion build links and runs.
+- **Linux:** `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace` pass. Clippy first flagged
+  `drop(watch)` (`drop_non_drop`: the non-macOS `ExitWatch` stub, an uninhabited enum, has no `Drop`); it is allowed there.
+- **Mojave:** not built or tested. Run `cargo test` there before merging. The release binary's `nm -u` and `otool -l` link checks
+  from `14-macos-10.7.md` were not run either. `kqueue` and `kevent` exist on 10.7 and the Lion build links and runs.
 - **Sidebar polling:** with the sidebar shown (automatic from 110 columns) or a turn or job active, `sync_queue` still runs every
   200 ms and queries the store (the inbox, and the job list). It no longer forces a redraw, but it still costs wakeups and
   SQLite calls. Waiting on a condition instead would remove it.
