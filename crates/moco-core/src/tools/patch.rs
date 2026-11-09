@@ -127,6 +127,42 @@ fn find_seq(lines: &[String], pat: &[&str], start: usize, eof: bool) -> Option<u
     None
 }
 
+fn find_seq_matches(lines: &[String], pat: &[&str], start: usize, eof: bool) -> Result<Option<usize>, Vec<usize>> {
+    if pat.len() > lines.len() {
+        return Ok(None);
+    }
+    let last = lines.len() - pat.len();
+    for eq in LEVELS {
+        let ok = |i: usize| pat.iter().enumerate().all(|(k, p)| eq(&lines[i + k], p));
+        let hits: Vec<usize> = if eof {
+            if last >= start && ok(last) { vec![last] } else { vec![] }
+        } else if start <= last {
+            (start..=last).filter(|&i| ok(i)).collect()
+        } else {
+            vec![]
+        };
+        if !hits.is_empty() {
+            return if hits.len() == 1 { Ok(Some(hits[0])) } else { Err(hits.into_iter().map(|i| i + 1).collect()) };
+        }
+    }
+    Ok(None)
+}
+
+fn missing_message(content: &str, path: &str, expected: &[&str], kind: &str) -> String {
+    let base = format!("Failed to find {kind} in {path}:\n{}", expected.join("\n"));
+    let hint = crate::tools::edit::closest_region(content, &expected.join("\n"), "patch")
+        .unwrap_or_else(|| "Re-read the file and make the hunk match its current content.".into());
+    format!("{base}\n{hint}")
+}
+
+fn multiple_message(path: &str, lines: &[usize]) -> String {
+    format!(
+        "Expected text matches more than once in {path} ({} times, at lines {}). Add surrounding context to make the hunk unique.",
+        lines.len(),
+        lines.iter().map(usize::to_string).collect::<Vec<_>>().join(", ")
+    )
+}
+
 /// Apply hunks to file text. Context lines keep the file's own text; CRLF and the trailing newline are preserved.
 pub fn apply(content: &str, hunks: &[Hunk], path: &str) -> Result<String, String> {
     let crlf = content.contains("\r\n");
@@ -137,7 +173,9 @@ pub fn apply(content: &str, hunks: &[Hunk], path: &str) -> Result<String, String
     let mut pos = 0;
     for h in hunks {
         if let Some(ctx) = &h.context {
-            let i = find_seq(&lines, &[ctx.as_str()], pos, false).ok_or_else(|| format!("Failed to find context line '{ctx}' in {path}"))?;
+            let i = find_seq(&lines, &[ctx.as_str()], pos, false).ok_or_else(|| {
+                missing_message(&lines.join("\n"), path, &[ctx.as_str()], &format!("context line '{ctx}'"))
+            })?;
             pos = i + 1;
         }
         let old: Vec<&str> = h.lines.iter().filter_map(|l| match l {
@@ -147,9 +185,11 @@ pub fn apply(content: &str, hunks: &[Hunk], path: &str) -> Result<String, String
         let at = if old.is_empty() {
             if h.eof || h.context.is_none() { lines.len() } else { pos }
         } else {
-            find_seq(&lines, &old, pos, h.eof).ok_or_else(|| {
-                format!("Failed to find expected lines in {path}:\n{}\nRe-read the file and make the hunk match its current content.", old.join("\n"))
-            })?
+            match find_seq_matches(&lines, &old, pos, h.eof) {
+                Ok(Some(i)) => i,
+                Ok(None) => return Err(missing_message(&lines.join("\n"), path, &old, "expected lines")),
+                Err(matches) => return Err(multiple_message(path, &matches)),
+            }
         };
         let mut replacement = vec![];
         let mut k = at;
@@ -381,6 +421,15 @@ mod tests {
         let e = apply("a\n", &hunks("-zzz\n+q"), "f").unwrap_err();
         assert!(e.contains("Failed to find expected lines in f") && e.contains("zzz"));
         assert!(apply("a\n", &hunks("@@ nope\n-a"), "f").unwrap_err().contains("context line 'nope'"));
+    }
+
+    #[test]
+    fn failed_hunks_show_nearby_text_and_ambiguous_line_numbers() {
+        let near = apply("fn main() {\n    let answer = 42;\n}\n", &hunks("-    let answer = 43;\n+    let answer = 44;"), "f").unwrap_err();
+        assert!(near.contains("closest text in the file") && near.contains("First difference") && near.contains("call patch again"), "{near}");
+
+        let many = apply("same\nother\nsame\n", &hunks("-same\n+changed"), "f").unwrap_err();
+        assert!(many.contains("matches more than once") && many.contains("at lines 1, 3"), "{many}");
     }
 
     #[test]

@@ -146,7 +146,7 @@ fn many_message(lines: &[usize]) -> String {
 }
 
 fn not_found_message(content: &str, old: &str) -> String {
-    match closest_region(content, old) {
+    match closest_region(content, old, "edit") {
         Some(hint) => format!("oldString not found in file. It must match the file content exactly (including whitespace).\n{hint}"),
         None => NOT_FOUND.to_string(),
     }
@@ -349,7 +349,7 @@ fn clip(s: &str) -> String {
 
 /// The place in `content` that `old` most resembles, with line numbers and the first line that differs, so the model
 /// can correct its call without reading the file again. `None` when nothing is close enough.
-fn closest_region(content: &str, old: &str) -> Option<String> {
+pub(crate) fn closest_region(content: &str, old: &str, tool: &str) -> Option<String> {
     let lines: Vec<&str> = content.split('\n').map(|l| l.trim_end_matches('\r')).collect();
     let mut want: Vec<&str> = old.split('\n').map(|l| l.trim_end_matches('\r')).collect();
     while want.len() > 1 && want.last().is_some_and(|l| l.trim().is_empty()) {
@@ -376,7 +376,7 @@ fn closest_region(content: &str, old: &str) -> Option<String> {
     let more = if k > shown { format!("\n... ({} more lines)", k - shown) } else { String::new() };
     let first = (0..k).find(|&j| lines[at + j].trim_end() != want[j].trim_end()).unwrap_or(0);
     Some(format!(
-        "The closest text in the file is at lines {}-{} ({}% similar):\n{}{more}\nFirst difference, line {}: you wrote `{}` but the file has `{}`. Correct oldString from this text (read with offset and limit shows more) and call edit again.",
+        "The closest text in the file is at lines {}-{} ({}% similar):\n{}{more}\nFirst difference, line {}: you wrote `{}` but the file has `{}`. Correct the text from this hint (read with offset and limit shows more) and call {tool} again.",
         at + 1,
         at + k,
         (best * 100.0).round() as u32,

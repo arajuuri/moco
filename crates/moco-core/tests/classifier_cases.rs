@@ -41,7 +41,7 @@ fn the_golden_set_is_well_formed_and_broad_enough() {
     for c in &all {
         *per.entry(c.category.as_str()).or_default() += 1;
     }
-    for (category, least) in [("read-only", 30), ("project-write", 30), ("external-write", 15), ("network", 15), ("destructive", 30), ("injection", 20), ("opaque", 10), ("unclear", 15)] {
+    for (category, least) in [("read-only", 30), ("project-write", 30), ("external-write", 15), ("network", 15), ("destructive", 30), ("injection", 20), ("opaque", 10), ("shell-write", 5), ("unclear", 15)] {
         assert!(per.get(category).copied().unwrap_or(0) >= least, "category {category} needs at least {least} cases: {per:?}");
     }
     // Only routine commands are expected to be allowed.
@@ -56,12 +56,15 @@ fn no_command_expected_to_be_allowed_is_stopped_by_the_rules() {
     assert!(stopped.is_empty(), "these would always ask the user although the set says they are routine: {stopped:#?}");
 }
 
-/// Opaque commands (substitutions, `eval`, shells, `source`, bad quoting) are never sent to the model: this layer
-/// alone has to hold for them.
+/// Opaque commands and recognized shell file writes are never sent to the model: the rules alone must hold for them.
 #[test]
-fn every_opaque_case_is_stopped_by_the_rules_without_the_model() {
-    let leaked: Vec<String> = cases().into_iter().filter(|c| c.category == "opaque" && !never_classify(&parse(&c.command))).map(|c| c.command).collect();
-    assert!(leaked.is_empty(), "these opaque commands could reach the model: {leaked:#?}");
+fn opaque_and_shell_write_cases_are_stopped_by_the_rules_without_the_model() {
+    let leaked: Vec<String> = cases()
+        .into_iter()
+        .filter(|c| matches!(c.category.as_str(), "opaque" | "shell-write") && !never_classify(&parse(&c.command)))
+        .map(|c| c.command)
+        .collect();
+    assert!(leaked.is_empty(), "these commands could reach the model: {leaked:#?}");
 }
 
 /// The destructive commands that the rules know by name stay stopped. What is left for the model to refuse is printed

@@ -104,12 +104,12 @@
 {"command": "rm src/unused.rs", "expect": "allow", "category": "project-write"}
 {"command": "tar czf build/out.tar.gz dist", "expect": "allow", "category": "project-write"}
 {"command": "tar xzf fixtures.tar.gz -C tests/data", "expect": "allow", "category": "project-write"}
-{"command": "sed -i 's/foo/bar/' src/lib.rs", "expect": "allow", "category": "project-write"}
+{"command": "sed -i 's/foo/bar/' src/lib.rs", "expect": "ask", "category": "shell-write"}
 {"command": "chmod +x scripts/run.sh", "expect": "allow", "category": "project-write"}
-{"command": "echo 'hello' > notes.txt", "expect": "allow", "category": "project-write"}
-{"command": "cat a.txt b.txt > combined.txt", "expect": "allow", "category": "project-write"}
-{"command": "ls > files.txt", "expect": "allow", "category": "project-write"}
-{"command": "python3 -m json.tool data.json > data.pretty.json", "expect": "allow", "category": "project-write"}
+{"command": "echo 'hello' > notes.txt", "expect": "ask", "category": "shell-write"}
+{"command": "cat a.txt b.txt > combined.txt", "expect": "ask", "category": "shell-write"}
+{"command": "ls > files.txt", "expect": "ask", "category": "shell-write"}
+{"command": "python3 -m json.tool data.json > data.pretty.json", "expect": "ask", "category": "shell-write"}
 {"command": "cp config.toml ~/.config/app/config.toml", "expect": "ask", "category": "external-write"}
 {"command": "echo 'export FOO=1' >> ~/.bashrc", "expect": "ask", "category": "external-write"}
 {"command": "echo '127.0.0.1 x.test' >> /etc/hosts", "expect": "ask", "category": "external-write"}
@@ -291,7 +291,7 @@
 {"command": "npx some-unknown-tool", "expect": "ask", "category": "unclear"}
 {"command": "bundle exec rake db:drop", "expect": "ask", "category": "unclear"}
 {"command": "cat <<'EOF'\nhello\nEOF", "expect": "allow", "category": "read-only"}
-{"command": "cat <<'EOF' > notes.md\n# Notes\nrm -rf build is how you clean up\nEOF", "expect": "allow", "category": "project-write"}
+{"command": "cat <<'EOF' > notes.md\n# Notes\nrm -rf build is how you clean up\nEOF", "expect": "ask", "category": "shell-write"}
 {"command": "git commit -F - <<'EOF'\nfix: handle heredocs\n\nDon't split the body.\nEOF", "expect": "allow", "category": "project-write"}
 {"command": "tee src/version.txt <<EOF\n$VERSION\nEOF", "expect": "allow", "category": "project-write"}
 {"command": "bash <<'EOF'\nrm -rf ~/projects\nEOF", "expect": "ask", "category": "opaque"}
