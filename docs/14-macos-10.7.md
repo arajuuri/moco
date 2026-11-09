@@ -25,18 +25,18 @@ minimum from about 1.86); #99 has the measurements.
 | Toolchain | `rust-toolchain.toml` and CI pin 1.78.0; `rust-version = "1.78"` in the workspace | Newest Rust every build machine runs (#100); 1.73 before that |
 | libc shim | `crates/moco/src/libc_shim.rs`: `getentropy`, `clock_gettime` | 1.78's `std` imports them; both need 10.12+ |
 | `Cargo.lock` | Format version 3 | Cargo before 1.78 cannot read version 4; kept while dependencies are held back |
-| ratatui / crossterm | 0.30 / 0.29 down to 0.25 / 0.27 | ratatui 0.26+ needs Rust 1.74 (no longer a limit since #100; not yet upgraded) |
+| ratatui / crossterm | 0.29 / 0.28 | ratatui 0.30 needs Rust 1.88 |
 | rusqlite | 0.41 down to 0.31 | 0.32+ uses C string literals (1.77); some versions under-declare their MSRV |
 | ignore / globset | Capped at 0.4.23 / 0.4.15 | Newer releases are edition 2024 and declare no MSRV |
 | getrandom (via ring) | Uses the `getentropy` shim in the binary | 0.2.11+ calls `getentropy()` directly. The shim forwards to the system function on 10.12+ and falls back to `/dev/urandom` on Lion |
 | std back-ports | `crates/moco-core/src/compat.rs`: `Option::is_none_or`, unsigned `is_multiple_of` | Methods added after 1.78 (the 1.73 back-ports of `inspect`, `inspect_err` and `File::set_modified` went with #100) |
-| ratatui back-ports | `crates/moco/src/tui/compat.rs`: `Frame::area`/`set_cursor_position`, `Layout::vertical`/`horizontal`, `Block::bordered`/`title_bottom`, `Line::style` | Methods added after 0.25 |
-| Small edits | `AtomicU64::try_update` to `fetch_update`, `iter::repeat_n` to `repeat().take()`, `Buffer[(x, y)]` to `Buffer::get(x, y)` (tests), `Set<'static>` to `Set` | No back-port possible or needed |
+| Ratatui back-ports | Removed `crates/moco/src/tui/compat.rs`; ratatui 0.29 provides the previously back-ported methods | |
+| Small edits | `AtomicU64::try_update` to `fetch_update`, `iter::repeat_n` to `repeat().take()`, `Set<'static>` to `Set` | No back-port possible or needed |
 | Lints | `unstable_name_collisions`, four clippy 1.73 lints and three clippy 1.78 lints that newer clippy does not raise on this code are allowed at crate level | Keeps code written for newer clippy unchanged |
 | `scripts/install.sh` | Deployment target 10.7; minos check accepts 10.7 or older | |
 
-The back-port traits keep call sites written in the newer style, so dropping 10.7 later means deleting the back-ports. Files that use them start with
-`use crate::compat::*;` (front end: `use moco_core::compat::*;`, plus `use super::compat::*;` in `tui/`).
+The remaining compatibility imports are for Rust standard-library back-ports: `use crate::compat::*;` (front end:
+`use moco_core::compat::*;`). Ratatui call sites use the native 0.29 APIs.
 
 ## Building
 
@@ -99,7 +99,7 @@ comment saying why.
 
 ## Writing code for 1.78
 
-Code and examples written for newer Rust or ratatui may use APIs newer than 1.78 / 0.25. Prefer adding a back-port to the relevant `compat.rs` over editing
+Code and examples written for newer Rust may use APIs newer than 1.78. Prefer adding a back-port to the relevant `compat.rs` over editing
 the call site, then run `cargo build`, `cargo test` and `cargo clippy --workspace --all-targets -- -D warnings`.
 
 ## Verified, and not yet verified
