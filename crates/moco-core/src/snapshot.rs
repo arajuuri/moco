@@ -692,23 +692,27 @@ mod tests {
 
     #[test]
     fn prune_spares_fresh_blobs_and_snapshots_in_use() {
+        // Files are aged by setting their mtime an hour back, and "fresh" means within 10 s: HFS+ rounds mtimes down to the
+        // whole second, so sub-second sleeps and limits would make a file touched just now look too old.
+        let age = |p: &Path| std::fs::File::options().write(true).open(p).unwrap().set_modified(SystemTime::now() - Duration::from_secs(3600)).unwrap();
         let mut t = Tree::new();
-        t.snaps.blob_grace = Duration::from_millis(300);
+        t.snaps.blob_grace = Duration::from_secs(10);
         t.put("a.txt", "v1");
         let s1 = t.cap(None);
-        std::thread::sleep(Duration::from_millis(400));
+        age(&t.snaps.manifest_path(&s1));
         // A capture in progress re-uses the old blob (its manifest is not written yet): the blob is refreshed.
         let bp = t.snaps.blob_path(&sha(b"v1"));
+        age(&bp);
         assert!(touch(&bp));
-        t.snaps.prune(&HashSet::new(), Duration::from_millis(200));
+        t.snaps.prune(&HashSet::new(), Duration::from_secs(10));
         assert!(t.snaps.manifest(&s1).is_err(), "old unreferenced manifest goes");
         assert!(bp.exists(), "a blob touched within the grace period survives");
         // Using a snapshot (restore, diff, capture with prev) marks it as in use.
         t.put("a.txt", "v2");
         let s2 = t.cap(None);
-        std::thread::sleep(Duration::from_millis(400));
+        age(&t.snaps.manifest_path(&s2));
         t.snaps.restore(&t.dir(), &s2, None).unwrap();
-        t.snaps.prune(&HashSet::new(), Duration::from_millis(200));
+        t.snaps.prune(&HashSet::new(), Duration::from_secs(10));
         assert!(t.snaps.manifest(&s2).is_ok(), "a snapshot in use is not pruned by age");
     }
 }
