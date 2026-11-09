@@ -122,7 +122,7 @@ pub(crate) fn tail(text: &str) -> Option<(String, usize, usize)> {
 /// Start `command` in its own process group, stdout and stderr combined into `out_path` (one file with a shared
 /// offset keeps them interleaved), no stdin.
 /// `sandbox_root` is `Some(project root)` to run it inside the sandbox (when one is active; see `sandbox.rs`).
-pub(crate) fn spawn(command: &str, workdir: &Path, out_path: &Path, sandbox_root: Option<&Path>) -> Result<Child, ToolError> {
+pub(crate) fn spawn(command: &str, workdir: &Path, out_path: &Path, sandbox_root: Option<&Path>, provider_key_env_vars: &[String]) -> Result<Child, ToolError> {
     if let Some(dir) = out_path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| ToolError::fail(e.to_string()))?;
     }
@@ -147,6 +147,9 @@ pub(crate) fn spawn(command: &str, workdir: &Path, out_path: &Path, sandbox_root
         .stdout(Stdio::from(file))
         .stderr(Stdio::from(err_file))
         .process_group(0);
+    for name in provider_key_env_vars {
+        cmd.env_remove(name);
+    }
     cmd.spawn().map_err(|e| ToolError::fail(format!("failed to start shell: {e}")))
 }
 
@@ -222,9 +225,9 @@ fn wait_capped(child: &mut Child, out_path: &Path, timeout: Option<Duration>, st
 }
 
 /// Run `command` to completion, no model involved. `timeout_ms` 0 means no timeout.
-pub(crate) fn run_foreground(command: &str, workdir: &Path, spill_dir: &Path, timeout_ms: u64, cancel: &AtomicBool, sandbox_root: Option<&Path>) -> Result<Finished, ToolError> {
+pub(crate) fn run_foreground(command: &str, workdir: &Path, spill_dir: &Path, timeout_ms: u64, cancel: &AtomicBool, sandbox_root: Option<&Path>, provider_key_env_vars: &[String]) -> Result<Finished, ToolError> {
     let out_path = spill_dir.join(format!("{}.txt", crate::id::new_id("shell")));
-    let mut child = spawn(command, workdir, &out_path, sandbox_root)?;
+    let mut child = spawn(command, workdir, &out_path, sandbox_root, provider_key_env_vars)?;
     let timeout = (timeout_ms > 0).then(|| Duration::from_millis(timeout_ms));
     let started = std::time::Instant::now();
     let mut f = wait(&mut child, &out_path, timeout, &|| cancel.load(std::sync::atomic::Ordering::Relaxed), false);
@@ -300,7 +303,8 @@ Do not use interactive commands. Do not use this tool to create or change files 
         }
 
         let root = (!unsandboxed).then_some(ctx.project_root.as_path());
-        let f = run_foreground(command, &workdir, &ctx.spill_dir, timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS), ctx.cancel, root)?;
+        let provider_key_env_vars = ctx.host.provider_key_env_vars();
+        let f = run_foreground(command, &workdir, &ctx.spill_dir, timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS), ctx.cancel, root, &provider_key_env_vars)?;
         if f.killed {
             return Err(ToolError::Interrupted);
         }
@@ -336,6 +340,14 @@ mod tests {
         assert_eq!(o.text, "out\nerr\n\n\n[exit code 3]");
         assert_eq!(o.metadata["exit"], 3);
         assert_eq!(run(&env, json!({"command":"printf hi"})).unwrap().text, "hi");
+    }
+
+    #[test]
+    fn shell_does_not_inherit_provider_keys_but_keeps_other_environment() {
+        let _vars = super::super::testutil::ScopedEnv::set(&[("ANTHROPIC_API_KEY", "sk-test-shell-key"), ("GITHUB_TOKEN", "test-github-token")]);
+        let env = Env::new();
+        let output = run(&env, json!({"command":r#"printf '%s|%s' "${ANTHROPIC_API_KEY-unset}" "${GITHUB_TOKEN-unset}""#})).unwrap().text;
+        assert_eq!(output, "unset|test-github-token");
     }
 
     #[test]
@@ -450,7 +462,7 @@ mod tests {
     fn output_past_the_cap_kills_the_command() {
         let env = Env::new();
         let out = env.work().join("capped.txt");
-        let mut child = spawn("yes", &env.work(), &out, None).unwrap();
+        let mut child = spawn("yes", &env.work(), &out, None, &[]).unwrap();
         let t = Instant::now();
         let f = wait_capped(&mut child, &out, None, &|| false, false, 1024 * 1024);
         assert!(t.elapsed() < Duration::from_secs(10), "took {:?}", t.elapsed());

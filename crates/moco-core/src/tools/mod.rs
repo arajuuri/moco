@@ -201,6 +201,10 @@ pub trait Host: Sync {
     /// One answer list (chosen labels or free text) per question; `Declined` if the user dismissed the form.
     fn ask(&self, questions: &[Question]) -> Result<Vec<Vec<String>>, ToolError>;
     fn subagent(&self, req: SubagentRequest) -> Result<SubagentResult, ToolError>;
+    /// Provider credential variable names that shell children must not inherit.
+    fn provider_key_env_vars(&self) -> Vec<String> {
+        Vec::new()
+    }
     /// Start a command that keeps running after the tool call returns; returns its job id and output file.
     /// `unsandboxed` skips the shell sandbox (already approved by the caller).
     fn start_background_shell(&self, command: &str, workdir: &Path, timeout: Option<std::time::Duration>, unsandboxed: bool) -> Result<(String, PathBuf), ToolError>;
@@ -686,10 +690,43 @@ pub(crate) mod testutil {
     use super::*;
     use std::sync::Mutex;
 
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
     pub struct TestPermitter {
         pub asked: Mutex<Vec<PermReq>>,
         pub reply: Mutex<Result<(), ToolError>>,
     }
+
+    pub struct ScopedEnv {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        vars: Vec<(String, Option<std::ffi::OsString>)>,
+    }
+    impl ScopedEnv {
+        pub fn set(vars: &[(&str, &str)]) -> Self {
+            let lock = ENV_LOCK.lock().unwrap();
+            let vars = vars
+                .iter()
+                .map(|(name, value)| {
+                    let previous = std::env::var_os(name);
+                    std::env::set_var(name, value);
+                    ((*name).to_string(), previous)
+                })
+                .collect();
+            ScopedEnv { _lock: lock, vars }
+        }
+    }
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            for (name, value) in self.vars.drain(..) {
+                if let Some(value) = value {
+                    std::env::set_var(name, value);
+                } else {
+                    std::env::remove_var(name);
+                }
+            }
+        }
+    }
+
     impl TestPermitter {
         pub fn allow() -> Self {
             TestPermitter { asked: Mutex::new(vec![]), reply: Mutex::new(Ok(())) }
@@ -726,6 +763,9 @@ pub(crate) mod testutil {
         fn subagent(&self, req: SubagentRequest) -> Result<SubagentResult, ToolError> {
             self.subagents.lock().unwrap().push(req.clone());
             Ok(SubagentResult { session_id: "ses_child".into(), output: format!("done: {}", req.prompt) })
+        }
+        fn provider_key_env_vars(&self) -> Vec<String> {
+            crate::catalog::Catalog::embedded().key_env_vars()
         }
         fn start_background_shell(&self, command: &str, workdir: &Path, timeout: Option<std::time::Duration>, _unsandboxed: bool) -> Result<(String, PathBuf), ToolError> {
             self.shells.lock().unwrap().push((command.to_string(), workdir.to_path_buf(), timeout));

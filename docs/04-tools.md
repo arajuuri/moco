@@ -63,7 +63,7 @@ Input `{command, workdir?, timeout?: ms, background?: bool}`.
 - Output: combined stdout+stderr streamed to a file; the result returns a bounded tail with the full-output path when truncated. Structured output `{output, exit?, signal?, shellID?, truncated, timeout?, status: completed|running}`.
 - Notices appended to output for: timeout, signal, non-zero exit (see `core/src/shell/result.ts`).
 - Background: returns immediately with `Command moved to the background (shell ID: X).\nOutput is streaming to: <file>`; completion injects a synthetic message and wakes the session.
-- Env: inherit; set `TERM=dumb`-like non-interactive; no TTY unless user opens a terminal.
+- Env: inherited except for environment variables moco uses to find provider API keys (catalog `env` names and `<PROVIDER>_API_KEY` fallbacks); set `TERM=dumb`-like non-interactive; no TTY unless user opens a terminal. To pass a provider key deliberately, put its assignment in the command, e.g. `ANTHROPIC_API_KEY=... cmd`.
 - User-initiated `!command` input in the UI uses the same machinery without the model (`session.shell`).
 
 ## webfetch

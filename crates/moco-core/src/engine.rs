@@ -787,6 +787,10 @@ impl Host for EngineHost<'_> {
         self.engine.run_subagent(self.session, req, self.ui, self.cancel)
     }
 
+    fn provider_key_env_vars(&self) -> Vec<String> {
+        self.engine.cfg.catalog.key_env_vars()
+    }
+
     fn start_background_shell(&self, command: &str, workdir: &std::path::Path, timeout: Option<Duration>, unsandboxed: bool) -> Result<(String, PathBuf), ToolError> {
         let eng = self.engine.shared()?;
         eng.start_shell_job(self.session, command, workdir, timeout, unsandboxed)

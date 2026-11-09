@@ -20,13 +20,17 @@ pub fn env_var_for(provider: &str) -> String {
     format!("{}_API_KEY", provider.to_uppercase().replace('-', "_"))
 }
 
+pub fn env_names_for(provider: &str, env_names: &[String]) -> Vec<String> {
+    env_names.iter().cloned().chain(std::iter::once(env_var_for(provider))).collect()
+}
+
 pub fn load_key(provider: &str, app_dir: &Path) -> Option<String> {
     load_key_with(provider, &[], app_dir)
 }
 
 /// Key lookup: the given environment variables (from the catalog), then `<PROVIDER>_API_KEY`, then `auth.json`.
 pub fn load_key_with(provider: &str, env_names: &[String], app_dir: &Path) -> Option<String> {
-    for name in env_names.iter().cloned().chain(std::iter::once(env_var_for(provider))) {
+    for name in env_names_for(provider, env_names) {
         if let Ok(k) = std::env::var(&name) {
             if !k.is_empty() {
                 return Some(k);
