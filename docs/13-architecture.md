@@ -284,9 +284,10 @@ the `Engine`, and picks a mode:
 - `app.rs` is a pure model. `App::update(AppEvent) -> Action` and `render(Frame, &mut App)` touch no terminal and no engine,
   so tests drive them with scripted events and read ratatui's `TestBackend`.
 - `mod.rs` is the event loop. The UI thread owns the terminal. An input thread turns crossterm events into `AppEvent`s. It is
-  not scoped, so leaving the UI never waits for it: crossterm 0.27 spins forever on a hung-up tty (#87). Before each poll it
-  checks the tty with `term::tty_gone` (`select` plus `FIONREAD`; macOS `poll` does not work on ttys) and, when the terminal
-  is gone, ends the UI the way SIGHUP and SIGTERM do (`SIGNALLED`). The
+  not scoped, so leaving the UI never waits for it: crossterm 0.27 spun forever on a hung-up tty (#87). Until that behavior
+  is verified with crossterm 0.28 on Lion, before each poll the thread checks the tty with `term::tty_gone` (`select` plus
+  `FIONREAD`; macOS `poll` does not work on ttys) and, when the terminal is gone, ends the UI the way SIGHUP and SIGTERM do
+  (`SIGNALLED`). The
   engine runs on a worker thread per run (`start_run`), inside a `thread::scope`. The worker's `TuiUi` converts each borrowed
   `UiEvent` to an owned `Ev` and sends it down the channel. `Ui::ask` sends the prompt with a reply channel and blocks the engine
   thread until the UI thread answers. While a turn runs, or jobs or the sidebar are active, the loop also syncs the inbox and the sidebar (MCP

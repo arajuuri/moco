@@ -23,7 +23,7 @@ fn dump(app: &mut App, w: u16, h: u16) -> serde_json::Value {
     let cells: Vec<serde_json::Value> = (0..h)
         .flat_map(|y| (0..w).map(move |x| (x, y)))
         .map(|(x, y)| {
-            let c = b.get(x, y);
+            let c = &b[(x, y)];
             serde_json::json!([c.symbol(), color(c.fg), color(c.bg), c.modifier.bits()])
         })
         .collect();
