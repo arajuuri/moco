@@ -3077,13 +3077,18 @@ mod tests {
         }
     }
 
-    /// A `sleep` duration that appears in no source text or invoking command line, so `pgrep -f` can find exactly our processes.
+    /// A `sleep` duration that appears in no source text or invoking command line, so `alive` can find exactly our processes.
     fn uniq(k: u32) -> u32 {
         20_000 + std::process::id() % 9_000 + k * 10_000
     }
 
+    /// Whether a process running `sleep n` exists. Uses `ps -A -o args=` (POSIX, on every macOS and Linux) rather than
+    /// `pgrep`, which Lion lacks; a failure to list processes fails the test instead of reading as "not running".
     fn alive(n: u32) -> bool {
-        std::process::Command::new("pgrep").args(["-f", &format!("sleep {n}")]).output().map(|o| o.status.success()).unwrap_or(false)
+        let out = std::process::Command::new("ps").args(["-A", "-o", "args="]).output().expect("run ps");
+        assert!(out.status.success(), "ps failed: {}", String::from_utf8_lossy(&out.stderr));
+        let pat = format!("sleep {n}");
+        String::from_utf8_lossy(&out.stdout).lines().any(|l| l.match_indices(&pat).any(|(i, _)| !l[i + pat.len()..].starts_with(|c: char| c.is_ascii_digit())))
     }
 
     fn bg_shell(id: &str, command: &str) -> Scripted {

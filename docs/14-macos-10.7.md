@@ -155,8 +155,13 @@ The same binary also runs on Mojave 10.14.6 (`--version`, `models --refresh`, `-
     second (APFS keeps nanoseconds). Six of them show a real gap (issue #97): snapshots reuse a file's hash when
     its size and mtime are unchanged, so an edit that keeps the size and lands in the same second as the previous
     snapshot is missed by undo and the session diff. This affects any HFS+ volume, not only Lion. The seventh
-    assumes sub-second mtimes in its own timing (issue #98).
-  - Two background-job tests fail because they check for the process with `pgrep`, which Lion lacks (issue #98).
+    assumed sub-second mtimes in its own timing.
+  - Two background-job tests failed because they checked for the process with `pgrep`, which Lion lacks.
+
+  Issue #98 fixed the last three (the job tests use `ps -A -o args=`, the prune test backdates mtimes and allows
+  whole seconds). On 2026-11-09 they passed on Lion, and the full run (8 min at 1 vCPU) failed 5 of the 6 #97 tests
+  (the count depends on timing) plus `a_hung_up_terminal_ends_moco_during_a_dialog`, which then passed three runs
+  in a row on its own.
 - macOS 10.7.0 to 10.7.4 and 10.8 to 10.13.
 - `sw_vers` reports "Mac OS X 10.7.x", while `sysinfo` labels it "macOS 10.7.x". This is cosmetic.
 
