@@ -15,7 +15,7 @@ By hand: `MACOSX_DEPLOYMENT_TARGET=10.7 CARGO_TARGET_DIR=<a directory outside th
 
 ## First run
 
-1. Give moco an API key: `moco auth anthropic` (reads the key from stdin, echo off) or set `ANTHROPIC_API_KEY`. Keys live in `~/Library/Application Support/moco/auth.json` (mode 600). Other providers: `moco auth openrouter`, or the env var shown by `moco models`.
+1. Give moco an API key: `moco auth anthropic` (reads the key from stdin, echo off) or set `ANTHROPIC_API_KEY`. Keys live in `~/Library/Application Support/moco/auth.json` (mode 600). Other providers: `moco auth openrouter`, or the env var shown by `moco models`. Shell commands do not inherit provider-key environment variables by default; pass one deliberately with an inline assignment such as `ANTHROPIC_API_KEY=... cmd`.
 2. `cd` into a project and run `moco`. Type a request; the answer streams, tool calls show as dim `>` lines, and a line after each turn shows tokens, cost, session cost and how full the context is.
 
 ## Command line

@@ -250,6 +250,11 @@ impl Catalog {
         self.providers.get(provider)?.models.get(model)
     }
 
+    /// Environment variables moco may read for provider API keys.
+    pub fn key_env_vars(&self) -> Vec<String> {
+        self.providers.values().flat_map(|p| crate::auth::env_names_for(&p.id, &p.env)).collect()
+    }
+
     /// Merge `providers` from config: new providers are added, existing ones are overridden field by field.
     pub fn apply_config(&mut self, cfg: &BTreeMap<String, crate::config::ProviderConfig>) {
         for (id, pc) in cfg {
@@ -341,6 +346,14 @@ mod tests {
         assert_eq!(c.providers["openai"].base_url().as_deref(), Some("https://api.openai.com/v1"));
         assert_eq!(c.providers["deepseek"].base_url().as_deref(), Some("https://api.deepseek.com"));
         assert_eq!(c.providers["fireworks-ai"].base_url().as_deref(), Some("https://api.fireworks.ai/inference/v1"), "trailing slash trimmed");
+    }
+
+    #[test]
+    fn key_env_vars_include_catalog_names_and_provider_fallbacks() {
+        let c = Catalog::parse(r#"{"custom-provider":{"env":["CUSTOM_KEY"],"models":{"m":{}}}}"#).unwrap();
+        let names = c.key_env_vars();
+        assert!(names.contains(&"CUSTOM_KEY".into()));
+        assert!(names.contains(&"CUSTOM_PROVIDER_API_KEY".into()));
     }
 
     #[test]

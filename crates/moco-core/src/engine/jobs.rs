@@ -313,7 +313,8 @@ impl Engine {
         let stop = Arc::new(AtomicBool::new(false));
         // Reserve the slot first (the cap is enforced here), then start the process.
         self.register(Job { id: id.clone(), kind: Kind::Shell, session_id: session.id.clone(), title: command.to_string(), started: Instant::now(), state: State::Running, out: Some(out.clone()), stop: stop.clone() })?;
-        let mut child = match shell::spawn(command, workdir, &out, root.as_deref()) {
+        let provider_key_env_vars = self.cfg.catalog.key_env_vars();
+        let mut child = match shell::spawn(command, workdir, &out, root.as_deref(), &provider_key_env_vars) {
             Ok(c) => c,
             Err(e) => {
                 self.unregister(&id);
@@ -398,7 +399,8 @@ impl Engine {
     /// the exchange in the conversation so the model knows what happened. Returns the text to show.
     pub fn run_user_command(&self, sid: &str, command: &str, cancel: &AtomicBool) -> Result<String, String> {
         let session = self.store().session(sid).map_err(|e| e.to_string())?.ok_or("no such session")?;
-        let f = shell::run_foreground(command, Path::new(&session.directory), &self.spill_dir(), 120_000, cancel, None).map_err(|e| e.message())?;
+        let provider_key_env_vars = self.cfg.catalog.key_env_vars();
+        let f = shell::run_foreground(command, Path::new(&session.directory), &self.spill_dir(), 120_000, cancel, None, &provider_key_env_vars).map_err(|e| e.message())?;
         if f.killed {
             return Err("interrupted".into());
         }
@@ -493,6 +495,28 @@ mod tests {
     }
 
     #[test]
+    fn background_shell_does_not_inherit_provider_keys_but_keeps_other_environment() {
+        let _vars = crate::tools::testutil::ScopedEnv::set(&[("ANTHROPIC_API_KEY", "sk-test-background-key"), ("GITHUB_TOKEN", "test-github-token")]);
+        let (eng, s, dir) = engine(crate::config::JobLimits::default());
+        let (id, out) = eng
+            .start_shell_job(
+                &s,
+                r#"printf '%s|%s' "${ANTHROPIC_API_KEY-unset}" "${GITHUB_TOKEN-unset}""#,
+                &dir.join("work"),
+                None,
+                true,
+            )
+            .unwrap();
+        let end = Instant::now() + Duration::from_secs(5);
+        while eng.running_jobs() > 0 && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(eng.running_jobs(), 0, "background shell {id} did not finish");
+        assert_eq!(std::fs::read_to_string(out).unwrap(), "unset|test-github-token");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn a_user_command_the_model_cannot_be_told_about_is_reported() {
         let (eng, s, dir) = engine(crate::config::JobLimits::default());
         let notices = collect_notices(&eng);
@@ -502,6 +526,17 @@ mod tests {
         assert!(shown.contains("hi"));
         let n = notices.lock().unwrap().clone();
         assert!(n.len() == 1 && n[0].contains("will not know") && n[0].contains("echo hi"), "{n:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn user_command_does_not_record_provider_keys_from_its_environment() {
+        let _vars = crate::tools::testutil::ScopedEnv::set(&[("ANTHROPIC_API_KEY", "sk-test-user-command-key"), ("GITHUB_TOKEN", "test-github-token")]);
+        let (eng, s, dir) = engine(crate::config::JobLimits::default());
+        let output = eng
+            .run_user_command(&s.id, r#"printf '%s|%s' "${ANTHROPIC_API_KEY-unset}" "${GITHUB_TOKEN-unset}""#, &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(output, "unset|test-github-token");
         let _ = std::fs::remove_dir_all(dir);
     }
 
