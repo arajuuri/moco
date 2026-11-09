@@ -168,9 +168,18 @@ impl Engine {
         if let (true, Some(limit)) = (self.cfg.compaction.auto, p.limit) {
             let size = compaction::context_size(&p.eff, compaction::estimate_request(&p.req));
             if size > self.cfg.compaction.threshold(limit) && !self.auto_failed.lock().unwrap().contains(sid) {
-                match self.compact_with(sid, "auto", p.session.clone(), &mut p.history, ui, cancel)? {
+                match self.compact_with(sid, "auto", p.session.clone(), &p.history, ui, cancel)? {
                     CompactResult::Compacted { .. } => {
-                        let session = self.store().session(sid)?.ok_or(StoreError::SessionGone)?;
+                        let session = {
+                            let st = self.store();
+                            let session = st.session(sid)?.ok_or(StoreError::SessionGone)?;
+                            // Include the checkpoint and user shell results written while summarizing, without
+                            // parsing the old messages again.
+                            let after = p.history.last().map(|m| m.id.as_str()).unwrap_or("");
+                            let added = st.messages_after(sid, after)?;
+                            p.history.extend(added);
+                            session
+                        };
                         p = match self.prepare_with(sid, step, ui, session, std::mem::take(&mut p.history))? {
                             Ok(p) => p,
                             Err(outcome) => return Ok(outcome),

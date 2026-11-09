@@ -1727,42 +1727,42 @@ mod tests {
     }
 
     #[test]
-    fn compaction_updates_loaded_history_to_match_persistence() {
-        let f = fixture_cfg(vec![text(SUMMARY), text(SUMMARY)], |c| c.compaction.keep = 1000);
+    fn auto_compaction_keeps_messages_persisted_during_summarization() {
+        let f = fixture_cfg(vec![text(SUMMARY), text("the answer")], |c| small_window(c, 3000, 1000));
         seed(&f, 4);
-        let mut history = f.msgs();
-        let cancel = AtomicBool::new(false);
+        f.say("next question");
         let ui = TestUi::default();
-        for round in 0..2 {
-            assert!(matches!(
-                f.engine.compact_with(&f.session.id, "auto", f.session.clone(), &mut history, &ui, &cancel).unwrap(),
-                CompactResult::Compacted { .. }
-            ));
-            assert_eq!(history, f.msgs(), "the cached checkpoint must be identical to the stored one");
-            let before = history.clone();
-            assert_eq!(
-                f.engine.compact_with(&f.session.id, "auto", f.session.clone(), &mut history, &ui, &cancel).unwrap(),
-                CompactResult::NothingToCompact
-            );
-            assert_eq!(history, before);
-            if round == 0 {
-                seed(&f, 4);
-                history = f.msgs();
-            }
+        let (engine, sid) = (f.engine.clone(), f.session.id.clone());
+        *ui.hook.lock().unwrap() = Some(Box::new(move |l| {
+            let text = if l.starts_with("status:compacting ") {
+                "command result before checkpoint"
+            } else if l.starts_with("status:compacted:") {
+                "command result after checkpoint"
+            } else {
+                return;
+            };
+            engine.store().add_message(&sid, "synthetic", &json!({"text": text})).unwrap();
+        }));
+        assert_eq!(f.run(&ui), RunOutcome::Idle);
+        let reqs = f.fake.requests.lock().unwrap();
+        let t = all_text(&reqs[1]);
+        for expected in ["SUMMARY-BODY", "next question", "command result before checkpoint", "command result after checkpoint"] {
+            assert!(t.contains(expected), "{t}");
         }
     }
 
     #[test]
-    fn failed_compaction_leaves_loaded_history_unchanged() {
-        for error in [ProviderError::Auth("bad key".into()), ProviderError::Interrupted] {
-            let f = fixture_cfg(vec![Scripted::Fail(vec![], error)], |c| c.compaction.keep = 1000);
-            seed(&f, 4);
+    fn incremental_history_matches_a_full_reload() {
+        let f = fixture_cfg(vec![text(SUMMARY), text(SUMMARY)], |c| c.compaction.keep = 1000);
+        seed(&f, 4);
+        for _ in 0..2 {
             let mut history = f.msgs();
-            let before = history.clone();
-            let outcome = f.engine.compact_with(&f.session.id, "auto", f.session.clone(), &mut history, &TestUi::default(), &AtomicBool::new(false)).unwrap();
-            assert!(matches!(outcome, CompactResult::Failed(_) | CompactResult::Interrupted));
-            assert_eq!(history, before);
+            let after = history.last().unwrap().id.clone();
+            assert!(matches!(f.engine.compact_with(&f.session.id, "auto", f.session.clone(), &history, &TestUi::default(), &AtomicBool::new(false)).unwrap(), CompactResult::Compacted { .. }));
+            history.extend(f.engine.store().messages_after(&f.session.id, &after).unwrap());
             assert_eq!(history, f.msgs());
+            assert!(f.engine.store().messages_after(&f.session.id, &history.last().unwrap().id).unwrap().is_empty());
+            seed(&f, 4);
         }
     }
 
