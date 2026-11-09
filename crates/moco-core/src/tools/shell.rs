@@ -166,7 +166,88 @@ pub(crate) struct Finished {
     pub out_path: PathBuf,
 }
 
-/// Wait for `child` (polling), killing its process group when `timeout` passes or `stop()` turns true.
+/// How often a waiting command is checked for `stop()` and for its output file outgrowing the cap, where something
+/// can wake the wait the moment the command exits (`ExitWatch`).
+const CHECK_INTERVAL: Duration = Duration::from_millis(100);
+/// The same checks, and the exit check, where nothing can (no `ExitWatch`).
+const POLL_INTERVAL: Duration = Duration::from_millis(15);
+/// Wait this long for a command that is known to have exited to become reapable.
+#[cfg(target_os = "macos")]
+const REAP_RETRY: Duration = Duration::from_millis(1);
+
+/// Wakes a waiting thread when a child exits, so `wait` needs no fast polling loop: a short command ends the moment it
+/// exits, and a long one costs one wakeup per `CHECK_INTERVAL` instead of one per `POLL_INTERVAL`. macOS only (a
+/// kqueue `NOTE_EXIT` watch). It is a hint, never the truth: `try_reap` decides whether the child has exited, so a
+/// missed or early event costs at most one interval.
+#[cfg(target_os = "macos")]
+struct ExitWatch {
+    kq: libc::c_int,
+    fired: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl ExitWatch {
+    /// `None` when the watch cannot be set up (no descriptors left, the pid is already gone): the caller polls.
+    fn new(pid: u32) -> Option<ExitWatch> {
+        unsafe {
+            let kq = libc::kqueue();
+            if kq < 0 {
+                return None;
+            }
+            // Other threads start commands too: this descriptor must not leak into them.
+            libc::fcntl(kq, libc::F_SETFD, libc::FD_CLOEXEC);
+            let mut ev: libc::kevent = std::mem::zeroed();
+            ev.ident = pid as libc::uintptr_t;
+            ev.filter = libc::EVFILT_PROC;
+            ev.flags = libc::EV_ADD | libc::EV_ONESHOT;
+            ev.fflags = libc::NOTE_EXIT;
+            if libc::kevent(kq, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) < 0 {
+                libc::close(kq);
+                return None;
+            }
+            Some(ExitWatch { kq, fired: false })
+        }
+    }
+
+    /// Sleep for up to `d`, less when the child exits.
+    fn sleep(&mut self, d: Duration) {
+        if self.fired {
+            // The exit was announced but `try_reap` does not see it yet; the event is used up, so poll briefly.
+            std::thread::sleep(REAP_RETRY.min(d));
+            return;
+        }
+        unsafe {
+            let ts = libc::timespec { tv_sec: d.as_secs() as libc::time_t, tv_nsec: d.subsec_nanos() as libc::c_long };
+            let mut out: libc::kevent = std::mem::zeroed();
+            self.fired = libc::kevent(self.kq, std::ptr::null(), 0, &mut out, 1, &ts) > 0;
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for ExitWatch {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.kq);
+        }
+    }
+}
+
+/// Where nothing can announce an exit, `wait` just sleeps. Uninhabited, so `ExitWatch::new` is always `None`.
+#[cfg(not(target_os = "macos"))]
+enum ExitWatch {}
+
+#[cfg(not(target_os = "macos"))]
+impl ExitWatch {
+    fn new(_pid: u32) -> Option<ExitWatch> {
+        None
+    }
+    fn sleep(&mut self, _d: Duration) {
+        match *self {}
+    }
+}
+
+/// Wait for `child`, killing its process group when `timeout` passes or `stop()` turns true.
 /// The output file is removed afterwards unless it was truncated or `keep_file` is set.
 pub(crate) fn wait(child: &mut Child, out_path: &Path, timeout: Option<Duration>, stop: &dyn Fn() -> bool, keep_file: bool) -> Finished {
     wait_capped(child, out_path, timeout, stop, keep_file, MAX_OUTPUT_FILE_BYTES)
@@ -178,6 +259,8 @@ fn wait_capped(child: &mut Child, out_path: &Path, timeout: Option<Duration>, st
     let pid = child.id();
     let start = Instant::now();
     let (mut timed_out, mut killed, mut over_cap) = (false, false, false);
+    // Registered after the spawn, so a command that already exited is still seen: `try_reap` runs first.
+    let mut watch = ExitWatch::new(pid);
     let status = loop {
         match try_reap(child) {
             Ok(Some(s)) => break s,
@@ -199,8 +282,14 @@ fn wait_capped(child: &mut Child, out_path: &Path, timeout: Option<Duration>, st
             kill_group(pid);
             break child.wait().unwrap_or_default();
         }
-        std::thread::sleep(Duration::from_millis(15));
+        // Never sleep past the timeout, so it fires on time however long the interval is.
+        let left = timeout.map_or(Duration::MAX, |t| t.saturating_sub(start.elapsed()));
+        match watch.as_mut() {
+            Some(w) => w.sleep(CHECK_INTERVAL.min(left)),
+            None => std::thread::sleep(POLL_INTERVAL.min(left)),
+        }
     };
+    drop(watch);
     let (full, total_lines) = read_output(out_path);
     let (mut text, truncated) = match tail(&full) {
         Some((kept, n, total)) => (format!("[output truncated: showing last {n} of {} lines; full output saved to {}]\n{kept}", total_lines.unwrap_or(total), out_path.display()), true),
@@ -485,6 +574,30 @@ mod tests {
         *env.perm.reply.lock().unwrap() = Err(ToolError::Declined);
         assert_eq!(run(&env, json!({"command":"sleep 5","background":true})).unwrap_err(), ToolError::Declined);
         assert_eq!(env.host.shells.lock().unwrap().len(), 1, "a declined command is never started");
+    }
+
+    #[test]
+    fn a_timeout_fires_on_time_between_checks() {
+        let env = Env::new();
+        let out = env.work().join("timeout.txt");
+        let mut child = spawn("sleep 10", &env.work(), &out, None, &[]).unwrap();
+        let t = Instant::now();
+        let f = wait(&mut child, &out, Some(Duration::from_millis(250)), &|| false, false);
+        let took = t.elapsed();
+        assert!(f.timed_out && f.signal.is_some(), "{}", f.text);
+        // Checks run every CHECK_INTERVAL, but the sleep is cut short at the deadline.
+        assert!(took >= Duration::from_millis(250) && took < Duration::from_millis(1500), "took {took:?}");
+    }
+
+    #[test]
+    fn a_command_that_exits_ends_the_wait_promptly() {
+        let env = Env::new();
+        let out = env.work().join("quick.txt");
+        let mut child = spawn("sleep 0.3", &env.work(), &out, None, &[]).unwrap();
+        let t = Instant::now();
+        let f = wait(&mut child, &out, None, &|| false, false);
+        assert_eq!(f.exit, Some(0));
+        assert!(t.elapsed() < Duration::from_millis(2000), "took {:?}", t.elapsed());
     }
 
     #[test]

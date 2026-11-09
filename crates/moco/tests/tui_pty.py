@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Drives `moco --tui` in a pseudo terminal: prompt, permission dialog, streamed answer, resize, quit.
 
-Usage: tui_pty.py MOCO CONFIG HOME WORKDIR SCENARIO    (SCENARIO: chat | sigterm | hangup | hangup-idle | steer | config | mode | suggest | newsession | panic)
+Usage: tui_pty.py MOCO CONFIG HOME WORKDIR SCENARIO    (SCENARIO: chat | sigterm | hangup | hangup-idle | idle | steer | config | mode | suggest | newsession | panic)
 Exits 0 when everything held; otherwise prints what went wrong and the screen text so far."""
 import fcntl, json, os, pty, re, select, signal, struct, sys, termios, time
 
@@ -232,6 +232,38 @@ elif scenario == "chat":
     send(b"\x1b[B\x05\x15")  # back down, End, clear the second
     pump(0.3)
     send(b"\x04")  # Ctrl-D on an empty composer
+    check_restored(wait_exit())
+elif scenario == "idle":
+    # An idle screen is not redrawn: nothing is written to the terminal while nothing happens (every tick used to write a
+    # cursor update). The animations must come back when there is something to animate.
+    def quiet_for(seconds, settle=10):
+        # Wait until a window passes without output, then require that the next `seconds` are silent too.
+        end = time.time() + settle
+        while True:
+            n = len(raw)
+            pump(1.5)
+            if len(raw) == n:
+                break
+            if time.time() > end:
+                fail("the terminal was still being written to %d s after the last event" % settle)
+        n = len(raw)
+        pump(seconds)
+        if len(raw) != n:
+            fail("an idle moco wrote %d bytes to the terminal in %d s: %r" % (len(raw) - n, seconds, raw[n:][:200]))
+
+    quiet_for(3)
+    send(b"hello")
+    wait_for(r"hello")  # keys still draw
+    quiet_for(2)
+    send(b"\x15")  # Ctrl-U clears the composer
+    pump(0.5)
+    send(b"Read a.txt and tell me what it says.\r")
+    wait_for(r"permissionneeded:read")
+    send(b"y")
+    wait_for(r"Thefilesays:ONE-LINE-OF-TEXT")
+    wait_for(r"in·\d+out")
+    quiet_for(3)  # the turn is over: the spinner stops and so does the output
+    send(b"\x04")
     check_restored(wait_exit())
 elif scenario == "newsession":
     # A prompt typed after /new must run in the new session (it used to be queued in the old one, so nothing happened).

@@ -74,6 +74,11 @@ fn a_hung_up_terminal_ends_moco_at_an_idle_prompt() {
 }
 
 #[test]
+fn an_idle_screen_is_not_redrawn() {
+    scenario("idle");
+}
+
+#[test]
 fn prompts_typed_during_a_turn_are_steered_or_queued_and_delivered() {
     scenario("steer");
 }
