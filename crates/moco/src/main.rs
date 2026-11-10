@@ -360,15 +360,25 @@ fn pick_session(store: &Store, token: &str, last: &[SessionSummary]) -> Result<S
 /// May a command that a *project's* config defines run? Such a command executes with your permissions, so it needs your
 /// approval: asked once in a terminal (`y` this time, `a` always for this project and this exact definition, anything
 /// else no) and remembered in the trust store. Without a terminal nobody can be asked: it stays off unless
-/// `MOCO_TRUST_PROJECT_CONFIG=1` (or the older `MOCO_TRUST_PROJECT_MCP=1`) is set.
-fn project_command_allowed(app_dir: &std::path::Path, origin: Option<&std::path::PathBuf>, what_kind: &str, name: &str, command: &str, fingerprint: &str) -> bool {
+/// `MOCO_TRUST_PROJECT_CONFIG=1` (or the older `MOCO_TRUST_PROJECT_MCP=1`) is set. `details` lists everything the
+/// fingerprint covers (`trust::describe_*`); it is only built when someone is asked.
+fn project_command_allowed(app_dir: &std::path::Path, origin: Option<&std::path::PathBuf>, what_kind: &str, name: &str, details: &dyn Fn() -> Vec<String>, fingerprint: &str) -> bool {
     if ["MOCO_TRUST_PROJECT_CONFIG", "MOCO_TRUST_PROJECT_MCP"].iter().any(|v| std::env::var(v).is_ok_and(|x| x == "1")) || trust::is_trusted(app_dir, fingerprint) {
         return true;
     }
     if !std::io::stdin().is_terminal() {
         return false;
     }
-    println!("The project config {} wants to run a {what_kind} '{name}':\n  {command}\nIt would run on your machine with your permissions.", origin.map(|o| tilde(&o.display().to_string())).unwrap_or_default());
+    let (verb, consequence) = if what_kind.starts_with("remote") {
+        ("connect to", "moco would connect with the settings above and let the model use its tools.")
+    } else {
+        ("run", "It would run on your machine with your permissions.")
+    };
+    println!("The project config {} wants to {verb} a {what_kind} '{}':", origin.map(|o| tilde(&o.display().to_string())).unwrap_or_default(), trust::shown(name));
+    for line in details() {
+        println!("  {line}");
+    }
+    println!("{consequence} Changing any of the above asks again.");
     print!("Allow it? [y] this time  [a] always for this project  [N] no: ");
     let _ = std::io::stdout().flush();
     let mut ans = String::new();
@@ -389,8 +399,9 @@ fn mcp_specs(cfg: &config::Config, origins: &std::collections::BTreeMap<String, 
     for (name, scfg) in &cfg.mcp.servers {
         let origin = origins.get(name);
         let trusted = scfg.disabled || origin.is_none_or(|o| trust::origin_is_trusted(o, app_dir));
-        let what = if scfg.is_remote() { scfg.url.clone().unwrap_or_default() } else { scfg.command.join(" ") };
-        if trusted || project_command_allowed(app_dir, origin, "MCP server", name, &what, &trust::fingerprint(cwd, name, scfg)) {
+        let kind = if scfg.is_remote() { "remote MCP server" } else { "MCP server" };
+        let details = || trust::describe_server(cwd, scfg, origin.and_then(|o| trust::raw_definition(o, &["mcp", "servers", name])).as_ref());
+        if trusted || project_command_allowed(app_dir, origin, kind, name, &details, &trust::fingerprint(cwd, name, scfg)) {
             specs.push(ServerSpec { name: name.clone(), config: scfg.clone(), cwd: cwd.to_path_buf() });
         } else {
             warnings.push(format!("MCP server '{name}' from {} was not started: project-defined commands need your approval (run moco in a terminal, or set MOCO_TRUST_PROJECT_CONFIG=1)", origin.map(|o| tilde(&o.display().to_string())).unwrap_or_default()));
@@ -409,8 +420,8 @@ fn formatters_from(cfg: &config::Config, origins: &std::collections::BTreeMap<St
         if origin.is_none_or(|o| trust::origin_is_trusted(o, app_dir)) {
             return true;
         }
-        let what = format!("{}   (for {})", fc.command.join(" "), fc.extensions.join(" "));
-        let ok = project_command_allowed(app_dir, origin, "formatter", name, &what, &trust::fingerprint_formatter(cwd, name, fc));
+        let details = || trust::describe_formatter(cwd, fc, origin.and_then(|o| trust::raw_definition(o, &["formatter", name])).as_ref());
+        let ok = project_command_allowed(app_dir, origin, "formatter", name, &details, &trust::fingerprint_formatter(cwd, name, fc));
         if !ok {
             warnings.borrow_mut().push(format!("formatter '{name}' from {} is off: project-defined commands need your approval (run moco in a terminal, or set MOCO_TRUST_PROJECT_CONFIG=1)", origin.map(|o| tilde(&o.display().to_string())).unwrap_or_default()));
         }
@@ -429,8 +440,8 @@ fn checks_from(cfg: &config::Config, origins: &std::collections::BTreeMap<String
         if origin.is_none_or(|o| trust::origin_is_trusted(o, app_dir)) {
             return true;
         }
-        let what = format!("{}   (for {})", cc.command.join(" "), cc.extensions.join(" "));
-        let ok = project_command_allowed(app_dir, origin, "check", name, &what, &trust::fingerprint_check(cwd, name, cc));
+        let details = || trust::describe_check(cwd, cc, origin.and_then(|o| trust::raw_definition(o, &["checks", name])).as_ref());
+        let ok = project_command_allowed(app_dir, origin, "check", name, &details, &trust::fingerprint_check(cwd, name, cc));
         if !ok {
             warnings.borrow_mut().push(format!("check '{name}' from {} is off: project-defined commands need your approval (run moco in a terminal, or set MOCO_TRUST_PROJECT_CONFIG=1)", origin.map(|o| tilde(&o.display().to_string())).unwrap_or_default()));
         }
@@ -814,7 +825,7 @@ fn main() {
     if let (Some(sh), None) = (&cfg.shell, std::env::var_os("MOCO_SHELL")) {
         // A project's `shell` is an executable that every shell call would run, so it needs approval like an MCP server.
         let origin = loaded.shell_origin.as_ref();
-        if origin.is_none_or(|o| trust::origin_is_trusted(o, &app_dir)) || project_command_allowed(&app_dir, origin, "shell", "shell", sh, &trust::fingerprint_shell(&cwd, sh)) {
+        if origin.is_none_or(|o| trust::origin_is_trusted(o, &app_dir)) || project_command_allowed(&app_dir, origin, "shell", "shell", &|| trust::describe_shell(&cwd, sh), &trust::fingerprint_shell(&cwd, sh)) {
             std::env::set_var("MOCO_SHELL", sh);
         } else {
             eprintln!("warning: shell '{sh}' from {} is ignored: project-defined commands need your approval (run moco in a terminal, or set MOCO_TRUST_PROJECT_CONFIG=1)", origin.map(|o| tilde(&o.display().to_string())).unwrap_or_default());
