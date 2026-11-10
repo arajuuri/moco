@@ -156,7 +156,7 @@ The model can run a long command in the background (`shell` with `background: tr
 
 ## Configuration
 
-Files named `moco.json` or `moco.jsonc` (comments and trailing commas allowed), merged from lowest to highest priority: `~/Library/Application Support/moco/config/`, then every parent directory of the working directory (and its `.moco/` subdirectory) outermost first, then `$MOCO_CONFIG`. `{env:NAME}` and `{file:path}` are substituted in the text. Objects merge by key; `permissions` and `instructions` lists add up.
+Files named `moco.json` or `moco.jsonc` (comments and trailing commas allowed), merged from lowest to highest priority: `~/Library/Application Support/moco/config/`, then every parent directory of the working directory (and its `.moco/` subdirectory) outermost first, then `$MOCO_CONFIG`. `{env:NAME}` and `{file:path}` are substituted in the text of your own config files (not in a project's, so a cloned repository cannot read your keys or files into a URL or header it chooses). A project's config also cannot change `websearch` (except `false` and `max_results`), provider endpoints, keys, headers or request overlays, or name `instructions` files outside the project; such keys are ignored with a warning. Objects merge by key; `permissions` and `instructions` lists add up.
 
 ```jsonc
 {
