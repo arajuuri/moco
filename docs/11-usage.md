@@ -163,7 +163,7 @@ Files named `moco.json` or `moco.jsonc` (comments and trailing commas allowed), 
   "model": "anthropic/claude-sonnet-5-5",
   "small_model": "anthropic/claude-haiku-5-5",          // titles
   "default_agent": "build",
-  "permission_mode": "manual",                           // default for new sessions: see docs/05-permissions.md
+  "permission_mode": "manual",                           // default for new sessions (a project's config may only say manual): see docs/05-permissions.md
   "shell": "/bin/zsh",
   "permissions": [                                       // last matching rule wins
     { "action": "shell", "resource": "ls *", "effect": "allow" },
