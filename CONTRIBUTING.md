@@ -127,7 +127,8 @@ To strict semver tools `0.1.0-12-g...` reads as a pre-release of 0.1.0; it is on
    gh workflow run release.yml --ref main
    ```
    It tags the head of `main` `v0.2.0` (from the `Cargo.toml` number), builds the macOS binary at that tag (so it
-   reports exactly `0.2.0`), runs the 10.7 checks (`scripts/check-macos-binary.sh`), and only then pushes the tag and
+   reports exactly `0.2.0`) with the classic linker that Lion needs (#113), runs the 10.7 checks
+   (`scripts/check-macos-binary.sh`), and only then pushes the tag and
    publishes a GitHub release with `moco-0.2.0-macos-x86_64.tar.gz` and its SHA-256. A failed run leaves no tag. If
    `v0.2.0` already tags another commit, the run stops: bump the version. Running it again on the tagged commit
    rebuilds and replaces the release files. Download with `gh release download v0.2.0`.
