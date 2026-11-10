@@ -902,7 +902,8 @@ fn main() {
     for w in &mcp_warnings {
         eprintln!("warning: {w}");
     }
-    let manager: Option<std::sync::Arc<Manager>> = (!mcp_specs.is_empty()).then(|| Manager::start(mcp_specs, &cfg.mcp.timeout, &app_dir));
+    // The merged catalog's key variables, so providers defined only in config are kept from MCP servers too (#122).
+    let manager: Option<std::sync::Arc<Manager>> = (!mcp_specs.is_empty()).then(|| Manager::start_with_provider_keys(mcp_specs, &cfg.mcp.timeout, &app_dir, engine_cfg.catalog.key_env_vars()));
     if let Some(m) = &manager {
         // Tools are fixed once a conversation starts, so wait for the servers instead of letting them appear mid-way.
         let wait = std::time::Duration::from_millis(cfg.mcp.timeout.startup.unwrap_or(30_000) + 2_000);
