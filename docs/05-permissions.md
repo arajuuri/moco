@@ -56,7 +56,9 @@ A switch applies from the next step of a run: a tool call already running is not
 - **manual** (default): `*` asks. Allowed without a prompt: `read`, `glob`, `grep`, `question`, `todowrite`, `skill`. Reading `.env` files asks, `.env.example` is allowed, `websearch` asks, and so does `external_directory` (it falls under `*`).
 - **auto**: the upstream default ruleset below. Everything is allowed except `.env` reads and `websearch`.
 
-The `explore` subagent denies `shell` in both modes, because a shell command can write and the rules must enforce its read-only role.
+The `explore` subagent denies `shell` in both modes, because a shell command can write and the rules must enforce its read-only role. Its rules come after the mode and the preset, so they never allow what those ask for: `webfetch` and `external_directory` ask, and so do reads of credentials (`auth.json`, `mcp-auth.json`, `~/.ssh`, `~/.aws`, ...; `agent.rs`, #115).
+
+`webfetch.private` (moco): a `webfetch` hop to a host that is or resolves to a non-public address (loopback, RFC 1918, link-local incl. `169.254.169.254`, IPv6 ULA, ...; `tools/webfetch.rs::is_local`) is also checked under this action, resource the URL, save `<origin>` and `<origin>/*`. It asks in both modes (`default_rules` has the ask, like `shell.unsandboxed`). The connection goes to the addresses that were checked.
 
 Not done: the automatic check that is meant to replace the prompt in auto mode.
 

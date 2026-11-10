@@ -61,6 +61,49 @@ Guidelines:
 
 Complete the user's search request efficiently and report your findings clearly.";
 
+/// Credentials a code search never needs: moco's own keys (`auth.json`, `mcp-auth.json`, by name, so they match
+/// wherever `MOCO_HOME` puts the data directory), SSH and GPG keys, cloud and registry credentials, the keychains.
+/// Each is matched both inside the project (a relative name) and outside it (an absolute one).
+const SECRET_DIRS: &[&str] = &[".ssh", ".gnupg", ".aws", ".azure", ".config/gcloud", ".kube", ".docker", ".password-store", "Library/Keychains"];
+const SECRET_FILES: &[&str] = &["auth.json", "mcp-auth.json", ".netrc", ".git-credentials", ".pgpass", ".npmrc", ".pypirc"];
+
+/// The explore agent's rules, appended after the mode rules and so also after the permission preset, which
+/// `config::resolve_agents_in` splices in right after the mode rules. They deny everything except searching and
+/// reading, and they never grant more than the parent agent gets (#115): what manual mode or the careful preset asks
+/// for (web fetches, directories outside the project) asks here too, and reading credentials always asks, because
+/// this agent reads the most untrusted text. Explore is stricter than its parent only in auto mode with
+/// `permission_preset: "trusted"`, where it still asks for these. Your own `permissions` come later and can allow them.
+fn explore_rules() -> Vec<Rule> {
+    let mut rules = vec![
+        Rule::new("*", "*", Effect::Deny),
+        // No shell: a command can write, and the rules (not the prompt) must keep this agent read-only.
+        Rule::new("shell", "*", Effect::Deny),
+        Rule::new("grep", "*", Effect::Allow),
+        Rule::new("glob", "*", Effect::Allow),
+        Rule::new("read", "*", Effect::Allow),
+        Rule::new("read", "*.env", Effect::Ask),
+        Rule::new("read", "*.env.*", Effect::Ask),
+        Rule::new("read", "*.env.example", Effect::Allow),
+    ];
+    for d in SECRET_DIRS {
+        for p in [d.to_string(), format!("{d}/*"), format!("*/{d}"), format!("*/{d}/*")] {
+            rules.push(Rule::new("read", &p, Effect::Ask));
+        }
+    }
+    for f in SECRET_FILES {
+        rules.push(Rule::new("read", f, Effect::Ask));
+        rules.push(Rule::new("read", &format!("*/{f}"), Effect::Ask));
+    }
+    rules.extend([
+        Rule::new("webfetch", "*", Effect::Ask),
+        Rule::new("webfetch.private", "*", Effect::Ask),
+        Rule::new("websearch", "*", Effect::Ask),
+        Rule::new("external_directory", "*", Effect::Ask),
+        Rule::new("subagent", "*", Effect::Deny),
+    ]);
+    rules
+}
+
 /// The built-in agents with the default permission mode.
 pub fn builtin() -> Vec<Agent> {
     builtin_for(PermissionMode::default())
@@ -77,21 +120,7 @@ pub fn builtin_for(mode: PermissionMode) -> Vec<Agent> {
     general.push(Rule::new("question", "*", Effect::Deny));
     general.push(Rule::new("subagent", "*", Effect::Deny));
     let mut explore = crate::permission::mode_rules(mode);
-    explore.extend([
-        Rule::new("*", "*", Effect::Deny),
-        // No shell: a command can write, and the rules (not the prompt) must keep this agent read-only.
-        Rule::new("shell", "*", Effect::Deny),
-        Rule::new("grep", "*", Effect::Allow),
-        Rule::new("glob", "*", Effect::Allow),
-        Rule::new("webfetch", "*", Effect::Allow),
-        Rule::new("websearch", "*", Effect::Ask),
-        Rule::new("read", "*", Effect::Allow),
-        Rule::new("read", "*.env", Effect::Ask),
-        Rule::new("read", "*.env.*", Effect::Ask),
-        Rule::new("read", "*.env.example", Effect::Allow),
-        Rule::new("subagent", "*", Effect::Deny),
-        Rule::new("external_directory", "*", Effect::Allow),
-    ]);
+    explore.extend(explore_rules());
     vec![
         Agent {
             id: "build".into(),
@@ -314,8 +343,76 @@ mod tests {
         assert_eq!(evaluate("read", ".env", &ex.permissions), Effect::Ask);
         assert_eq!(evaluate("read", ".env.example", &ex.permissions), Effect::Allow);
         assert_eq!(evaluate("subagent", "general", &ex.permissions), Effect::Deny);
-        assert_eq!(evaluate("external_directory", "/etc/*", &ex.permissions), Effect::Allow);
+        assert_eq!(evaluate("external_directory", "/etc/*", &ex.permissions), Effect::Ask);
+        assert_eq!(evaluate("webfetch", "https://example.com/", &ex.permissions), Effect::Ask);
         assert!(ex.system.as_deref().unwrap().starts_with("You are a file search specialist"));
+    }
+
+    /// #115: explore's rules come after the mode and the preset, so they must not allow what those ask for.
+    #[test]
+    fn explore_never_gets_more_than_its_parent() {
+        use crate::permission::{evaluate, PermissionMode};
+        let probes = [
+            ("read", "src/main.rs"),
+            ("grep", "fn main"),
+            ("glob", "**/*.rs"),
+            ("webfetch", "https://evil.example/?d=key"),
+            ("webfetch.private", "http://169.254.169.254/latest/meta-data/"),
+            ("websearch", "x"),
+            ("external_directory", "/Users/me/Library/Application Support/moco/*"),
+            ("external_directory", "/home/me/.ssh/*"),
+        ];
+        let rank = |e: Effect| match e {
+            Effect::Deny => 0,
+            Effect::Ask => 1,
+            Effect::Allow => 2,
+        };
+        for preset in [None, Some("careful"), Some("trusted")] {
+            let cfg: crate::config::Config = serde_json::from_value(serde_json::json!({ "permission_preset": preset })).unwrap();
+            for mode in [PermissionMode::Manual, PermissionMode::Auto] {
+                let agents = crate::config::resolve_agents_in(&cfg, mode);
+                let perms = |id: &str| find(&agents, id).unwrap().permissions;
+                let (build, explore) = (perms("build"), perms("explore"));
+                for (action, resource) in probes {
+                    let (b, e) = (evaluate(action, resource, &build), evaluate(action, resource, &explore));
+                    assert!(rank(e) <= rank(b), "{mode:?} {preset:?}: explore {e:?} but build {b:?} for {action} {resource}");
+                }
+                assert_eq!(evaluate("read", "src/main.rs", &explore), Effect::Allow, "explore still reads the project");
+                for action in ["webfetch", "external_directory"] {
+                    assert_eq!(evaluate(action, "x", &explore), Effect::Ask, "{mode:?} {preset:?}: {action}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn explore_asks_before_reading_credentials() {
+        use crate::permission::evaluate;
+        for mode in [crate::permission::PermissionMode::Manual, crate::permission::PermissionMode::Auto] {
+            let ex = find(&builtin_for(mode), "explore").unwrap().permissions;
+            for path in [
+                "/Users/me/Library/Application Support/moco/auth.json",
+                "/tmp/moco-home/mcp-auth.json",
+                "auth.json",
+                "/Users/me/.ssh/id_ed25519",
+                "/Users/me/.ssh",
+                ".ssh/config",
+                "/Users/me/.aws/credentials",
+                "/Users/me/.gnupg/private-keys-v1.d/x.key",
+                "/Users/me/.config/gcloud/application_default_credentials.json",
+                "/Users/me/Library/Keychains/login.keychain-db",
+                "/Users/me/.netrc",
+                "/Users/me/.git-credentials",
+                "/Users/me/.docker/config.json",
+                "/Users/me/.kube/config",
+                "app/.env",
+            ] {
+                assert_eq!(evaluate("read", path, &ex), Effect::Ask, "{mode:?}: {path}");
+            }
+            for path in ["src/auth.rs", "docs/ssh.md", "src/aws/client.rs", "/Users/me/src/x/README.md", ".env.example"] {
+                assert_eq!(evaluate("read", path, &ex), Effect::Allow, "{mode:?}: {path}");
+            }
+        }
     }
 
     #[test]

@@ -126,7 +126,7 @@ Anthropic's current models take `low` to `max` (and `none` where thinking can be
 
 ## Web search
 
-The assistant can search the web with the `websearch` tool and read pages with `webfetch`. By default it uses DuckDuckGo, which needs no account or key. **moco asks before every new kind of search** (your words are sent to the search service); answer `a` to allow searches for the project, or add `{ "action": "websearch", "resource": "*", "effect": "allow" }` to `permissions` in the config.
+The assistant can search the web with the `websearch` tool and read pages with `webfetch`. By default it uses DuckDuckGo, which needs no account or key. **moco asks before every new kind of search** (your words are sent to the search service); answer `a` to allow searches for the project, or add `{ "action": "websearch", "resource": "*", "effect": "allow" }` to `permissions` in the config. A fetch from this machine or its network (a host that is or resolves to a loopback, private, link-local or similar address, such as `localhost`, `192.168.x.x` or the cloud metadata address `169.254.169.254`, also when a redirect leads there) asks for `webfetch.private` in every mode; `a` allows that origin for the project.
 
 ```jsonc
 { "websearch": { "provider": "brave", "max_results": 8 } }   // duckduckgo (default), brave, tavily, exa, searxng
