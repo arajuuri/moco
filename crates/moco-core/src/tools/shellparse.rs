@@ -24,7 +24,9 @@ pub struct Command {
     pub text: String,
     /// Unquoted words, same filtering.
     pub words: Vec<String>,
-    /// Directory targets of cd/pushd/popd/chdir and `git -C`/`--git-dir`/`--work-tree`.
+    /// Places that get the external-directory check: directory targets of cd/pushd/popd/chdir and `git
+    /// -C`/`--git-dir`/`--work-tree`, input redirection targets, and the files and directories that read commands
+    /// (`cat`, `head`, `grep`, `rg`...) read (issue #117).
     pub dirs: Vec<String>,
 }
 
@@ -407,6 +409,9 @@ fn expand(pairs: &[(String, String)], depth: usize, opaque: &mut bool, nested: &
         changed = pairs[i..].iter().enumerate().any(|(k, (raw, val))| raw != val && (k < n || val.starts_with('-')));
     }
     dirs.extend(dirs_of(&words));
+    let (read, secret) = read_paths(pairs, i, &name);
+    dirs.extend(read);
+    *opaque |= secret;
 
     let follow = |script: &str, opaque: &mut bool, nested: &mut Vec<Command>| {
         let inner = parse_at(script, depth + 1);
@@ -416,6 +421,14 @@ fn expand(pairs: &[(String, String)], depth: usize, opaque: &mut bool, nested: &
     let arithmetic = ["-eq", "-ne", "-lt", "-le", "-gt", "-ge"];
     match name.as_str() {
         "let" => *opaque = true,
+        // `export GIT_EXTERNAL_DIFF=x` changes later commands just as `GIT_EXTERNAL_DIFF=x` does; an alias or a `hash
+        // -p` entry changes which program a later name runs, and `enable -f` loads a builtin from a library.
+        "declare" | "typeset" | "local" | "export" | "readonly" if rest.iter().any(|w| is_assignment(w) && is_risky_assignment(w)) => *opaque = true,
+        "alias" if rest.iter().any(|w| w.contains('=')) => *opaque = true,
+        "hash" | "enable" if rest.iter().any(|w| w.starts_with('-') && w.contains(['p', 'f'])) => *opaque = true,
+        // A file named like an option (`--pre=sh`, which a cloned repository can contain) becomes one when an
+        // unquoted glob or a variable expands to it, and rg's `--pre` runs a program on every file it searches.
+        "rg" if pairs[i + 1..].iter().take_while(|(_, v)| v != "--").any(|(raw, _)| raw.starts_with(['*', '?', '[', '{', '$']) || raw.starts_with("\"$")) => *opaque = true,
         "[[" if rest.iter().any(|w| arithmetic.contains(&w.as_str())) => *opaque = true,
         "declare" | "typeset" | "local" | "export" | "readonly" if rest.iter().any(|w| w.starts_with('-') && w.contains('i')) => *opaque = true,
         "eval" => follow(&rest.join(" "), opaque, nested),
@@ -453,16 +466,21 @@ fn is_assignment(w: &str) -> bool {
     }
 }
 
-/// Variables that change which executable, library, startup file or helper program runs.
+/// Variables that change which executable, library, startup file, config file or helper program runs. Cargo reads
+/// its whole config from `CARGO_*` (`CARGO_BUILD_RUSTC_WRAPPER`, `CARGO_TARGET_<triple>_RUNNER`...), so only the
+/// settings that cannot run anything are left out.
 fn is_risky_assignment(w: &str) -> bool {
     let k = w.split_once('=').map_or(w, |(k, _)| k);
+    const CARGO_SAFE: &[&str] = &["CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "CARGO_BUILD_JOBS", "CARGO_NET_OFFLINE", "CARGO_LOG"];
     k.starts_with("LD_") || k.starts_with("DYLD_") || k.starts_with("BASH_FUNC_") || k.starts_with("GIT_") || k.starts_with("NPM_CONFIG_")
+        || (k.starts_with("CARGO_") && !CARGO_SAFE.contains(&k) && !k.starts_with("CARGO_TERM_"))
         || matches!(
             k,
             "PATH" | "BASH_ENV" | "ENV" | "IFS" | "SHELLOPTS" | "BASHOPTS" | "PS4" | "PROMPT_COMMAND" | "CDPATH" | "GLOBIGNORE"
-                | "PYTHONPATH" | "PYTHONSTARTUP" | "PYTHONHOME" | "NODE_OPTIONS" | "NODE_PATH" | "RUBYOPT" | "RUBYLIB"
-                | "PERL5OPT" | "PERL5LIB" | "RUSTC" | "RUSTC_WRAPPER" | "RUSTFLAGS" | "PAGER" | "MANPAGER" | "EDITOR"
-                | "VISUAL" | "LESSOPEN" | "SSH_ASKPASS" | "HOME" | "SHELL"
+                | "ZDOTDIR" | "PYTHONPATH" | "PYTHONSTARTUP" | "PYTHONHOME" | "NODE_OPTIONS" | "NODE_PATH" | "RUBYOPT" | "RUBYLIB"
+                | "PERL5OPT" | "PERL5LIB" | "PERL5DB" | "RUSTC" | "RUSTC_WRAPPER" | "RUSTC_WORKSPACE_WRAPPER" | "RUSTFLAGS"
+                | "RUSTDOC" | "RUSTDOCFLAGS" | "PAGER" | "MANPAGER" | "MANOPT" | "EDITOR" | "VISUAL" | "LESS" | "LESSOPEN"
+                | "LESSCLOSE" | "SSH_ASKPASS" | "SUDO_ASKPASS" | "HOME" | "XDG_CONFIG_HOME" | "SHELL" | "RIPGREP_CONFIG_PATH"
         )
 }
 
@@ -519,6 +537,426 @@ fn is_in_place_writer(words: &[String]) -> bool {
     words.iter().skip(1).any(|w| {
         w == "--in-place" || w == "-i" || w == "-pi" || w == "-ip" || w.starts_with("-i") || w.starts_with("-pi") || w.starts_with("-ip")
     })
+}
+
+/// `w` is the long option `full` (with or without `=value`) or an abbreviation of it at least `min` characters long:
+/// GNU getopt and git take any unambiguous prefix (`sort --o=x` is `sort --output=x`).
+fn long_opt(w: &str, full: &str, min: usize) -> bool {
+    let key = w.split_once('=').map_or(w, |(k, _)| k);
+    key.starts_with("--") && key.len() >= min && full.starts_with(key)
+}
+
+/// The words before a `--`, after which nothing is an option.
+fn options_part(args: &[String]) -> &[String] {
+    &args[..args.iter().position(|w| w == "--").unwrap_or(args.len())]
+}
+
+/// A cluster of short options (`-no`) that has one of `letters` before any of `stop`, which takes the rest of the
+/// word as its argument.
+fn short_has(w: &str, letters: &str, stop: &str) -> bool {
+    let Some(cluster) = w.strip_prefix('-').filter(|c| !c.is_empty() && !c.starts_with('-')) else { return false };
+    for c in cluster.chars() {
+        if letters.contains(c) {
+            return true;
+        }
+        if stop.contains(c) {
+            return false;
+        }
+    }
+    false
+}
+
+/// Options and scripts that make a command that looks read-only run another program or write a file that the command
+/// line does not show as a write (issue #117): `git log --output=~/.zshrc`, `git diff --ext-diff`, `git config`
+/// writes, `rg --pre sh`, `cargo test --config 'target.x.runner="..."'`, `sort -o`, `sed 'w file'` and `sed 'e cmd'`,
+/// awk's `system()`, `print > "file"` and pipes, `find -fprint`, `man -P`. Such a command is opaque, like `sed -i`.
+fn runs_or_writes_through_options(words: &[String]) -> bool {
+    let Some(first) = words.first() else { return false };
+    let args = &words[1..];
+    let opts = options_part(args);
+    let any = |full: &str, min: usize| opts.iter().any(|w| long_opt(w, full, min));
+    match program_name(first) {
+        "git" => git_runs_or_writes(args),
+        "rg" => opts.iter().any(|w| matches!(w.split_once('=').map_or(w.as_str(), |(k, _)| k), "--pre" | "--pre-glob" | "--hostname-bin")),
+        // clap does not take abbreviations.
+        "cargo" => opts.iter().any(|w| w == "--config" || w.starts_with("--config=")),
+        "sort" | "gsort" => any("--output", 3) || any("--compress-program", 4) || opts.iter().any(|w| short_has(w, "o", "ktST")),
+        "sed" | "gsed" => sed_runs_or_writes(args),
+        "awk" | "gawk" | "mawk" | "nawk" => awk_runs_or_writes(args),
+        "find" | "gfind" => args.iter().any(|w| matches!(w.as_str(), "-fprint" | "-fprint0" | "-fprintf" | "-fls")),
+        "man" => any("--pager", 4) || any("--html", 4) || opts.iter().any(|w| short_has(w, "PH", "")),
+        "sdiff" => any("--output", 3) || any("--diff-program", 4) || opts.iter().any(|w| short_has(w, "o", "w")),
+        _ => false,
+    }
+}
+
+/// git subcommand options that write a file (`--output` of diff, log, show..., `archive -o`) or run a program
+/// (`--ext-diff` runs `diff.external`, `grep -O` a pager, `rebase -x`, `--upload-pack`/`--receive-pack`/`--exec` a
+/// helper), and `git config` writes, which can set `core.fsmonitor`, `diff.external` or an alias that a later `git
+/// status` or `git diff` runs.
+fn git_runs_or_writes(args: &[String]) -> bool {
+    // `None`: options that run programs or that the parser does not know, which `expand` already made opaque.
+    let Some((g, _)) = git_globals(args) else { return false };
+    let Some(sub) = args.get(g) else { return false };
+    let rest = &args[g + 1..];
+    let opts = options_part(rest);
+    let any = |full: &str, min: usize| opts.iter().any(|w| long_opt(w, full, min));
+    any("--output", 4)
+        || any("--ext-diff", 5)
+        || any("--upload-pack", 4)
+        || any("--receive-pack", 4)
+        || opts.iter().any(|w| w == "--exec" || w.starts_with("--exec="))
+        || (sub == "grep" && (any("--open-files-in-pager", 4) || opts.iter().any(|w| short_has(w, "O", "efABCm"))))
+        || (sub == "rebase" && opts.iter().any(|w| short_has(w, "x", "sXCS")))
+        || (sub == "archive" && opts.iter().any(|w| short_has(w, "o", "")))
+        || (sub == "config" && git_config_writes(rest))
+}
+
+/// `git config` that changes a config file rather than reading it: a name and a value, `set`, `unset`, `edit`..., or an
+/// option other than the reading ones.
+fn git_config_writes(args: &[String]) -> bool {
+    const READ: &[&str] = &["--get", "--get-all", "--get-regexp", "--get-urlmatch", "--get-color", "--get-colorbool", "--list", "-l"];
+    const FLAGS: &[&str] = &[
+        "--global", "--system", "--local", "--worktree", "--includes", "--no-includes", "--show-origin", "--show-scope", "--name-only", "--null",
+        "-z", "--bool", "--int", "--bool-or-int", "--path", "--expiry-date", "--all",
+    ];
+    const ARGS: &[&str] = &["--file", "-f", "--blob", "--type", "--default"];
+    if args.iter().any(|w| READ.contains(&w.as_str())) {
+        return false;
+    }
+    let mut positional = vec![];
+    let mut i = 0;
+    while let Some(w) = args.get(i) {
+        i += 1;
+        if !w.starts_with('-') {
+            positional.push(w.as_str());
+            continue;
+        }
+        let key = w.split_once('=').map_or(w.as_str(), |(k, _)| k);
+        if ARGS.contains(&key) {
+            i += usize::from(!w.contains('='));
+        } else if !FLAGS.contains(&key) {
+            return true;
+        }
+    }
+    match positional.first() {
+        Some(&"get" | &"list") => false,
+        Some(&"set" | &"unset" | &"edit" | &"rename-section" | &"remove-section") => true,
+        _ => positional.len() > 1,
+    }
+}
+
+/// sed scripts (`-e`, `--expression` or the first operand) that write a file (`w`, `W`, `s///w`) or run a command
+/// (GNU `e`, `s///e`), and in-place edits written in ways `is_in_place_writer` does not see (`-ni`, `--in-place=.bak`).
+/// A script read from a file (`-f`) is not known, so it counts too; GNU `--sandbox` turns all of them off.
+fn sed_runs_or_writes(args: &[String]) -> bool {
+    if options_part(args).iter().any(|w| long_opt(w, "--sandbox", 4)) {
+        return false;
+    }
+    let (mut scripts, mut explicit, mut first) = (vec![], false, None);
+    let mut i = 0;
+    while let Some(w) = args.get(i) {
+        i += 1;
+        if w == "--" {
+            first = first.or(args.get(i));
+            break;
+        }
+        if long_opt(w, "--file", 4) || long_opt(w, "--in-place", 4) {
+            return true;
+        }
+        if long_opt(w, "--expression", 3) {
+            explicit = true;
+            match w.split_once('=') {
+                Some((_, s)) => scripts.push(s.to_string()),
+                None => {
+                    scripts.extend(args.get(i).cloned());
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        if w.starts_with("--") {
+            i += usize::from(long_opt(w, "--line-length", 3) && !w.contains('='));
+            continue;
+        }
+        if let Some(cluster) = w.strip_prefix('-').filter(|c| !c.is_empty()) {
+            for (k, c) in cluster.char_indices() {
+                let rest = &cluster[k + c.len_utf8()..];
+                match c {
+                    'f' | 'i' => return true,
+                    'e' => {
+                        explicit = true;
+                        if rest.is_empty() {
+                            scripts.extend(args.get(i).cloned());
+                            i += 1;
+                        } else {
+                            scripts.push(rest.to_string());
+                        }
+                        break;
+                    }
+                    'l' => {
+                        i += usize::from(rest.is_empty());
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        first = first.or(Some(w));
+    }
+    if !explicit {
+        scripts.extend(first.cloned());
+    }
+    scripts.iter().any(|s| sed_script_runs_or_writes(s))
+}
+
+/// Past the closing `d` of a delimited part (regex, replacement) that starts at `cs[*i]`; false when it is not closed.
+fn skip_delimited(cs: &[char], i: &mut usize, d: char) -> bool {
+    while let Some(&c) = cs.get(*i) {
+        *i += 1;
+        if c == '\\' {
+            *i += 1;
+        } else if c == d {
+            return true;
+        }
+    }
+    false
+}
+
+/// Walks a sed script command by command: addresses, then the command letter and what belongs to it. Anything it
+/// does not recognize counts as running or writing (a wrong guess only asks).
+fn sed_script_runs_or_writes(script: &str) -> bool {
+    let cs: Vec<char> = script.chars().collect();
+    let skip_to = |i: &mut usize, end: &[char]| {
+        while cs.get(*i).is_some_and(|c| !end.contains(c)) {
+            *i += 1;
+        }
+    };
+    let mut i = 0;
+    loop {
+        while cs.get(i).is_some_and(|c| c.is_whitespace() || *c == ';') {
+            i += 1;
+        }
+        let Some(&start) = cs.get(i) else { return false };
+        let mut c = start;
+        // Addresses: line numbers, `$`, `/re/`, `\cREc`, ranges, steps, regex flags and negation.
+        loop {
+            match c {
+                '0'..='9' | '$' | ',' | '~' | '+' | '!' | 'I' | 'M' | ' ' | '\t' => i += 1,
+                '/' => {
+                    i += 1;
+                    if !skip_delimited(&cs, &mut i, '/') {
+                        return true;
+                    }
+                }
+                '\\' => {
+                    let Some(&d) = cs.get(i + 1) else { return true };
+                    i += 2;
+                    if !skip_delimited(&cs, &mut i, d) {
+                        return true;
+                    }
+                }
+                _ => break,
+            }
+            let Some(&next) = cs.get(i) else { return false };
+            c = next;
+        }
+        i += 1;
+        match c {
+            'w' | 'W' | 'e' => return true,
+            's' | 'y' => {
+                let Some(&d) = cs.get(i) else { return true };
+                i += 1;
+                if matches!(d, '\n' | '\\') || !skip_delimited(&cs, &mut i, d) || !skip_delimited(&cs, &mut i, d) {
+                    return true;
+                }
+                while let Some(&flag) = cs.get(i).filter(|f| !matches!(f, ';' | '\n' | '}')) {
+                    if c == 's' && matches!(flag, 'w' | 'e') {
+                        return true;
+                    }
+                    i += 1;
+                }
+            }
+            // Text to the end of the line; a backslash at the end continues it.
+            'a' | 'i' | 'c' => loop {
+                skip_to(&mut i, &['\n']);
+                if i < cs.len() && i > 0 && cs[i - 1] == '\\' {
+                    i += 1;
+                    continue;
+                }
+                break;
+            },
+            'r' | 'R' | '#' => skip_to(&mut i, &['\n']),
+            'b' | 't' | 'T' | ':' | 'v' => skip_to(&mut i, &[';', '\n', '}']),
+            'q' | 'Q' | 'l' | 'L' => {
+                while cs.get(i).is_some_and(|c| c.is_ascii_digit() || *c == ' ') {
+                    i += 1;
+                }
+            }
+            '{' | '}' | '=' | 'd' | 'D' | 'g' | 'G' | 'h' | 'H' | 'n' | 'N' | 'p' | 'P' | 'x' | 'z' | 'F' => {}
+            _ => return true,
+        }
+    }
+}
+
+/// awk programs that run commands or write files, and options other than `-F`, `-v` and gawk's `-e`/`--source`
+/// (`-f progfile`, gawk's `--load`, `-o file`, mawk's `-W exec`...), which count too.
+fn awk_runs_or_writes(args: &[String]) -> bool {
+    let (mut programs, mut explicit) = (vec![], false);
+    let mut i = 0;
+    while let Some(w) = args.get(i) {
+        i += 1;
+        if w == "--" {
+            programs.extend(args.get(i).filter(|_| !explicit).cloned());
+            break;
+        }
+        if w == "-" || !w.starts_with('-') {
+            if !explicit {
+                programs.push(w.clone());
+            }
+            break;
+        }
+        let (key, inline) = w.split_once('=').map_or((w.as_str(), None), |(k, v)| (k, Some(v)));
+        match key {
+            "--field-separator" | "--assign" => i += usize::from(inline.is_none()),
+            "--source" => {
+                explicit = true;
+                programs.extend(inline.map(String::from).or_else(|| args.get(i).cloned()));
+                i += usize::from(inline.is_none());
+            }
+            _ if w.starts_with("-F") || w.starts_with("-v") => i += usize::from(w.len() == 2),
+            "-e" => {
+                explicit = true;
+                programs.extend(args.get(i).cloned());
+                i += 1;
+            }
+            _ => return true,
+        }
+    }
+    programs.iter().any(|p| awk_program_runs_or_writes(p))
+}
+
+/// `system()`, a pipe to or from a command (`print | "sh"`, `"cmd" | getline`), gawk's `@load`, `@include` and
+/// indirect calls, and `>` in a `print` or `printf` statement outside parentheses, which writes to a file.
+fn awk_program_runs_or_writes(p: &str) -> bool {
+    let cs: Vec<char> = p.chars().collect();
+    let skip_until = |i: &mut usize, end: char| {
+        *i += 1;
+        while cs.get(*i).is_some_and(|&c| c != end) {
+            if cs[*i] == '\\' {
+                *i += 1;
+            }
+            *i += 1;
+        }
+    };
+    let (mut i, mut in_print, mut depth, mut prev) = (0, false, 0usize, None::<char>);
+    while let Some(&c) = cs.get(i) {
+        match c {
+            '"' => skip_until(&mut i, '"'),
+            // A regex literal (where a division could not stand); a `|` or `>` in it is not an operator.
+            '/' if prev.map_or(true, |p| "(,~!{};&|=".contains(p)) => skip_until(&mut i, '/'),
+            '#' => {
+                while cs.get(i).is_some_and(|&c| c != '\n') {
+                    i += 1;
+                }
+                continue;
+            }
+            '|' if cs.get(i + 1) == Some(&'|') => i += 1,
+            '|' | '@' => return true,
+            '>' if in_print && depth == 0 => return true,
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ';' | '\n' | '{' | '}' => (in_print, depth) = (false, 0),
+            c if c.is_ascii_alphabetic() || c == '_' => {
+                let start = i;
+                while cs.get(i + 1).is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_') {
+                    i += 1;
+                }
+                match cs[start..=i].iter().collect::<String>().as_str() {
+                    "print" | "printf" => (in_print, depth) = (true, 0),
+                    "system" => return true,
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        if !c.is_whitespace() {
+            prev = Some(c);
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Programs that print the files named as their operands (in whole or in part); `grep`, `egrep`, `fgrep` and `rg`
+/// take a pattern first.
+const READERS: &[&str] = &["cat", "tac", "head", "tail", "less", "more", "nl", "od", "xxd", "hexdump", "strings", "base64", "grep", "egrep", "fgrep", "rg"];
+
+/// The paths a command (`pairs`, its `(raw, unquoted)` words, with the program `name` at `prog`) reads, for the
+/// external-directory check: input redirections and the operands of `READERS`, with a leading `$HOME` written as
+/// `~`. Also whether one of them is a `.env` file, which the default rules ask for before the read tool reads it (a
+/// glob such as `.e*` may be one).
+fn read_paths(pairs: &[(String, String)], prog: usize, name: &str) -> (Vec<String>, bool) {
+    let mut paths = vec![];
+    // `< file`, `<file`, `0<file`, `<>file` anywhere in the command (`< file cat` too); not heredocs, here-strings or
+    // `<&3`. Only unquoted operators count: `grep '<' f` has none.
+    let mut k = 0;
+    while let Some((raw, val)) = pairs.get(k) {
+        k += 1;
+        let op = raw.trim_start_matches(|c: char| c.is_ascii_digit());
+        let Some(target) = op.strip_prefix("<>").or_else(|| op.strip_prefix('<')) else { continue };
+        if target.is_empty() {
+            paths.extend(pairs.get(k).map(|(_, v)| v.clone()));
+            k += 1;
+        } else if !target.starts_with(['<', '&', '(']) {
+            let v = val.trim_start_matches(|c: char| c.is_ascii_digit());
+            paths.extend(v.strip_prefix("<>").or_else(|| v.strip_prefix('<')).map(String::from));
+        }
+    }
+    if READERS.contains(&name) {
+        let args = &pairs[(prog + 1).min(pairs.len())..];
+        let vals: Vec<String> = args.iter().map(|(_, v)| v.clone()).collect();
+        let pattern_first = matches!(name, "grep" | "egrep" | "fgrep" | "rg")
+            && !options_part(&vals).iter().any(|w| short_has(w, "ef", "") || long_opt(w, "--regexp", 5) || long_opt(w, "--file", 4));
+        let (mut operands, mut skipped) = (false, !pattern_first);
+        let mut j = 0;
+        while let Some((raw, w)) = args.get(j) {
+            j += 1;
+            // Redirections were taken above (a `>` target is a write, which makes the command opaque anyway).
+            if let Some(n) = redirection_words(raw) {
+                j += n - 1;
+                continue;
+            }
+            if !operands && w == "--" {
+                operands = true;
+                continue;
+            }
+            // Options are skipped; an option's argument is taken as an operand, which can only add a check.
+            if !operands && w.starts_with('-') && w != "-" {
+                continue;
+            }
+            if !skipped {
+                skipped = true;
+                continue;
+            }
+            paths.push(w.clone());
+        }
+    }
+    let paths: Vec<String> = paths
+        .into_iter()
+        .filter(|p| !p.is_empty() && p != "-" && !p.starts_with("/dev/fd/") && !matches!(p.as_str(), "/dev/null" | "/dev/stdin" | "/dev/zero" | "/dev/random" | "/dev/urandom"))
+        .map(|p| match p.strip_prefix("${HOME}").or_else(|| p.strip_prefix("$HOME")) {
+            Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("~{rest}"),
+            _ => p,
+        })
+        .collect();
+    let secret = paths.iter().any(|p| {
+        let base = p.rsplit('/').next().unwrap_or(p);
+        let env = |n: &str| (crate::wildcard::matches(n, "*.env") || crate::wildcard::matches(n, "*.env.*")) && !crate::wildcard::matches(n, "*.env.example");
+        env(base) || (base.starts_with(['.', '{']) && base.contains(['*', '?', '[', '{']))
+    });
+    (paths, secret)
 }
 
 fn is_python(program: &str) -> bool {
@@ -910,7 +1348,7 @@ fn parse_at(input: &str, depth: usize) -> Parsed {
         commands.extend(nested);
     }
     parsed.commands = commands;
-    if parsed.commands.iter().any(|c| python_writes(c) || is_in_place_writer(&c.words)) {
+    if parsed.commands.iter().any(|c| python_writes(c) || is_in_place_writer(&c.words) || runs_or_writes_through_options(&c.words)) {
         parsed.opaque = true;
     }
     parsed
@@ -1195,6 +1633,145 @@ mod tests {
         assert!(!p.opaque);
         assert_eq!(p.commands.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(), ["cd sub", "ls -la"]);
         assert_eq!(p.commands[0].dirs, ["sub"]);
+    }
+
+    #[test]
+    fn options_that_run_programs_or_write_files_are_opaque() {
+        // Issue #117: the careful preset allows several of these programs, so an option or script that turns one into
+        // a file write or a program run must ask, and never reach the classifier.
+        for c in [
+            "git log -1 --format=%B --output=/home/u/.zshrc",
+            "git log --outp=x",
+            "git diff --output x",
+            "git show HEAD '--output=x'",
+            "git -C sub show --output=x",
+            "git diff --ext-diff",
+            "git log -p --ext",
+            "git grep -O hi",
+            "git grep --open-files-in-pager=vim hi",
+            "git rebase -x 'make' main",
+            "git fetch --upload-pack='sh -c id' origin",
+            "git archive -o /tmp/x HEAD",
+            "git config core.fsmonitor 'sh -c id'",
+            "git config set alias.st '!id'",
+            "git config --add diff.external x",
+            "git config --unset core.pager",
+            "git config -e",
+            "rg --pre sh x",
+            "rg --pre=/bin/sh x",
+            "rg x --pre-glob '*' --pre cat",
+            "rg --hostname-bin=./x x",
+            "rg x *",
+            "rg x $DIR",
+            "rg x \"$DIR\"",
+            "cargo test --config 'target.x86_64-apple-darwin.runner=\"sh -c id\"'",
+            "cargo --config build.rustc-wrapper=./x build",
+            "cargo check --config=./evil.toml",
+            "sort -o ~/.zshrc x",
+            "sort -no x y",
+            "sort --o=x y",
+            "sort --compress-program=sh y",
+            "sed 's/a/b/w /tmp/x' f",
+            "sed -n '1w out' f",
+            "sed -e p -e 'W out' f",
+            "sed --expression='1e id' f",
+            "sed 's/x/id/e' f",
+            "sed -f script.sed f",
+            "sed -ni 's/a/b/' f",
+            "sed --in-place=.bak 's/a/b/' f",
+            "sed --line-length 5 'w x' f",
+            "awk 'BEGIN{system(\"id\")}'",
+            "awk '{print > \"/tmp/x\"}' f",
+            "awk '{printf \"%s\", $0 >> \"x\"}' f",
+            "awk '{print | \"sh\"}' f",
+            "awk 'BEGIN{\"id\" | getline x}'",
+            "awk -f prog.awk f",
+            "gawk '@load \"x\"; BEGIN{}'",
+            "find . -fprint /tmp/x",
+            "find . -name x -fprintf out '%p'",
+            "man -P 'sh -c id' ls",
+            "man --pager=x ls",
+            // Variables that make one of them run something else.
+            "export GIT_EXTERNAL_DIFF=./x; git diff",
+            "export RIPGREP_CONFIG_PATH=./c; rg x",
+            "RIPGREP_CONFIG_PATH=./c rg x",
+            "CARGO_BUILD_RUSTC_WRAPPER=./x cargo build",
+            "XDG_CONFIG_HOME=./x git status",
+            "LESS='+!id' less f",
+            "alias cat='sh -c id'; cat x",
+            "hash -p ./x git; git status",
+        ] {
+            assert!(parse(c).opaque, "{c}");
+        }
+        for c in [
+            "git log --oneline -20",
+            "git log -p -1 --format='%h %s'",
+            "git diff --stat HEAD~1",
+            "git diff --output-indicator-new=+ x",
+            "git diff --no-ext-diff",
+            "git show HEAD:src/lib.rs",
+            "git grep -n hi",
+            "git config user.name",
+            "git config --get core.pager",
+            "git config --global --list",
+            "git config get user.email",
+            "git log -- --output=x",
+            "rg 'struct Foo' crates/",
+            "rg -n --glob '*.rs' unwrap",
+            "rg x '*'",
+            "rg x -- *",
+            "cargo test -p moco-core",
+            "cargo test -- --config",
+            "CARGO_TARGET_DIR=/tmp/t cargo build",
+            "CARGO_TERM_COLOR=always cargo test",
+            "sort names.txt",
+            "sort -t, -k2 x",
+            "sort -to x",
+            "sed -n '1,40p' src/lib.rs",
+            "sed 's/foo/bar/g' f",
+            "sed -e '/^$/d' -e 's|a|b|' f",
+            "sed -n '$!N;s/\\n/ /;p' f",
+            "sed --sandbox 'w x' f",
+            "sed -n '/start/,/end/{/x/p}' f",
+            "sed 'y/abc/xyz/' f",
+            "sed '1i\\\nheader' f",
+            "awk '{print $1}' access.log",
+            "awk -F: '$3 > 100 {print $1}' f",
+            "awk '{print ($1 > 2)}' f",
+            "awk '$1 ~ /a|b/ {n++} END {print n}' f",
+            "awk -v n=3 'NR <= n || /x/' f",
+            "awk '{printf \"%s > %s\\n\", $1, $2}' f",
+            "find . -name '*.rs'",
+            "man ls",
+            "export FOO=1; ls",
+        ] {
+            assert!(!parse(c).opaque, "{c}");
+        }
+    }
+
+    #[test]
+    fn files_that_read_commands_read_get_the_external_check() {
+        let dirs = |c: &str| parse(c).commands.into_iter().flat_map(|c| c.dirs).collect::<Vec<_>>();
+        assert_eq!(dirs("cat ~/.ssh/id_rsa"), ["~/.ssh/id_rsa"]);
+        assert_eq!(dirs("head -5 /etc/hosts src/a.rs"), ["/etc/hosts", "src/a.rs"]);
+        assert_eq!(dirs("grep -rn KEY ~"), ["~"], "the pattern is not a path");
+        assert_eq!(dirs("grep -eKEY -- -x /etc"), ["-x", "/etc"]);
+        assert_eq!(dirs("grep '>' /etc/x"), ["/etc/x"], "a quoted `>` is the pattern, not a redirection");
+        assert_eq!(dirs("rg TODO /etc"), ["/etc"]);
+        assert_eq!(dirs("/bin/cat ../../x"), ["../../x"]);
+        assert_eq!(dirs("cat $HOME/.aws/credentials"), ["~/.aws/credentials"]);
+        assert_eq!(dirs("wc -c < ~/.ssh/id_rsa"), ["~/.ssh/id_rsa"], "input redirections of any command");
+        assert_eq!(dirs("< /etc/passwd tr a b"), ["/etc/passwd"]);
+        assert_eq!(dirs("cat /dev/null - x 2>/dev/null"), ["x"]);
+        assert!(dirs("ls /etc").is_empty(), "listing is not reading");
+        assert!(dirs("cat <<EOF\nx\nEOF").is_empty());
+        // `.env` asks before the read tool reads it; a shell command that prints it asks too.
+        for c in ["cat .env", "head -3 app/.env.local", "grep KEY .env", "tail x .e*", "cat < .env", "cat {.env,x}", "cat x.env"] {
+            assert!(parse(c).opaque, "{c}");
+        }
+        for c in ["cat .env.example", "cat README.md", "grep -rn env src", "grep .env src"] {
+            assert!(!parse(c).opaque, "{c}");
+        }
     }
 
     #[test]

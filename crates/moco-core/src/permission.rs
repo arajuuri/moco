@@ -138,16 +138,40 @@ pub fn default_rules() -> Vec<Rule> {
     ]
 }
 
+/// Shell commands the careful preset runs without asking. Their options that run programs or write files
+/// (`git log --output=`, `rg --pre`, `cargo --config`...) make a command opaque (`shellparse`), the files they read
+/// get the external-directory check, and reading `.env` asks, so each of these only reads or builds (issue #117).
+/// Building and testing still run the project's own code (`build.rs`, tests); the sandbox is what contains that.
+pub const CAREFUL_SHELL_ALLOW: &[&str] = &[
+    "ls", "cat", "head", "tail", "wc", "rg", "grep", "git status", "git diff", "git log", "git show", "cargo check", "cargo test", "cargo build",
+];
+
+/// Paths in the project that the careful preset asks before the edit tools change: files that git, moco and other
+/// agents or editors run code from or load as configuration on their own (`.git/hooks`, and `.git/config`, whose
+/// `core.fsmonitor` every `git status` runs), and, for a project in the home folder, shell startup files and other
+/// places in `$HOME` that run code (compare `sandbox.rs`). Paths outside the project ask through `external_directory`.
+const CAREFUL_EDIT_ASK: &[&str] = &[
+    ".git", ".moco", "moco.json", "moco.jsonc", ".claude", ".agents", ".vscode", ".profile", ".bashrc", ".bash_profile", ".bash_login",
+    ".bash_logout", ".zshrc", ".zshenv", ".zprofile", ".zlogin", ".zlogout", ".cshrc", ".tcshrc", ".login", ".logout", ".config/fish",
+    ".config/git", ".gitconfig", ".ssh", "Library/LaunchAgents",
+];
+
 /// Rules of a `permission_preset`, placed after the mode rules and before the user's own `permissions`.
-/// `trusted` adds nothing; `careful` asks for shell commands (except read-only and build ones), web fetches and
-/// edits outside the project, and always asks for `git push`, `rm -rf` and `sudo`.
+/// `trusted` adds nothing; `careful` asks for shell commands (except read-only and build ones), web fetches, edits
+/// outside the project and edits of the project's git, moco and agent config (`CAREFUL_EDIT_ASK`), and always asks
+/// for `git push`, `rm -rf` and `sudo`.
 pub fn preset_rules(name: &str) -> Option<Vec<Rule>> {
     match name {
         "trusted" => Some(vec![]),
         "careful" => {
             let mut rules = vec![Rule::soft_ask("shell", "*")];
-            for c in ["ls *", "cat *", "head *", "tail *", "wc *", "rg *", "grep *", "git status *", "git diff *", "git log *", "git show *", "cargo check *", "cargo test *", "cargo build *"] {
-                rules.push(Rule::new("shell", c, Effect::Allow));
+            for c in CAREFUL_SHELL_ALLOW {
+                rules.push(Rule::new("shell", &format!("{c} *"), Effect::Allow));
+            }
+            // A variable can expand to an option the rules never saw (`X=--output=x; git log $X`): the classifier,
+            // which sees the whole command line, decides instead of the allow.
+            for c in CAREFUL_SHELL_ALLOW {
+                rules.push(Rule::soft_ask("shell", &format!("{c} *$*")));
             }
             for c in ["git push *", "rm -rf *", "rm -fr *", "sudo *"] {
                 rules.push(Rule::new("shell", c, Effect::Ask));
@@ -158,6 +182,13 @@ pub fn preset_rules(name: &str) -> Option<Vec<Rule>> {
                 Rule::new("external_directory", "*", Effect::Ask),
                 Rule::new("shell.unsandboxed", "*", Effect::Ask),
             ]);
+            for p in CAREFUL_EDIT_ASK {
+                for r in [p.to_string(), format!("{p}/*"), format!("*/{p}"), format!("*/{p}/*")] {
+                    rules.push(Rule::new("edit", &r, Effect::Ask));
+                }
+            }
+            // A file named like an option (`--pre=sh`) becomes one when a glob in a command expands to it.
+            rules.extend([Rule::new("edit", "-*", Effect::Ask), Rule::new("edit", "*/-*", Effect::Ask)]);
             Some(rules)
         }
         _ => None,
@@ -255,6 +286,47 @@ mod tests {
         assert!(!only_default_asks("shell", &res(&["make"]), &user, &[]));
         let from_json: Rule = serde_json::from_str(r#"{"action":"shell","resource":"*","effect":"ask","soft":true}"#).unwrap();
         assert!(!from_json.soft, "config cannot mark a rule soft");
+    }
+
+    #[test]
+    fn careful_preset_allows_reads_and_builds_but_not_what_their_options_hide() {
+        // Issue #117.
+        let careful: Vec<Rule> = mode_rules(PermissionMode::Auto).into_iter().chain(preset_rules("careful").unwrap()).collect();
+        let shell = |c: &str| {
+            let p = crate::tools::shellparse::parse(c);
+            let r: Vec<String> = p.commands.iter().map(|c| c.text.clone()).collect();
+            (if p.opaque { Ask } else { decide("shell", &r, &careful, &[]) }, p.opaque, only_default_asks("shell", &r, &careful, &[]))
+        };
+        for c in [
+            "git status", "git diff --stat", "git log --oneline -5", "git log -p -1 --format='%h %s'", "git show HEAD", "ls -la", "cat src/main.rs",
+            "head -n 20 Cargo.toml", "wc -l src/*.rs", "grep -rn TODO src", "rg -n --glob '*.rs' unwrap", "cargo test -p moco-core", "cargo build --release",
+            "CARGO_TARGET_DIR=/tmp/t cargo check",
+        ] {
+            assert_eq!(shell(c), (Allow, false, false), "{c}");
+        }
+        // Options that write files or run programs make the command opaque: it asks, and the classifier never sees it.
+        for c in ["git log -1 --format=%B --output=/tmp/x", "git diff --ext-diff", "rg --pre sh x", "rg x *", "cargo test --config 'build.rustc-wrapper=\"x\"'", "cat .env", "RIPGREP_CONFIG_PATH=x rg y"] {
+            assert_eq!(shell(c).0, Ask, "{c}");
+            assert!(shell(c).1, "{c}");
+        }
+        // A variable could expand to an option: a default ask, which the classifier (seeing the whole line) may allow.
+        for c in ["X=--output=/tmp/x; git log $X", "cargo test \"$T\"", "grep -n 'x$' f"] {
+            assert_eq!(shell(c), (Ask, false, true), "{c}");
+        }
+        assert_eq!(shell("git push origin x"), (Ask, false, false), "the always-ask list still wins");
+
+        // Edits of what git, moco and other agents run or load ask; ordinary project files do not.
+        for p in [
+            ".git/config", ".git/hooks/pre-commit", ".git", "sub/.git/config", ".moco/moco.json", "moco.json", "moco.jsonc", ".claude/settings.json",
+            ".agents/skills/x/SKILL.md", ".vscode/tasks.json", ".zshrc", ".config/fish/config.fish", ".ssh/authorized_keys", "Library/LaunchAgents/x.plist",
+            "--pre=sh", "src/-x",
+        ] {
+            assert_eq!(evaluate("edit", p, &careful), Ask, "{p}");
+        }
+        for p in ["src/main.rs", ".gitignore", ".github/workflows/ci.yml", "AGENTS.md", "docs/moco.json.md", "a-b.rs", "src/x-y/z.rs", "build.rs"] {
+            assert_eq!(evaluate("edit", p, &careful), Allow, "{p}");
+        }
+        assert_eq!(evaluate("edit", ".git/config", &mode_rules(PermissionMode::Auto)), Allow, "only the preset asks");
     }
 
     #[test]

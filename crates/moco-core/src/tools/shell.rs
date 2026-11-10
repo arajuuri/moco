@@ -365,7 +365,13 @@ Do not use interactive commands. Do not use this tool to create or change files 
                 Some(rest) => PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(rest.trim_start_matches('/')),
                 None => PathBuf::from(dir),
             };
-            ctx.check_external(&normalize(&if dir.is_absolute() { dir } else { workdir.join(dir) }))?;
+            // A file a command reads is checked by its folder and, for a link, the folder of its target.
+            let path = normalize(&if dir.is_absolute() { dir } else { workdir.join(dir) });
+            if path.is_file() {
+                ctx.check_external_file(&path)?;
+            } else {
+                ctx.check_external(&path)?;
+            }
         }
         let mut resources: Vec<String> = parsed.commands.iter().map(|c| c.text.clone()).collect();
         let mut save: Vec<String> = parsed.commands.iter().map(|c| shellparse::save_pattern(&c.words)).collect();
@@ -469,6 +475,23 @@ mod tests {
         assert_eq!(asked[0].action, "external_directory");
         assert_eq!(asked[0].resources, ["/usr/*"]);
         assert_eq!(asked[1].action, "shell");
+    }
+
+    #[test]
+    fn files_read_outside_the_project_ask_by_their_folder() {
+        // Issue #117: `cat ~/.ssh/id_rsa` must not pass as an allowed `cat *` without the external-directory check.
+        let env = Env::new();
+        let outside = env.dir.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("id_rsa"), "key").unwrap();
+        std::os::unix::fs::symlink(outside.join("id_rsa"), env.work().join("link")).unwrap();
+        let o = real_path(&outside).display().to_string();
+        run(&env, json!({"command": format!("cat {}/id_rsa src/none.rs < link", outside.display())})).ok();
+        let asked = env.perm.asked();
+        let external: Vec<&str> = asked.iter().filter(|r| r.action == "external_directory").flat_map(|r| r.resources.iter().map(String::as_str)).collect();
+        let want = format!("{o}/*");
+        assert_eq!(external, [want.as_str(), want.as_str()], "a file is checked by its folder, a link by its target's; files in the project are not asked for");
+        assert_eq!(asked.last().unwrap().action, "shell");
     }
 
     #[test]
