@@ -144,7 +144,10 @@ Verified on Lion 10.7.5 (11G63) with that binary:
   key, which gets `invalid x-api-key`). TLS is rustls/ring with the roots compiled in (`webpki-roots`), so Lion's old
   keychain and system TLS do not matter.
 - moco's exact Seatbelt profile works under Lion's `sandbox-exec`, `(remote unix-socket)` included: writes outside the
-  allowed subpaths are refused, `/tmp` is writable, and outbound network is blocked.
+  allowed subpaths are refused, `/tmp` is writable, and outbound network is blocked. The #123 profile (protected
+  `.git/hooks`, `.git/config`, `.moco` and the like, credential reads denied) was checked there on 2026-11-10 with git
+  1.7.12: commits, branches and checkout work inside it, and writes to the protected paths, renaming `.git` or the
+  project, a hard link to `.git/config` and reading `auth.json` are refused. The same checks pass on Mojave.
 - The TUI over an SSH pty (`TERM=xterm-256color`) draws the header, input box and spinner with Unicode box-drawing
   glyphs, sends a message, shows the error and exits cleanly.
 - A real session with a valid Anthropic key (2026-11-08, TUI in auto mode): it read and edited a file, ran
