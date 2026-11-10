@@ -133,6 +133,8 @@ pub fn default_rules() -> Vec<Rule> {
         Rule::new("websearch", "*", Effect::Ask),
         // Running outside the shell sandbox is never covered by the blanket allow.
         Rule::new("shell.unsandboxed", "*", Effect::Ask),
+        // Nor is a fetch from this machine or its local network (`tools/webfetch.rs`, #115).
+        Rule::new("webfetch.private", "*", Effect::Ask),
     ]
 }
 

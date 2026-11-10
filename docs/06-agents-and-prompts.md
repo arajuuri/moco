@@ -20,7 +20,7 @@ Agent { id, name, model?: {providerID, modelID, variant?}, request {settings, he
 | `build` | Build | primary | no | "The default agent. Executes tools based on configured permissions." Adds `question: allow` |
 | `plan` | Plan | primary | no | "Read-only agent for exploring the codebase and planning work before implementation." Adds `question: allow`, `edit: deny`, `edit: <plan dir>/*: allow` |
 | `general` | General | subagent | no | "General-purpose agent for researching complex questions and executing multi-step tasks. Use this agent to execute multiple units of work in parallel." Adds `question: deny`, `subagent: deny` |
-| `explore` | Explore | subagent | no | file search specialist; permissions: `* deny`, then allow `grep, glob, webfetch, websearch, read` (ask for `.env`, `.env.*`; allow `.env.example`), deny `shell` (a command can write), `subagent deny`, `external_directory allow`. System prompt below |
+| `explore` | Explore | subagent | no | file search specialist; permissions: `* deny`, then allow `grep, glob, read` (ask for `.env`, `.env.*` and credentials such as `auth.json`, `mcp-auth.json`, `~/.ssh`, `~/.aws`, `~/.gnupg`, keychains; allow `.env.example`), deny `shell` (a command can write), `subagent deny`; `webfetch`, `webfetch.private`, `websearch` and `external_directory` ask, so explore never gets more than manual mode or the careful preset gives its parent (moco, #115; upstream allows them). System prompt below |
 | `compaction` | Compaction | primary | yes | summarizer, prompt built by compaction code |
 | `title` | Title | primary | yes | `* deny`; system prompt below |
 | `summary` | Summary | primary | yes | `* deny`; system prompt below |

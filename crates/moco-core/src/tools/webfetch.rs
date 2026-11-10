@@ -1,5 +1,6 @@
 use super::*;
 use std::io::Read;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
 pub struct WebFetch;
@@ -40,6 +41,51 @@ pub fn join_url(base: &str, location: &str) -> String {
     let dir_end = base[..base.find(['?', '#']).unwrap_or(base.len())].rfind('/').filter(|i| *i >= origin_end).map(|i| i + 1).unwrap_or(origin_end);
     let dir = if dir_end == origin_end { format!("{}/", &base[..origin_end]) } else { base[..dir_end].to_string() };
     format!("{dir}{location}")
+}
+
+/// An address on this machine or its local network rather than on the internet: loopback, private (RFC 1918, IPv6
+/// unique local), link-local (169.254.0.0/16, where cloud metadata services answer, and fe80::/10), shared
+/// (100.64.0.0/10), unspecified, multicast, broadcast and reserved ranges, also when an IPv6 address embeds one of
+/// these (IPv4-mapped or -compatible, NAT64, 6to4).
+pub fn is_local(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(a) => {
+            let o = a.octets();
+            a.is_loopback()
+                || a.is_private()
+                || a.is_link_local()
+                || a.is_multicast()
+                || o[0] == 0
+                || (o[0] == 100 && o[1] & 0xc0 == 64)
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+                || (o[0] == 198 && o[1] & 0xfe == 18)
+                || o[0] >= 240
+        }
+        IpAddr::V6(a) => {
+            let s = a.segments();
+            let v4 = |hi: u16, lo: u16| is_local(IpAddr::V4(Ipv4Addr::from((u32::from(hi) << 16) | u32::from(lo))));
+            if let Some(m) = a.to_ipv4_mapped() {
+                return is_local(IpAddr::V4(m));
+            }
+            a.is_multicast()
+                || s[0] & 0xfe00 == 0xfc00
+                || s[0] & 0xffc0 == 0xfe80
+                || s[0] & 0xffc0 == 0xfec0
+                // ::a.b.c.d (also :: and ::1), NAT64 64:ff9b::a.b.c.d, 6to4 2002:aabb:ccdd::.
+                || (s[..6] == [0; 6] && v4(s[6], s[7]))
+                || (s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] && v4(s[6], s[7]))
+                || (s[0] == 0x2002 && v4(s[1], s[2]))
+        }
+    }
+}
+
+/// The addresses a URL's host stands for. A literal address is used as is; a name is looked up (getaddrinfo).
+fn resolve(host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = bare.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+    Ok((bare, port).to_socket_addrs()?.collect())
 }
 
 impl Tool for WebFetch {
@@ -99,16 +145,41 @@ fn blocking<T: Send + 'static>(ctx: &ToolCtx, f: impl FnOnce() -> T + Send + 'st
 }
 
 /// GET with manual redirects: every hop is permission-checked again. Returns (body, content type).
+///
+/// A hop whose host is or resolves to a local address (`is_local`) also needs `webfetch.private`, which asks in every
+/// mode unless a rule allows it: a fetch is a request sent from inside the user's network, which can reach services
+/// that trust that (cloud metadata at 169.254.169.254, routers, admin pages, dev servers) and is the way out for
+/// what a prompt injection wants to steal or change. It asks rather than refusing because fetching a local dev
+/// server or docs page is a normal thing to want. The connection goes to the addresses that were checked, so a name
+/// that resolves differently a moment later (DNS rebinding) cannot slip past.
 fn fetch(ctx: &ToolCtx, url: &mut String, timeout: Duration, max_bytes: usize) -> Result<(String, String), ToolError> {
-    let agent = ureq::AgentBuilder::new().redirects(0).timeout(timeout).build();
     for hop in 0..=MAX_REDIRECTS {
         if !(url.starts_with("http://") || url.starts_with("https://")) {
             return Err(ToolError::fail("URL must start with http:// or https://"));
         }
         ctx.permit("webfetch", vec![url.clone()], vec!["*".into()])?;
+        // The URL as ureq will see it (`http://2130706433/` is 127.0.0.1), to look up the host it will connect to.
+        let parsed = ureq::get(url.as_str()).request_url().map_err(|e| ToolError::fail(format!("Invalid URL: {e}")))?;
+        let parsed = parsed.as_url();
+        let (host, port) = (parsed.host_str().unwrap_or_default().to_string(), parsed.port_or_known_default().unwrap_or(80));
+        let lookup = host.clone();
+        let addrs = blocking(ctx, move || resolve(&lookup, port))?.map_err(|e| ToolError::fail(format!("Request failed: could not resolve {host}: {e}")))?;
+        if addrs.is_empty() {
+            return Err(ToolError::fail(format!("Request failed: no address for {host}")));
+        }
+        if addrs.iter().any(|a| is_local(a.ip())) {
+            let origin = parsed.origin().ascii_serialization();
+            ctx.permit("webfetch.private", vec![url.clone()], vec![origin.clone(), format!("{origin}/*")])?;
+        }
         if ctx.cancelled() {
             return Err(ToolError::Interrupted);
         }
+        let pinned = addrs;
+        let agent = ureq::AgentBuilder::new()
+            .redirects(0)
+            .timeout(timeout)
+            .resolver(move |_: &str| -> std::io::Result<Vec<SocketAddr>> { Ok(pinned.clone()) })
+            .build();
         let call = agent
             .get(url)
             .set("User-Agent", UA)
@@ -185,8 +256,11 @@ mod tests {
         let o = run(&env, json!({"url": format!("{}/start", first.url)})).unwrap();
         assert_eq!(o.text, "final");
         assert_eq!(o.metadata["url"], format!("{}/landing", target.url));
-        let asked: Vec<_> = env.perm.asked().into_iter().map(|r| r.resources[0].clone()).collect();
-        assert_eq!(asked, [format!("{}/start", first.url), format!("{}/landing", target.url)]);
+        let asked: Vec<_> = env.perm.asked().into_iter().map(|r| (r.action, r.resources[0].clone())).collect();
+        let (start, landing) = (format!("{}/start", first.url), format!("{}/landing", target.url));
+        let hop = |a: &str, u: &str| (a.to_string(), u.to_string());
+        // The test servers are on 127.0.0.1, so each hop is also a private fetch.
+        assert_eq!(asked, [hop("webfetch", &start), hop("webfetch.private", &start), hop("webfetch", &landing), hop("webfetch.private", &landing)]);
         // A denied redirect target stops the fetch.
         let t2 = serve(vec![page("text/plain", "secret")]);
         let f2 = serve(vec![Canned { status: 301, headers: vec![("Location", format!("{}/x", t2.url))], body: String::new() }]);
@@ -227,6 +301,80 @@ mod tests {
             assert!(matches!(r, Err(ToolError::Interrupted)), "{r:?}");
             assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
         }
+    }
+
+    #[test]
+    fn local_addresses() {
+        let local = [
+            "127.0.0.1", "127.8.9.10", "0.0.0.0", "10.1.2.3", "172.16.0.1", "172.31.255.255", "192.168.1.1", "169.254.169.254",
+            "100.64.0.1", "100.127.255.254", "192.0.0.170", "198.18.0.1", "224.0.0.1", "255.255.255.255", "240.0.0.1",
+            "::1", "::", "fc00::1", "fd12:3456::1", "fe80::1", "fec0::1", "ff02::1", "::ffff:127.0.0.1", "::ffff:169.254.169.254",
+            "::127.0.0.1", "64:ff9b::a9fe:a9fe", "2002:c0a8:0101::1", "fd00:ec2::254",
+        ];
+        let public = ["1.1.1.1", "8.8.8.8", "172.32.0.1", "172.15.255.255", "100.128.0.1", "198.20.0.1", "169.255.0.1", "2606:4700::1111", "::ffff:8.8.8.8", "2002:0808:0808::1"];
+        for a in local {
+            assert!(is_local(a.parse().unwrap()), "{a} is local");
+        }
+        for a in public {
+            assert!(!is_local(a.parse().unwrap()), "{a} is public");
+        }
+    }
+
+    /// A permitter that applies real rules and refuses whatever would ask, recording each request with its verdict.
+    struct Rules(Vec<crate::permission::Rule>, std::sync::Mutex<Vec<(String, String, crate::permission::Effect)>>);
+    impl Permitter for Rules {
+        fn check(&self, req: &PermReq) -> Result<(), ToolError> {
+            use crate::permission::{decide, Effect};
+            let e = decide(&req.action, &req.resources, &self.0, &[]);
+            self.1.lock().unwrap().push((req.action.clone(), req.resources[0].clone(), e));
+            match e {
+                Effect::Allow => Ok(()),
+                _ => Err(ToolError::Blocked(format!("{e:?}: {}", req.action))),
+            }
+        }
+    }
+
+    #[test]
+    fn local_hosts_ask_even_when_fetches_are_allowed() {
+        use crate::permission::{mode_rules, Effect, PermissionMode, Rule};
+        let env = Env::new();
+        let fetch_with = |rules: Vec<Rule>, url: &str| {
+            let p = Rules(rules, Default::default());
+            let r = {
+                let mut ctx = env.ctx();
+                ctx.permitter = &p;
+                WebFetch.run(&json!({ "url": url }), &ctx)
+            };
+            (r, p.1.into_inner().unwrap())
+        };
+        // Auto mode without a preset allows every fetch, but not one to this machine; the server is never contacted.
+        let s = serve(vec![page("text/plain", "local")]);
+        let u = format!("{}/x", s.url);
+        let (r, log) = fetch_with(mode_rules(PermissionMode::Auto), &u);
+        assert!(matches!(r, Err(ToolError::Blocked(_))), "{r:?}");
+        assert_eq!(log, [("webfetch".into(), u.clone(), Effect::Allow), ("webfetch.private".into(), u.clone(), Effect::Ask)]);
+        // A name is looked up first, and so is the odd spelling of an address that ureq would understand.
+        for alias in [u.replace("127.0.0.1", "localhost"), u.replace("127.0.0.1", "2130706433"), u.replace("127.0.0.1", "[::ffff:127.0.0.1]")] {
+            let (r, log) = fetch_with(mode_rules(PermissionMode::Auto), &alias);
+            assert!(r.is_err() && log.last().unwrap().0 == "webfetch.private", "{alias}: {r:?} {log:?}");
+        }
+        assert!(s.requests.lock().unwrap().is_empty());
+        // A rule can allow a local origin (an "always" answer saves the same pattern).
+        let mut rules = mode_rules(PermissionMode::Auto);
+        rules.push(Rule::new("webfetch.private", &format!("{}/*", s.url), Effect::Allow));
+        assert_eq!(fetch_with(rules, &u).0.unwrap().text, "local");
+        // A public page that redirects to the metadata address is stopped at that hop.
+        let jump = serve(vec![Canned { status: 302, headers: vec![("Location", "http://169.254.169.254/latest/meta-data/".into())], body: String::new() }]);
+        let mut rules = mode_rules(PermissionMode::Auto);
+        rules.push(Rule::new("webfetch.private", &format!("{}/*", jump.url), Effect::Allow));
+        let (r, log) = fetch_with(rules, &format!("{}/go", jump.url));
+        assert!(matches!(r, Err(ToolError::Blocked(_))), "{r:?}");
+        assert_eq!(log.last().unwrap(), &("webfetch.private".into(), "http://169.254.169.254/latest/meta-data/".into(), Effect::Ask));
+        // What is saved for "always" is the origin.
+        let env2 = Env::new();
+        let _ = run(&env2, json!({"url": u}));
+        let private = env2.perm.asked().into_iter().find(|r| r.action == "webfetch.private").unwrap();
+        assert_eq!(private.save, [s.url.clone(), format!("{}/*", s.url)]);
     }
 
     #[test]
