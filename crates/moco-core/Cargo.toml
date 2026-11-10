@@ -10,7 +10,7 @@ publish.workspace = true
 # with a newer cargo), but several crates under-declare it, hence the explicit caps below.
 [dependencies]
 fastrand = "2"
-rusqlite = { version = "~0.31", features = ["bundled"] } # 0.32+ uses c"" literals (1.77) and #[expect] (1.81)
+rusqlite = { version = "~0.32.1", features = ["bundled"] } # 0.33+ uses #[expect] (Rust 1.81); 0.32.1 bundles SQLite 3.46.0 (#103)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
