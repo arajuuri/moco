@@ -96,6 +96,8 @@ pub struct Manager {
     timeouts: Timeouts,
     /// Where OAuth tokens for remote servers are kept.
     app_dir: PathBuf,
+    /// Provider key variables kept out of stdio servers' environment (`auth::child_env`).
+    provider_keys: Vec<String>,
     me: Mutex<Weak<Manager>>,
 }
 
@@ -115,8 +117,16 @@ pub fn tool_name(server: &str, tool: &str) -> String {
 }
 
 impl Manager {
-    /// Start every server in the background and return at once; use `wait_ready` to wait for them.
+    /// `start_with_provider_keys` with the key variables of the catalog in `app_dir` (cached or embedded). Providers
+    /// defined only in config `providers` are not in it; pass the merged catalog's `key_env_vars` to cover them.
     pub fn start(specs: Vec<ServerSpec>, timeouts: &McpTimeouts, app_dir: &std::path::Path) -> Arc<Manager> {
+        let provider_keys = crate::catalog::Catalog::load(app_dir).key_env_vars();
+        Manager::start_with_provider_keys(specs, timeouts, app_dir, provider_keys)
+    }
+
+    /// Start every server in the background and return at once; use `wait_ready` to wait for them.
+    /// Stdio servers do not inherit `provider_keys` (moco's provider key variables) unless their `environment` sets them.
+    pub fn start_with_provider_keys(specs: Vec<ServerSpec>, timeouts: &McpTimeouts, app_dir: &std::path::Path, provider_keys: Vec<String>) -> Arc<Manager> {
         let t = Timeouts {
             startup: Duration::from_millis(timeouts.startup.unwrap_or(30_000)),
             catalog: Duration::from_millis(timeouts.catalog.unwrap_or(30_000)),
@@ -129,7 +139,7 @@ impl Manager {
                 Server { spec, status, client: None, catalog: Catalog::default() }
             })
             .collect();
-        let m = Arc::new(Manager { servers: Mutex::new(servers), timeouts: t, app_dir: app_dir.to_path_buf(), me: Mutex::new(Weak::new()) });
+        let m = Arc::new(Manager { servers: Mutex::new(servers), timeouts: t, app_dir: app_dir.to_path_buf(), provider_keys, me: Mutex::new(Weak::new()) });
         *m.me.lock().unwrap() = Arc::downgrade(&m);
         let names: Vec<String> = m.servers.lock().unwrap().iter().filter(|s| s.status == Status::Pending).map(|s| s.spec.name.clone()).collect();
         for name in names {
@@ -190,7 +200,7 @@ impl Manager {
                 }
                 None => spec.cwd.clone(),
             };
-            let client = match Client::spawn(&spec.config.command, &cwd, &spec.config.environment, notify) {
+            let client = match Client::spawn(&spec.config.command, &cwd, &spec.config.environment, &self.provider_keys, notify) {
                 Ok(c) => c,
                 Err(e) => return self.set_status(name, Status::Failed(e)),
             };
@@ -820,6 +830,29 @@ mod tests {
     }
 
     #[test]
+    fn stdio_servers_get_provider_keys_only_from_their_own_config() {
+        if python().is_none() {
+            return eprintln!("skipped: python3 not available");
+        }
+        let dir = std::env::temp_dir().join(crate::id::new_id("mcp-keys"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let m = {
+            // `start` takes the key names from the catalog (here the embedded one), as `shell` does.
+            let _vars = crate::tools::testutil::ScopedEnv::set(&[("ANTHROPIC_API_KEY", "sk-test-inherited"), ("OPENAI_API_KEY", "sk-test-inherited"), ("GITHUB_TOKEN", "gh-test")]);
+            start(vec![spec("plain", &[], &dir), spec("keyed", &[("OPENAI_API_KEY", "sk-test-configured")], &dir)], McpTimeouts::default())
+        };
+        let env = Env::new();
+        let read = |t: &str, var: &str| tool(&m, t).run(&json!({"var": var}), &env.ctx()).unwrap().text.split('|').next().unwrap().to_string();
+        assert_eq!(read("plain_env", "ANTHROPIC_API_KEY"), "");
+        assert_eq!(read("plain_env", "OPENAI_API_KEY"), "");
+        assert_eq!(read("plain_env", "GITHUB_TOKEN"), "gh-test", "other variables are inherited");
+        assert_eq!(read("keyed_env", "OPENAI_API_KEY"), "sk-test-configured", "a key the server's config sets reaches it");
+        assert_eq!(read("keyed_env", "ANTHROPIC_API_KEY"), "");
+        m.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn timeouts_cancellation_crashes_and_reconnecting() {
         if python().is_none() {
             return eprintln!("skipped: python3 not available");
@@ -939,7 +972,7 @@ mod tests {
             return eprintln!("skipped: python3 not available");
         }
         let dir = std::env::temp_dir();
-        let c = Client::spawn(&["python3".into(), FAKE.into()], &dir, &Default::default(), Arc::new(|_, _| {})).unwrap();
+        let c = Client::spawn(&["python3".into(), FAKE.into()], &dir, &Default::default(), &[], Arc::new(|_, _| {})).unwrap();
         // The server prints a non-JSON line first, and pings the client right after the handshake.
         let info = c.initialize(Duration::from_secs(10)).unwrap();
         assert_eq!(info["serverInfo"]["name"], "fake");
@@ -948,7 +981,7 @@ mod tests {
         assert_eq!(r["nextCursor"], "p2");
         let e = c.request("no/such/method", json!({}), Duration::from_secs(5), None).unwrap_err();
         assert_eq!(e, RpcError::Server { code: -32601, message: "Method not found: no/such/method".into() });
-        assert!(Client::spawn(&["/definitely/not/here".into()], &dir, &Default::default(), Arc::new(|_, _| {})).err().unwrap().contains("cannot start"));
-        assert_eq!(Client::spawn(&[], &dir, &Default::default(), Arc::new(|_, _| {})).err().unwrap(), "no command configured");
+        assert!(Client::spawn(&["/definitely/not/here".into()], &dir, &Default::default(), &[], Arc::new(|_, _| {})).err().unwrap().contains("cannot start"));
+        assert_eq!(Client::spawn(&[], &dir, &Default::default(), &[], Arc::new(|_, _| {})).err().unwrap(), "no command configured");
     }
 }

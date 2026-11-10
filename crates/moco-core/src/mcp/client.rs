@@ -229,14 +229,16 @@ impl Inner {
 }
 
 impl Client {
-    /// Start `command` (program and arguments) in `cwd` with `env` added to the inherited environment.
+    /// Start `command` (program and arguments) in `cwd` with the inherited environment minus `provider_keys`, plus
+    /// `env` (the server's configured variables, which win; see `auth::child_env`).
     /// `notify` is called, from the reader thread, for every notification the server sends.
-    pub fn spawn(command: &[String], cwd: &Path, env: &BTreeMap<String, String>, notify: NotifyFn) -> Result<Arc<Client>, String> {
+    pub fn spawn(command: &[String], cwd: &Path, env: &BTreeMap<String, String>, provider_keys: &[String], notify: NotifyFn) -> Result<Arc<Client>, String> {
         let Some((program, args)) = command.split_first() else { return Err("no command configured".into()) };
-        let mut child = Command::new(program)
+        let mut cmd = Command::new(program);
+        crate::auth::child_env(&mut cmd, provider_keys, env);
+        let mut child = cmd
             .args(args)
             .current_dir(cwd)
-            .envs(env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -443,7 +445,25 @@ mod tests {
 
     fn spawn(script: &str) -> Arc<Client> {
         let cmd = ["sh".to_string(), "-c".to_string(), script.to_string()];
-        Client::spawn(&cmd, Path::new("/"), &BTreeMap::new(), Arc::new(|_, _| {})).unwrap()
+        Client::spawn(&cmd, Path::new("/"), &BTreeMap::new(), &[], Arc::new(|_, _| {})).unwrap()
+    }
+
+    #[test]
+    fn a_server_gets_no_provider_keys_unless_its_config_sets_them() {
+        let script = r#"printf 'anthropic=%s openai=%s github=%s\n' "${ANTHROPIC_API_KEY-unset}" "${OPENAI_API_KEY-unset}" "${GITHUB_TOKEN-unset}" >&2; exec sleep 30"#;
+        let cmd = ["sh".to_string(), "-c".to_string(), script.to_string()];
+        let keys = ["ANTHROPIC_API_KEY".to_string(), "OPENAI_API_KEY".to_string()];
+        let configured = BTreeMap::from([("OPENAI_API_KEY".to_string(), "configured".to_string())]);
+        let c = {
+            let _vars = crate::tools::testutil::ScopedEnv::set(&[("ANTHROPIC_API_KEY", "sk-test-mcp"), ("OPENAI_API_KEY", "sk-test-inherited"), ("GITHUB_TOKEN", "gh-test")]);
+            Client::spawn(&cmd, Path::new("/"), &configured, &keys, Arc::new(|_, _| {})).unwrap()
+        };
+        let t = Instant::now();
+        while c.stderr_tail().is_empty() && t.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(c.stderr_tail(), "anthropic=unset openai=configured github=gh-test");
+        c.shutdown();
     }
 
     #[test]

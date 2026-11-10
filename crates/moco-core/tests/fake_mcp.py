@@ -79,7 +79,7 @@ for line in sys.stdin:
         elif name == "structured":
             send({"jsonrpc": "2.0", "id": mid, "result": {"content": [], "structuredContent": {"answer": 42}}})
         elif name == "env":
-            send({"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": "%s|%s" % (os.environ.get("MCP_TEST_VAR", ""), os.getcwd())}]}})
+            send({"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": "%s|%s" % (os.environ.get(args.get("var", "MCP_TEST_VAR"), ""), os.getcwd())}]}})
         elif name == "added":
             send({"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": "the added tool works"}]}})
         else:

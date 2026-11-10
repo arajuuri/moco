@@ -29,11 +29,13 @@ pub enum Outcome {
 pub struct Formatters {
     list: Vec<Formatter>,
     timeout: Duration,
+    /// Provider key variables kept out of the formatter's environment (`auth::child_env`).
+    provider_keys: Vec<String>,
 }
 
 impl Default for Formatters {
     fn default() -> Self {
-        Formatters { list: vec![], timeout: Duration::from_secs(30) }
+        Formatters { list: vec![], timeout: Duration::from_secs(30), provider_keys: vec![] }
     }
 }
 
@@ -57,11 +59,17 @@ impl Formatters {
                 environment: c.environment.clone(),
             })
             .collect();
-        Formatters { list, timeout: Duration::from_secs(30) }
+        Formatters { list, ..Default::default() }
     }
 
     pub fn with_timeout(mut self, t: Duration) -> Self {
         self.timeout = t;
+        self
+    }
+
+    /// Don't pass these variables (moco's provider keys) to formatters unless a formatter's `environment` sets them.
+    pub fn with_provider_keys(mut self, names: Vec<String>) -> Self {
+        self.provider_keys = names;
         self
     }
 
@@ -92,7 +100,9 @@ impl Formatters {
         let log = std::env::temp_dir().join(format!("{}.log", crate::id::new_id("fmt")));
         let Ok(out) = std::fs::File::create(&log) else { return fail("no temporary file for the formatter's output".into()) };
         let Ok(err) = out.try_clone() else { return fail("no temporary file for the formatter's output".into()) };
-        let child = Command::new(&args[0]).args(&args[1..]).current_dir(cwd).envs(&f.environment).stdin(Stdio::null()).stdout(Stdio::from(out)).stderr(Stdio::from(err)).process_group(0).spawn();
+        let mut cmd = Command::new(&args[0]);
+        crate::auth::child_env(&mut cmd, &self.provider_keys, &f.environment);
+        let child = cmd.args(&args[1..]).current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::from(out)).stderr(Stdio::from(err)).process_group(0).spawn();
         let mut child = match child {
             Ok(c) => c,
             Err(e) => {
@@ -273,5 +283,18 @@ pub(crate) mod tests {
         std::fs::write(&p, b"\xef\xbb\xbfbody").unwrap();
         assert_eq!(f.run(&p, &dir), Outcome::Unchanged, "the formatter removed the BOM, moco restored it: net no change");
         assert_eq!(std::fs::read(&p).unwrap(), b"\xef\xbb\xbfbody");
+    }
+
+    #[test]
+    fn formatters_get_provider_keys_only_from_their_own_environment() {
+        let (dir, _) = setup();
+        let p = dir.join("a.txt");
+        std::fs::write(&p, "x").unwrap();
+        let script = r#"printf '%s|%s|%s' "${ANTHROPIC_API_KEY-unset}" "${OPENAI_API_KEY-unset}" "${GITHUB_TOKEN-unset}" > "$0""#;
+        let c = FormatterConfig { command: vec!["sh".into(), "-c".into(), script.into()], extensions: vec!["txt".into()], environment: BTreeMap::from([("OPENAI_API_KEY".to_string(), "configured".to_string())]), ..Default::default() };
+        let f = Formatters::from_config(&BTreeMap::from([("env".to_string(), c)]), &|_| true).with_provider_keys(vec!["ANTHROPIC_API_KEY".into(), "OPENAI_API_KEY".into()]);
+        let _vars = crate::tools::testutil::ScopedEnv::set(&[("ANTHROPIC_API_KEY", "sk-test-fmt"), ("OPENAI_API_KEY", "sk-test-inherited"), ("GITHUB_TOKEN", "gh-test")]);
+        assert!(matches!(f.run(&p, &dir), Outcome::Changed { .. }));
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "unset|configured|gh-test");
     }
 }

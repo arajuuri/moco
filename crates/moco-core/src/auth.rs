@@ -24,6 +24,16 @@ pub fn env_names_for(provider: &str, env_names: &[String]) -> Vec<String> {
     env_names.iter().cloned().chain(std::iter::once(env_var_for(provider))).collect()
 }
 
+/// Give a child process moco's environment without the provider key variables in `provider_keys` (moco's own
+/// credentials, from `Catalog::key_env_vars`), then `configured` on top: what the child's own config sets on purpose,
+/// so a key named there still reaches it. Shell commands, MCP servers, formatters and checks all start this way (#92, #122).
+pub fn child_env(cmd: &mut std::process::Command, provider_keys: &[String], configured: &std::collections::BTreeMap<String, String>) {
+    for name in provider_keys {
+        cmd.env_remove(name);
+    }
+    cmd.envs(configured);
+}
+
 pub fn load_key(provider: &str, app_dir: &Path) -> Option<String> {
     load_key_with(provider, &[], app_dir)
 }

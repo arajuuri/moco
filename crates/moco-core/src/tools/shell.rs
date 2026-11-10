@@ -147,9 +147,7 @@ pub(crate) fn spawn(command: &str, workdir: &Path, out_path: &Path, sandbox_root
         .stdout(Stdio::from(file))
         .stderr(Stdio::from(err_file))
         .process_group(0);
-    for name in provider_key_env_vars {
-        cmd.env_remove(name);
-    }
+    crate::auth::child_env(&mut cmd, provider_key_env_vars, &Default::default());
     cmd.spawn().map_err(|e| ToolError::fail(format!("failed to start shell: {e}")))
 }
 
