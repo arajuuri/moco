@@ -54,7 +54,14 @@ otool -l $HOME/moco-target-107/release/moco | grep -A3 -E 'LC_VERSION_MIN_MACOSX
 
 Before copying the binary, also check that it links nothing newer than Lion has. `otool -L` should list only
 `libSystem` and `libiconv`. `nm -u <binary> | grep -E 'getentropy|clock_gettime|os_unfair_lock|ulock'` should print
-nothing (all of those need 10.12+).
+nothing (all of those need 10.12+). `scripts/check-macos-binary.sh <binary>` runs all of these checks.
+
+The entry point must be `LC_UNIXTHREAD` (`otool -l <binary> | grep -E 'cmd LC_(MAIN|UNIXTHREAD)'`). `LC_MAIN` exists
+only from 10.8: Lion's kernel finds no entry point and the binary dies at launch with "Illegal instruction: 4" or
+"Segmentation fault: 11" (#113). Xcode 11's linker and MacPorts `ld64` write `LC_UNIXTHREAD` for a 10.7 target. The
+linker in Xcode 15 and later always writes `LC_MAIN`; its classic linker still writes `LC_UNIXTHREAD`, so builds with
+a newer Xcode need `RUSTFLAGS="-C link-arg=-ld_classic"`. The release workflow does this on GitHub's
+`macos-15-intel` runner (Xcode 16.4, SDK 15.5); a v0.1.0 build made that way ran on Lion 10.7.5 (2026-11-10).
 
 ### Building on Lion with MacPorts
 
