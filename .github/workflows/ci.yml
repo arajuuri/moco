@@ -28,7 +28,7 @@ jobs:
   linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false # nothing here pushes
       - uses: dtolnay/rust-toolchain@d2e383c7f7a2470b3f766fe5611d0bc4ffe2fd71 # 1.78.0 branch; keep in sync with rust-toolchain.toml
@@ -58,7 +58,7 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: "10.7"
       RUSTFLAGS: "-C link-arg=-ld_classic" # LC_UNIXTHREAD, not LC_MAIN, so Lion can start the binary (#113)
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false # nothing here pushes
       - uses: dtolnay/rust-toolchain@d2e383c7f7a2470b3f766fe5611d0bc4ffe2fd71 # 1.78.0 branch; keep in sync with rust-toolchain.toml
