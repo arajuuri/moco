@@ -46,8 +46,7 @@ jobs:
   # and the dependencies, not the profile, so the release build (`scripts/install.sh`) is not compiled here.
   # It runs on pushes to `main` and on manual dispatch, not on every PR push.
   #
-  # The 10.7 check has not yet run on this runner (earlier runs predate the Lion target). If its newer Xcode cannot
-  # produce LC_VERSION_MIN_MACOSX 10.7, the check fails rather than passing a binary Lion cannot load.
+  # The classic linker (`-ld_classic`) is needed for an LC_UNIXTHREAD entry point, as in release.yml (#113).
   #
   # Disabled to avoid macOS runner costs: remove `false &&` to turn it on.
   macos:
@@ -55,6 +54,7 @@ jobs:
     runs-on: macos-15-intel
     env:
       MACOSX_DEPLOYMENT_TARGET: "10.7"
+      RUSTFLAGS: "-C link-arg=-ld_classic" # LC_UNIXTHREAD, not LC_MAIN, so Lion can start the binary (#113)
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.78.0 # keep in sync with rust-toolchain.toml
@@ -62,5 +62,5 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }} # PR runs reuse main's cache instead of storing their own
       - run: cargo test --locked --workspace # python3 is preinstalled; the fake MCP/LLM servers need it
-      - name: Check minos <= 10.7 and nothing newer than Lion is linked
+      - name: Check minos <= 10.7, an LC_UNIXTHREAD entry point and nothing newer than Lion linked
         run: scripts/check-macos-binary.sh target/debug/moco

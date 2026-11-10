@@ -8,8 +8,9 @@
 # no tag behind. Running it again for a commit that already has its tag rebuilds and replaces the release files; a
 # tag that exists on another commit stops the run (bump the version instead).
 #
-# The 10.7 checks have not yet run on this runner (see the `macos` job in ci.yml). If its Xcode cannot produce a
-# binary with LC_VERSION_MIN_MACOSX 10.7, the run fails and nothing is published.
+# The runner's default linker (Xcode 15+) always writes an LC_MAIN entry point, which Lion cannot start (#113), so the
+# build uses the classic linker (`-ld_classic`), which writes LC_UNIXTHREAD for a 10.7 target. Apple has deprecated
+# it; if a runner image drops it, the build or the entry-point check fails and nothing is published.
 name: release
 
 on:
@@ -25,6 +26,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   MACOSX_DEPLOYMENT_TARGET: "10.7"
+  RUSTFLAGS: "-C link-arg=-ld_classic" # LC_UNIXTHREAD, not LC_MAIN, so Lion can start the binary (#113)
 
 jobs:
   macos:
