@@ -1292,4 +1292,46 @@ mod tests {
         assert_eq!(s.session(&ses_id).unwrap().unwrap().agent, "build");
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    /// A database at the first schema version, written without `Store` (as the earliest builds left it), opens with
+    /// every later migration applied and its rows intact. Guards SQLite and rusqlite upgrades (#103) as well as new
+    /// migrations.
+    #[test]
+    fn a_version_1_database_migrates_to_the_current_schema() {
+        let dir = std::env::temp_dir().join(new_id("moco-store"));
+        let path = dir.join("moco.db");
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let c = Connection::open(&path).unwrap();
+            c.query_row("pragma journal_mode=wal", [], |_| Ok(())).unwrap();
+            c.execute_batch("create table migrations(version integer primary key, applied_at integer not null)").unwrap();
+            c.execute_batch(MIGRATIONS[0].1).unwrap();
+            c.execute_batch(
+                "insert into migrations values (1, 0);
+                 insert into project values ('prj_1', '/p', 'p', 0);
+                 insert into session(id, project_id, directory, agent, title, time_created, time_updated)
+                     values ('ses_1', 'prj_1', '/p', 'build', 'old', 0, 0);
+                 insert into message values ('msg_1', 'ses_1', 'user', '{\"text\":\"hi\"}', 0);
+                 insert into message values ('msg_2', 'ses_1', 'assistant', '{\"parts\":[],\"snapshot\":\"snap1\"}', 0);
+                 insert into todo values ('ses_1', 0, 'step', 'pending');",
+            )
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let version: i64 = s.conn.query_row("select max(version) from migrations", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, MIGRATIONS.last().unwrap().0);
+        let ses = s.session("ses_1").unwrap().unwrap();
+        assert_eq!((ses.agent.as_str(), ses.title.as_deref(), ses.variant, ses.permission_mode), ("build", Some("old"), None, None));
+        assert_eq!(s.messages("ses_1").unwrap().len(), 2);
+        assert_eq!(s.last_snapshot("ses_1").unwrap().as_deref(), Some("snap1"));
+        assert_eq!(s.todos("ses_1").unwrap().len(), 1);
+        let fk: i64 = s.conn.query_row("pragma foreign_keys", [], |r| r.get(0)).unwrap();
+        assert_eq!(fk, 1);
+        // New rows go into the migrated tables, and deleting the session cascades.
+        s.add_message("ses_1", "user", &json!({"text": "again"})).unwrap();
+        s.conn.execute("delete from session where id='ses_1'", []).unwrap();
+        let left: i64 = s.conn.query_row("select count(*) from message", [], |r| r.get(0)).unwrap();
+        assert_eq!(left, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
