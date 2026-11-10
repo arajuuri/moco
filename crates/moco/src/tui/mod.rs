@@ -306,7 +306,9 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
 
         // Prompts that were sent during a turn leave the inbox when the engine delivers them: that is when
         // they become part of the conversation, so that is when they appear in the transcript.
-        let sync_queue = |app: &mut App, sid: &str| {
+        // Returns whether it changed anything the screen shows: the store and the MCP manager change without an event.
+        let sync_queue = |app: &mut App, sid: &str| -> bool {
+            let before = (app.queued.clone(), app.jobs, app.mcp.clone(), app.job_list.clone(), app.rows.len());
             let waiting = engine.store().inbox_items(sid).unwrap_or_default();
             let (still, gone): (Vec<_>, Vec<_>) = std::mem::take(&mut app.queued).into_iter().partition(|q| waiting.iter().any(|w| w.id == q.id));
             for q in gone {
@@ -324,20 +326,26 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
                 app.mcp = host.manager.as_ref().map(|m| m.status().iter().map(|i| (i.name.clone(), moco_core::mcp::manager::describe(i))).collect()).unwrap_or_default();
                 app.job_list = engine.background_jobs(None).iter().filter(|j| j.status.starts_with("running")).map(|j| (j.id.clone(), format!("{} {}s", j.kind, j.seconds))).collect();
             }
+            before != (app.queued.clone(), app.jobs, app.mcp.clone(), app.job_list.clone(), app.rows.len())
         };
         let mut last_sync = std::time::Instant::now();
         let mut title_marked = false;
         let mut actions: VecDeque<Action> = VecDeque::new();
         let mut quit = false;
+        // Draw only when the screen can have changed (see `App::wants_redraw`), not on every idle tick.
+        let mut dirty = true;
         while !quit {
             if SIGNALLED.load(Ordering::Relaxed) {
                 break;
             }
             if (app.running || !app.queued.is_empty() || app.jobs > 0 || app.sidebar_shown()) && last_sync.elapsed() >= Duration::from_millis(200) {
-                sync_queue(&mut app, &sid);
+                dirty |= sync_queue(&mut app, &sid);
                 last_sync = std::time::Instant::now();
             }
-            terminal.draw(|f| app::render(f, &mut app))?;
+            if dirty {
+                terminal.draw(|f| app::render(f, &mut app))?;
+                dirty = false;
+            }
             let first = match rx.recv_timeout(Duration::from_millis(150)) {
                 Ok(e) => e,
                 Err(RecvTimeoutError::Timeout) => AppEvent::Tick,
@@ -364,7 +372,9 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
                 }
                 let finished_idle = matches!(ev, AppEvent::RunDone(Ok(moco_core::engine::RunOutcome::Idle)));
                 let was_key = matches!(ev, AppEvent::Key(_) | AppEvent::Focus(true));
+                let was_tick = matches!(ev, AppEvent::Tick);
                 actions.push_back(app.update(ev));
+                dirty |= app.wants_redraw(was_tick);
                 if was_key && title_marked {
                     title_marked = false;
                     let _ = crossterm::execute!(terminal.backend_mut(), crossterm::terminal::SetTitle("moco"));

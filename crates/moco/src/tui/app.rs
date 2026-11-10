@@ -529,6 +529,20 @@ impl App {
         Action::None
     }
 
+    /// Is anything on screen driven by time rather than by events? The status-line spinner and retry countdown need a
+    /// running turn, the running-tool glyph needs a tool row still marked running, and background jobs show a count.
+    /// While this is false, a `Tick` changes nothing the user can see, so the loop skips the redraw (an idle redraw
+    /// costs CPU here and makes the terminal emulator repaint). Erring towards true only costs a redraw.
+    pub fn animating(&self) -> bool {
+        self.running || self.jobs > 0 || self.retry.is_some() || self.rows.iter().any(|r| matches!(r, Row::Tool { state: ToolState::Running, .. }))
+    }
+
+    /// Does the screen need drawing after an event? Any event but `Tick` may have changed it; a `Tick` only moves
+    /// the animations.
+    pub fn wants_redraw(&self, was_tick: bool) -> bool {
+        !was_tick || self.animating()
+    }
+
     /// Is the user probably not looking? The terminal's own focus reports decide when it sends them;
     /// otherwise a stretch without key presses does.
     pub fn away(&self) -> bool {
@@ -3095,5 +3109,64 @@ mod tests {
         type_str(&mut a, "END");
         let s = screen(&mut a, 20, 8);
         assert!(s[s.len() - 3].contains("xxEND"), "{s:?}"); // the composer wraps long lines now
+    }
+
+    fn running_tool_row() -> Row {
+        Row::Tool { id: "t".into(), depth: 0, agent: "build".into(), name: "shell".into(), summary: String::new(), state: ToolState::Running, detail: None, output: String::new(), auto: None }
+    }
+
+    #[test]
+    fn an_idle_tick_does_not_need_a_redraw_but_any_other_event_does() {
+        let mut a = App::new("m", "build");
+        assert!(!a.animating());
+        assert!(!a.wants_redraw(true), "a tick on an idle screen changes nothing");
+        assert!(a.wants_redraw(false), "a key, a resize or an engine event may change the screen");
+        a.update(AppEvent::Tick);
+        assert!(!a.wants_redraw(true));
+    }
+
+    #[test]
+    fn ticks_keep_redrawing_while_something_is_animated() {
+        // The spinner and the retry countdown need a running turn.
+        let mut a = App::new("m", "build");
+        a.running = true;
+        assert!(a.animating() && a.wants_redraw(true));
+        a.running = false;
+        // Background jobs, a retry that is waiting, and a tool row that is still running.
+        a.jobs = 1;
+        assert!(a.animating());
+        a.jobs = 0;
+        a.retry = Some((std::time::Instant::now(), 1, "overloaded".into()));
+        assert!(a.animating());
+        a.retry = None;
+        assert!(!a.animating());
+        a.rows.push(running_tool_row());
+        assert!(a.animating() && a.wants_redraw(true), "the running glyph blinks on ticks");
+        if let Some(Row::Tool { state, .. }) = a.rows.last_mut() {
+            *state = ToolState::Done;
+        }
+        assert!(!a.animating(), "once the tool is done nothing moves");
+    }
+
+    #[test]
+    fn what_the_ticks_animate_is_exactly_what_animating_covers() {
+        // If a screen element that changes with `tick` is added without `animating` knowing, this fails: the frames of
+        // an idle app must not depend on the tick count, and those of a running app must.
+        let mut idle = App::new("m", "build");
+        let before = screen(&mut idle, 100, 12);
+        for _ in 0..7 {
+            idle.update(AppEvent::Tick);
+        }
+        assert_eq!(before, screen(&mut idle, 100, 12), "an idle screen is the same on every tick");
+
+        let mut busy = App::new("m", "build");
+        busy.running = true;
+        let frames: Vec<_> = (0..4)
+            .map(|_| {
+                busy.update(AppEvent::Tick);
+                screen(&mut busy, 100, 12)
+            })
+            .collect();
+        assert!(frames.windows(2).all(|w| w[0] != w[1]), "the spinner moves on every tick of a running turn");
     }
 }

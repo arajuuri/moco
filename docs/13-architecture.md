@@ -218,7 +218,10 @@ Details that matter:
   into permission resources and "always" patterns, and forces a prompt for opaque constructs (`eval`, `$(...)`, `base64 -d | sh`)
   and obvious file writes (in-place `sed`/`perl`, Python `open(..., 'w')`, and output redirections except `/dev/null`). With
   `sandbox.enabled` the command runs under `sandbox-exec` with a profile that denies writes outside the project, temp directories
-  and `sandbox.writable`. `unsandboxed: true` asks under the `shell.unsandboxed` action.
+  and `sandbox.writable`. `unsandboxed: true` asks under the `shell.unsandboxed` action. Waiting for a command (`wait_capped`,
+  shared by foreground shells and background jobs) sleeps on a kqueue `NOTE_EXIT` watch on macOS, so it wakes when the command
+  exits and otherwise every 100 ms to check `stop()` and the output cap; `try_reap` still decides whether the child exited. Without
+  the watch (other platforms, or setup failed) it polls every 15 ms. See `15-idle-cpu.md`.
 - **Output** is bounded to 2000 lines or 50 KiB; the rest is saved under `data/tool-output/` and the model is told the path.
 - **Edits** (`edit`, `write`, `patch`) write atomically under a per-file lock (`fsio.rs`), then run the configured
   formatter (`format.rs`). After a step that changed files, configured checks (`check.rs`) run once and their report is added
@@ -291,7 +294,9 @@ the `Engine`, and picks a mode:
   not scoped, so leaving the UI never waits for it: crossterm 0.27 spun forever on a hung-up tty (#87). Until that behavior
   is verified with crossterm 0.28 on Lion, before each poll the thread checks the tty with `term::tty_gone` (`select` plus
   `FIONREAD`; macOS `poll` does not work on ttys) and, when the terminal is gone, ends the UI the way SIGHUP and SIGTERM do
-  (`SIGNALLED`). The
+  (`SIGNALLED`). The loop draws only when the screen can have changed: any event but `Tick`, a `Tick` while `App::animating()`
+  (a running turn, jobs, a pending retry, a running tool row), or a `sync_queue` that changed something. `render` must not depend
+  on `tick` for anything `animating()` does not cover (`15-idle-cpu.md`). The
   engine runs on a worker thread per run (`start_run`), inside a `thread::scope`. The worker's `TuiUi` converts each borrowed
   `UiEvent` to an owned `Ev` and sends it down the channel. `Ui::ask` sends the prompt with a reply channel and blocks the engine
   thread until the UI thread answers. While a turn runs, or jobs or the sidebar are active, the loop also syncs the inbox and the sidebar (MCP
