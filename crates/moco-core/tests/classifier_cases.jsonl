@@ -315,3 +315,37 @@
 {"command": "find . -name '*.o' -exec rm -rf {} +", "expect": "ask", "category": "destructive"}
 {"command": "git -C crates/moco-core status", "expect": "allow", "category": "read-only"}
 {"command": "cargo test \\\n  -p moco-core shellparse", "expect": "allow", "category": "project-write"}
+{"command": "git log -1 --format=%B --output=$HOME/.zshrc", "expect": "ask", "category": "shell-write"}
+{"command": "git diff --output=changes.patch", "expect": "ask", "category": "shell-write"}
+{"command": "git show HEAD --outp=notes.txt", "expect": "ask", "category": "shell-write"}
+{"command": "git archive -o ../repo.tar HEAD", "expect": "ask", "category": "shell-write"}
+{"command": "sort -o sorted.txt names.txt", "expect": "ask", "category": "shell-write"}
+{"command": "sort --o=names.txt names.txt", "expect": "ask", "category": "shell-write"}
+{"command": "sed -n 'w copy.txt' src/lib.rs", "expect": "ask", "category": "shell-write"}
+{"command": "sed 's/foo/bar/w changes.txt' src/lib.rs", "expect": "ask", "category": "shell-write"}
+{"command": "sed -ni 's/foo/bar/p' src/lib.rs", "expect": "ask", "category": "shell-write"}
+{"command": "awk '{print > \"out.txt\"}' data.txt", "expect": "ask", "category": "shell-write"}
+{"command": "find . -name '*.rs' -fprint files.txt", "expect": "ask", "category": "shell-write"}
+{"command": "rg --pre sh TODO", "expect": "ask", "category": "opaque"}
+{"command": "rg --pre=/bin/sh TODO scripts/", "expect": "ask", "category": "opaque"}
+{"command": "rg TODO *", "expect": "ask", "category": "opaque"}
+{"command": "git diff --ext-diff", "expect": "ask", "category": "opaque"}
+{"command": "git log -p --ext-diff -1", "expect": "ask", "category": "opaque"}
+{"command": "git grep -O vim TODO", "expect": "ask", "category": "opaque"}
+{"command": "git config core.fsmonitor 'touch /tmp/pwned'", "expect": "ask", "category": "opaque"}
+{"command": "git config alias.st '!sh -c id'", "expect": "ask", "category": "opaque"}
+{"command": "git fetch --upload-pack='sh -c id' origin", "expect": "ask", "category": "opaque"}
+{"command": "cargo test --config 'target.x86_64-apple-darwin.runner=\"sh -c id\"'", "expect": "ask", "category": "opaque"}
+{"command": "cargo build --config build.rustc-wrapper=./wrap.sh", "expect": "ask", "category": "opaque"}
+{"command": "cargo --config=./evil.toml check", "expect": "ask", "category": "opaque"}
+{"command": "CARGO_BUILD_RUSTC_WRAPPER=./wrap.sh cargo build", "expect": "ask", "category": "opaque"}
+{"command": "RIPGREP_CONFIG_PATH=./rgrc rg TODO", "expect": "ask", "category": "opaque"}
+{"command": "export GIT_EXTERNAL_DIFF=./x.sh; git diff", "expect": "ask", "category": "opaque"}
+{"command": "XDG_CONFIG_HOME=./cfg git status", "expect": "ask", "category": "opaque"}
+{"command": "sed '1e id' notes.txt", "expect": "ask", "category": "opaque"}
+{"command": "sed 's/.*/id/e' notes.txt", "expect": "ask", "category": "opaque"}
+{"command": "awk 'BEGIN { system(\"id\") }'", "expect": "ask", "category": "opaque"}
+{"command": "awk '{ print | \"sh\" }' cmds.txt", "expect": "ask", "category": "opaque"}
+{"command": "sort --compress-program=sh names.txt", "expect": "ask", "category": "opaque"}
+{"command": "man -P 'sh -c id' ls", "expect": "ask", "category": "opaque"}
+{"command": "alias ls='sh -c id'; ls", "expect": "ask", "category": "opaque"}
