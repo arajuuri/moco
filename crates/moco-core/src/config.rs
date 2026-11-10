@@ -854,7 +854,9 @@ pub fn resolve_agents_in(cfg: &Config, mode: crate::permission::PermissionMode) 
     }
     agents.retain(|a| !cfg.agents.get(&a.id).is_some_and(|c| c.disabled));
     // The preset goes right after the mode rules, so an agent's own rules (plan's edit deny, explore's read-only set) still win.
-    let preset = preset_name(cfg, mode).and_then(crate::permission::preset_rules).unwrap_or_default();
+    // Then the user's temp directory, after the preset's `external_directory` ask and before explore's (#67).
+    let mut preset = preset_name(cfg, mode).and_then(crate::permission::preset_rules).unwrap_or_default();
+    preset.extend(crate::tools::temp_dir_rules());
     let at = crate::permission::mode_rules(mode).len();
     for a in &mut agents {
         let at = at.min(a.permissions.len());

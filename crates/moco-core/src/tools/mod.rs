@@ -297,9 +297,11 @@ impl ToolCtx<'_> {
         if self.is_internal(dir) {
             return Ok(());
         }
-        // The symlink-free name, so what the user allows once or always holds for every spelling of the directory.
+        // The symlink-free name, so what the user allows once or always holds for every spelling of the directory. The
+        // rules see only this name, so the user's own temp directory, which the mode rules allow
+        // (`permission::temp_dir_rules`), cannot be used to reach anything else through a link in it.
         let dir = real_path(dir);
-        let root = project_root_of(&dir);
+        let root = always_root_of(&dir);
         self.permit(
             "external_directory",
             vec![format!("{}/*", dir.display())],
@@ -365,6 +367,91 @@ fn owned_by_user(p: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     let me = unsafe { libc::geteuid() };
     std::fs::symlink_metadata(p).is_ok_and(|m| m.uid() == me)
+}
+
+/// What an "always" answer to `external_directory` covers: the project root of `dir`, or, when `dir` has none and lies
+/// in a scratch folder of the user's in a shared temp directory (`/private/tmp/moco_head/src`), that whole scratch
+/// folder (`/private/tmp/moco_head`), so the next subfolder does not ask again (#67). `dir` is symlink-free.
+fn always_root_of(dir: &Path) -> PathBuf {
+    let root = project_root_of(dir);
+    if root != dir {
+        return root;
+    }
+    scratch_folder_of(dir, unsafe { libc::geteuid() }).unwrap_or(root)
+}
+
+/// The ancestor of `dir` (or `dir` itself) that sits directly in a shared, sticky, world-writable directory such as
+/// `/private/tmp`, `/var/tmp` or `/Users/Shared`, if `me` owns it and nobody else can write to it. A folder another
+/// user made there (or one anyone can add to) is not widened: "always" then covers only `dir`.
+fn scratch_folder_of(dir: &Path, me: u32) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let shared = |p: &Path| std::fs::metadata(p).is_ok_and(|m| m.is_dir() && m.mode() & 0o1002 == 0o1002);
+    let top = dir.ancestors().find(|a| a.parent().is_some_and(shared))?;
+    let m = std::fs::symlink_metadata(top).ok()?;
+    (m.is_dir() && m.uid() == me && m.mode() & 0o022 == 0).then(|| top.to_path_buf())
+}
+
+/// `external_directory` is allowed in the user's own temp directory (`user_temp_dir`, #67): a long session works in
+/// scratch folders there and would otherwise ask again and again. These are rules, not an exemption in
+/// `check_external`, and `config::resolve_agents_in` places them right after the mode's and the preset's rules, so
+/// whatever comes later still wins: the explore agent's `external_directory * ask` (it reads the most untrusted text,
+/// so it keeps asking there), and the user's own `permissions` (a `deny` or `ask` for the temp directory). moco's data
+/// directory, when `MOCO_HOME` puts it in the temp directory, still asks, since it holds the provider keys. The shared
+/// `/tmp` is not covered.
+pub fn temp_dir_rules() -> Vec<crate::permission::Rule> {
+    temp_dir_rules_for(user_temp_dir().as_deref(), &crate::auth::app_dir())
+}
+
+fn temp_dir_rules_for(tmp: Option<&Path>, app_dir: &Path) -> Vec<crate::permission::Rule> {
+    use crate::permission::{Effect, Rule};
+    let Some(tmp) = tmp else { return vec![] };
+    let mut rules = vec![Rule::new("external_directory", &format!("{}/*", tmp.display()), Effect::Allow)];
+    let app = real_path(app_dir);
+    if app.starts_with(tmp) {
+        rules.push(Rule::new("external_directory", &format!("{}/*", app.display()), Effect::Ask));
+    }
+    rules
+}
+
+/// The user's own temp directory, `$TMPDIR` with symlinks resolved (on macOS the per-user, mode 700
+/// `/private/var/folders/xx/.../T`), if it is safe to let the file tools into it without an `external_directory`
+/// prompt (#67). It must be a directory the user owns that no one else can write to, under parents that only root or
+/// the user can change (or that are sticky, like `/tmp` for `/tmp/me`), and it must not be `/`, the home directory or
+/// above it. The shared `/tmp` itself fails these checks (it is world-writable), and so does an unset `TMPDIR`.
+pub fn user_temp_dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(tmp) = TEST_TEMP_DIR.with(|t| t.borrow().clone()) {
+        return private_temp_dir(&tmp, None, unsafe { libc::geteuid() });
+    }
+    let tmp = std::env::var_os("TMPDIR").filter(|t| !t.is_empty())?;
+    let home = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
+    private_temp_dir(Path::new(&tmp), home.as_deref(), unsafe { libc::geteuid() })
+}
+
+// Tests set this instead of `TMPDIR`: the variable is process-wide (`std::env::temp_dir` reads it in every test), this
+// is per thread.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_TEMP_DIR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+fn private_temp_dir(dir: &Path, home: Option<&Path>, me: u32) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    if !dir.is_absolute() {
+        return None;
+    }
+    let real = std::fs::canonicalize(dir).ok()?;
+    // It becomes a permission pattern: no wildcard characters (and no `\`, which patterns read as `/`).
+    let plain = real.to_str().is_some_and(|s| !s.contains(|c| matches!(c, '*' | '?' | '\\')));
+    if !plain || real.parent().is_none() || home.map(real_path).is_some_and(|h| h.starts_with(&real)) {
+        return None;
+    }
+    let m = std::fs::metadata(&real).ok()?;
+    if !m.is_dir() || m.uid() != me || m.mode() & 0o022 != 0 {
+        return None;
+    }
+    let safe_parent = |p: &Path| std::fs::metadata(p).is_ok_and(|m| (m.uid() == 0 || m.uid() == me) && (m.mode() & 0o022 == 0 || m.mode() & 0o1000 != 0));
+    real.ancestors().skip(1).all(safe_parent).then_some(real)
 }
 
 /// `p` with symlinks resolved. The part that does not exist yet (a file about to be created, in a folder that is
@@ -915,6 +1002,218 @@ pub(crate) mod testutil {
     impl Drop for Env {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
+/// #67: the user's own temp directory needs no `external_directory` prompt; the shared `/tmp` still asks.
+#[cfg(test)]
+mod temp_dir_tests {
+    use super::grep::tests::Rules;
+    use super::testutil::*;
+    use super::*;
+    use crate::permission::PermissionMode;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    fn me() -> u32 {
+        unsafe { libc::geteuid() }
+    }
+
+    fn mkdir(p: &Path, mode: u32) -> PathBuf {
+        std::fs::create_dir_all(p).unwrap();
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+        p.to_path_buf()
+    }
+
+    /// An `Env` whose directory only the user can change (with umask 002 it would be group-writable, and so no
+    /// place for a private temp dir).
+    fn env() -> Env {
+        let env = Env::new();
+        mkdir(&env.dir, 0o755);
+        env
+    }
+
+    /// A mode's rules (and the careful preset in auto mode), with the temp dir rules where `resolve_agents_in` puts them.
+    fn rules(mode: PermissionMode) -> Rules {
+        let mut extra = if mode == PermissionMode::Auto { crate::permission::preset_rules("careful").unwrap() } else { vec![] };
+        extra.extend(temp_dir_rules());
+        Rules::new(mode, extra)
+    }
+
+    /// Sets this thread's temp directory (instead of `TMPDIR`) until dropped.
+    struct TempDir;
+    impl TempDir {
+        fn set(p: &Path) -> TempDir {
+            TEST_TEMP_DIR.with(|t| *t.borrow_mut() = Some(p.to_path_buf()));
+            TempDir
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            TEST_TEMP_DIR.with(|t| *t.borrow_mut() = None);
+        }
+    }
+
+    fn read(ctx: &ToolCtx, p: &Path) -> Result<ToolOutput, ToolError> {
+        read::Read.run(&json!({"path": p.to_string_lossy()}), ctx)
+    }
+
+    #[test]
+    fn only_a_private_temp_dir_of_the_users_counts() {
+        let env = env();
+        let tmp = mkdir(&env.dir.join("T"), 0o700);
+        let real = std::fs::canonicalize(&tmp).unwrap();
+        assert_eq!(private_temp_dir(&tmp, None, me()), Some(real.clone()));
+        symlink(&tmp, env.dir.join("T-link")).unwrap();
+        assert_eq!(private_temp_dir(&env.dir.join("T-link"), None, me()), Some(real.clone()), "compared with links resolved");
+        assert_eq!(private_temp_dir(&tmp, None, me() + 1), None, "someone else's");
+        assert_eq!(private_temp_dir(&tmp, Some(&tmp), me()), None, "the home directory");
+        assert_eq!(private_temp_dir(&env.dir, Some(&tmp), me()), None, "above the home directory");
+        assert_eq!(private_temp_dir(Path::new("/"), None, me()), None);
+        assert_eq!(private_temp_dir(Path::new("T"), None, me()), None, "relative");
+        assert_eq!(private_temp_dir(&env.dir.join("missing"), None, me()), None);
+        for mode in [0o777, 0o770, 0o1777, 0o720] {
+            let d = mkdir(&env.dir.join(format!("m{mode:o}")), mode);
+            assert_eq!(private_temp_dir(&d, None, me()), None, "{mode:o}: others can write to it");
+        }
+        let wild = mkdir(&env.dir.join("a*b"), 0o700);
+        assert_eq!(private_temp_dir(&wild, None, me()), None, "a wildcard in the pattern");
+        // A private folder below a parent that others can change is not private.
+        let open = mkdir(&env.dir.join("open"), 0o777);
+        let below = mkdir(&open.join("T"), 0o700);
+        assert_eq!(private_temp_dir(&below, None, me()), None);
+        // The shared /tmp (/private/tmp on macOS) is world-writable.
+        assert_eq!(private_temp_dir(Path::new("/tmp"), None, me()), None);
+    }
+
+    #[test]
+    fn the_users_temp_dir_needs_no_external_directory_prompt() {
+        let env = env();
+        let tmp = mkdir(&env.dir.join("T"), 0o700);
+        std::fs::create_dir_all(tmp.join("scratch/sub")).unwrap();
+        std::fs::write(tmp.join("scratch/sub/a.txt"), "a").unwrap();
+        symlink(&tmp, env.dir.join("T-link")).unwrap();
+        std::fs::create_dir_all(env.dir.join("outside")).unwrap();
+        std::fs::write(env.dir.join("outside/o.txt"), "o").unwrap();
+        let _t = TempDir::set(&tmp);
+        for mode in [PermissionMode::Manual, PermissionMode::Auto] {
+            let perm = rules(mode);
+            let ctx = ToolCtx { permitter: &perm, ..env.ctx() };
+            assert_eq!(read(&ctx, &tmp.join("scratch/sub/a.txt")).unwrap().text, "1: a");
+            assert_eq!(read(&ctx, &env.dir.join("T-link/scratch/sub/a.txt")).unwrap().text, "1: a");
+            ctx.check_external(&tmp).unwrap();
+            ctx.check_external(&tmp.join("new/dir")).unwrap();
+            assert!(perm.prompts().is_empty(), "{mode:?}: {:?}", perm.prompts());
+            assert_eq!(read(&ctx, &env.dir.join("outside/o.txt")), Err(ToolError::Declined));
+            assert_eq!(perm.prompts(), [format!("external_directory {}/*", real_path(&env.dir.join("outside")).display())]);
+        }
+    }
+
+    #[test]
+    fn a_link_from_the_temp_dir_to_elsewhere_still_asks() {
+        let env = env();
+        let tmp = mkdir(&env.dir.join("T"), 0o700);
+        let outside = env.dir.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "s").unwrap();
+        symlink(&outside, tmp.join("dirlink")).unwrap();
+        symlink(outside.join("secret.txt"), tmp.join("filelink")).unwrap();
+        let _t = TempDir::set(&tmp);
+        let perm = rules(PermissionMode::Manual);
+        let ctx = ToolCtx { permitter: &perm, ..env.ctx() };
+        let want = format!("external_directory {}/*", real_path(&outside).display());
+        for p in ["dirlink/secret.txt", "filelink"] {
+            assert_eq!(read(&ctx, &tmp.join(p)), Err(ToolError::Declined), "{p}");
+            assert_eq!(perm.prompts().last(), Some(&want), "{p}");
+        }
+        assert_eq!(glob::Glob.run(&json!({"pattern": "*", "path": tmp.join("dirlink").to_string_lossy()}), &ctx), Err(ToolError::Declined));
+        assert_eq!(perm.prompts().last(), Some(&want));
+        assert_eq!(perm.prompts().len(), 3);
+    }
+
+    #[test]
+    fn a_shared_temp_dir_asks_and_always_covers_the_users_scratch_folder() {
+        let env = env();
+        let shared = mkdir(&env.dir.join("tmp"), 0o1777);
+        let scratch = mkdir(&shared.join("moco_head"), 0o755);
+        let sub = scratch.join("src/deep");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("a.rs"), "a").unwrap();
+        let ctx = env.ctx();
+        let pattern = |p: &Path| format!("{}/*", real_path(p).display());
+        read(&ctx, &sub.join("a.rs")).unwrap();
+        let asked = env.perm.asked();
+        assert_eq!(asked[0].action, "external_directory", "a shared temp dir is not exempt");
+        assert_eq!(asked[0].resources, [pattern(&sub)]);
+        assert_eq!(asked[0].save, [pattern(&scratch)], "\"always\" covers the whole scratch folder");
+        assert!(crate::wildcard::matches(&pattern(&scratch.join("other")), &asked[0].save[0]), "a sibling folder is covered");
+        assert!(!crate::wildcard::matches(&pattern(&shared.join("moco_other")), &asked[0].save[0]), "another scratch folder is not");
+
+        let save = |dir: &Path| {
+            ctx.check_external(dir).unwrap();
+            env.perm.asked().last().unwrap().save.clone()
+        };
+        assert_eq!(save(&scratch), [pattern(&scratch)]);
+        // The shared dir itself is not one of the user's scratch folders in it: it keeps its own pattern, unless the
+        // test's own folder is one in the system's shared /tmp (Linux; on macOS it is under the private $TMPDIR).
+        use std::os::unix::fs::MetadataExt;
+        let in_shared_tmp = real_path(&env.dir).parent().and_then(|p| std::fs::metadata(p).ok()).is_some_and(|m| m.mode() & 0o1002 == 0o1002);
+        assert_eq!(save(&shared), [pattern(if in_shared_tmp { &env.dir } else { &shared })]);
+        // A folder others can write to is not widened, nor is one somebody else owns.
+        let open = mkdir(&shared.join("open"), 0o777);
+        std::fs::create_dir_all(open.join("x")).unwrap();
+        assert_eq!(save(&open.join("x")), [pattern(&open.join("x"))]);
+        assert_eq!(scratch_folder_of(&real_path(&sub), me() + 1), None);
+        // A project in it keeps its project root.
+        let repo = scratch.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        assert_eq!(save(&repo.join("src")), [pattern(&repo)]);
+    }
+
+    #[test]
+    fn temp_dir_rules_cover_the_temp_dir_but_not_moco_data_or_its_neighbours() {
+        use crate::permission::{evaluate, Effect};
+        let t = Path::new("/nonexistent-moco/folders/ab/cd/T");
+        assert!(temp_dir_rules_for(None, t).is_empty(), "no private temp dir: no rule");
+        let rules = temp_dir_rules_for(Some(t), &t.join("moco-home"));
+        for r in ["/nonexistent-moco/folders/ab/cd/T/*", "/nonexistent-moco/folders/ab/cd/T/x/y/*"] {
+            assert_eq!(evaluate("external_directory", r, &rules), Effect::Allow, "{r}");
+        }
+        for r in ["/nonexistent-moco/folders/ab/cd/T/moco-home/*", "/nonexistent-moco/folders/ab/cd/T/moco-home/sessions/*", "/nonexistent-moco/folders/ab/cd/T-x/*", "/nonexistent-moco/folders/ab/cd/C/*", "/private/tmp/x/*"] {
+            assert_eq!(evaluate("external_directory", r, &rules), Effect::Ask, "{r}");
+        }
+        assert_eq!(evaluate("read", "/nonexistent-moco/folders/ab/cd/T/a", &rules), Effect::Ask, "only external_directory");
+    }
+
+    /// The temp dir rules come after the mode's and the preset's asks and before the explore agent's rules and the
+    /// user's `permissions`, so build skips the prompt there, explore still asks, and the user can take it back.
+    #[test]
+    fn the_temp_dir_rule_sits_between_the_defaults_and_what_must_win() {
+        use crate::permission::{evaluate, Effect, Rule};
+        let env = env();
+        let tmp = mkdir(&env.dir.join("T"), 0o700);
+        let _t = TempDir::set(&tmp);
+        let inside = format!("{}/scratch/*", real_path(&tmp).display());
+        for preset in [None, Some("careful"), Some("trusted")] {
+            for mode in [PermissionMode::Manual, PermissionMode::Auto] {
+                for user in [vec![], vec![Rule::new("external_directory", &inside, Effect::Deny)]] {
+                    let cfg: crate::config::Config = serde_json::from_value(json!({ "permission_preset": preset, "permissions": user })).unwrap();
+                    let agents = crate::config::resolve_agents_in(&cfg, mode);
+                    let perms = |id: &str| agents.iter().find(|a| a.id == id).unwrap().permissions.clone();
+                    let at = format!("{mode:?} {preset:?} user rules {}", user.len());
+                    let (want, explore) = if user.is_empty() { (Effect::Allow, Effect::Ask) } else { (Effect::Deny, Effect::Deny) };
+                    for id in ["build", "plan", "general"] {
+                        assert_eq!(evaluate("external_directory", &inside, &perms(id)), want, "{id} {at}");
+                    }
+                    assert_eq!(evaluate("external_directory", &inside, &perms("explore")), explore, "explore {at}");
+                    if (mode, preset) != (PermissionMode::Auto, Some("trusted")) {
+                        for shared in ["/private/tmp/x/*", "/tmp/x/*"] {
+                            assert_eq!(evaluate("external_directory", shared, &perms("build")), Effect::Ask, "{shared} {at}");
+                        }
+                    }
+                }
+            }
         }
     }
 }
