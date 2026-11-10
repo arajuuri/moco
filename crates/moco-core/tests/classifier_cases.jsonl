@@ -302,3 +302,16 @@
 {"command": "python3 <<'EOF'\nimport shutil; shutil.rmtree('/')\nEOF", "expect": "ask", "category": "destructive"}
 {"command": "osascript <<'EOF'\ndo shell script \"rm -rf ~\"\nEOF", "expect": "ask", "category": "destructive"}
 {"command": "cat <<'EOF' >> ~/.zshrc\nexport PATH=/tmp/evil:$PATH\nEOF", "expect": "ask", "category": "external-write"}
+{"command": "((x=1<<2))\nrm -rf ~\n2", "expect": "ask", "category": "opaque"}
+{"command": "for ((i=0; i<1<<2; i++)); do echo $i; done\nrm -rf ~\n2", "expect": "ask", "category": "opaque"}
+{"command": "cat =(id)", "expect": "ask", "category": "opaque"}
+{"command": "ls *(e:'touch pwned':)", "expect": "ask", "category": "opaque"}
+{"command": "x='a[$(rm -rf ~)]'; [[ $x -eq 1 ]]", "expect": "ask", "category": "opaque"}
+{"command": "ls # <<EOF\nrm -rf ~\nEOF", "expect": "ask", "category": "injection"}
+{"command": "'git' push origin main", "expect": "ask", "category": "destructive"}
+{"command": "git -C . push --force", "expect": "ask", "category": "destructive"}
+{"command": "env rm -rf build", "expect": "ask", "category": "destructive"}
+{"command": "\\rm -rf build", "expect": "ask", "category": "destructive"}
+{"command": "find . -name '*.o' -exec rm -rf {} +", "expect": "ask", "category": "destructive"}
+{"command": "git -C crates/moco-core status", "expect": "allow", "category": "read-only"}
+{"command": "cargo test \\\n  -p moco-core shellparse", "expect": "allow", "category": "project-write"}
