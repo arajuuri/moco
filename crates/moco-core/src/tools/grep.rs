@@ -35,13 +35,17 @@ impl Tool for Grep {
         let limit = opt_u64(input, "limit").unwrap_or(100).max(1) as usize;
         ctx.check_external(&root)?;
         ctx.permit("grep", vec![pattern.to_string()], vec!["*".into()])?;
-        // The search reads file contents: a root reached through a link (`safe.txt -> .env`, a linked directory) is
-        // authorized as `read` of what it leads to, then searched at that resolved place.
+        // The search shows file contents, so a file the model names is a `read` as well, checked as the read tool
+        // checks it (`grep . .env` asks like `read .env`). A root reached through a link (`safe.txt -> .env`, a linked
+        // directory) is authorized as what it leads to, then searched at that resolved place. A plain directory root
+        // needs no read check: what the walk finds in it is checked file by file below.
         let real = real_path(&root);
-        if real != normalize(&root) && ctx.display(&real) != ctx.display(&root) {
+        let named_file = real.is_file();
+        if named_file || (real != normalize(&root) && ctx.display(&real) != ctx.display(&root)) {
             ctx.permit_path("read", &root, vec!["*".into()])?;
         }
         let root = real;
+        let protection = ReadProtection::new(ctx);
         let src = if opt_bool(input, "literal").unwrap_or(false) { regex::escape(pattern) } else { pattern.to_string() };
         let re = RegexBuilder::new(&src)
             .case_insensitive(!opt_bool(input, "caseSensitive").unwrap_or(true))
@@ -55,6 +59,7 @@ impl Tool for Grep {
         let mut out: Vec<String> = vec![];
         let mut total = 0usize;
         let mut skipped = 0usize;
+        let mut withheld: Vec<String> = vec![];
         // Stop counting precisely after this many matches; report "N+".
         let count_cap = limit.saturating_mul(COUNT_FACTOR);
         let mut capped = false;
@@ -78,6 +83,12 @@ impl Tool for Grep {
                 if !(inc.is_match(&rel) || path.file_name().is_some_and(|n| inc.is_match(n))) {
                     continue;
                 }
+            }
+            // Found by the walk, not named by the model: a file the read rules protect (`prod.env`) is left out and
+            // listed instead of asked about in the middle of a search. Grepping or reading it by path asks.
+            if !named_file && protection.covers(path) {
+                withheld.push(rel.display().to_string());
+                continue;
             }
             let Ok(file) = std::fs::File::open(path) else { continue };
             // Data dumps and logs of this size are not what grep is for here, and would take minutes.
@@ -117,7 +128,19 @@ impl Tool for Grep {
                 }
             }
         }
-        let note = if skipped > 0 { format!("[{skipped} file(s) over {} MiB were skipped; search them with the shell tool if needed]", MAX_FILE_BYTES / (1024 * 1024)) } else { String::new() };
+        let mut notes = vec![];
+        if skipped > 0 {
+            notes.push(format!("[{skipped} file(s) over {} MiB were skipped; search them with the shell tool if needed]", MAX_FILE_BYTES / (1024 * 1024)));
+        }
+        if !withheld.is_empty() {
+            let more = if withheld.len() > 5 { format!(" and {} more", withheld.len() - 5) } else { String::new() };
+            notes.push(format!(
+                "[{} file(s) were not searched because reading them needs permission: {}{more}. Grep or read one by its path to ask for it.]",
+                withheld.len(),
+                withheld[..withheld.len().min(5)].join(", ")
+            ));
+        }
+        let note = notes.join("\n");
         if out.is_empty() {
             return Ok(ToolOutput::text(if note.is_empty() { "No matches found".to_string() } else { format!("No matches found\n\n{note}") }));
         }
@@ -133,10 +156,122 @@ impl Tool for Grep {
     }
 }
 
+/// The files the built-in read rules protect (`*.env`, `*.env.*`, not `*.env.example`), judged by the name the read
+/// tool's check would give them (relative to the working directory or project, as `ToolCtx::permit_path` names them).
+/// A walk cannot ask the permitter without prompting, so rules from config are applied only to paths the model names.
+struct ReadProtection {
+    rules: Vec<crate::permission::Rule>,
+    bases: Vec<PathBuf>,
+}
+
+impl ReadProtection {
+    fn new(ctx: &ToolCtx) -> Self {
+        use crate::permission::{default_rules, Effect, Rule};
+        let mut rules = vec![Rule::new("read", "*", Effect::Allow)];
+        rules.extend(default_rules().into_iter().filter(|r| r.action == "read" && r.resource != "*"));
+        let mut bases: Vec<PathBuf> = vec![];
+        for b in [&ctx.cwd, &ctx.project_root] {
+            for b in [normalize(b), real_path(b)] {
+                if !bases.contains(&b) {
+                    bases.push(b);
+                }
+            }
+        }
+        ReadProtection { rules, bases }
+    }
+
+    fn covers(&self, path: &Path) -> bool {
+        let rel = self.bases.iter().find_map(|b| path.strip_prefix(b).ok().filter(|r| !r.as_os_str().is_empty())).unwrap_or(path);
+        crate::permission::evaluate("read", &rel.to_string_lossy(), &self.rules) != crate::permission::Effect::Allow
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::super::testutil::Env;
     use super::*;
+    use crate::permission::{decide, mode_rules, Effect, PermissionMode, Rule};
+    use std::sync::Mutex;
+
+    /// Decides as the engine does for a mode's rules (plus `extra`), records every request that would prompt and
+    /// refuses it, so a test sees what the user would have been asked.
+    pub(in crate::tools) struct Rules {
+        rules: Vec<Rule>,
+        asked: Mutex<Vec<String>>,
+    }
+    impl Rules {
+        pub(in crate::tools) fn new(mode: PermissionMode, extra: Vec<Rule>) -> Self {
+            let mut rules = mode_rules(mode);
+            rules.extend(extra);
+            Rules { rules, asked: Mutex::new(vec![]) }
+        }
+        pub(in crate::tools) fn auto() -> Self {
+            Rules::new(PermissionMode::Auto, vec![])
+        }
+        /// The prompts, as `action resource, resource`.
+        pub(in crate::tools) fn prompts(&self) -> Vec<String> {
+            self.asked.lock().unwrap().clone()
+        }
+    }
+    impl Permitter for Rules {
+        fn check(&self, req: &PermReq) -> Result<(), ToolError> {
+            match decide(&req.action, &req.resources, &self.rules, &[]) {
+                Effect::Allow => Ok(()),
+                Effect::Deny => Err(ToolError::Blocked(format!("Permission denied: {} {}", req.action, req.resources.join(", ")))),
+                Effect::Ask => {
+                    self.asked.lock().unwrap().push(format!("{} {}", req.action, req.resources.join(", ")));
+                    Err(ToolError::Declined)
+                }
+            }
+        }
+    }
+
+    fn run_with(env: &Env, perm: &Rules, v: Value) -> Result<String, ToolError> {
+        Grep.run(&v, &ToolCtx { permitter: perm, ..env.ctx() }).map(|o| o.text)
+    }
+
+    #[test]
+    fn a_protected_file_named_as_the_root_is_a_read_and_asks() {
+        let env = Env::new();
+        env.file(".env", b"DB_PASSWORD=hunter2\n");
+        env.file("conf/prod.env", b"API_KEY=sk-live\n");
+        env.file("notes.txt", b"DB_PASSWORD is in .env\n");
+        for mode in [PermissionMode::Auto, PermissionMode::Manual] {
+            let perm = Rules::new(mode, vec![]);
+            assert_eq!(run_with(&env, &perm, json!({"pattern":".","path":".env"})), Err(ToolError::Declined), "{mode:?}");
+            assert_eq!(run_with(&env, &perm, json!({"pattern":".","path":"conf/prod.env"})), Err(ToolError::Declined), "{mode:?}");
+            assert_eq!(perm.prompts(), ["read .env", "read conf/prod.env"], "{mode:?}");
+            // An ordinary file is still searched without a prompt.
+            assert!(run_with(&env, &perm, json!({"pattern":"DB_","path":"notes.txt"})).unwrap().ends_with(":1: DB_PASSWORD is in .env"));
+            assert_eq!(perm.prompts().len(), 2, "{mode:?}");
+        }
+        // Allowed by the user's rules: searched as before.
+        let perm = Rules::new(PermissionMode::Auto, vec![Rule::new("read", "*.env", Effect::Allow)]);
+        assert_eq!(run_with(&env, &perm, json!({"pattern":"DB_","path":".env"})).unwrap(), ":1: DB_PASSWORD=hunter2");
+        // Denied by them: blocked.
+        let perm = Rules::new(PermissionMode::Auto, vec![Rule::new("read", "notes.txt", Effect::Deny)]);
+        assert!(matches!(run_with(&env, &perm, json!({"pattern":"DB_","path":"notes.txt"})), Err(ToolError::Blocked(_))));
+    }
+
+    #[test]
+    fn a_tree_walk_leaves_out_protected_files_and_says_so() {
+        let env = Env::new();
+        env.file("conf/prod.env", b"SECRET=1\n");
+        env.file("app.env.local", b"SECRET=2\n");
+        env.file("x.env.d/inner.txt", b"SECRET=3\n");
+        env.file("app.env.example", b"SECRET=example\n");
+        env.file("src/main.rs", b"// SECRET=4 is not a secret\n");
+        let perm = Rules::auto();
+        let t = run_with(&env, &perm, json!({"pattern":"SECRET"})).unwrap();
+        assert!(t.starts_with("app.env.example:1: SECRET=example\nsrc/main.rs:1: // SECRET=4"), "{t}");
+        assert!(!t.contains("SECRET=1") && !t.contains("SECRET=2") && !t.contains("SECRET=3"), "{t}");
+        assert!(t.contains("[3 file(s) were not searched because reading them needs permission: app.env.local, conf/prod.env, x.env.d/inner.txt."), "{t}");
+        assert!(perm.prompts().is_empty(), "a walk does not prompt: {:?}", perm.prompts());
+        // Also under a subdirectory root, and when the include glob names them.
+        let t = run_with(&env, &perm, json!({"pattern":"SECRET","path":"conf","include":"*.env"})).unwrap();
+        assert!(t.starts_with("No matches found") && t.contains("needs permission: prod.env."), "{t}");
+        assert!(perm.prompts().is_empty());
+    }
 
     fn run(env: &Env, v: Value) -> Result<String, ToolError> {
         Grep.run(&v, &env.ctx()).map(|o| o.text)

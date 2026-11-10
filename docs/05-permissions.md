@@ -84,6 +84,8 @@ Not done: the automatic check that is meant to replace the prompt in auto mode.
 | shell | one per parsed command, e.g. `git push origin main` | arity-based prefix + ` *`, e.g. `git push *` |
 | external_directory | `<dir>/*` | `<project root of dir>/*` |
 
+Tools that show a file's content also check `read` on it, as the read tool does (moco, #119): `grep` on a file path, `edit` of an existing file, and a patch `Update File` (with or without `Move to`) of an existing file. Ordinary files pass silently because `read *` is allowed in both modes; `.env` asks even where edits are allowed. A `grep` directory walk does not prompt: files the built-in `.env` rules protect are left out and listed in a note, and grepping or reading one by path asks. Config rules apply to the paths a tool names; a walk cannot see them without prompting.
+
 ### Shell command scanning (`shell/parse.ts`)
 
 1. Tokenize the command string with a real shell grammar (upstream: tree-sitter bash/powershell). Extract every simple command, including those inside `&&`, `||`, `;`, pipes, `$(...)` substitutions and subshells.

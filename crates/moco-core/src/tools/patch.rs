@@ -252,6 +252,19 @@ impl Tool for Patch {
         let mut seen = std::collections::HashSet::new();
         resources.retain(|r| seen.insert(r.clone()));
         ctx.permit("edit", resources, vec!["*".into()])?;
+        // Updating a file reveals what is in it: a move puts its text where it can be read, and whether the hunks
+        // match (or the closest text a failed one quotes) tells what it holds. So every existing file an Update
+        // starts from is a `read` too, checked as the read tool checks it: `.env` asks even where edits do not.
+        // Ordinary files pass silently (`read *` is allowed in every mode). Add and Delete show nothing of a file.
+        let mut read_checked = std::collections::HashSet::new();
+        for op in &ops {
+            if let Op::Update { path, .. } = op {
+                let abs = ctx.resolve(path);
+                if abs.is_file() && read_checked.insert(abs.clone()) {
+                    ctx.permit_path("read", &abs, vec!["*".into()])?;
+                }
+            }
+        }
         // Every file this patch touches is ours until it is written and formatted (issue #6). Taken after the
         // prompt, which can take minutes, and before the first read.
         let _locks = super::fsio::lock_files(&files);
@@ -538,5 +551,38 @@ mod tests {
         *env.perm.reply.lock().unwrap() = Err(ToolError::Declined);
         assert_eq!(run(&env, &wrap("*** Add File: x.txt\n+x")).unwrap_err(), ToolError::Declined);
         assert!(!env.work().join("x.txt").exists());
+    }
+
+    /// Issue #119: moving `.env` to a readable name, or probing it with hunks, needs the read permission that
+    /// reading it would.
+    #[test]
+    fn updating_a_file_the_read_rules_protect_asks_for_read_first() {
+        use super::super::grep::tests::Rules;
+        use crate::permission::{Effect, PermissionMode, Rule};
+        let env = Env::new();
+        let secret = b"DB_PASSWORD=hunter2\n";
+        env.file(".env", secret);
+        let with = |perm: &Rules, body: &str| Patch.run(&json!({ "patchText": wrap(body) }), &ToolCtx { permitter: perm, ..env.ctx() });
+        let perm = Rules::auto();
+        assert_eq!(with(&perm, "*** Update File: .env\n*** Move to: leak.txt\n@@\n+#").unwrap_err(), ToolError::Declined);
+        assert_eq!(with(&perm, "*** Update File: .env\n@@\n-DB_PASSWORD=hunter\n+DB_PASSWORD=x").unwrap_err(), ToolError::Declined);
+        assert_eq!(perm.prompts(), ["read .env", "read .env"]);
+        assert!(!env.work().join("leak.txt").exists());
+        assert_eq!(std::fs::read(env.work().join(".env")).unwrap(), secret);
+        // Manual mode, once the edit itself is approved ("edit .env, leak.txt" alone no longer lets it through).
+        let perm = Rules::new(PermissionMode::Manual, vec![Rule::new("edit", "*", Effect::Allow)]);
+        assert_eq!(with(&perm, "*** Update File: .env\n*** Move to: leak.txt\n@@\n+#").unwrap_err(), ToolError::Declined);
+        assert_eq!(perm.prompts(), ["read .env"]);
+        assert!(!env.work().join("leak.txt").exists());
+
+        // Adding or deleting shows nothing of a file's content, and ordinary files are updated and moved as before.
+        let perm = Rules::auto();
+        env.file("a.txt", b"name = moco\n");
+        let o = with(&perm, "*** Add File: new.env\n+X=1\n*** Update File: a.txt\n*** Move to: b.txt\n@@\n-name = moco\n+name = x\n*** Delete File: .env").unwrap();
+        assert_eq!(o.text, "Success. Updated the following files:\nA new.env\nM b.txt\nD .env");
+        assert!(perm.prompts().is_empty(), "{:?}", perm.prompts());
+        // A failed hunk in an ordinary file still quotes the closest text.
+        let e = with(&perm, "*** Update File: b.txt\n@@\n-name = xyz\n+y").unwrap_err();
+        assert!(e.message().contains("closest text") && e.message().contains("1: name = x"), "{}", e.message());
     }
 }
