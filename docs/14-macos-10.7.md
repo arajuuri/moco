@@ -25,8 +25,8 @@ minimum from about 1.86); #99 has the measurements.
 | Toolchain | `rust-toolchain.toml` and CI pin 1.78.0; `rust-version = "1.78"` in the workspace | Newest Rust every build machine runs (#100); 1.73 before that |
 | libc shim | `crates/moco/src/libc_shim.rs`: `getentropy`, `clock_gettime` | 1.78's `std` imports them; both need 10.12+ |
 | `Cargo.lock` | Format version 3 | Cargo before 1.78 cannot read version 4; kept while dependencies are held back |
-| ratatui / crossterm | 0.29 / 0.28 | ratatui 0.30 needs Rust 1.88 |
-| rusqlite | 0.41 down to 0.31 | 0.32+ uses C string literals (1.77); some versions under-declare their MSRV |
+| ratatui / crossterm | 0.29 / 0.28 | ratatui 0.30 needs Rust 1.88. Its `lru` stays at 0.12.5, which has two soundness advisories (RUSTSEC-2026-0002, -0253) fixed only in 0.16.3 / 0.18.2; ratatui 0.29 requires `^0.12` and calls neither affected method (#126) |
+| rusqlite | 0.41 down to 0.31 | 0.32+ uses C string literals (1.77); some versions under-declare their MSRV. The bundled SQLite is 3.45.0 (RUSTSEC-2026-0459, fixed in 3.54); rusqlite 0.32.1 / libsqlite3-sys 0.30.1 (SQLite 3.46.0) are the newest that build on 1.78 (#103, #126) |
 | ignore / globset | Capped at 0.4.23 / 0.4.15 | Newer releases are edition 2024 and declare no MSRV |
 | getrandom (via ring) | Uses the `getentropy` shim in the binary | 0.2.11+ calls `getentropy()` directly. The shim forwards to the system function on 10.12+ and falls back to `/dev/urandom` on Lion |
 | std back-ports | `crates/moco-core/src/compat.rs`: `Option::is_none_or`, unsigned `is_multiple_of` | Methods added after 1.78 (the 1.73 back-ports of `inspect`, `inspect_err` and `File::set_modified` went with #100) |

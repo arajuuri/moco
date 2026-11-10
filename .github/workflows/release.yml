@@ -11,6 +11,11 @@
 # The runner's default linker (Xcode 15+) always writes an LC_MAIN entry point, which Lion cannot start (#113), so the
 # build uses the classic linker (`-ld_classic`), which writes LC_UNIXTHREAD for a 10.7 target. Apple has deprecated
 # it; if a runner image drops it, the build or the entry-point check fails and nothing is published.
+#
+# Supply chain (#126): the `macos` job compiles every dependency's build scripts and proc macros, so it gets a
+# read-only token and keeps no git credentials. Only the `publish` job, which runs no third-party Rust code, can
+# write: it re-creates the same tag, pushes it and uploads the files `macos` built. Third-party actions are pinned
+# to commit SHAs (Dependabot, `.github/dependabot.yml`, proposes updates).
 name: release
 
 on:
@@ -20,8 +25,7 @@ concurrency:
   group: release
   cancel-in-progress: false
 
-permissions:
-  contents: write # push the tag, create the release
+permissions: {} # each job asks for what it needs
 
 env:
   CARGO_TERM_COLOR: always
@@ -32,11 +36,19 @@ jobs:
   macos:
     if: github.ref == 'refs/heads/main'
     runs-on: macos-15-intel
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+      tag: ${{ steps.tag.outputs.tag }}
+      new: ${{ steps.tag.outputs.new }}
+      name: ${{ steps.pkg.outputs.name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0 # git describe needs the history and the tags
-      - uses: dtolnay/rust-toolchain@1.78.0 # keep in sync with rust-toolchain.toml
+          persist-credentials: false # nothing in this job pushes; build scripts must not find a token in .git/config
+      - uses: dtolnay/rust-toolchain@d2e383c7f7a2470b3f766fe5611d0bc4ffe2fd71 # 1.78.0 branch; keep in sync with rust-toolchain.toml
 
       - name: Tag the commit (locally)
         id: tag
@@ -80,22 +92,46 @@ jobs:
           cat "dist/$name.tar.gz.sha256"
           echo "name=$name" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ steps.pkg.outputs.name }}
           path: |
             dist/${{ steps.pkg.outputs.name }}.tar.gz
             dist/${{ steps.pkg.outputs.name }}.tar.gz.sha256
 
+  # Pushes the tag and publishes what `macos` built and checked. It runs only if `macos` succeeded, so a failed build
+  # still leaves no tag. The tag is re-created here on the same commit with the same name and message; `git describe`
+  # in the build saw an identical one.
+  publish:
+    needs: macos
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # push the tag, create the release
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false # the push below passes the token explicitly, for that one command
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ needs.macos.outputs.name }}
+          path: dist
+
       - name: Push the tag and publish the release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.tag.outputs.tag }}
-          VERSION: ${{ steps.tag.outputs.version }}
-          NAME: ${{ steps.pkg.outputs.name }}
-          NEW: ${{ steps.tag.outputs.new }}
+          TAG: ${{ needs.macos.outputs.tag }}
+          VERSION: ${{ needs.macos.outputs.version }}
+          NAME: ${{ needs.macos.outputs.name }}
+          NEW: ${{ needs.macos.outputs.new }}
         run: |
-          [ "$NEW" = false ] || git push origin "refs/tags/$TAG"
+          if [ "$NEW" != false ]; then
+            git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              tag -a "$TAG" -m "moco $VERSION" "$GITHUB_SHA"
+            # The token reaches git through a one-off credential helper that reads it from the environment: it is
+            # not written to .git/config and not on the command line.
+            git -c credential.helper= -c 'credential.helper=!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f' \
+              push origin "refs/tags/$TAG"
+          fi
           files=("dist/$NAME.tar.gz" "dist/$NAME.tar.gz.sha256")
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "${files[@]}" --clobber
