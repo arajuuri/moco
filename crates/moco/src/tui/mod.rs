@@ -18,6 +18,7 @@ pub use complete::Completer;
 use app::{Action, App, AppEvent, Ev};
 use crossterm::event::{self, Event};
 use moco_core::engine::{Engine, PermissionPrompt, Reply, Ui, UiEvent};
+use moco_core::mentions::Origin;
 use moco_core::store::Mode;
 use moco_core::tools::Question;
 use std::collections::VecDeque;
@@ -54,7 +55,8 @@ pub struct Host<'a> {
     /// The previous process died mid-run: continue that run first.
     pub recovered: bool,
     /// Expand mentions and put the prompt in the inbox; returns its inbox id and notes about attachments.
-    pub submit: &'a dyn Fn(&str, &str, Mode) -> Result<(String, Vec<String>), String>,
+    /// The origin says who wrote the text (a project command's mentions are checked, `mentions::Origin`).
+    pub submit: &'a dyn Fn(&str, &str, Mode, &Origin) -> Result<(String, Vec<String>), String>,
     /// Turn `/name args` into a prompt (custom commands, MCP prompts). `Err` carries a message for the user.
     pub command: &'a dyn Fn(&str) -> Result<Resolved, String>,
     pub completer: Option<Completer>,
@@ -76,6 +78,8 @@ pub struct Resolved {
     pub text: String,
     pub agent: Option<String>,
     pub model: Option<String>,
+    /// Who wrote `text`: the user (their own or a built-in command), a project, or an MCP server.
+    pub origin: Origin,
 }
 
 fn load_history(path: &std::path::Path) -> Vec<String> {
@@ -289,7 +293,7 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
         };
 
         // Queue a prompt for the session and start the run, showing attachment notes.
-        let send_prompt = |app: &mut App, sid: &str, text: &str| match (host.submit)(sid, text, Mode::Steer) {
+        let send_prompt = |app: &mut App, sid: &str, text: &str, origin: &Origin| match (host.submit)(sid, text, Mode::Steer, origin) {
             Ok((_, notes)) => {
                 for n in notes {
                     app.push_info(n);
@@ -407,7 +411,7 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
                                 start_run(&mut app, &sid, false);
                             }
                         }
-                        Action::Enqueue { text, shown, queue } => match (host.submit)(&sid, &text, if queue { Mode::Queue } else { Mode::Steer }) {
+                        Action::Enqueue { text, shown, queue } => match (host.submit)(&sid, &text, if queue { Mode::Queue } else { Mode::Steer }, &Origin::User) {
                             Ok((id, notes)) => {
                                 for n in notes {
                                     app.push_info(n);
@@ -605,14 +609,14 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
                                                     builtin::stored_ok(&mut app, "the command's model", stored);
                                                 }
                                             }
-                                            send_prompt(&mut app, &sid, &r.text);
+                                            send_prompt(&mut app, &sid, &r.text, &r.origin);
                                         }
                                         Err(e) => app.rows.push(app::Row::Error(e)),
                                     }
                                 }
                             } else {
                                 app.push_user(shown.clone());
-                                send_prompt(&mut app, &sid, &text);
+                                send_prompt(&mut app, &sid, &text, &Origin::User);
                             }
                         }
                     }

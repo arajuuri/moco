@@ -373,7 +373,7 @@ pub fn run(host: &Host, app: &mut App, sid: &str, agent: &str, name: &str, args:
                     app.open_picker(Picker::new(PickKind::Queue, "waiting prompts: Enter switches next-step/after-turn, Ctrl-D removes", items, ""));
                 }
             } else {
-                match (host.submit)(sid, args, moco_core::store::Mode::Queue) {
+                match (host.submit)(sid, args, moco_core::store::Mode::Queue, &moco_core::mentions::Origin::User) {
                     Ok((id, notes)) => {
                         for n in notes {
                             app.push_info(n);
