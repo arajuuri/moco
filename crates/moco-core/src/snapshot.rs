@@ -2,7 +2,8 @@
 //!
 //! A snapshot is a content-addressed manifest: every non-ignored file of a directory with its SHA-256 and mode,
 //! file contents stored once as blobs. Capturing walks the tree (honoring `.gitignore`, skipping `.git`) and
-//! re-hashes only files whose size or mtime changed since the previous snapshot. Restoring writes back changed
+//! re-hashes only files whose size, mtime or ctime changed since the previous snapshot (see `racy` for files changed
+//! too close to a capture to be trusted on their timestamps). Restoring writes back changed
 //! files and deletes files that did not exist; ignored files are never touched. Self-contained: no `git` needed.
 use crate::compat::*;
 use ignore::WalkBuilder;
@@ -10,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -47,6 +48,59 @@ pub struct Entry {
     /// Modification time hint (ns since epoch) so unchanged files are not re-read.
     #[serde(default)]
     pub mtime_ns: u64,
+    /// Status-change time (ns since epoch). Nonzero only when the file's size, mtime and ctime can be trusted as a
+    /// cache key by the next capture; 0 when the file changed too close to this capture (`racy`) or the manifest
+    /// predates this field, so the next capture re-reads it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub ctime_ns: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// What a capture compares to tell that a file is unchanged without reading it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    size: u64,
+    mtime_ns: u64,
+    ctime_ns: u64,
+}
+
+const NS: u64 = 1_000_000_000;
+/// How long after a whole-second timestamp another write can still get the same one (HFS+ and ext3 keep whole
+/// seconds, FAT two).
+const COARSE_WINDOW_NS: u64 = 2 * NS;
+/// The same for sub-second timestamps: covers kernels that stamp files from a coarse clock (up to a 10 ms tick behind)
+/// and 10 ms (exFAT) timestamps.
+const FINE_WINDOW_NS: u64 = 100_000_000;
+
+/// Seconds and nanoseconds since the epoch as ns; 0 (unknown) if before the epoch or out of range.
+fn epoch_ns(secs: i64, nsec: i64) -> u64 {
+    u64::try_from(secs).ok().and_then(|s| s.checked_mul(NS)).and_then(|n| n.checked_add(u64::try_from(nsec).ok()?)).unwrap_or(0)
+}
+
+impl Stamp {
+    fn of(meta: &std::fs::Metadata) -> Stamp {
+        Stamp { size: meta.len(), mtime_ns: epoch_ns(meta.mtime(), meta.mtime_nsec()), ctime_ns: epoch_ns(meta.ctime(), meta.ctime_nsec()) }
+    }
+}
+
+/// Whether a file stat'ed by a capture that started at `start_ns` could still be written again without its stamp
+/// changing ("racily clean", as git calls it). On a filesystem with whole-second timestamps (HFS+) an edit that keeps the
+/// size and lands in the same second as the capture leaves size, mtime and ctime as they were, so such a file must not
+/// be trusted on its stamp: the next capture re-reads it. ctime is used as well as mtime because nothing but a real change
+/// sets it (`touch -d`, `cp -p` and `tar` set mtime back, not ctime), so a stamp that is not racy can only repeat if the
+/// file is not written again. Whether timestamps are whole seconds is judged from the timestamp itself (a sub-second
+/// filesystem gives a whole second once in 10^9 files, which only costs that file a re-read).
+fn racy(st: &Stamp, start_ns: u64) -> bool {
+    let t = st.mtime_ns.max(st.ctime_ns);
+    let window = if t % NS == 0 { COARSE_WINDOW_NS } else { FINE_WINDOW_NS };
+    st.mtime_ns == 0 || st.ctime_ns == 0 || start_ns < t.saturating_add(window)
+}
+
+fn now_ns() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
 }
 
 /// Why a file is not part of a snapshot.
@@ -124,6 +178,9 @@ pub struct Snapshots {
     /// Prune never deletes blobs (or temp files) modified more recently than this, so it cannot remove the blobs
     /// of a capture in another process that has not written its manifest yet.
     pub blob_grace: Duration,
+    /// Tests: (capture start, mtime and ctime of every file), to simulate a filesystem with whole-second timestamps.
+    #[cfg(test)]
+    fake_times: Option<(u64, u64)>,
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -198,7 +255,14 @@ fn check_parents(dir: &Path, rel: &str) -> Result<(), SnapError> {
 
 impl Snapshots {
     pub fn new(root: PathBuf) -> Self {
-        Snapshots { root, max_files: 50_000, max_file_bytes: 2 * 1024 * 1024, blob_grace: Duration::from_secs(3600) }
+        Snapshots {
+            root,
+            max_files: 50_000,
+            max_file_bytes: 2 * 1024 * 1024,
+            blob_grace: Duration::from_secs(3600),
+            #[cfg(test)]
+            fake_times: None,
+        }
     }
 
     fn blob_path(&self, hash: &str) -> PathBuf {
@@ -226,9 +290,16 @@ impl Snapshots {
     }
 
     /// Snapshot `dir` as it is now. `prev` (an earlier snapshot of the same directory) lets unchanged files skip hashing.
-    pub fn capture(&self, dir: &Path, prev: Option<&str>) -> Result<String, SnapError> {
+    pub fn capture(&self, dir: &Path, prev_id: Option<&str>) -> Result<String, SnapError> {
+        // Taken before anything is read, so an entry judged settled (`racy`) was settled before its file was read.
+        #[allow(unused_mut)]
+        let mut start_ns = now_ns();
+        #[cfg(test)]
+        if let Some((start, _)) = self.fake_times {
+            start_ns = start;
+        }
         // Using a snapshot counts as use: a resumed old session keeps its manifests from being pruned by age.
-        let prev = prev.and_then(|p| self.manifest_in_use(p).ok()).unwrap_or_default();
+        let prev = prev_id.and_then(|p| self.manifest_in_use(p).ok()).unwrap_or_default();
         let mut files = BTreeMap::new();
         let mut skipped: Vec<Skipped> = vec![];
         let walker = WalkBuilder::new(dir)
@@ -261,9 +332,16 @@ impl Snapshots {
             if files.len() >= self.max_files {
                 return Err(SnapError::TooManyFiles(self.max_files));
             }
-            let mtime_ns = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_nanos() as u64).unwrap_or(0);
+            #[allow(unused_mut)]
+            let mut st = Stamp::of(&meta);
+            #[cfg(test)]
+            if let Some((_, t)) = self.fake_times {
+                (st.mtime_ns, st.ctime_ns) = (t, t);
+            }
+            let mtime_ns = st.mtime_ns;
             let mode = meta.permissions().mode() & 0o777;
-            let cached = prev.files.get(&rel).filter(|e| e.size == meta.len() && e.mtime_ns == mtime_ns && mtime_ns != 0);
+            // Only entries recorded as settled (nonzero ctime) are trusted, so an old manifest's entries are re-read once.
+            let cached = prev.files.get(&rel).filter(|e| e.ctime_ns != 0 && Stamp { size: e.size, mtime_ns: e.mtime_ns, ctime_ns: e.ctime_ns } == st);
             // A cached entry's blob is not stat'ed: `prev` was just marked in use, so prune keeps the blobs it refers to.
             let hash = match cached {
                 Some(e) => e.hash.clone(),
@@ -281,7 +359,8 @@ impl Snapshots {
                     h
                 }
             };
-            files.insert(rel, Entry { hash, size: meta.len(), mode, mtime_ns });
+            let ctime_ns = if racy(&st, start_ns) { 0 } else { st.ctime_ns };
+            files.insert(rel, Entry { hash, size: meta.len(), mode, mtime_ns, ctime_ns });
         }
         let mut hasher = Sha256::new();
         let mut line = String::new();
@@ -297,9 +376,13 @@ impl Snapshots {
             hasher.update(line.as_bytes());
         }
         let id = hex(&hasher.finalize());
-        // The id is content-addressed: an existing manifest is the same file, so only mark it as recently used.
+        // The id is content-addressed: an existing manifest has the same content, so it is only marked as recently used.
+        // The exception is the cache hints of the snapshot just compared against: when they changed (a racy file has
+        // settled, a file was touched, an old manifest without ctimes), it is rewritten so the next capture need not
+        // re-read those files again. Every version is correct for the same content, so a concurrent reader is unaffected.
         let mp = self.manifest_path(&id);
-        if !touch(&mp) {
+        let better_hints = prev_id == Some(id.as_str()) && prev.files != files;
+        if better_hints || !touch(&mp) {
             let manifest = Manifest { files, skipped };
             write_addressed(&mp, serde_json::to_string(&manifest).map_err(|e| SnapError::Io(e.to_string()))?.as_bytes())?;
         }
@@ -596,7 +679,7 @@ mod tests {
     fn restore_rejects_unsafe_manifests_and_missing_snapshots() {
         let t = Tree::new();
         t.put("a.txt", "x");
-        let evil = Manifest { files: BTreeMap::from([("../outside.txt".to_string(), Entry { hash: sha(b"x"), size: 1, mode: 0o644, mtime_ns: 0 })]), skipped: vec![] };
+        let evil = Manifest { files: BTreeMap::from([("../outside.txt".to_string(), Entry { hash: sha(b"x"), size: 1, mode: 0o644, mtime_ns: 0, ctime_ns: 0 })]), skipped: vec![] };
         write_atomic(&t.snaps.manifest_path("evil"), serde_json::to_string(&evil).unwrap().as_bytes()).unwrap();
         assert!(t.snaps.restore(&t.dir(), "evil", None).unwrap_err().to_string().contains("unsafe path"));
         assert!(matches!(t.snaps.restore(&t.dir(), "nope", None), Err(SnapError::Missing(_))));
@@ -681,7 +764,9 @@ mod tests {
 
     #[test]
     fn unchanged_capture_does_not_rewrite_the_manifest() {
-        let t = Tree::new();
+        let mut t = Tree::new();
+        // Stamps settled well before both captures, so their cache hints match and there is nothing to improve.
+        t.snaps.fake_times = Some((T + 60 * NS, T));
         t.put("a.txt", "one");
         let s1 = t.cap(None);
         let mp = t.snaps.manifest_path(&s1);
@@ -714,5 +799,104 @@ mod tests {
         t.snaps.restore(&t.dir(), &s2, None).unwrap();
         t.snaps.prune(&HashSet::new(), Duration::from_secs(10));
         assert!(t.snaps.manifest(&s2).is_ok(), "a snapshot in use is not pruned by age");
+    }
+
+    /// A whole second, as HFS+ stamps files.
+    const T: u64 = 1_794_172_009 * NS;
+
+    #[test]
+    fn same_second_same_size_edit_is_noticed_with_whole_second_timestamps() {
+        // HFS+ (#97): every file's mtime and ctime is the same whole second as the capture, so v1 -> v2 keeps the stamp.
+        let mut t = Tree::new();
+        t.snaps.fake_times = Some((T + NS / 2, T));
+        t.put("a.txt", "v1");
+        t.put("b.txt", "unchanged");
+        let s1 = t.cap(None);
+        t.put("a.txt", "v2");
+        let s2 = t.cap(Some(&s1));
+        assert_ne!(s1, s2, "the edit is captured although size, mtime and ctime are unchanged");
+        assert_eq!(t.snaps.diff(&s1, &s2).unwrap().iter().map(|d| d.path.as_str()).collect::<Vec<_>>(), ["a.txt"]);
+        // Undo brings v1 back.
+        t.snaps.restore(&t.dir(), &s1, Some(&s2)).unwrap();
+        assert_eq!(t.read("a.txt").as_deref(), Some("v1"));
+    }
+
+    #[test]
+    fn racy_entries_are_re_read_until_they_settle_then_cached() {
+        let mut t = Tree::new();
+        t.snaps.fake_times = Some((T + NS / 2, T));
+        t.put("a.txt", "v1");
+        let s1 = t.cap(None);
+        assert_eq!(t.snaps.manifest(&s1).unwrap().files["a.txt"].ctime_ns, 0, "changed within the capture's second: not a cache key");
+        // 1.5 s later the stamp may still repeat (FAT keeps two seconds), so it is still re-read.
+        t.snaps.fake_times = Some((T + 3 * NS / 2, T));
+        t.put("a.txt", "v2");
+        let s2 = t.cap(Some(&s1));
+        assert_ne!(s1, s2);
+        // Two seconds on, no later write can get that stamp: the entry settles and the manifest's hints are updated.
+        t.snaps.fake_times = Some((T + 2 * NS, T));
+        assert_eq!(t.cap(Some(&s2)), s2, "same content, same id");
+        assert_eq!(t.snaps.manifest(&s2).unwrap().files["a.txt"].ctime_ns, T, "the settled stamp is stored in place");
+        // From now on the stamp is trusted and the file is not read: a change that keeps the stamp (impossible on a
+        // real filesystem once settled) shows the cache is used.
+        t.put("a.txt", "v3");
+        t.snaps.fake_times = Some((T + 5 * NS, T));
+        assert_eq!(t.cap(Some(&s2)), s2, "settled entry reused without reading the file");
+        // Any change of the stamp is noticed.
+        t.snaps.fake_times = Some((T + 5 * NS, T + NS));
+        assert_ne!(t.cap(Some(&s2)), s2);
+    }
+
+    #[test]
+    fn racy_windows_for_whole_second_and_sub_second_timestamps() {
+        let st = |m: u64, c: u64| Stamp { size: 1, mtime_ns: m, ctime_ns: c };
+        // Whole seconds: two seconds must pass.
+        assert!(racy(&st(T, T), T));
+        assert!(racy(&st(T, T), T + NS + NS / 2));
+        assert!(!racy(&st(T, T), T + 2 * NS));
+        // Sub-second timestamps (APFS, ext4) settle after 100 ms, so recently edited files keep their cache too.
+        let f = T + 123_456_789;
+        assert!(racy(&st(f, f), f + 50_000_000));
+        assert!(!racy(&st(f, f), f + 100_000_000));
+        // ctime counts: an mtime set back (touch -d, cp -p) does not hide a fresh change.
+        assert!(racy(&st(T - 3600 * NS, f), f + 1));
+        // Unknown times are never trusted; a capture start before the stamp (clock set back) is racy.
+        assert!(racy(&st(0, f), f + NS) && racy(&st(f, 0), f + NS) && racy(&st(f, f), f - NS));
+    }
+
+    #[test]
+    fn mtime_preserving_change_is_noticed_through_ctime() {
+        // Same size, and the mtime put back to what it was (cp -p, tar, rsync -t): ctime still moves. Real timestamps.
+        let t = Tree::new();
+        let p = t.dir().join("a.txt");
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        let put_old = |c: &str| {
+            t.put("a.txt", c);
+            std::fs::File::options().write(true).open(&p).unwrap().set_modified(old).unwrap();
+        };
+        put_old("v1");
+        // Wait until the stamp has settled (100 ms, or 2 s with whole-second timestamps) so s1 trusts it.
+        while racy(&Stamp::of(&std::fs::metadata(&p).unwrap()), now_ns()) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let s1 = t.cap(None);
+        assert_ne!(t.snaps.manifest(&s1).unwrap().files["a.txt"].ctime_ns, 0, "settled");
+        put_old("v2");
+        assert_ne!(t.cap(Some(&s1)), s1);
+    }
+
+    #[test]
+    fn old_manifests_without_ctimes_still_load_and_are_re_read() {
+        let t = Tree::new();
+        t.put("a.txt", "new");
+        let m = std::fs::metadata(t.dir().join("a.txt")).unwrap();
+        // A manifest written before ctimes were stored, whose size and mtime match but whose hash is stale.
+        let mtime_ns = epoch_ns(m.mtime(), m.mtime_nsec());
+        let old = format!(r#"{{"files":{{"a.txt":{{"hash":"{}","size":3,"mode":420,"mtime_ns":{mtime_ns}}}}}}}"#, sha(b"old"));
+        write_atomic(&t.snaps.manifest_path("old"), old.as_bytes()).unwrap();
+        assert_eq!(t.snaps.manifest("old").unwrap().files["a.txt"].ctime_ns, 0);
+        let s = t.cap(Some("old"));
+        assert_eq!(t.snaps.manifest(&s).unwrap().files["a.txt"].hash, sha(b"new"), "an entry without a ctime is not trusted");
+        assert_eq!(s, t.cap(None));
     }
 }
