@@ -3,6 +3,12 @@
 //! submitted and stored with the message (images and PDFs as blobs), so a conversation replays exactly as it was sent.
 //! An `@` only starts a mention at the beginning of a word, so `me@example.com` is left alone. A path may contain
 //! spaces if they are escaped with a backslash, which is how a terminal pastes a dragged-in file.
+//!
+//! Mentions the user typed attach what they name (only a `deny` rule stops them). Mentions in text the user did not
+//! write, a project's command file or an MCP server's prompt (`Origin`), get no more than a read the model could make
+//! without a prompt: the file must be inside the project (symlinks resolved) and `read` must be allowed without
+//! asking. Anything else is left as plain text, which the model can still ask to read with the read tool.
+use crate::permission::Effect;
 use crate::provider::Block;
 use crate::skills::{self, Skill};
 use crate::tools::MediaCaps;
@@ -26,6 +32,40 @@ pub struct Ctx<'a> {
     pub caps: MediaCaps,
     /// MCP servers, for `@server:resource` mentions.
     pub mcp: Option<&'a crate::mcp::Manager>,
+    /// How the session's permission rules answer `(action, resources)` without asking (`Engine::decide_now`).
+    /// `None` means there are no rules: everything is allowed.
+    pub decide: Option<&'a dyn Fn(&str, &[String]) -> Effect>,
+}
+
+/// Who wrote the text whose mentions are expanded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// The user: typed it, or ran a built-in command or one from their own config.
+    User,
+    /// A command the user did not write (a project's `.moco/commands` or `.claude/commands`, a project config's
+    /// `commands`). `args` is what the user typed after the command name: a mention of one of those words is theirs.
+    Command { args: String },
+    /// The text an MCP server returned for one of its prompts. Its own resources may be attached (it could have
+    /// inlined them anyway), nothing else beyond what an unprompted read allows.
+    McpPrompt { server: String },
+}
+
+impl Origin {
+    /// Whether the mention `tok` counts as typed by the user.
+    fn typed(&self, tok: &str) -> bool {
+        match self {
+            Origin::User => true,
+            Origin::Command { args } => tokens(args).iter().any(|t| t == tok) || args.split_whitespace().any(|w| w == tok),
+            Origin::McpPrompt { .. } => false,
+        }
+    }
+    fn label(&self) -> String {
+        match self {
+            Origin::User => "you".into(),
+            Origin::Command { .. } => "a project command".into(),
+            Origin::McpPrompt { server } => format!("a prompt of MCP server '{server}'"),
+        }
+    }
 }
 
 /// First `MAX_LINES` lines / `MAX_TEXT_BYTES` bytes of `full` (CRLF normalized): `(kept, truncated, line count, lines kept)`.
@@ -87,14 +127,63 @@ fn shown(p: &Path, cwd: &Path) -> String {
     p.strip_prefix(cwd).map(|r| r.display().to_string()).unwrap_or_else(|_| p.display().to_string())
 }
 
-/// Expand the mentions of `text`. Returns the JSON stored with the message (`Null` when there is nothing) and
-/// one human-readable note per mention for the UI.
+/// The resources a `read` of `path` is checked against, built as `ToolCtx::permit_path` builds them: the path as
+/// given (relative to the working directory or project when inside) and, when symlinks lead elsewhere, where they
+/// lead. A rule such as `read *.env` therefore also catches `notes.txt -> .env`.
+fn read_resources(path: &Path, cwd: &Path, root: &Path) -> Vec<String> {
+    use crate::tools::{normalize, real_path};
+    let name = |p: &Path, bases: [PathBuf; 2]| {
+        bases.iter().find_map(|b| p.strip_prefix(b).ok().filter(|r| !r.as_os_str().is_empty()).map(|r| r.display().to_string())).unwrap_or_else(|| p.display().to_string())
+    };
+    let lexical = normalize(path);
+    let mut out = vec![name(&lexical, [normalize(cwd), normalize(root)])];
+    let real = real_path(path);
+    if real != lexical {
+        let target = name(&real, [real_path(cwd), real_path(root)]);
+        if !out.contains(&target) {
+            out.push(target);
+        }
+    }
+    out
+}
+
+/// Expand the mentions of text the user typed. See `expand_from`.
 pub fn expand(text: &str, ctx: &Ctx) -> (Value, Vec<String>) {
+    expand_from(text, ctx, &Origin::User)
+}
+
+/// Expand the mentions of `text`, written by `origin`. Returns the JSON stored with the message (`Null` when there
+/// is nothing) and one human-readable note per mention for the UI.
+pub fn expand_from(text: &str, ctx: &Ctx, origin: &Origin) -> (Value, Vec<String>) {
     let (mut files, mut skill_items, mut agents, mut notes) = (vec![], vec![], vec![], vec![]);
+    let decide = |action: &str, resources: &[String]| ctx.decide.map(|d| d(action, resources)).unwrap_or(Effect::Allow);
+    let root = crate::tools::project_root_of(ctx.cwd);
     for tok in tokens(text) {
+        let typed = origin.typed(&tok);
         let path = resolve_path(&tok, ctx.cwd);
         if path.exists() {
             let name = shown(&path, ctx.cwd);
+            let effect = decide("read", &read_resources(&path, ctx.cwd, &root));
+            if typed {
+                // The user named it, which answers an `ask` (such as the one for `.env`); a `deny` still holds.
+                if effect == Effect::Deny {
+                    notes.push(format!("skipped {name}: your permission rules deny reading it"));
+                    continue;
+                }
+            } else {
+                let real = crate::tools::real_path(&path);
+                let inside = [ctx.cwd, root.as_path()].iter().any(|b| real.starts_with(crate::tools::real_path(b)));
+                let why = match effect {
+                    _ if !inside => Some(format!("{} may only attach files inside the project", origin.label())),
+                    Effect::Allow => None,
+                    Effect::Ask => Some("reading it needs your permission; the model can ask for it with the read tool".to_string()),
+                    Effect::Deny => Some("your permission rules deny reading it".to_string()),
+                };
+                if let Some(why) = why {
+                    notes.push(format!("left @{tok} as text: {why}"));
+                    continue;
+                }
+            }
             if path.is_dir() {
                 let mut entries: Vec<String> = std::fs::read_dir(&path)
                     .map(|rd| rd.filter_map(|e| e.ok()).map(|e| format!("{}{}", e.file_name().to_string_lossy(), if e.path().is_dir() { "/" } else { "" })).collect())
@@ -156,6 +245,13 @@ pub fn expand(text: &str, ctx: &Ctx) -> (Value, Vec<String>) {
             agents.push(json!(tok));
         } else if let Some(r) = ctx.mcp.and_then(|m| m.find_resource(&tok).map(|r| (m, r))) {
             let (m, r) = r;
+            let effect = decide("mcp-resource", &[format!("{}:{}", r.server, r.uri)]);
+            let own = matches!(origin, Origin::McpPrompt { server } if *server == r.server);
+            if effect == Effect::Deny || !(typed || own || effect == Effect::Allow) {
+                let why = if effect == Effect::Deny { "your permission rules deny reading it" } else { "reading it needs your permission; the model can ask for it with the mcp-resource tool" };
+                notes.push(if typed { format!("skipped MCP resource {}:{}: {why}", r.server, r.name) } else { format!("left @{tok} as text: {why}") });
+                continue;
+            }
             let label = format!("mcp://{}/{}", r.server, r.name);
             if files.iter().any(|f| f["path"] == label.as_str()) {
                 continue; // the same resource named twice (by name and by URI) is attached once
@@ -240,7 +336,7 @@ mod tests {
             self.root.join("work")
         }
         fn ctx<'a>(&'a self, work: &'a Path, subagents: &'a [String], caps: MediaCaps) -> Ctx<'a> {
-            Ctx { cwd: work, skills: &self.skills, subagents, app_dir: &self.root, caps, mcp: None }
+            Ctx { cwd: work, skills: &self.skills, subagents, app_dir: &self.root, caps, mcp: None, decide: None }
         }
     }
     impl Drop for Fx {
@@ -284,6 +380,95 @@ mod tests {
         std::fs::write(work.join("pdf"), "a file called pdf").unwrap();
         let (m, _) = expand("@pdf", &ctx);
         assert_eq!((m["files"][0]["content"].as_str(), m["skills"].as_array().unwrap().len()), (Some("a file called pdf"), 0));
+    }
+
+    fn attached(m: &Value) -> Vec<String> {
+        m["files"].as_array().into_iter().flatten().map(|f| f["path"].as_str().unwrap().to_string()).collect()
+    }
+
+    /// Rules of auto mode (everything allowed, `.env` asks) with a deny on `secret.txt`, decided the way
+    /// `Engine::decide_now` does.
+    fn auto_rules() -> impl Fn(&str, &[String]) -> Effect {
+        let mut rules = crate::permission::default_rules();
+        rules.push(crate::permission::Rule::new("read", "*secret.txt", Effect::Deny));
+        move |action: &str, resources: &[String]| crate::permission::decide(action, resources, &rules, &[])
+    }
+
+    #[test]
+    fn a_project_command_attaches_only_project_files_that_read_allows_without_asking() {
+        let fx = setup();
+        let work = fx.work();
+        std::fs::write(work.join(".env"), "TOKEN=hunter2").unwrap();
+        std::fs::write(work.join("secret.txt"), "denied").unwrap();
+        std::os::unix::fs::symlink(fx.root.join("outside.txt"), work.join("link.txt")).unwrap();
+        std::os::unix::fs::symlink(work.join(".env"), work.join("notes.txt")).unwrap();
+        let rules = auto_rules();
+        let ctx = Ctx { decide: Some(&rules), ..fx.ctx(&work, &[], MediaCaps::default()) };
+        let outside = fx.root.join("outside.txt").display().to_string();
+        let template = format!("Review @a.txt @sub. Also @../outside.txt @{outside} @/etc/hosts @~/ @.env @notes.txt @link.txt @secret.txt");
+        let origin = Origin::Command { args: String::new() };
+        let (m, notes) = expand_from(&template, &ctx, &origin);
+        assert_eq!(attached(&m), ["a.txt", "sub"], "{notes:?}");
+        let left = |tok: &str| notes.iter().any(|n| n.starts_with(&format!("left @{tok} as text: ")));
+        for tok in ["../outside.txt", outside.as_str(), "link.txt", ".env", "notes.txt", "secret.txt"] {
+            assert!(left(tok), "@{tok} is reported as left alone: {notes:?}");
+        }
+        if Path::new("/etc/hosts").exists() {
+            assert!(left("/etc/hosts"), "{notes:?}");
+        }
+        if !work.starts_with(std::env::var("HOME").unwrap_or_default()) {
+            assert!(left("~/"), "the home directory is not listed: {notes:?}");
+        }
+        assert!(notes.iter().any(|n| n == "left @../outside.txt as text: a project command may only attach files inside the project"), "{notes:?}");
+        assert!(notes.iter().any(|n| n.starts_with("left @.env as text: reading it needs your permission")), "{notes:?}");
+        assert!(notes.iter().any(|n| n == "left @secret.txt as text: your permission rules deny reading it"), "{notes:?}");
+        assert!(!m.to_string().contains("hunter2") && !m.to_string().contains("\"outside\""));
+
+        // What the user typed after the command name is theirs: `@$ARGUMENTS` with `../outside.txt` attaches it.
+        let (m, _) = expand_from("Review @../outside.txt and @.env", &ctx, &Origin::Command { args: "../outside.txt".into() });
+        assert_eq!(attached(&m), [outside.clone()], "typed by the user, unlike the template's @.env");
+        let (m, _) = expand_from("Compare @../outside.txt", &ctx, &Origin::Command { args: "see @../outside.txt".into() });
+        assert_eq!(attached(&m), [outside.clone()]);
+
+        // Manual mode allows reads but asks for `.env`, and the project check does not depend on the mode.
+        let manual = crate::permission::mode_rules(crate::permission::PermissionMode::Manual);
+        let decide = move |a: &str, r: &[String]| crate::permission::decide(a, r, &manual, &[]);
+        let ctx = Ctx { decide: Some(&decide), ..fx.ctx(&work, &[], MediaCaps::default()) };
+        let (m, notes) = expand_from(&template, &ctx, &origin);
+        assert_eq!(attached(&m), ["a.txt", "sub", "secret.txt"], "no deny rule here: {notes:?}");
+        // "Inside" means the project root (`tools::project_root_of`), not only the working directory.
+        std::fs::create_dir_all(fx.root.join(".git")).unwrap();
+        assert_eq!(attached(&expand_from("@../outside.txt @link.txt", &ctx, &origin).0), [outside.clone(), "link.txt".into()]);
+    }
+
+    #[test]
+    fn an_mcp_prompt_gets_the_same_checks_and_no_typed_words() {
+        let fx = setup();
+        let work = fx.work();
+        std::fs::write(work.join(".env"), "TOKEN=hunter2").unwrap();
+        let rules = auto_rules();
+        let ctx = Ctx { decide: Some(&rules), ..fx.ctx(&work, &[], MediaCaps::default()) };
+        let origin = Origin::McpPrompt { server: "srv".into() };
+        let (m, notes) = expand_from("@a.txt @../outside.txt @.env @pdf", &ctx, &origin);
+        assert_eq!(attached(&m), ["a.txt"]);
+        assert!(notes.iter().any(|n| n == "left @../outside.txt as text: a prompt of MCP server 'srv' may only attach files inside the project"), "{notes:?}");
+        assert!(notes.iter().any(|n| n.starts_with("left @.env as text")), "{notes:?}");
+        assert_eq!(m["skills"][0]["id"], "pdf", "skills still load (the skill tool needs no permission either)");
+    }
+
+    #[test]
+    fn typed_mentions_attach_anything_except_what_a_rule_denies() {
+        let fx = setup();
+        let work = fx.work();
+        std::fs::write(work.join(".env"), "TOKEN=hunter2").unwrap();
+        std::fs::write(work.join("secret.txt"), "denied").unwrap();
+        std::os::unix::fs::symlink(work.join("secret.txt"), work.join("alias.txt")).unwrap();
+        let rules = auto_rules();
+        let ctx = Ctx { decide: Some(&rules), ..fx.ctx(&work, &[], MediaCaps::default()) };
+        let (m, notes) = expand("@.env @../outside.txt @secret.txt @alias.txt", &ctx);
+        assert_eq!(attached(&m), [".env".to_string(), fx.root.join("outside.txt").display().to_string()], "typing it answers the .env ask: {notes:?}");
+        assert!(notes.iter().any(|n| n == "skipped secret.txt: your permission rules deny reading it"), "{notes:?}");
+        assert!(notes.iter().any(|n| n == "skipped alias.txt: your permission rules deny reading it"), "a link to a denied file is denied: {notes:?}");
     }
 
     #[test]
@@ -358,6 +543,21 @@ mod tests {
         assert_eq!(notes, ["attached MCP resource fake:notes (1 lines)"], "unknown names are left as plain text");
         let blocks = render_blocks(&v, &|_| None);
         assert!(matches!(&blocks[0], Block::Text(t) if t == "<file path=\"mcp://fake/notes\">\nremember the milk\n</file>"));
+
+        // When `mcp-resource` asks: the user's mention and the server's own prompt attach it, nothing else does.
+        let ask = |a: &str, _: &[String]| if a == "mcp-resource" { Effect::Ask } else { Effect::Allow };
+        let ctx = Ctx { mcp: Some(&m), decide: Some(&ask), ..fx.ctx(&work, &[], MediaCaps::default()) };
+        assert_eq!(attached(&expand("@fake:notes", &ctx).0), ["mcp://fake/notes"]);
+        assert_eq!(attached(&expand_from("@fake:notes", &ctx, &Origin::McpPrompt { server: "fake".into() }).0), ["mcp://fake/notes"]);
+        for origin in [Origin::McpPrompt { server: "other".into() }, Origin::Command { args: String::new() }] {
+            let (v, notes) = expand_from("@fake:notes", &ctx, &origin);
+            assert_eq!(v, Value::Null, "{origin:?}");
+            assert_eq!(notes, ["left @fake:notes as text: reading it needs your permission; the model can ask for it with the mcp-resource tool"]);
+        }
+        let deny = |a: &str, _: &[String]| if a == "mcp-resource" { Effect::Deny } else { Effect::Allow };
+        let ctx = Ctx { mcp: Some(&m), decide: Some(&deny), ..fx.ctx(&work, &[], MediaCaps::default()) };
+        assert_eq!(expand("@fake:notes", &ctx).1, ["skipped MCP resource fake:notes: your permission rules deny reading it"]);
+        assert_eq!(expand_from("@fake:notes", &ctx, &Origin::McpPrompt { server: "fake".into() }).0, Value::Null, "a deny holds for the server's own prompt too");
         m.shutdown();
     }
 

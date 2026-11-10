@@ -545,6 +545,18 @@ impl Engine {
         self.media_caps(p, m)
     }
 
+    /// What the session's rules (its current agent's, then the project's saved "always" rules) say about a request,
+    /// without asking anyone: an `ask` stays `Ask`. For `@` mentions, which are resolved before a run starts
+    /// (`mentions::Ctx::decide`). A session that cannot be read, or saved rules that cannot be, never make it laxer.
+    pub fn decide_now(&self, sid: &str, action: &str, resources: &[String]) -> Effect {
+        let st = self.store();
+        let Some(session) = st.session(sid).ok().flatten() else { return Effect::Ask };
+        let agents = self.agents_of(&session);
+        let Some(agent) = agent::find(agents, &session.agent).or_else(|| agents.first().cloned()) else { return Effect::Ask };
+        let saved = st.saved_permissions(&session.project_id).unwrap_or_default();
+        permission::decide(action, resources, &agent.permissions, &saved)
+    }
+
     /// Lines for `/permissions`: what the classifier allowed without asking in this session (and its subagents), and
     /// the "always allow" rules saved for the project.
     pub fn permissions_report(&self, sid: &str) -> Result<Vec<String>, StoreError> {
@@ -2022,6 +2034,25 @@ mod tests {
         assert_eq!(f.run(&TestUi::replying(vec![Reply::Reject(None)])), RunOutcome::Declined);
     }
 
+    /// `decide_now` (for `@` mentions, #124): the session's mode and agent, its config rules, then the saved ones.
+    #[test]
+    fn decide_now_follows_the_session_rules_without_asking() {
+        let cfg: config::Config = serde_json::from_value(json!({"permissions":[{"action":"read","resource":"*secret*","effect":"deny"}]})).unwrap();
+        let f = fixture_cfg(vec![], |c| {
+            c.permission_mode = PermissionMode::Manual;
+            c.agents_by_mode = BTreeMap::from([(PermissionMode::Manual, config::resolve_agents_in(&cfg, PermissionMode::Manual)), (PermissionMode::Auto, config::resolve_agents_in(&cfg, PermissionMode::Auto))]);
+        });
+        let sid = f.session.id.as_str();
+        let d = |action: &str, r: &str| f.engine.decide_now(sid, action, &[r.to_string()]);
+        assert_eq!((d("read", "a.txt"), d("read", ".env"), d("read", "my-secret.txt"), d("mcp-resource", "s:x")), (Effect::Allow, Effect::Ask, Effect::Deny, Effect::Ask));
+        f.engine.store().set_permission_mode(sid, Some("auto")).unwrap();
+        assert_eq!((d("read", "a.txt"), d("read", ".env"), d("read", "my-secret.txt"), d("mcp-resource", "s:x")), (Effect::Allow, Effect::Ask, Effect::Deny, Effect::Allow));
+        f.engine.store().save_permission(&f.session.project_id, "read", "*.env").unwrap();
+        f.engine.store().save_permission(&f.session.project_id, "read", "*secret*").unwrap();
+        assert_eq!((d("read", ".env"), d("read", "my-secret.txt")), (Effect::Allow, Effect::Deny), "a saved allow cannot lift a deny");
+        assert_eq!(f.engine.decide_now("ses_gone", "read", &["a.txt".into()]), Effect::Ask, "no session, no rules: ask");
+    }
+
     // --- command classifier (classifier.rs) ---
 
     fn verdict(v: &str, risk: &str) -> Scripted {
@@ -2898,7 +2929,7 @@ mod tests {
         let f = fixture(vec![text("seen"), text("again")]);
         f.file("notes.txt", "remember the milk\n");
         let skills_none: Vec<skills::Skill> = vec![];
-        let ctx = crate::mentions::Ctx { cwd: &f.dir.join("work"), skills: &skills_none, subagents: &["explore".to_string()], app_dir: f.engine.app_dir(), caps: MediaCaps::default(), mcp: None };
+        let ctx = crate::mentions::Ctx { cwd: &f.dir.join("work"), skills: &skills_none, subagents: &["explore".to_string()], app_dir: f.engine.app_dir(), caps: MediaCaps::default(), mcp: None, decide: None };
         let (m, notes) = crate::mentions::expand("what does @notes.txt say? ask @explore too", &ctx);
         assert_eq!(notes.len(), 2);
         f.engine.submit_with(&f.session.id, "what does @notes.txt say? ask @explore too", Some(m), Mode::Steer).unwrap();
@@ -2960,7 +2991,7 @@ mod tests {
         let f = fixture(vec![text("it is a diagram")]);
         std::fs::write(f.dir.join("work/diagram.png"), tiny_png()).unwrap();
         let work = f.dir.join("work");
-        let ctx = crate::mentions::Ctx { cwd: &work, skills: &[], subagents: &[], app_dir: f.engine.app_dir(), caps: MediaCaps::default(), mcp: None };
+        let ctx = crate::mentions::Ctx { cwd: &work, skills: &[], subagents: &[], app_dir: f.engine.app_dir(), caps: MediaCaps::default(), mcp: None, decide: None };
         let (m, notes) = crate::mentions::expand("explain @diagram.png", &ctx);
         assert!(notes[0].starts_with("attached image diagram.png"));
         f.engine.submit_with(&f.session.id, "explain @diagram.png", Some(m), Mode::Steer).unwrap();

@@ -988,10 +988,17 @@ fn main() {
 
     // Expand @mentions of files, directories, skills and agents, tell the user what was attached, then queue the prompt.
     let caps_of = |sid: &str| engine.store().session(sid).ok().flatten().map(|s| engine.current_media_caps(&s)).unwrap_or_default();
-    let send = |sid: &str, text: &str| -> bool {
+    // `origin` says who wrote the text: mentions in a project's command or an MCP prompt are checked (#124).
+    let expand_mentions = |sid: &str, text: &str, origin: &mentions::Origin| {
         let subagents = engine.subagent_names();
         let caps = caps_of(sid);
-        let (m, notes) = mentions::expand(text, &mentions::Ctx { cwd: &cwd, skills: &found_skills, subagents: &subagents, app_dir: &app_dir, caps, mcp: manager.as_deref() });
+        let decide = |action: &str, resources: &[String]| engine.decide_now(sid, action, resources);
+        mentions::expand_from(text, &mentions::Ctx { cwd: &cwd, skills: &found_skills, subagents: &subagents, app_dir: &app_dir, caps, mcp: manager.as_deref(), decide: Some(&decide) }, origin)
+    };
+    let command_origin = |cmd: &commands::Command, args: &str| cmd.origin(&app_dir, &loaded.command_origins, args);
+    let mcp_origin = |name: &str| mentions::Origin::McpPrompt { server: manager.as_ref().and_then(|m| m.prompts().into_iter().find(|p| p.command == name)).map(|p| p.server).unwrap_or_default() };
+    let send = |sid: &str, text: &str, origin: &mentions::Origin| -> bool {
+        let (m, notes) = expand_mentions(sid, text, origin);
         for n in notes {
             println!("{DIM}{n}{RESET}");
         }
@@ -1005,23 +1012,21 @@ fn main() {
     // The full-screen UI is the default on a terminal; -p, pipes and --plain keep the line-based chat.
     if prompt.is_none() && want_tui.unwrap_or(on_terminal) {
         let sid = session.id.clone();
-        let submit = |sid: &str, text: &str, mode: Mode| -> Result<(String, Vec<String>), String> {
-            let subagents = engine.subagent_names();
-            let caps = caps_of(sid);
-            let (m, notes) = mentions::expand(text, &mentions::Ctx { cwd: &cwd, skills: &found_skills, subagents: &subagents, app_dir: &app_dir, caps, mcp: manager.as_deref() });
+        let submit = |sid: &str, text: &str, mode: Mode, origin: &mentions::Origin| -> Result<(String, Vec<String>), String> {
+            let (m, notes) = expand_mentions(sid, text, origin);
             let id = engine.submit_with(sid, text, Some(m), mode).map_err(|e| format!("could not queue the prompt: {e}"))?;
             Ok((id, notes))
         };
         let command = |line: &str| -> Result<tui::Resolved, String> {
             let (name, args) = line[1..].split_once(char::is_whitespace).unwrap_or((&line[1..], ""));
             if let Some(m) = manager.as_ref().filter(|m| m.prompts().iter().any(|p| p.command == name)) {
-                return m.get_prompt(name, args).map(|text| tui::Resolved { text, agent: None, model: None });
+                return m.get_prompt(name, args).map(|text| tui::Resolved { text, agent: None, model: None, origin: mcp_origin(name) });
             }
             let cmd = found_commands.iter().find(|c| c.name == name).ok_or_else(|| format!("unknown command /{name} (Ctrl-P lists the commands)"))?;
             if cmd.subagent {
                 return Err(format!("/{name} runs in a subagent, which the full-screen UI cannot show yet; run `moco --plain` for it"));
             }
-            Ok(tui::Resolved { text: commands::expand(cmd, args), agent: cmd.agent.clone(), model: cmd.model.clone() })
+            Ok(tui::Resolved { text: commands::expand(cmd, args), agent: cmd.agent.clone(), model: cmd.model.clone(), origin: command_origin(cmd, args) })
         };
         let completer = tui::Completer::new(
             &cwd,
@@ -1050,17 +1055,17 @@ fn main() {
     }
     if let Some(p) = prompt {
         // `-p "/review the last commit"` works like typing the command.
-        let text = match p.strip_prefix('/').and_then(|r| {
+        let (text, origin) = match p.strip_prefix('/').and_then(|r| {
             let (name, args) = r.split_once(char::is_whitespace).unwrap_or((r, ""));
             if let Some(m) = manager.as_ref().filter(|m| m.prompts().iter().any(|p| p.command == name)) {
-                return Some(m.get_prompt(name, args).unwrap_or_else(|e| die(&e)));
+                return Some((m.get_prompt(name, args).unwrap_or_else(|e| die(&e)), mcp_origin(name)));
             }
-            found_commands.iter().find(|c| c.name == name && !c.subagent).map(|c| commands::expand(c, args))
+            found_commands.iter().find(|c| c.name == name && !c.subagent).map(|c| (commands::expand(c, args), command_origin(c, args)))
         }) {
             Some(t) => t,
-            None => p,
+            None => (p, mentions::Origin::User),
         };
-        if !send(&session.id, &text) {
+        if !send(&session.id, &text, &origin) {
             die("could not queue the prompt");
         }
         let mut last = run(&session.id, false);
@@ -1424,7 +1429,7 @@ fn main() {
                 if let Some(m) = manager.as_ref().filter(|m| m.prompts().iter().any(|p| p.command == name)) {
                     match m.get_prompt(name, args) {
                         Ok(text) => {
-                            if send(&session.id, &text) {
+                            if send(&session.id, &text, &mcp_origin(name)) {
                                 run(&session.id, false);
                             }
                         }
@@ -1437,13 +1442,12 @@ fn main() {
                     continue;
                 };
                 let prompt = commands::expand(cmd, args);
+                let origin = command_origin(cmd, args);
                 if cmd.subagent {
                     // Runs in a child session; the result is shown here and recorded in this conversation.
                     let parent = engine.store().session(&session.id).ok().flatten();
                     let Some(parent) = parent else { continue };
-                    let subagents = engine.subagent_names();
-                    let caps = caps_of(&session.id);
-                    let (m, notes) = mentions::expand(&prompt, &mentions::Ctx { cwd: &cwd, skills: &found_skills, subagents: &subagents, app_dir: &app_dir, caps, mcp: manager.as_deref() });
+                    let (m, notes) = expand_mentions(&session.id, &prompt, &origin);
                     for n in notes {
                         println!("{DIM}{n}{RESET}");
                     }
@@ -1480,7 +1484,7 @@ fn main() {
                         }
                         (cur.as_ref().map(|c| c.agent.clone()), cur.and_then(|c| c.model))
                     };
-                    if send(&session.id, &prompt) {
+                    if send(&session.id, &prompt, &origin) {
                         run(&session.id, false);
                     }
                     let st = engine.store();
@@ -1493,7 +1497,7 @@ fn main() {
                 }
             }
             _ => {
-                if send(&session.id, line) {
+                if send(&session.id, line, &mentions::Origin::User) {
                     run(&session.id, false);
                 }
             }

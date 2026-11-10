@@ -22,11 +22,16 @@ fn home() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_default())
 }
 
+/// The config roots that are the user's own, not a project's: `~/.claude`, `~/.agents`, `<app dir>/config`.
+pub fn user_roots(app_dir: &Path) -> Vec<PathBuf> {
+    vec![home().join(".claude"), home().join(".agents"), app_dir.join("config")]
+}
+
 /// Config roots, lowest priority first: `~/.claude`, `~/.agents`, `<app dir>/config`, then for every directory
 /// from the filesystem root down to the working directory its `.claude`, `.agents` and `.moco`.
 /// (`.claude` and `.agents` are read for compatibility with skills and commands written for other tools.)
 pub fn config_roots(app_dir: &Path, cwd: &Path) -> Vec<PathBuf> {
-    let mut roots = vec![home().join(".claude"), home().join(".agents"), app_dir.join("config")];
+    let mut roots = user_roots(app_dir);
     let mut ancestors: Vec<&Path> = cwd.ancestors().collect();
     ancestors.reverse();
     for a in ancestors {

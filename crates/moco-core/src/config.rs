@@ -398,6 +398,8 @@ pub struct Loaded {
     pub formatter_origins: BTreeMap<String, PathBuf>,
     /// The same for `checks.<name>`.
     pub check_origins: BTreeMap<String, PathBuf>,
+    /// The same for `commands.<name>`: `@` mentions in a project's command are not the user's (`mentions::Origin`).
+    pub command_origins: BTreeMap<String, PathBuf>,
     /// The config file that set `shell` last: a project's is an executable to run, so it must be vetted too.
     pub shell_origin: Option<PathBuf>,
 }
@@ -716,12 +718,17 @@ fn strip_project_relaxing_modes(v: &mut Value, path: &Path, warnings: &mut Vec<S
     }
 }
 
+/// Whether a config file is the user's own (in `<app dir>/config/`, or `$MOCO_CONFIG`) rather than a project's.
+pub fn is_user_level(app_dir: &Path, path: &Path) -> bool {
+    path.parent() == Some(app_dir.join("config").as_path()) || std::env::var_os("MOCO_CONFIG").is_some_and(|p| p == path)
+}
+
 pub fn load(app_dir: &Path, cwd: &Path) -> Loaded {
     let mut merged = Value::Object(Default::default());
     let mut out = Loaded::default();
     let mut user_classifier = Value::Null;
     for path in discover(app_dir, cwd) {
-        let user_level = path.parent() == Some(app_dir.join("config").as_path()) || std::env::var_os("MOCO_CONFIG").is_some_and(|p| p == path);
+        let user_level = is_user_level(app_dir, &path);
         let warnings = &mut out.warnings;
         let parsed = std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|raw| {
             let text = if user_level {
@@ -763,6 +770,9 @@ pub fn load(app_dir: &Path, cwd: &Path) -> Loaded {
                 }
                 for name in v["checks"].as_object().into_iter().flat_map(|o| o.keys()) {
                     out.check_origins.insert(name.clone(), path.clone());
+                }
+                for name in v["commands"].as_object().into_iter().flat_map(|o| o.keys()) {
+                    out.command_origins.insert(name.clone(), path.clone());
                 }
                 if v["checks"].is_boolean() {
                     out.check_origins.clear();
