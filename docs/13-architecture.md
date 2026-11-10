@@ -218,7 +218,8 @@ Details that matter:
   into permission resources and "always" patterns, and forces a prompt for opaque constructs (`eval`, `$(...)`, `base64 -d | sh`)
   and obvious file writes (in-place `sed`/`perl`, Python `open(..., 'w')`, and output redirections except `/dev/null`). With
   `sandbox.enabled` the command runs under `sandbox-exec` with a profile that denies writes outside the project, temp directories
-  and `sandbox.writable`. `unsandboxed: true` asks under the `shell.unsandboxed` action. Waiting for a command (`wait_capped`,
+  and `sandbox.writable`, keeps code-running paths inside them read-only (`.git/hooks`, `.git/config`, `.moco`, shell
+  startup files, the cargo registry) and denies reading credentials (#123). `unsandboxed: true` asks under the `shell.unsandboxed` action. Waiting for a command (`wait_capped`,
   shared by foreground shells and background jobs) sleeps on a kqueue `NOTE_EXIT` watch on macOS, so it wakes when the command
   exits and otherwise every 100 ms to check `stop()` and the output cap; `try_reap` still decides whether the child exited. Without
   the watch (other platforms, or setup failed) it polls every 15 ms. See `15-idle-cpu.md`.
