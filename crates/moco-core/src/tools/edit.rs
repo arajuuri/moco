@@ -63,6 +63,12 @@ If a call fails, the error says what is closest in the file: correct the call an
         }
         ctx.check_external_file(&path)?;
         ctx.permit_path("edit", &path, vec!["*".into()])?;
+        // An edit shows what the file holds: whether oldString matches and how often, and on a miss the closest
+        // text in the file. So it is a `read` too, checked as the read tool checks it: `.env` asks even where edits
+        // do not. Ordinary files pass silently (`read *` is allowed in every mode).
+        if path.is_file() {
+            ctx.permit_path("read", &path, vec!["*".into()])?;
+        }
         // Use what was authorized: the resolved target, so a link swapped in after the check is not followed.
         let path = real_path(&path);
         // From here to the end of formatting no other call may change this file (issue #6).
@@ -640,5 +646,37 @@ mod tests {
         *env.perm.reply.lock().unwrap() = Err(ToolError::Declined);
         assert!(Edit.run(&json!({"path":"f.txt","oldString":"keep","newString":"x"}), &env.ctx()).is_err());
         assert_eq!(std::fs::read(&p).unwrap(), b"keep");
+    }
+
+    /// Issue #119: a guessed oldString must not get the real line of a `.env` file back in the error, nor tell by
+    /// succeeding or failing what the file holds, unless reading it is allowed.
+    #[test]
+    fn editing_a_file_the_read_rules_protect_asks_for_read_first() {
+        use super::super::grep::tests::Rules;
+        use crate::permission::{Effect, PermissionMode, Rule};
+        let env = Env::new();
+        let p = env.file(".env", b"DB_USER=app\nDB_PASSWORD=hunter2\n");
+        let edit = |perm: &Rules, old: &str| Edit.run(&json!({"path":".env","oldString":old,"newString":"DB_PASSWORD=x"}), &ToolCtx { permitter: perm, ..env.ctx() });
+        let perm = Rules::auto();
+        assert_eq!(edit(&perm, "DB_PASSWORD=hunted").unwrap_err(), ToolError::Declined);
+        assert_eq!(edit(&perm, "DB_PASSWORD=hunter2").unwrap_err(), ToolError::Declined);
+        assert_eq!(perm.prompts(), ["read .env", "read .env"]);
+        assert_eq!(std::fs::read(&p).unwrap(), b"DB_USER=app\nDB_PASSWORD=hunter2\n");
+        // Manual mode, once the user has approved the edit itself.
+        let perm = Rules::new(PermissionMode::Manual, vec![Rule::new("edit", "*", Effect::Allow)]);
+        assert_eq!(edit(&perm, "DB_PASSWORD=hunted").unwrap_err(), ToolError::Declined);
+        assert_eq!(perm.prompts(), ["read .env"]);
+        // Reading it allowed by the user's rules: the usual hint.
+        let perm = Rules::new(PermissionMode::Auto, vec![Rule::new("read", ".env", Effect::Allow)]);
+        let e = message(edit(&perm, "DB_PASSWORD=hunted").unwrap_err());
+        assert!(e.contains("closest text") && e.contains("hunter2"), "{e}");
+
+        // An ordinary file in auto mode: no prompt, and the hint quotes the file as before.
+        env.file("conf.txt", b"name = moco\n");
+        let perm = Rules::auto();
+        let e = message(Edit.run(&json!({"path":"conf.txt","oldString":"name = mocca","newString":"x"}), &ToolCtx { permitter: &perm, ..env.ctx() }).unwrap_err());
+        assert!(e.contains("name = moco"), "{e}");
+        Edit.run(&json!({"path":"conf.txt","oldString":"name = moco","newString":"name = x"}), &ToolCtx { permitter: &perm, ..env.ctx() }).unwrap();
+        assert!(perm.prompts().is_empty(), "{:?}", perm.prompts());
     }
 }
