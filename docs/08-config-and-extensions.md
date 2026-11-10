@@ -28,7 +28,7 @@ Implemented in `crates/moco-core/src/config.rs` and `instructions.rs`.
     { "action": "shell", "resource": "ls *", "effect": "allow" }
 ] }
 ```
-- Instructions: `<app dir>/config/AGENTS.md`, then `AGENTS.md` in each directory from the project root (nearest `.git`) down to the working directory, falling back to `CLAUDE.md` in a directory that has no `AGENTS.md` (a moco extension). Files are re-read from disk on every step instead of being sent as deltas, which keeps them live but costs prompt-cache hits when they change. `read` adds `AGENTS.md` files in directories between the file and the working directory, remembered per session (`instruction_state` table).
+- Instructions: `<app dir>/config/AGENTS.md`, then `AGENTS.md` in each directory from the project root (nearest `.git`, see `04-tools.md`) down to the working directory, falling back to `CLAUDE.md` in a directory that has no `AGENTS.md` (a moco extension). Files are re-read from disk on every step instead of being sent as deltas, which keeps them live but costs prompt-cache hits when they change. `read` adds `AGENTS.md` files in directories between the file and the working directory, remembered per session (`instruction_state` table).
 - Not done: remote config, managed/system config, live reload, `{file:}` path rules beyond "relative to the config file", URL instructions, `agents` markdown files, MCP (Phase 3, later slice).
 
 ## Top-level keys (`Config.Info`)
