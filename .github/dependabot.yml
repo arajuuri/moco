@@ -1,0 +1,15 @@
+# Workflow actions are pinned to commit SHAs (#126); this proposes updates to those pins.
+# Cargo is left out on purpose: dependencies must build with Rust 1.78 ("Regenerating the lockfile" in
+# docs/14-macos-10.7.md), which Dependabot does not check.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+    ignore:
+      # Its refs are per-toolchain branches (`1.78.0`), not releases; the pin moves with rust-toolchain.toml.
+      - dependency-name: dtolnay/rust-toolchain
