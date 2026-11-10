@@ -600,6 +600,50 @@ fn strip_project_relaxing_rules(v: &mut Value, path: &Path, warnings: &mut Vec<S
     }
 }
 
+/// The mode keys get the same treatment as `permissions`: a project's config may only tighten them.
+/// - `permission_mode`: only `"manual"` is kept (it asks for everything); `"auto"` would allow everything.
+/// - `permission_preset`: always dropped. `"trusted"` removes auto mode's prompts, and `"careful"` adds allow
+///   rules on top of manual mode's asks (and is already the auto default), so neither tightens in every mode.
+/// - `sandbox`: `enabled: true` and `network: false` are kept; turning it off, allowing network and adding
+///   `writable` paths are dropped.
+fn strip_project_relaxing_modes(v: &mut Value, path: &Path, warnings: &mut Vec<String>) {
+    let Some(o) = v.as_object_mut() else { return };
+    let mut ignored = |key: &str, why: &str| {
+        warnings.push(format!("{}: {key} {why}; put it in your own config (the app config dir or $MOCO_CONFIG)", path.display()))
+    };
+    if let Some(m) = o.get("permission_mode") {
+        if m.as_str() != Some("manual") {
+            o.remove("permission_mode");
+            ignored("permission_mode", "ignored; a project can only ask for \"manual\"");
+        }
+    }
+    for key in ["permission_preset", "permissionPreset"] {
+        if o.remove(key).is_some() {
+            ignored(key, "ignored; a project cannot choose the permission preset");
+        }
+    }
+    const SANDBOX_WHY: &str = "ignored; a project can only turn the sandbox on or its network off";
+    if o.get("sandbox").is_some_and(|s| !s.is_object()) {
+        o.remove("sandbox");
+        ignored("sandbox", SANDBOX_WHY);
+    }
+    if let Some(s) = o.get_mut("sandbox").and_then(Value::as_object_mut) {
+        let relaxing: Vec<String> = s
+            .iter()
+            .filter(|(k, val)| match k.as_str() {
+                "enabled" => **val != Value::Bool(true),
+                "network" => **val != Value::Bool(false),
+                _ => true,
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in relaxing {
+            s.remove(&k);
+            ignored(&format!("sandbox.{k}"), SANDBOX_WHY);
+        }
+    }
+}
+
 pub fn load(app_dir: &Path, cwd: &Path) -> Loaded {
     let mut merged = Value::Object(Default::default());
     let mut out = Loaded::default();
@@ -615,6 +659,7 @@ pub fn load(app_dir: &Path, cwd: &Path) -> Loaded {
                 if !user_level {
                     strip_provider_endpoints(&mut v, &path, &mut out.warnings);
                     strip_project_relaxing_rules(&mut v, &path, &mut out.warnings);
+                    strip_project_relaxing_modes(&mut v, &path, &mut out.warnings);
                 }
                 if let Some(c) = v.as_object_mut().and_then(|o| o.remove("permission_classifier")) {
                     if !user_level {
@@ -833,6 +878,77 @@ mod tests {
         std::fs::write(app.join("config/moco.json"), r#"{"providers":{"ollama":{"base_url":"http://localhost:11434/v1"}}}"#).unwrap();
         let l = load(&app, &proj);
         assert_eq!(l.config.providers["ollama"].base_url.as_deref(), Some("http://localhost:11434/v1"), "the user's own config is trusted");
+    }
+
+    /// Load with `user` as the app config and `project` as the project's moco.json.
+    fn load_pair(user: &str, project: &str) -> Loaded {
+        let root = tmp();
+        let (app, proj) = (root.join("app"), root.join("proj"));
+        std::fs::create_dir_all(app.join("config")).unwrap();
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(app.join("config/moco.jsonc"), user).unwrap();
+        std::fs::write(proj.join("moco.json"), project).unwrap();
+        let l = load(&app, &proj);
+        let _ = std::fs::remove_dir_all(root);
+        l
+    }
+
+    #[test]
+    fn a_project_can_only_choose_manual_mode() {
+        use crate::permission::PermissionMode::{Auto, Manual};
+        let l = load_pair("{}", r#"{"permission_mode":"auto"}"#);
+        assert_eq!(permission_mode(&l.config), Ok(Manual));
+        assert!(l.warnings.iter().any(|w| w.contains("permission_mode") && w.contains("ignored")), "{:?}", l.warnings);
+        let l = load_pair(r#"{"permission_mode":"manual"}"#, r#"{"permission_mode":"auto"}"#);
+        assert_eq!(permission_mode(&l.config), Ok(Manual), "a project cannot override the user's manual");
+        let l = load_pair(r#"{"permission_mode":"auto"}"#, r#"{"permission_mode":"manual"}"#);
+        assert_eq!(permission_mode(&l.config), Ok(Manual), "a project may tighten to manual");
+        assert!(l.warnings.is_empty(), "{:?}", l.warnings);
+        let l = load_pair(r#"{"permission_mode":"auto"}"#, r#"{"permission_mode":"yolo"}"#);
+        assert_eq!(permission_mode(&l.config), Ok(Auto), "a bad project value is dropped, the user's stays");
+        let l = load_pair(r#"{"permission_mode":"auto"}"#, "{}");
+        assert_eq!(permission_mode(&l.config), Ok(Auto), "the user's own config still works");
+    }
+
+    #[test]
+    fn a_project_cannot_choose_the_permission_preset() {
+        use crate::permission::PermissionMode::{Auto, Manual};
+        for key in ["permission_preset", "permissionPreset"] {
+            let l = load_pair("{}", &format!(r#"{{"{key}":"trusted"}}"#));
+            assert_eq!(l.config.permission_preset, None, "{key}");
+            assert_eq!(preset_name(&l.config, Auto), Some("careful"), "auto keeps the careful default");
+            assert!(l.warnings.iter().any(|w| w.contains(key) && w.contains("ignored")), "{:?}", l.warnings);
+        }
+        let l = load_pair("{}", r#"{"permission_preset":"careful"}"#);
+        assert_eq!(preset_name(&l.config, Manual), None, "careful's allow rules must not loosen manual mode");
+        let l = load_pair(r#"{"permission_preset":"trusted"}"#, r#"{"permission_preset":"careful"}"#);
+        assert_eq!(l.config.permission_preset.as_deref(), Some("trusted"), "the user's own choice stands");
+    }
+
+    #[test]
+    fn a_project_can_only_tighten_the_sandbox() {
+        use crate::sandbox::SandboxConfig;
+        let l = load_pair("{}", r#"{"sandbox":{"enabled":false,"writable":["/"],"network":true}}"#);
+        assert_eq!(l.config.sandbox, SandboxConfig::default());
+        assert_eq!(l.warnings.iter().filter(|w| w.contains("sandbox.") && w.contains("ignored")).count(), 3, "{:?}", l.warnings);
+        let user = r#"{"sandbox":{"enabled":true,"writable":["~/moco-target"]}}"#;
+        let l = load_pair(user, r#"{"sandbox":{"enabled":false,"writable":["~"]}}"#);
+        assert_eq!(l.config.sandbox, SandboxConfig { enabled: true, writable: vec!["~/moco-target".into()], network: None }, "the user's sandbox stays");
+        let l = load_pair(r#"{"sandbox":{"network":true}}"#, r#"{"sandbox":{"enabled":true,"network":false}}"#);
+        assert_eq!(l.config.sandbox, SandboxConfig { enabled: true, writable: vec![], network: Some(false) }, "a project may turn it on and cut network");
+        assert!(l.warnings.is_empty(), "{:?}", l.warnings);
+        let l = load_pair(user, r#"{"sandbox":null}"#);
+        assert!(l.config.sandbox.enabled, "a non-object sandbox is ignored");
+        assert!(l.warnings.iter().any(|w| w.contains("sandbox ignored")), "{:?}", l.warnings);
+    }
+
+    #[test]
+    fn the_issue_114_config_keeps_every_prompt() {
+        let l = load_pair("{}", r#"{"permission_mode":"auto","permission_preset":"trusted","sandbox":{"enabled":false}}"#);
+        assert_eq!(permission_mode(&l.config), Ok(crate::permission::PermissionMode::Manual));
+        assert_eq!(l.config.permission_preset, None);
+        assert_eq!(l.config.sandbox, crate::sandbox::SandboxConfig::default());
+        assert_eq!(l.warnings.len(), 3, "{:?}", l.warnings);
     }
 
     #[test]
