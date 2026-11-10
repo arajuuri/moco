@@ -46,11 +46,13 @@ pub struct Checks {
     max_files: usize,
     max_lines: usize,
     max_bytes: usize,
+    /// Provider key variables kept out of the check's environment (`auth::child_env`).
+    provider_keys: Vec<String>,
 }
 
 impl Default for Checks {
     fn default() -> Self {
-        Checks { list: vec![], max_files: 20, max_lines: 50, max_bytes: 8 * 1024 }
+        Checks { list: vec![], max_files: 20, max_lines: 50, max_bytes: 8 * 1024, provider_keys: vec![] }
     }
 }
 
@@ -79,6 +81,12 @@ impl Checks {
     /// Cap the files passed to a check and the diagnostics kept from it.
     pub fn with_limits(mut self, max_files: usize, max_lines: usize, max_bytes: usize) -> Self {
         (self.max_files, self.max_lines, self.max_bytes) = (max_files.max(1), max_lines.max(1), max_bytes.max(1));
+        self
+    }
+
+    /// Don't pass these variables (moco's provider keys) to checks unless a check's `environment` sets them.
+    pub fn with_provider_keys(mut self, names: Vec<String>) -> Self {
+        self.provider_keys = names;
         self
     }
 
@@ -119,7 +127,9 @@ impl Checks {
         let log = std::env::temp_dir().join(format!("{}.log", crate::id::new_id("chk")));
         let Ok(out) = std::fs::File::create(&log) else { return Verdict::Note("no temporary file for the output".into()) };
         let Ok(err) = out.try_clone() else { return Verdict::Note("no temporary file for the output".into()) };
-        let child = Command::new(&args[0]).args(&args[1..]).current_dir(cwd).envs(&c.environment).stdin(Stdio::null()).stdout(Stdio::from(out)).stderr(Stdio::from(err)).process_group(0).spawn();
+        let mut cmd = Command::new(&args[0]);
+        crate::auth::child_env(&mut cmd, &self.provider_keys, &c.environment);
+        let child = cmd.args(&args[1..]).current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::from(out)).stderr(Stdio::from(err)).process_group(0).spawn();
         let mut child = match child {
             Ok(ch) => ch,
             Err(e) => {
@@ -331,5 +341,17 @@ pub(crate) mod tests {
         let mut off = map.clone();
         off.get_mut("fake").unwrap().disabled = true;
         assert_eq!(Checks::from_config(&off, &|n| n == "fake").names().len(), 0);
+    }
+
+    #[test]
+    fn checks_get_provider_keys_only_from_their_own_environment() {
+        let d = dir();
+        let mut map = config(r#"printf 'env=%s|%s|%s\n' "${ANTHROPIC_API_KEY-unset}" "${OPENAI_API_KEY-unset}" "${GITHUB_TOKEN-unset}"; exit 1"#, "rs", None);
+        map.get_mut("fake").unwrap().environment = BTreeMap::from([("OPENAI_API_KEY".to_string(), "configured".to_string())]);
+        let checks = Checks::from_config(&map, &|_| true).with_provider_keys(vec!["ANTHROPIC_API_KEY".into(), "OPENAI_API_KEY".into()]);
+        let _vars = crate::tools::testutil::ScopedEnv::set(&[("ANTHROPIC_API_KEY", "sk-test-check"), ("OPENAI_API_KEY", "sk-test-inherited"), ("GITHUB_TOKEN", "gh-test")]);
+        let runs = checks.run(&[d.join("a.rs")], &d, &AtomicBool::new(false));
+        let Verdict::Errors(t) = &runs[0].verdict else { panic!("{:?}", runs[0].verdict) };
+        assert!(t.contains("env=unset|configured|gh-test"), "{t}");
     }
 }

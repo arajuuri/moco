@@ -228,6 +228,14 @@ impl EngineConfig {
             jitter: Box::new(fastrand::f64),
         }
     }
+
+    /// Keep the catalog's provider key variables out of formatters and checks, as `shell` does (#122).
+    fn hiding_provider_keys(mut self) -> Self {
+        let keys = self.catalog.key_env_vars();
+        self.formatters = self.formatters.with_provider_keys(keys.clone());
+        self.checks = self.checks.with_provider_keys(keys);
+        self
+    }
 }
 
 /// Lock a mutex, ignoring poisoning: the data stays usable after a panic on another thread.
@@ -361,11 +369,13 @@ fn add_usage(a: Usage, b: Usage) -> Usage {
 impl Engine {
     /// Single provider answering every model ref.
     pub fn new(store: Store, provider: Box<dyn Provider>, cfg: EngineConfig) -> Self {
+        let cfg = cfg.hiding_provider_keys();
         Engine { store: Mutex::new(store), providers: HashMap::new(), fallback: Some(provider), tools: tools::all(subagent_list(&cfg), cfg.skills.clone(), cfg.websearch.clone()).into_iter().map(Arc::from).collect(), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()), check_failing: Mutex::new(HashSet::new()), title_tried: Mutex::new(HashSet::new()), classified: Mutex::new(HashSet::new()), unpriced_noted: Mutex::new(HashSet::new()), notified: Mutex::new(HashSet::new()), me: Mutex::new(std::sync::Weak::new()), jobs: jobs::Jobs::default(), notifier: Mutex::new(None), limit_state: Default::default() }
     }
 
     /// One client per provider id; a model ref's provider part picks the client.
     pub fn with_providers(store: Store, providers: HashMap<String, Box<dyn Provider>>, cfg: EngineConfig) -> Self {
+        let cfg = cfg.hiding_provider_keys();
         Engine { store: Mutex::new(store), providers, fallback: None, tools: tools::all(subagent_list(&cfg), cfg.skills.clone(), cfg.websearch.clone()).into_iter().map(Arc::from).collect(), cfg, auto_failed: Mutex::new(HashSet::new()), prompt_lock: Mutex::new(()), snapshot_off: Mutex::new(HashSet::new()), check_failing: Mutex::new(HashSet::new()), title_tried: Mutex::new(HashSet::new()), classified: Mutex::new(HashSet::new()), unpriced_noted: Mutex::new(HashSet::new()), notified: Mutex::new(HashSet::new()), me: Mutex::new(std::sync::Weak::new()), jobs: jobs::Jobs::default(), notifier: Mutex::new(None), limit_state: Default::default() }
     }
 
@@ -1115,6 +1125,18 @@ mod tests {
         assert!(out[2].contains("Check fake did not complete: timed out"), "{}", out[2]);
         let m = f.msgs();
         assert!(m[1].data["parts"].as_array().unwrap().iter().all(|p| p["state"]["status"] == "completed"));
+    }
+
+    #[test]
+    fn checks_do_not_inherit_the_catalogs_provider_keys() {
+        let script = r#"for f in "$@"; do echo "$f:1:1: error: key=${ANTHROPIC_API_KEY-unset} other=${GITHUB_TOKEN-unset}"; done; exit 1"#;
+        let f = fixture_cfg(vec![], |cfg| cfg.checks = crate::check::Checks::from_config(&crate::check::tests::config(script, "txt", None), &|_| true));
+        f.fake.extend(two_edits_and_a_note(&f));
+        f.say("edit things");
+        let _vars = crate::tools::testutil::ScopedEnv::set(&[("ANTHROPIC_API_KEY", "sk-test-engine"), ("GITHUB_TOKEN", "gh-test")]);
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        let out = tool_outputs(&f);
+        assert!(out[2].contains("key=unset other=gh-test"), "{}", out[2]);
     }
 
     /// A failure is followed by "passed" once the model fixed it, and then silence.
