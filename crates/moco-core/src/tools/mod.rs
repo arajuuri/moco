@@ -339,9 +339,32 @@ impl ToolCtx<'_> {
     }
 }
 
-/// Nearest ancestor containing `.git`, else the directory itself.
+/// Nearest ancestor containing a `.git` the user owns, else the directory itself. A `.git` at `/`, in the home
+/// directory or above it (a dotfiles repo) does not count, nor does one owned by someone else (planted in `/tmp`):
+/// everything under the root is internal, so either would turn off the external-directory checks there (#120).
 pub fn project_root_of(dir: &Path) -> PathBuf {
-    dir.ancestors().find(|a| a.join(".git").exists()).unwrap_or(dir).to_path_buf()
+    let home = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
+    project_root_in(dir, home.as_deref(), &owned_by_user)
+}
+
+fn project_root_in(dir: &Path, home: Option<&Path>, owned: &dyn Fn(&Path) -> bool) -> PathBuf {
+    let found = dir.ancestors().find(|a| {
+        let git = a.join(".git");
+        git.exists() && owned(&git)
+    });
+    let home = home.map(real_path);
+    match found {
+        Some(a) if a.parent().is_some() && !home.is_some_and(|h| h.starts_with(real_path(a))) => a.to_path_buf(),
+        _ => dir.to_path_buf(),
+    }
+}
+
+/// Whether the user running moco owns `p` itself (a symlink is judged by its own owner), as git's `safe.directory`
+/// check does.
+fn owned_by_user(p: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let me = unsafe { libc::geteuid() };
+    std::fs::symlink_metadata(p).is_ok_and(|m| m.uid() == me)
 }
 
 /// `p` with symlinks resolved. The part that does not exist yet (a file about to be created, in a folder that is
@@ -498,6 +521,83 @@ mod alias_tests {
         assert_eq!(normalize_input("edit", json!("text")), json!("text"));
         assert_eq!(normalize_input("edit", json!({"edits":"x","file_path":"a"})), json!({"edits":"x","path":"a"}));
         assert_eq!(normalize_input("edit", json!({"edits":[1,"two"],"file_path":"a"})), json!({"edits":[1,"two"],"path":"a"}));
+    }
+}
+
+#[cfg(test)]
+mod project_root_tests {
+    use super::*;
+
+    fn tree() -> PathBuf {
+        let r = std::env::temp_dir().join(crate::id::new_id("moco-root"));
+        std::fs::create_dir_all(r.join("home/repo/src")).unwrap();
+        std::fs::create_dir_all(r.join("home/scratch/deep")).unwrap();
+        std::fs::create_dir_all(r.join("home/repo/.git")).unwrap();
+        r
+    }
+
+    fn root(dir: &Path, home: &Path) -> PathBuf {
+        project_root_in(dir, Some(home), &owned_by_user)
+    }
+
+    #[test]
+    fn a_repo_below_home_is_the_root_of_everything_in_it() {
+        let r = tree();
+        let home = r.join("home");
+        assert_eq!(root(&home.join("repo/src"), &home), home.join("repo"));
+        assert_eq!(root(&home.join("repo"), &home), home.join("repo"));
+        // A `.git` file (a worktree or submodule) counts as well.
+        std::fs::create_dir_all(home.join("repo/wt/x")).unwrap();
+        std::fs::write(home.join("repo/wt/.git"), "gitdir: ../.git/worktrees/wt").unwrap();
+        assert_eq!(root(&home.join("repo/wt/x"), &home), home.join("repo/wt"));
+        // Without a home directory the nearest `.git` still wins.
+        assert_eq!(project_root_in(&home.join("repo/src"), None, &owned_by_user), home.join("repo"));
+        let _ = std::fs::remove_dir_all(r);
+    }
+
+    #[test]
+    fn a_dotfiles_repo_in_home_or_above_does_not_widen_the_root() {
+        let r = tree();
+        let home = r.join("home");
+        std::fs::create_dir_all(home.join(".git")).unwrap();
+        assert_eq!(root(&home.join("scratch/deep"), &home), home.join("scratch/deep"));
+        assert_eq!(root(&home, &home), home);
+        // A repo inside home is still found first.
+        assert_eq!(root(&home.join("repo/src"), &home), home.join("repo"));
+        // A `.git` above home (`/Users/.git`) is no better.
+        std::fs::remove_dir_all(home.join(".git")).unwrap();
+        std::fs::create_dir_all(r.join(".git")).unwrap();
+        assert_eq!(root(&home.join("scratch"), &home), home.join("scratch"));
+        // The home is compared by its real location, whatever spelling `$HOME` uses.
+        std::os::unix::fs::symlink(&home, r.join("homelink")).unwrap();
+        std::fs::create_dir_all(home.join(".git")).unwrap();
+        assert_eq!(root(&home.join("scratch"), &r.join("homelink")), home.join("scratch"));
+        let _ = std::fs::remove_dir_all(r);
+    }
+
+    #[test]
+    fn a_git_outside_home_still_counts() {
+        let r = tree();
+        std::fs::create_dir_all(r.join("elsewhere/.git")).unwrap();
+        std::fs::create_dir_all(r.join("elsewhere/a")).unwrap();
+        assert_eq!(root(&r.join("elsewhere/a"), &r.join("home")), r.join("elsewhere"));
+        let _ = std::fs::remove_dir_all(r);
+    }
+
+    #[test]
+    fn a_git_someone_else_owns_is_skipped() {
+        let r = tree();
+        let home = r.join("home");
+        // As if another user had planted `<tmp>/.git`: the search goes on past it and falls back to the directory.
+        std::fs::create_dir_all(r.join(".git")).unwrap();
+        let planted = r.join(".git");
+        let not_planted = |p: &Path| p != planted;
+        assert_eq!(project_root_in(&r.join("home/scratch"), None, &not_planted), r.join("home/scratch"));
+        assert_eq!(project_root_in(&home.join("repo/src"), None, &not_planted), home.join("repo"));
+        // Our own files pass the real check.
+        assert!(owned_by_user(&home.join("repo/.git")));
+        assert!(!owned_by_user(&r.join("missing")));
+        let _ = std::fs::remove_dir_all(r);
     }
 }
 

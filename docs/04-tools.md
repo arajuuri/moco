@@ -7,7 +7,7 @@ because tool descriptions steer the model strongly.
 
 Common rules
 - Paths may be relative to the session working directory (the "Location") or absolute.
-- A path inside the Location or its project root is *internal*. Anything else is *external*: it additionally requires an `external_directory` permission
+- A path inside the Location or its project root is *internal*. moco's project root is the nearest ancestor with a `.git` the user owns, but never `/`, the home directory or a directory above it (a dotfiles repo in `$HOME` would make the whole home internal); without one it is the Location. Anything else is *external*: it additionally requires an `external_directory` permission
   with resource `<dir>/*` (save pattern = project-root-of-that-dir `/*`). See `05-permissions.md`.
 - Every result is bounded by the generic output truncation (2000 lines / 50 KiB, spill to file) in addition to tool-specific limits.
 - Tool failures that the model can act on return a `ToolFailure {message}`; defects/interrupts propagate.
