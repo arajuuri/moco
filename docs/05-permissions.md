@@ -58,6 +58,8 @@ A switch applies from the next step of a run: a tool call already running is not
 
 The `explore` subagent denies `shell` in both modes, because a shell command can write and the rules must enforce its read-only role. Its rules come after the mode and the preset, so they never allow what those ask for: `webfetch` and `external_directory` ask, and so do reads of credentials (`auth.json`, `mcp-auth.json`, `~/.ssh`, `~/.aws`, ...; `agent.rs`, #115).
 
+Temp directories (moco, #67): `external_directory` is allowed in the user's own `$TMPDIR` (on macOS the per-user, mode 700 `/private/var/folders/.../T`), compared with symlinks resolved. It counts only if the user owns it, no one else can write to it or change its parents, and it is not `/` or the home directory or above it; an unset `TMPDIR` gives no exemption. The rule (`tools::temp_dir_rules`) is placed right after the mode and preset rules, so the `explore` agent still asks there and your `permissions` can ask or deny again; moco's data directory still asks when `MOCO_HOME` is inside `$TMPDIR`. Because the check is on the resolved directory, a symlink in `$TMPDIR` that leads elsewhere asks for the target. Files there are still files: other processes may have written them, so their content is as untrusted as anything a `shell` `cat` could show. The shared, world-writable `/tmp` (`/private/tmp`) keeps asking; "always" for a folder there without a `.git` saves the user's own top-level scratch folder (`/private/tmp/moco_head/*`) instead of only the subfolder asked about, unless that folder belongs to someone else or others can write to it. Edits in temp directories can't be undone (snapshots cover only the session directory).
+
 `webfetch.private` (moco): a `webfetch` hop to a host that is or resolves to a non-public address (loopback, RFC 1918, link-local incl. `169.254.169.254`, IPv6 ULA, ...; `tools/webfetch.rs::is_local`) is also checked under this action, resource the URL, save `<origin>` and `<origin>/*`. It asks in both modes (`default_rules` has the ask, like `shell.unsandboxed`). The connection goes to the addresses that were checked.
 
 Not done: the automatic check that is meant to replace the prompt in auto mode.
@@ -86,7 +88,7 @@ Not done: the automatic check that is meant to replace the prompt in auto mode.
 | glob/grep | the pattern | `*` |
 | webfetch | the URL | `*` |
 | shell | one per parsed command, e.g. `git push origin main` | arity-based prefix + ` *`, e.g. `git push *` |
-| external_directory | `<dir>/*` | `<project root of dir>/*` |
+| external_directory | `<dir>/*` | `<project root of dir>/*` (in a shared temp dir: the user's scratch folder, see above) |
 
 Tools that show a file's content also check `read` on it, as the read tool does (moco, #119): `grep` on a file path, `edit` of an existing file, and a patch `Update File` (with or without `Move to`) of an existing file. Ordinary files pass silently because `read *` is allowed in both modes; `.env` asks even where edits are allowed. A `grep` directory walk does not prompt: files the built-in `.env` rules protect are left out and listed in a note, and grepping or reading one by path asks. Config rules apply to the paths a tool names; a walk cannot see them without prompting.
 
