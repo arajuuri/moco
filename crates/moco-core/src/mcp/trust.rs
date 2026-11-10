@@ -116,6 +116,8 @@ static ABSENT: Value = Value::Null;
 fn secret_value(effective: &str, raw: Option<Option<&str>>) -> String {
     let n = effective.chars().count();
     match raw {
+        // Project configs are never substituted (#116), so there the template is what is sent.
+        Some(Some(r)) if substituted(r) && r == effective => format!("{}   (sent as written; {{env:}} and {{file:}} are only expanded in your own config)", shown(r)),
         Some(Some(r)) if substituted(r) => format!("{}   (substituted when used)", shown(r)),
         Some(Some(_)) => shown(effective),
         Some(None) => format!("<{n} chars from another config file, such as your own; not shown>"),
@@ -464,6 +466,12 @@ mod tests {
 
         let text = describe_server(&proj, &cfg, None).join("\n");
         assert!(text.contains("TOKEN=<9 chars, not shown>") && !text.contains("sk-secret"), "without the raw text a value's length is all that shows: {text}");
+
+        // A project config is not substituted (#116): the template itself is the value, and the prompt says so.
+        let literal = McpServerConfig { environment: [("TOKEN".to_string(), "{env:GH_TOKEN}".to_string())].into(), ..cfg.clone() };
+        let text = describe_server(&proj, &literal, Some(&raw)).join("\n");
+        assert!(text.contains("TOKEN={env:GH_TOKEN}   (sent as written; {env:} and {file:} are only expanded in your own config)"), "{text}");
+        assert!(!text.contains("substituted when used"), "{text}");
 
         let f = FormatterConfig { command: vec!["./fmt.sh".into(), "$FILE".into()], extensions: vec![".js".into()], environment: [("DYLD_INSERT_LIBRARIES".to_string(), "./x.dylib".to_string())].into(), ..Default::default() };
         std::fs::write(proj.join("fmt.sh"), "").unwrap();
