@@ -69,7 +69,8 @@ impl Engine {
         'attempts: for _ in 0..4 {
             let mut messages = self.chat(&portion);
             append_user_text(&mut messages, compaction::prompt(update));
-            let req = Request { model: model_id.clone(), system: compaction::SYSTEM.into(), messages, max_tokens: self.cfg.max_tokens, overlay: self.base_overlay(&provider_id, &model_id), ..Default::default() };
+            let mut req = Request { model: model_id.clone(), system: compaction::SYSTEM.into(), messages, overlay: self.base_overlay(&provider_id, &model_id), ..Default::default() };
+            req.max_tokens = fit_output(self.output_budget(&provider_id, &model_id), limit, compaction::estimate_request(&req));
             match self.summarize(provider, &req, ui, cancel) {
                 Ok((text, u)) => {
                     usage_total = add_usage(usage_total, u);

@@ -28,7 +28,8 @@ drain(session):
    - `Completed{needsContinuation}`: continue if the step produced tool calls (the model must see results), else go idle.
    - `Retry` / `Continue`: wait per backoff and re-run.
    - `RecoverFull`/`Compacted`: provider rejected context as too long before any output -> compact once, retry (only once per step: `recoverOverflow` flag).
-   - `OutputLimit`: model hit max output tokens; may need continuation.
+   - `OutputLimit`: model hit max output tokens; may need continuation. (moco: `StepOutcome::CutOff`, continued with a stored
+     synthetic message at most twice in a row; the output budget follows the model's `limit.output`, see #148.)
 
 Each step captures a filesystem **snapshot** before local tools can run (taken in parallel with the request) so edits can be diffed and reverted.
 

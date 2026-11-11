@@ -158,7 +158,9 @@ pub struct EffortInfo {
 pub struct EngineConfig {
     /// Default `provider/model` (an agent's own `model` overrides it).
     pub model: String,
-    pub max_tokens: u32,
+    /// Output budget per request (config `max_tokens`): a cap on the model's own output limit, or the budget for models
+    /// whose limit the catalog does not know. Unset: the model's limit, else `DEFAULT_MAX_TOKENS`.
+    pub max_tokens: Option<u32>,
     pub app_dir: PathBuf,
     /// The agents in the default permission mode (`permission_mode`); also the list for sessions without agents of their own.
     pub agents: Vec<Agent>,
@@ -200,7 +202,7 @@ impl EngineConfig {
     pub fn new(model: &str, app_dir: PathBuf) -> Self {
         EngineConfig {
             model: model.into(),
-            max_tokens: 16_000,
+            max_tokens: None,
             app_dir,
             agents: agent::builtin(),
             permission_mode: PermissionMode::default(),
@@ -408,6 +410,20 @@ impl Engine {
             add(r);
         }
         o
+    }
+
+    /// Output tokens to ask `model` for (#148). Thinking counts against this budget too, so it follows the model's own
+    /// output limit from the catalog (capped at the configured `max_tokens`, if any); a fixed 16k used to leave an
+    /// always-thinking model at high effort nothing for its answer. Only the tokens written are billed, so a large budget
+    /// costs nothing by itself.
+    pub(crate) fn output_budget(&self, provider_id: &str, model_id: &str) -> u32 {
+        let own = self.cfg.catalog.model(provider_id, model_id).map(|m| m.limit.output).filter(|o| *o > 0).map(|o| o.min(u32::MAX as u64) as u32);
+        match (own, self.cfg.max_tokens) {
+            (Some(own), Some(cap)) => own.min(cap),
+            (Some(own), None) => own,
+            (None, Some(n)) => n,
+            (None, None) => DEFAULT_MAX_TOKENS,
+        }
     }
 
     /// Reasoning levels a model offers: the built-in ones for its protocol, then the ones defined in config.
@@ -842,6 +858,20 @@ impl Host for EngineHost<'_> {
 
 /// Output tokens a model that thinks whatever the request says may spend before a short answer (`short_answer_shape`).
 const THINKING_HEADROOM: u32 = 2_000;
+
+/// Output budget for a model whose output limit the catalog does not know (and no `max_tokens` is configured).
+pub const DEFAULT_MAX_TOKENS: u32 = 16_000;
+/// The least `fit_output` leaves a request when the prompt nearly fills the window (compaction makes room soon after).
+const MIN_OUTPUT: u32 = 4_096;
+
+/// `budget`, lowered so that the prompt (about `prompt` tokens) plus the output fit in a `context` window: providers
+/// reject a request whose `max_tokens` would run past the window. A tenth of the prompt is kept free for the error of
+/// the estimate.
+pub(crate) fn fit_output(budget: u32, context: Option<u64>, prompt: u64) -> u32 {
+    let Some(context) = context.filter(|c| *c > 0) else { return budget };
+    let room = context.saturating_sub(prompt + prompt / 10);
+    (budget as u64).min(room.max(MIN_OUTPUT as u64)) as u32
+}
 
 #[cfg(test)]
 mod tests {
@@ -2441,6 +2471,94 @@ mod tests {
         let ui = TestUi::replying(vec![Reply::Once]);
         f.run(&ui);
         assert!(notices(&ui).iter().any(|n| n.contains("no usable answer")), "{:?}", notices(&ui));
+    }
+
+    fn cut_off(events: Vec<Event>) -> Scripted {
+        let mut events = events;
+        events.push(Event::Finish { reason: FinishReason::MaxTokens, usage: Usage::default() });
+        Scripted::Events(events)
+    }
+
+    fn last_user_text(req: &Request) -> String {
+        let m = req.messages.last().unwrap();
+        assert_eq!(m.role, Role::User);
+        m.content.iter().filter_map(|b| if let Block::Text(t) = b { Some(t.as_str()) } else { None }).collect::<Vec<_>>().join("\n")
+    }
+
+    /// #148: an answer cut off at the output token limit is continued, with the partial text kept in the conversation.
+    #[test]
+    fn an_answer_cut_off_at_the_output_limit_is_continued() {
+        let f = fixture(vec![cut_off(vec![Event::TextDelta("part one".into())]), text("part two")]);
+        f.say("write a lot");
+        let ui = TestUi::default();
+        assert_eq!(f.run(&ui), RunOutcome::Idle);
+        let reqs = f.fake.requests.lock().unwrap();
+        assert_eq!(reqs.len(), 2);
+        let n = reqs[1].messages.len();
+        assert_eq!(reqs[1].messages[n - 2], ChatMessage { role: Role::Assistant, content: vec![Block::Text("part one".into())] });
+        assert!(last_user_text(&reqs[1]).contains("Continue exactly where it stopped"), "{:?}", reqs[1].messages);
+        assert_eq!(&reqs[1].messages[..reqs[0].messages.len()], &reqs[0].messages[..], "the continuation extends the request");
+        assert_eq!(notices_containing(&ui, "asking the model to continue"), 1);
+        assert_eq!(notices_containing(&ui, "stopped at the output token limit"), 0);
+    }
+
+    /// The reported case: thinking used up the whole budget and no answer was written.
+    #[test]
+    fn a_reply_that_only_thought_before_the_limit_is_asked_to_answer() {
+        let f = fixture(vec![cut_off(vec![Event::ReasoningDelta("hmm".into())]), text("the answer")]);
+        f.say("explain");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        let reqs = f.fake.requests.lock().unwrap();
+        assert_eq!(reqs.len(), 2);
+        let last = last_user_text(&reqs[1]);
+        assert!(last.contains("explain") && last.contains("while thinking"), "{last}");
+    }
+
+    #[test]
+    fn continuations_are_capped() {
+        let f = fixture(vec![cut_off(vec![Event::TextDelta("a".into())]), cut_off(vec![Event::TextDelta("b".into())]), cut_off(vec![Event::TextDelta("c".into())])]);
+        f.say("write a lot");
+        let ui = TestUi::default();
+        assert_eq!(f.run(&ui), RunOutcome::Idle);
+        assert_eq!(f.fake.calls(), 1 + 2);
+        assert_eq!(notices_containing(&ui, "stopped at the output token limit"), 1);
+        // A new prompt starts with a fresh allowance.
+        f.fake.extend(vec![cut_off(vec![Event::TextDelta("d".into())]), text("e")]);
+        f.say("again");
+        assert_eq!(f.run(&ui), RunOutcome::Idle);
+        assert_eq!(f.fake.calls(), 3 + 2);
+    }
+
+    #[test]
+    fn the_output_budget_follows_the_model_limit() {
+        let with = |output: u64, max_tokens: Option<u32>| {
+            let f = fixture_cfg(vec![], |c| {
+                small_window(c, 1_000_000, 1000);
+                c.catalog.providers.get_mut("anthropic").unwrap().models.get_mut("claude-test").unwrap().limit.output = output;
+                c.max_tokens = max_tokens;
+            });
+            f.engine.output_budget("anthropic", "claude-test")
+        };
+        assert_eq!(with(32_000, None), 32_000);
+        assert_eq!(with(128_000, None), 128_000, "the model's whole limit");
+        assert_eq!(with(128_000, Some(64_000)), 64_000, "max_tokens caps it");
+        assert_eq!(with(8_000, Some(100_000)), 8_000, "never above the model's own limit");
+        assert_eq!(with(0, None), DEFAULT_MAX_TOKENS, "unknown limit");
+        assert_eq!(with(0, Some(20_000)), 20_000);
+        // The request carries it.
+        let f = fixture_cfg(vec![text("hi")], |c| small_window(c, 1_000_000, 1000));
+        f.say("hello");
+        f.run(&TestUi::default());
+        assert_eq!(f.fake.requests.lock().unwrap()[0].max_tokens, 1000);
+    }
+
+    #[test]
+    fn the_output_budget_leaves_the_prompt_room_in_the_window() {
+        assert_eq!(fit_output(64_000, None, 500_000), 64_000);
+        assert_eq!(fit_output(64_000, Some(200_000), 10_000), 64_000);
+        assert_eq!(fit_output(64_000, Some(200_000), 150_000), 200_000 - 165_000);
+        assert_eq!(fit_output(64_000, Some(200_000), 199_000), MIN_OUTPUT, "a nearly full window still gets a little");
+        assert_eq!(fit_output(1_000, Some(200_000), 199_000), 1_000);
     }
 
     /// A UI nobody is behind, like a background subagent's.

@@ -111,7 +111,9 @@ This is the path every request takes, from keystroke to stored answer.
    step changed, tool results are bounded (`truncate.rs`) and written into the message parts, usage and cost are added to the
    session, and the final assistant message is stored.
 9. **Decide.** Tool calls present: `Continue` (another step, after the cost limits are checked). None: `Done`, and the loop
-   delivers any queued input or returns `Idle`. `Declined`, `Interrupted`, `Failed` and `LimitReached` stop the run.
+   delivers any queued input or returns `Idle`. A reply that stopped at the output token limit without a tool call is
+   `CutOff`: `drain` stores a synthetic message asking the model to go on (or, if thinking used up the budget, to answer)
+   and runs another step, at most twice in a row (#148). `Declined`, `Interrupted`, `Failed` and `LimitReached` stop the run.
 
 Cancellation is an `AtomicBool` passed down through the engine, the provider adapters (which check it at every read and
 while waiting for headers), the shell tool (which kills the process group) and the retry sleep.
@@ -160,7 +162,9 @@ data/tui-history     prompt history of the full-screen UI
 
 `provider/mod.rs` defines a protocol-neutral request and event model:
 
-- `Request` has the system prompt, `messages`, `tools`, `max_tokens`, `tools_disabled` (keep the tool definitions for the
+- `Request` has the system prompt, `messages`, `tools`, `max_tokens` (`Engine::output_budget`: the catalog's `limit.output`
+  capped by the `max_tokens` config, 16k when unknown, lowered by `fit_output` so prompt plus output fit the window),
+  `tools_disabled` (keep the tool definitions for the
   cache but forbid calls), `effort`, an `overlay` from config, and `tail`.
 - `Event` is `TextDelta`, `ReasoningDelta`, `ToolInputStart`, `ToolCall`, `BadToolCall` (input that was not valid JSON, so the
   model gets a tool error instead of the stream failing), `Native` and `Finish`.
