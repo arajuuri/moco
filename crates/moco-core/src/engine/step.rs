@@ -33,7 +33,22 @@ fn log_tool(name: &str, outcome: &Result<ToolOutput, ToolError>, elapsed: Durati
 pub(super) enum StepOutcome {
     Continue,
     Done,
+    /// The model stopped at the output token limit without calling a tool; `answered` says whether any answer text
+    /// came before the cut (otherwise thinking used up the budget). `drain` asks it to go on (#148).
+    CutOff { answered: bool },
     Stop(RunOutcome),
+}
+
+/// How many times in a row a reply cut off at the output token limit is continued before the turn ends.
+const MAX_CONTINUATIONS: u32 = 2;
+
+/// The stored message that asks the model to go on after its reply was cut off at the output token limit.
+fn continuation_text(answered: bool) -> &'static str {
+    if answered {
+        "Your previous response was cut off at the output token limit. Continue exactly where it stopped, without repeating what you already wrote. If a lot remains, write it in smaller parts."
+    } else {
+        "Your previous response used up the output token limit while thinking, before any answer was written. Think less this time and answer now; if the answer is long, write it in smaller parts."
+    }
 }
 
 struct AttemptResult {
@@ -46,12 +61,13 @@ struct AttemptResult {
 
 impl Engine {
     pub(super) fn drain(&self, sid: &str, ui: &dyn Ui, cancel: &AtomicBool, resume: bool) -> Result<RunOutcome, StoreError> {
-        let (mut continuing, mut step) = (resume, 0u32);
+        let (mut continuing, mut step, mut cut_offs) = (resume, 0u32, 0u32);
         let _budget = self.limits_begin(sid);
         loop {
             let delivered = self.store().deliver(sid, !continuing)?;
             if !delivered.is_empty() {
                 step = 0; // new user input resets the step allowance
+                cut_offs = 0;
                 self.limits_new_input(sid); // and the cost allowance of the run
                 ui.event(&UiEvent::Delivered);
             }
@@ -62,8 +78,24 @@ impl Engine {
                 return Ok(RunOutcome::Interrupted);
             }
             match self.run_step(sid, step, ui, cancel)? {
-                StepOutcome::Continue => continuing = true,
+                StepOutcome::Continue => (continuing, cut_offs) = (true, 0),
                 StepOutcome::Done => continuing = false,
+                StepOutcome::CutOff { answered } => {
+                    if cut_offs >= MAX_CONTINUATIONS {
+                        ui.event(&UiEvent::Notice("response stopped at the output token limit"));
+                        continuing = false;
+                    } else {
+                        // Stored (not appended at request time) so the next request extends this one and a resumed
+                        // session sees the same conversation.
+                        cut_offs += 1;
+                        self.store().add_message(sid, "synthetic", &json!({"text": continuation_text(answered), "description": "continuation"}))?;
+                        ui.event(&UiEvent::Notice("response reached the output token limit; asking the model to continue"));
+                        if let Some(o) = self.check_limits(sid, ui) {
+                            return Ok(o);
+                        }
+                        continuing = true;
+                    }
+                }
                 StepOutcome::Stop(o) => return Ok(o),
             }
             step += 1;
@@ -143,18 +175,19 @@ impl Engine {
         // The stored list, so the model sees it even when its own todowrite calls are far back or were compacted
         // away. In `tail`, after the cached prefix, so it can change without a cache miss.
         let tail = if advertised.iter().any(|t| t.name() == "todowrite") { agent::todo_reminder(&self.store().todos(sid)?) } else { None };
-        let req = Request {
+        let mut req = Request {
             model: model_id.clone(),
             system,
             messages,
             tail,
             tools: advertised.iter().map(|t| ToolDef { name: t.name().into(), description: t.description(), schema: t.schema() }).collect(),
-            max_tokens: self.cfg.max_tokens,
+            max_tokens: 0,
             tools_disabled: max_steps_hit,
             effort,
             overlay,
         };
         let limit = self.cfg.catalog.model(&provider_id, &model_id).map(|m| m.limit.context).filter(|l| *l > 0);
+        req.max_tokens = fit_output(self.output_budget(&provider_id, &model_id), limit, compaction::context_size(&eff, compaction::estimate_request(&req)));
         Ok(Ok(Prepared { session, agent, req, provider, provider_id, model_id, eff, history, limit, tools: all_tools }))
     }
 
@@ -302,9 +335,9 @@ impl Engine {
             Ok(()) if result.declined => StepOutcome::Stop(RunOutcome::Declined),
             Ok(()) => {
                 if matches!(result.finish, Some((FinishReason::MaxTokens, _))) && tool_calls == 0 {
-                    ui.event(&UiEvent::Notice("response stopped at the output token limit"));
-                }
-                if tool_calls > 0 && tools_disabled {
+                    let answered = result.parts.iter().any(|p| p["type"] == "text" && p["text"].as_str().is_some_and(|t| !t.trim().is_empty()));
+                    StepOutcome::CutOff { answered }
+                } else if tool_calls > 0 && tools_disabled {
                     // The step allowance is used up and the model called tools anyway: don't let it go on.
                     let n = agent::effective_steps(&agent, self.cfg.limits.max_steps).unwrap_or(step);
                     StepOutcome::Stop(RunOutcome::LimitReached { what: format!("The step limit ({n}) was reached and the model kept calling tools") })
@@ -321,7 +354,7 @@ impl Engine {
             StepOutcome::Continue => self.check_limits(sid, ui).map_or(StepOutcome::Continue, StepOutcome::Stop),
             o => o,
         };
-        crate::log_debug!("engine", "step end session={sid} step={step} tool_calls={tool_calls} next={}", match &outcome { StepOutcome::Continue => "continue".to_string(), StepOutcome::Done => "done".to_string(), StepOutcome::Stop(o) => format!("stop:{o:?}") });
+        crate::log_debug!("engine", "step end session={sid} step={step} tool_calls={tool_calls} next={}", match &outcome { StepOutcome::Continue => "continue".to_string(), StepOutcome::Done => "done".to_string(), StepOutcome::CutOff { answered } => format!("cut-off answered={answered}"), StepOutcome::Stop(o) => format!("stop:{o:?}") });
         Ok(outcome)
     }
 

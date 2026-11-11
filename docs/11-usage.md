@@ -174,12 +174,15 @@ Files named `moco.json` or `moco.jsonc` (comments and trailing commas allowed), 
   "providers": { "ollama": { "base_url": "http://localhost:11434/v1",
                  "models": { "qwen3-coder": { "limit": { "context": 32768, "output": 8192 } } } } },
   "compaction": { "auto": true, "buffer": "15%", "keep": 20000 },
+  "max_tokens": 32000,                                   // cap on the output budget per request (thinking included); see below
   "snapshots": true,
   "skills": ["~/shared-skills"],                         // extra skill directories
   "commands": { "ship": { "description": "Tag and push", "template": "Tag the release and push it. $ARGUMENTS", "agent": "build" } }
 }
 ```
 Actions are `read`, `edit` (write, edit and patch), `glob`, `grep`, `shell`, `webfetch`, `question`, `subagent`, `external_directory`. Details: `05-permissions.md`, `08-config-and-extensions.md`, `07-providers.md`.
+
+**Output budget**: each request asks for the model's own output limit (`limit.output` in the catalog, or set per model as in the `ollama` example), 16,000 when the limit is unknown. `max_tokens` caps it (and is the budget for models without a limit). Only the tokens written are billed. Thinking counts against it. A reply cut off at the budget is continued automatically, up to twice in a row.
 
 **Project instructions**: `AGENTS.md` (or `CLAUDE.md` where there is no `AGENTS.md`) in the project root down to the working directory, `config/AGENTS.md` globally, plus `instructions` files. They are re-read every step.
 

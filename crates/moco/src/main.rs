@@ -896,6 +896,7 @@ fn main() {
     }
     let mut engine_cfg = EngineConfig::new(&model, app_dir.clone());
     engine_cfg.effort = cfg.effort.clone();
+    engine_cfg.max_tokens = cfg.max_tokens.filter(|n| *n > 0);
     engine_cfg.limits = cfg.limits;
     engine_cfg.agents = agents;
     engine_cfg.permission_mode = default_mode;

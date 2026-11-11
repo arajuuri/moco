@@ -239,6 +239,10 @@ pub struct Config {
     pub default_agent: Option<String>,
     /// Default reasoning effort (a variant name such as `high`); unset leaves the provider's default.
     pub effort: Option<String>,
+    /// Output token budget per request: caps the model's own output limit (`limit.output`), and is the budget for models
+    /// without one. Unset: the model's limit, or 16,000 when the catalog has none.
+    #[serde(alias = "maxTokens")]
+    pub max_tokens: Option<u32>,
     pub shell: Option<String>,
     /// `"manual"` (default: ask before anything that changes state or leaves the project) or `"auto"`.
     pub permission_mode: Option<String>,
