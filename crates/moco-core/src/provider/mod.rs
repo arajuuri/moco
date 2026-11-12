@@ -108,6 +108,10 @@ pub enum FinishReason {
     EndTurn,
     ToolUse,
     MaxTokens,
+    /// The provider's safety system or the model declined (Anthropic `stop_reason: "refusal"`). The text is what the
+    /// provider said about why (a category and/or explanation), empty when it said nothing. Output streamed before it is
+    /// incomplete and must not be treated as an answer.
+    Refusal(String),
     Other(String),
 }
 

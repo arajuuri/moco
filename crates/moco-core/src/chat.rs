@@ -53,11 +53,15 @@ pub fn to_chat_with(messages: &[Message], load: Loader) -> Vec<ChatMessage> {
                 }
             }
             "assistant" => {
+                // A refused reply is incomplete: the model doesn't get its text (or reasoning) back as if it had said it.
+                // Tool calls stay, because their results are in the conversation and must stay paired.
+                let refused = m.data["finish"] == "refusal";
                 let mut blocks = vec![];
                 let mut results = vec![];
                 let mut media = vec![];
                 for p in m.data["parts"].as_array().into_iter().flatten() {
                     match p["type"].as_str() {
+                        Some("text" | "native") if refused => {}
                         Some("text") => {
                             if let Some(t) = p["text"].as_str().filter(|t| !t.is_empty()) {
                                 blocks.push(Block::Text(t.into()));
@@ -135,6 +139,23 @@ mod tests {
             ]
         );
         assert_eq!(c[3].content, [Block::Text("done".into())]);
+    }
+
+    #[test]
+    fn a_refused_reply_keeps_only_its_tool_calls() {
+        let m = vec![
+            msg("user", json!({"text":"go"})),
+            msg("assistant", json!({"finish":"refusal","parts":[
+                {"type":"native","provider":"anthropic","data":{"type":"thinking"}},
+                {"type":"text","text":"half an answer"},
+                {"type":"tool","id":"t1","name":"read","input":{"path":"a"},"state":{"status":"completed","output":"x"}}]})),
+            msg("assistant", json!({"finish":"refusal","parts":[{"type":"text","text":"only text"}]})),
+            msg("user", json!({"text":"again"})),
+        ];
+        let c = to_chat(&m);
+        assert_eq!(c[1].content, [Block::ToolUse { id: "t1".into(), name: "read".into(), input: json!({"path":"a"}) }]);
+        assert_eq!(c[2].content, [Block::ToolResult { id: "t1".into(), content: "x".into(), is_error: false }, Block::Text("again".into())], "the text-only refusal is gone");
+        assert_eq!(c.len(), 3);
     }
 
     #[test]

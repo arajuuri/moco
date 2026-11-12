@@ -113,7 +113,10 @@ This is the path every request takes, from keystroke to stored answer.
 9. **Decide.** Tool calls present: `Continue` (another step, after the cost limits are checked). None: `Done`, and the loop
    delivers any queued input or returns `Idle`. A reply that stopped at the output token limit without a tool call is
    `CutOff`: `drain` stores a synthetic message asking the model to go on (or, if thinking used up the budget, to answer)
-   and runs another step, at most twice in a row (#148). `Declined`, `Interrupted`, `Failed` and `LimitReached` stop the run.
+   and runs another step, at most twice in a row (#148). A refusal (`FinishReason::Refusal`, Anthropic's
+   `stop_reason: "refusal"`) is `Failed` with a notice. It is never retried or continued, and the message is stored with
+   `finish: "refusal"` so `chat.rs` leaves its text out of later requests (#153). Any other unknown stop reason ends the
+   turn with a notice. `Declined`, `Interrupted`, `Failed` and `LimitReached` stop the run.
 
 Cancellation is an `AtomicBool` passed down through the engine, the provider adapters (which check it at every read and
 while waiting for headers), the shell tool (which kills the process group) and the retry sleep.

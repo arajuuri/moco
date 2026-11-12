@@ -163,6 +163,8 @@ pub struct Parser {
     blocks: HashMap<u64, BlockState>,
     usage: Usage,
     stop: Option<String>,
+    /// What a refusal's `stop_details` said (see `FinishReason::Refusal`).
+    stop_details: String,
 }
 
 impl Parser {
@@ -234,6 +236,12 @@ impl Parser {
                 if let Some(r) = v["delta"]["stop_reason"].as_str() {
                     self.stop = Some(r.to_string());
                 }
+                // Only set on a refusal: `category` (e.g. "cyber", may be null) and an optional `explanation`.
+                let details = &v["delta"]["stop_details"];
+                let why: Vec<&str> = [details["category"].as_str(), details["explanation"].as_str()].into_iter().flatten().filter(|s| !s.trim().is_empty()).collect();
+                if !why.is_empty() {
+                    self.stop_details = why.join(": ");
+                }
                 if let Some(o) = v["usage"]["output_tokens"].as_u64() {
                     self.usage.output = o;
                 }
@@ -243,6 +251,7 @@ impl Parser {
                     Some("end_turn") | Some("stop_sequence") | None => FinishReason::EndTurn,
                     Some("tool_use") => FinishReason::ToolUse,
                     Some("max_tokens") => FinishReason::MaxTokens,
+                    Some("refusal") => FinishReason::Refusal(std::mem::take(&mut self.stop_details)),
                     Some(o) => FinishReason::Other(o.into()),
                 };
                 out.push(Event::Finish { reason, usage: self.usage });
@@ -344,6 +353,27 @@ mod tests {
         // The signature is replay data: stored with the turn, before the content it belongs to.
         assert_eq!(ev[1], Event::Native { provider: "anthropic".into(), data: json!({"type": "thinking", "thinking": "hm", "signature": "x", "model": ""}) });
         assert_eq!(ev[3], Event::ToolCall { id: "t".into(), name: "glob".into(), input: json!({}) });
+    }
+
+    #[test]
+    fn a_refusal_is_its_own_finish_reason_with_what_the_provider_said() {
+        let refused = |delta: &str| {
+            let ev = parse(&[
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"| 8 | 28 · "}}"#,
+                r#"{"type":"content_block_stop","index":0}"#,
+                delta,
+                r#"{"type":"message_stop"}"#,
+            ])
+            .expect("a refusal is a normal end of stream, not an error");
+            match ev.last() {
+                Some(Event::Finish { reason: FinishReason::Refusal(why), usage }) => (why.clone(), usage.output),
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(refused(r#"{"type":"message_delta","delta":{"stop_reason":"refusal","stop_details":{"type":"refusal","category":"cyber","explanation":"Declined."}},"usage":{"output_tokens":977}}"#), ("cyber: Declined.".into(), 977), "the streamed output is still counted");
+        assert_eq!(refused(r#"{"type":"message_delta","delta":{"stop_reason":"refusal","stop_details":{"type":"refusal","category":null}},"usage":{"output_tokens":3}}"#).0, "");
+        assert_eq!(refused(r#"{"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":3}}"#).0, "", "stop_details is optional");
     }
 
     #[test]
