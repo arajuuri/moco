@@ -315,7 +315,14 @@ impl ToolCtx<'_> {
             .unwrap_or_else(|| self.display(path));
         let mut resources = vec![name];
         if real != normalize(path) {
-            let target = self.display(real);
+            // `real` as it is, not resolved again: for a patch `Delete File` it is the symlink itself, and `display`
+            // would follow it (then a project reached through a symlinked parent, such as `/tmp` -> `/private/tmp`,
+            // named the link's target as well). For the other tools `real` is already symlink-free, so this is
+            // what `display` gives.
+            let target = [&self.cwd, &self.project_root]
+                .iter()
+                .find_map(|base| real.strip_prefix(real_path(base)).ok())
+                .map_or_else(|| real.to_string_lossy().into_owned(), |r| r.to_string_lossy().into_owned());
             if !resources.contains(&target) {
                 resources.push(target);
             }
