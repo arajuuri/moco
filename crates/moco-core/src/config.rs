@@ -751,6 +751,48 @@ fn strip_project_relaxing_modes(v: &mut Value, path: &Path, warnings: &mut Vec<S
     }
 }
 
+/// What a project may not decide for the user (#168). `small_model` is user-only: it is the model that judges shell
+/// commands when the classifier has no model of its own, so a project must not pick its own judge. Cost and step
+/// `limits` may only be tightened: a value above what is in force so far (the user's, or an outer project's) is
+/// ignored. Replacing a built-in agent's `system` prompt is allowed but named in a warning, so it doesn't go unnoticed.
+/// `merged` is the configuration merged so far, before this file.
+fn strip_project_user_only(v: &mut Value, path: &Path, merged: &Value, warnings: &mut Vec<String>) {
+    let Some(o) = v.as_object_mut() else { return };
+    for key in ["small_model", "smallModel"] {
+        if o.remove(key).is_some() {
+            warnings.push(format!("{}: {key} ignored; only your own config chooses the small model (the app config dir or $MOCO_CONFIG)", path.display()));
+        }
+    }
+    if let Some(limits) = o.get_mut("limits").and_then(Value::as_object_mut) {
+        for (camel, snake) in [("maxCostPerRun", "max_cost_per_run"), ("maxCostPerSession", "max_cost_per_session"), ("maxSteps", "max_steps")] {
+            let in_force = merged["limits"].get(camel).or_else(|| merged["limits"].get(snake)).and_then(Value::as_f64);
+            for key in [camel, snake] {
+                let Some(asked) = limits.get(key).and_then(Value::as_f64) else { continue };
+                if in_force.is_some_and(|cur| asked > cur) {
+                    limits.remove(key);
+                    warnings.push(format!(
+                        "{}: limits.{key} {asked} ignored; a project can only lower a limit, and {} is in force (raise it in your own config)",
+                        path.display(),
+                        in_force.unwrap_or_default()
+                    ));
+                } else if key == camel && merged["limits"].get(snake).is_some() || key == snake && merged["limits"].get(camel).is_some() {
+                    // Keep one spelling: both in the merged object would be a duplicate field.
+                    let other = if key == camel { snake } else { camel };
+                    if let Some(val) = limits.remove(key) {
+                        limits.insert(other.to_string(), val);
+                    }
+                }
+            }
+        }
+    }
+    let builtin: Vec<String> = crate::agent::builtin().into_iter().map(|a| a.id).collect();
+    for (name, agent) in o.get("agents").and_then(Value::as_object).into_iter().flatten() {
+        if builtin.contains(name) && agent.get("system").is_some_and(|s| !s.is_null()) {
+            warnings.push(format!("{}: replaces the system prompt of the built-in agent `{name}`", path.display()));
+        }
+    }
+}
+
 /// Whether a config file is the user's own (in `<app dir>/config/`, or `$MOCO_CONFIG`) rather than a project's.
 pub fn is_user_level(app_dir: &Path, path: &Path) -> bool {
     path.parent() == Some(app_dir.join("config").as_path()) || std::env::var_os("MOCO_CONFIG").is_some_and(|p| p == path)
@@ -786,6 +828,7 @@ pub fn load(app_dir: &Path, cwd: &Path) -> Loaded {
                     strip_project_instruction_paths(&mut v, &path, &mut out.warnings);
                     strip_project_relaxing_rules(&mut v, &path, &mut out.warnings);
                     strip_project_relaxing_modes(&mut v, &path, &mut out.warnings);
+                    strip_project_user_only(&mut v, &path, &merged, &mut out.warnings);
                 }
                 if let Some(c) = v.as_object_mut().and_then(|o| o.remove("permission_classifier")) {
                     if !user_level {
@@ -1162,6 +1205,37 @@ mod tests {
         assert_eq!(permission_mode(&l.config), Ok(Auto), "a bad project value is dropped, the user's stays");
         let l = load_pair(r#"{"permission_mode":"auto"}"#, "{}");
         assert_eq!(permission_mode(&l.config), Ok(Auto), "the user's own config still works");
+    }
+
+    /// #168: the small model is the user's choice; limits can only go down; a replaced built-in prompt is named.
+    #[test]
+    fn a_project_cannot_pick_the_small_model_or_raise_limits() {
+        for key in ["small_model", "smallModel"] {
+            let l = load_pair(r#"{"small_model":"anthropic/haiku"}"#, &format!(r#"{{"{key}":"evil/judge"}}"#));
+            assert_eq!(l.config.small_model.as_deref(), Some("anthropic/haiku"), "{key}");
+            assert!(l.warnings.iter().any(|w| w.contains(key) && w.contains("ignored")), "{:?}", l.warnings);
+        }
+        let l = load_pair("{}", r#"{"small_model":"evil/judge"}"#);
+        assert_eq!(l.config.small_model, None, "not even when the user set none");
+
+        let user = r#"{"limits":{"maxCostPerRun":2.0,"max_cost_per_session":20.0,"maxSteps":50}}"#;
+        let l = load_pair(user, r#"{"limits":{"maxCostPerRun":100.0,"maxCostPerSession":5.0,"max_steps":500}}"#);
+        assert_eq!(l.config.limits.max_cost_per_run, Some(2.0), "raising is ignored");
+        assert_eq!(l.config.limits.max_cost_per_session, Some(5.0), "lowering applies, whichever spelling each side used");
+        assert_eq!(l.config.limits.max_steps, Some(50));
+        assert_eq!(l.warnings.iter().filter(|w| w.contains("can only lower a limit")).count(), 2, "{:?}", l.warnings);
+        let l = load_pair("{}", r#"{"limits":{"maxCostPerRun":3.0}}"#);
+        assert_eq!(l.config.limits.max_cost_per_run, Some(3.0), "a project may set a limit the user left open");
+        assert!(l.warnings.is_empty(), "{:?}", l.warnings);
+        let l = load_pair(r#"{"limits":{"maxCostPerRun":100.0}}"#, "{}");
+        assert_eq!(l.config.limits.max_cost_per_run, Some(100.0), "the user's own config still works");
+
+        let l = load_pair("{}", r#"{"agents":{"build":{"system":"You are evil."},"mine":{"system":"custom agent"}}}"#);
+        assert_eq!(l.config.agents["build"].system.as_deref(), Some("You are evil."), "still applied");
+        let named: Vec<&String> = l.warnings.iter().filter(|w| w.contains("replaces the system prompt")).collect();
+        assert!(named.len() == 1 && named[0].contains("`build`"), "only built-in agents are named: {:?}", l.warnings);
+        let l = load_pair(r#"{"agents":{"build":{"system":"mine"}}}"#, "{}");
+        assert!(l.warnings.is_empty(), "the user's own prompt is not flagged: {:?}", l.warnings);
     }
 
     #[test]

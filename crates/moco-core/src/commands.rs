@@ -118,6 +118,21 @@ pub fn discover(app_dir: &Path, cwd: &Path, configured: &BTreeMap<String, Comman
     found.into_values().collect()
 }
 
+/// Warnings for built-in commands (`/review`, `/init`) that a project's command file or config replaced (#168): the
+/// replacement runs whenever the user types the familiar name, so it should not go unnoticed. The user's own
+/// replacements are not mentioned.
+pub fn project_overrides(found: &[Command], app_dir: &Path, origins: &BTreeMap<String, std::path::PathBuf>) -> Vec<String> {
+    let builtin: Vec<String> = builtin().into_iter().map(|c| c.name).collect();
+    found
+        .iter()
+        .filter(|c| builtin.contains(&c.name) && !c.user_written(app_dir, origins))
+        .map(|c| {
+            let from = if c.source == "config" { origins.get(&c.name).map(|p| p.display().to_string()).unwrap_or_else(|| "a project config".into()) } else { c.source.clone() };
+            format!("{from}: replaces the built-in command /{}", c.name)
+        })
+        .collect()
+}
+
 impl Command {
     /// Whether the user wrote this command: a built-in, a file in their own config roots (`~/.claude`, `~/.agents`,
     /// `<app dir>/config`), or a `commands` entry of their own config (`origins` is `config::Loaded::command_origins`).
@@ -193,6 +208,25 @@ mod tests {
         let t = by("test");
         assert_eq!((t.description.as_str(), t.agent.as_deref(), t.model.as_deref(), t.subagent), ("Run tests: all of them", Some("plan"), Some("openai/gpt-x"), true));
         assert_eq!(by("first-line").description, "The first non-empty line becomes the description.");
+        let _ = std::fs::remove_dir_all(r);
+    }
+
+    /// #168: a project that replaces /review or /init is named; the user's own replacement is not.
+    #[test]
+    fn a_project_replacing_a_built_in_command_is_named() {
+        let r = tree();
+        let app = r.join("app");
+        put(r.join("proj/.claude/commands/init.md"), "do something else");
+        let cfg = BTreeMap::from([("review".to_string(), CommandConfig { template: "exfiltrate".into(), ..Default::default() })]);
+        let origins = BTreeMap::from([("review".to_string(), r.join("proj/.moco/moco.json"))]);
+        let got = discover(&app, &r.join("proj"), &cfg);
+        let w = project_overrides(&got, &app, &origins);
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(w.iter().any(|w| w.contains("/init") && w.contains(".claude/commands/init.md")), "{w:?}");
+        assert!(w.iter().any(|w| w.contains("/review") && w.contains("proj/.moco/moco.json")), "{w:?}");
+        let mine = BTreeMap::from([("review".to_string(), app.join("config/moco.json"))]);
+        let _ = std::fs::remove_file(r.join("proj/.claude/commands/init.md"));
+        assert!(project_overrides(&discover(&app, &r.join("proj"), &cfg), &app, &mine).is_empty(), "the user's own /review");
         let _ = std::fs::remove_dir_all(r);
     }
 
