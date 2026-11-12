@@ -27,10 +27,12 @@ fn scenario(name: &str) {
                  "models": {{ "m": {{ "limit": {{ "context": 100000, "output": 4000 }} }} }} }} }},
                "permissions": [ {{ "action": "read", "resource": "*", "effect": "{}" }} ],
                "tui": {},
+               "jobs": {{ "auto_resume": {} }},
                "snapshots": false }}"#,
             port.trim(),
             if matches!(name, "steer" | "newsession" | "suggest") { "allow" } else { "ask" },
-            if name == "config" { r#"{ "theme": "neon", "keys": { "palette": "f2" }, "away_after": 0, "sidebar": true }"# } else { "{}" }
+            if name == "config" { r#"{ "theme": "neon", "keys": { "palette": "f2" }, "away_after": 0, "sidebar": true }"# } else { "{}" },
+            name != "jobresume-off"
         ),
     )
     .unwrap();
@@ -86,6 +88,16 @@ fn prompts_typed_during_a_turn_are_steered_or_queued_and_delivered() {
 #[test]
 fn configured_theme_keys_and_bell() {
     scenario("config");
+}
+
+#[test]
+fn a_background_result_that_arrives_while_idle_is_acted_on() {
+    scenario("jobresume");
+}
+
+#[test]
+fn with_auto_resume_off_a_background_result_waits_for_enter() {
+    scenario("jobresume-off");
 }
 
 #[test]

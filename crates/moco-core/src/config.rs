@@ -264,17 +264,19 @@ pub struct Config {
 }
 
 /// `jobs`: how many background jobs may run at once, `{"max_shells": 8, "max_subagents": 4}`. Starting one more
-/// is a tool error for the model.
+/// is a tool error for the model. `auto_resume` (default true): when a job's result arrives while the chat is idle,
+/// the TUI lets the assistant react at once instead of waiting for the user's next message (#150).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct JobLimits {
     pub max_shells: usize,
     pub max_subagents: usize,
+    pub auto_resume: bool,
 }
 
 impl Default for JobLimits {
     fn default() -> Self {
-        JobLimits { max_shells: 8, max_subagents: 4 }
+        JobLimits { max_shells: 8, max_subagents: 4, auto_resume: true }
     }
 }
 

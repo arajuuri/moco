@@ -337,6 +337,10 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
         let mut title_marked = false;
         let mut actions: VecDeque<Action> = VecDeque::new();
         let mut quit = false;
+        // A background job's result may be waiting in the inbox while the chat is idle: let the assistant react to it
+        // without a key press, as soon as no picker, viewer or dialog is in the way (#150, `jobs.auto_resume`).
+        let auto_resume = engine.job_limits().auto_resume;
+        let mut resume_wanted = false;
         // Draw only when the screen can have changed (see `App::wants_redraw`), not on every idle tick.
         let mut dirty = true;
         while !quit {
@@ -376,6 +380,7 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
                     last_sync = std::time::Instant::now();
                 }
                 let finished_idle = matches!(ev, AppEvent::RunDone(Ok(moco_core::engine::RunOutcome::Idle)));
+                resume_wanted |= auto_resume && matches!(ev, AppEvent::Background(_));
                 let was_key = matches!(ev, AppEvent::Key(_) | AppEvent::Focus(true));
                 let was_tick = matches!(ev, AppEvent::Tick);
                 actions.push_back(app.update(ev));
@@ -395,11 +400,13 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
                     }
                 }
                 if finished_idle {
-                    // A prompt that arrived as the turn ended is still waiting: run again to deliver it.
+                    // A prompt that arrived as the turn ended is still waiting: run again to deliver it. So is a job
+                    // result that came in after the run's last look at the inbox (the user's own prompts always go).
                     sync_queue(&mut app, &sid);
                     if !app.queued.is_empty() && !app.running {
                         start_run(&mut app, &sid, false);
                     }
+                    resume_wanted |= auto_resume;
                 }
                 while let Some(action) = actions.pop_front() {
                     match action {
@@ -625,6 +632,13 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
                 handled += 1;
                 if handled < 256 {
                     next = rx.try_recv().ok();
+                }
+            }
+            if resume_wanted && app.can_resume() {
+                resume_wanted = false;
+                if engine.store().pending_inbox(&sid).unwrap_or(0) > 0 {
+                    start_run(&mut app, &sid, false);
+                    dirty = true;
                 }
             }
         }

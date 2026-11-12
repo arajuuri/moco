@@ -40,6 +40,8 @@ def responses(handler, body):
             {"type": "response.completed", "response": {"status": "completed", "usage": {"input_tokens": 5, "output_tokens": 3}}}], True)
     items = body["input"]
     outputs = [i for i in items if i.get("type") == "function_call_output"]
+    if "BACKGROUND-JOB" in json.dumps(items):  # #150: a background job that finishes after the turn has ended
+        return background_job(handler, items, outputs)
     if not outputs:
         if "SLOW" in json.dumps(items):
             time.sleep(1.5)  # lets a test type while the turn is running
@@ -65,6 +67,19 @@ def responses(handler, body):
     sse(handler, [
         {"type": "response.output_text.delta", "delta": text},
         {"type": "response.completed", "response": {"status": "completed", "usage": {"input_tokens": 150, "input_tokens_details": {"cached_tokens": 100}, "output_tokens": 12}}}], True)
+
+
+def background_job(handler, items, outputs):
+    done = {"type": "response.completed", "response": {"status": "completed", "usage": {"input_tokens": 50, "output_tokens": 5}}}
+    if "JOB-RESULT-42" in json.dumps(items):  # the job's result was delivered: report it
+        return sse(handler, [{"type": "response.output_text.delta", "delta": "The job printed JOB-RESULT-42."}, done], True)
+    if outputs:  # the job was started: end the turn, as a model waiting to be told does
+        return sse(handler, [{"type": "response.output_text.delta", "delta": "Started it; waiting for the result."}, done], True)
+    call = {"type": "function_call", "id": "fc_bg", "call_id": "call_bg", "name": "shell", "status": "completed",
+            "arguments": json.dumps({"command": "sleep 1; echo JOB-RESULT-$((40 + 2))", "background": True})}
+    return sse(handler, [
+        {"type": "response.output_item.added", "output_index": 0, "item": dict(call, arguments="")},
+        {"type": "response.output_item.done", "output_index": 0, "item": call}, done], True)
 
 
 def gemini(handler, body):

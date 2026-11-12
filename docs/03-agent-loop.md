@@ -154,7 +154,8 @@ Code: `snapshot.rs` (the store) and `engine.rs` (`take_snapshot`, `undo`, `redo`
 
 The spec has a finished background job insert a synthetic message and *resume the session*. moco queues the message as a steer and resumes the session only where that cannot interfere with you:
 - while a turn is running, the message is delivered at its next step boundary, so the model reacts mid-turn;
-- while the chat is idle at its prompt, a dim notice line is printed and the message waits; it is delivered with your next message, or immediately if you press Enter on an empty line;
+- while the TUI is idle, the session runs again at once so the assistant can react (#150). If a picker, viewer or dialog is open, it runs when that closes; text you are typing stays in the composer. `"jobs": {"auto_resume": false}` turns this off, and then the line-based chat's behavior applies;
+- while the line-based chat is idle at its prompt, a dim notice line is printed and the message waits; it is delivered with your next message, or immediately if you press Enter on an empty line (the notice says so);
 - with `moco -p`, moco waits for running jobs after the turn, runs the session again so the assistant can report, and stops any jobs left when it exits.
-Running the session on its own while you are typing a line (the full-screen UIs can do this cleanly) would interleave its output with your input and could steal your answers to permission prompts, so it is deliberately not done in the line-based chat.
+Running the session on its own while you are typing a line (the TUI does this cleanly) would interleave its output with your input and could steal your answers to permission prompts, so it is deliberately not done in the line-based chat.
 
