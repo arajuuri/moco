@@ -919,6 +919,9 @@ fn main() {
     engine_cfg.snapshots = cfg.snapshots.unwrap_or(true);
     let found_skills = skills::discover(&app_dir, &cwd, &cfg.skills);
     let found_commands = commands::discover(&app_dir, &cwd, &cfg.commands);
+    for w in commands::project_overrides(&found_commands, &app_dir, &loaded.command_origins) {
+        eprintln!("warning: config: {w}");
+    }
     engine_cfg.skills = found_skills.clone();
     engine_cfg.small_model = cfg.small_model.clone();
     engine_cfg.classifier = loaded.classifier.settings();
