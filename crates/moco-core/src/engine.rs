@@ -54,6 +54,10 @@ pub enum UiEvent<'a> {
     Retry { attempt: u32, wait: Duration, error: &'a str },
     /// After each step: this step's tokens and cost, session total, and how full the context is.
     StepUsage { usage: Usage, cost: Option<f64>, session_cost: f64, context_tokens: u64, context_limit: Option<u64> },
+    /// The context changed outside a step (compaction finished): an estimate of the new fill, the model's window and
+    /// the session total (which now includes the summary call). Not a step, so it adds nothing to per-turn counters;
+    /// the next `StepUsage` replaces the estimate with the provider's count.
+    ContextUsage { context_tokens: u64, context_limit: Option<u64>, session_cost: f64 },
     /// The permission classifier was called (`classifier.rs`): what the call cost, the session total (which includes
     /// it) and the part of that total spent on classifying.
     ClassifierUsage { cost: f64, session_cost: f64, classifier_cost: f64 },
@@ -908,6 +912,7 @@ mod tests {
             UiEvent::ToolFinished { name, ok, .. } => format!("done:{name}:{ok}"),
             UiEvent::Retry { attempt, wait, .. } => format!("retry:{attempt}:{}", wait.as_secs()),
             UiEvent::StepUsage { .. } => "usage".into(),
+            UiEvent::ContextUsage { context_tokens, .. } => format!("context:{context_tokens}"),
             UiEvent::ClassifierUsage { .. } => "classifier-usage".into(),
             UiEvent::AutoAllowed { command, risk, reason, .. } => format!("auto:{risk}:{command}:{reason}"),
             UiEvent::Notice(n) => format!("notice:{n}"),
@@ -1916,6 +1921,21 @@ mod tests {
         assert!(second.contains("Update the existing checkpoint") && !second.contains("You MUST summarize"));
         let eff = compaction::effective(&f.msgs());
         assert!(eff[0].data["text"].as_str().unwrap().contains("SECOND-SUMMARY") && !eff[0].data["text"].as_str().unwrap().contains("SUMMARY-BODY"));
+    }
+
+    #[test]
+    fn manual_compaction_reports_the_new_context_fill() {
+        // #151: without a step afterwards, nothing else would tell the UI that the context shrank.
+        let f = fixture_cfg(vec![text(SUMMARY)], |c| small_window(c, 3000, 1000));
+        seed(&f, 4);
+        let ui = TestUi::default();
+        let cancel = AtomicBool::new(false);
+        let CompactResult::Compacted { before, after } = f.engine.compact(&f.session.id, &ui, &cancel).unwrap() else { panic!("not compacted") };
+        assert!(after < before);
+        let log = ui.log();
+        let reports: Vec<_> = log.iter().filter(|l| l.starts_with("context:")).collect();
+        assert_eq!(reports, [&format!("context:{after}")], "one estimate, the one compaction returned: {log:?}");
+        assert!(!log.iter().any(|l| l == "usage"), "compaction is not a step");
     }
 
     #[test]

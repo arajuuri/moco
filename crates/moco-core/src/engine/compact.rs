@@ -117,14 +117,16 @@ impl Engine {
             return Ok(CompactResult::Failed("the model returned an empty summary".into()));
         }
         let after: u64 = compaction::estimate_text(&summary) + eff[k..].iter().map(compaction::estimate).sum::<u64>();
-        {
+        let session_cost = {
             let st = self.store();
             st.add_message(sid, "compaction", &json!({ "summary": summary, "keepFrom": keep_from, "trigger": trigger, "replaced": k }))?;
             let cost = self.cfg.catalog.model(&provider_id, &model_id).and_then(|m| catalog::cost(m, &usage_total)).unwrap_or(0.0);
             st.add_usage(sid, cost, &usage_total)?;
-        }
+            st.usage_totals(sid)?.0
+        };
         crate::log_info!("engine", "compaction done session={sid} trigger={trigger} tokens {before} -> {after} ms={}", compaction_started.elapsed().as_millis());
         ui.event(&UiEvent::Status(&format!("compacted: about {} -> {} tokens", human_tokens(before), human_tokens(after))));
+        ui.event(&UiEvent::ContextUsage { context_tokens: after, context_limit: limit, session_cost });
         Ok(CompactResult::Compacted { before, after })
     }
 
