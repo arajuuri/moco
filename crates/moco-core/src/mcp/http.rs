@@ -66,29 +66,100 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Complete SSE events (`data:` lines joined, blank-line terminated), including a final unterminated one.
-fn read_events(reader: impl Read, mut on_event: impl FnMut(&str) -> bool) {
+/// The largest JSON body, SSE line or SSE event accepted from a server.
+const MAX_MESSAGE: usize = 64 * 1024 * 1024;
+/// Redirects followed per request, and only within the same origin (`Inner::send`).
+const MAX_REDIRECTS: usize = 3;
+
+fn size(bytes: usize) -> String {
+    if bytes >= 1 << 20 { format!("{} MiB", bytes >> 20) } else { format!("{bytes} bytes") }
+}
+
+/// Complete SSE events (`data:` lines joined, blank-line terminated), including a final unterminated one. A line or an
+/// event longer than `limit` bytes ends the stream with an error, so a server cannot make the client buffer without
+/// bound. A read error ends the stream quietly.
+fn read_events(reader: impl Read, limit: usize, mut on_event: impl FnMut(&str) -> bool) -> Result<(), String> {
     use std::io::BufRead;
-    let mut lines = std::io::BufReader::new(reader).lines();
-    let mut data: Vec<String> = vec![];
-    while let Some(Ok(line)) = lines.next() {
-        if line.is_empty() {
-            if !data.is_empty() && on_event(&data.join("\n")) {
-                return;
+    let mut reader = std::io::BufReader::new(reader);
+    let (mut line, mut data, mut have_data) = (Vec::new(), String::new(), false);
+    loop {
+        line.clear();
+        // Room for the line ending after a line of exactly `limit` bytes.
+        match reader.by_ref().take(limit as u64 + 2).read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let bytes = line.strip_suffix(b"\n").unwrap_or(&line);
+        let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
+        if bytes.len() > limit {
+            return Err(format!("the server sent an SSE line larger than {}", size(limit)));
+        }
+        let text = String::from_utf8_lossy(bytes);
+        if text.is_empty() {
+            if have_data && on_event(&data) {
+                return Ok(());
             }
             data.clear();
-        } else if let Some(d) = line.strip_prefix("data:") {
-            data.push(d.strip_prefix(' ').unwrap_or(d).to_string());
+            have_data = false;
+        } else if let Some(d) = text.strip_prefix("data:") {
+            let d = d.strip_prefix(' ').unwrap_or(d);
+            if data.len() + d.len() + 1 > limit {
+                return Err(format!("the server sent an SSE event larger than {}", size(limit)));
+            }
+            if have_data {
+                data.push('\n');
+            }
+            data.push_str(d);
+            have_data = true;
         }
     }
-    if !data.is_empty() {
-        on_event(&data.join("\n"));
+    if have_data {
+        on_event(&data);
     }
+    Ok(())
+}
+
+/// `location` resolved against `from`, if it stays on the same origin (scheme, host and port).
+fn same_origin(from: &str, location: &str) -> Option<String> {
+    let base = ureq::get(from).request_url().ok()?;
+    let next = base.as_url().join(location).ok()?;
+    (next.origin() == base.as_url().origin()).then(|| next.to_string())
+}
+
+/// Why a 3xx answer that `Inner::send` returned unfollowed ends the request.
+fn redirect_refused(resp: &ureq::Response) -> String {
+    format!(
+        "the server answered with a redirect (HTTP {} to {}) that moco does not follow: it follows at most {MAX_REDIRECTS}, and only on the same host, so that the configured headers go nowhere else. Set the server's `url` to the final address.",
+        resp.status(),
+        resp.header("location").unwrap_or("?")
+    )
 }
 
 impl Inner {
-    fn build(&self, method: &str, timeout: Option<Duration>) -> ureq::Request {
-        let mut req = self.agent.request(method, &self.url);
+    /// Send one request, following up to `MAX_REDIRECTS` redirects within the same origin by sending the same request
+    /// (method and body included) to the new address. The agent itself follows none: ureq strips only `authorization`
+    /// and `cookie`, so the configured headers and the session id would reach any host (#163). A redirect to another
+    /// origin, or one too many, is returned unfollowed and the caller refuses it (`redirect_refused`).
+    #[allow(clippy::result_large_err)] // the same `Result` as ureq's own `call`, which the callers match on
+    fn send(&self, method: &str, timeout: Option<Duration>, body: Option<&str>) -> Result<ureq::Response, ureq::Error> {
+        let mut url = self.url.clone();
+        for hop in 0..=MAX_REDIRECTS {
+            let req = self.build(method, &url, timeout);
+            let resp = match body {
+                Some(b) => req.send_string(b)?,
+                None => req.call()?,
+            };
+            let next = resp.header("location").and_then(|l| same_origin(&url, l));
+            match next {
+                Some(next) if (300..400).contains(&resp.status()) && hop < MAX_REDIRECTS => url = next,
+                _ => return Ok(resp),
+            }
+        }
+        unreachable!("the last hop returns")
+    }
+
+    fn build(&self, method: &str, url: &str, timeout: Option<Duration>) -> ureq::Request {
+        let mut req = self.agent.request(method, url);
         if let Some(t) = timeout {
             req = req.timeout(t);
         }
@@ -116,7 +187,8 @@ impl Inner {
 
     fn post_raw(&self, body: &Value, timeout: Duration) -> Result<Reply, PostErr> {
         let had_session = lock(&self.session).is_some();
-        match self.build("POST", Some(timeout)).send_string(&body.to_string()) {
+        match self.send("POST", Some(timeout), Some(&body.to_string())) {
+            Ok(resp) if (300..400).contains(&resp.status()) => Err(PostErr::Rpc(RpcError::Closed(redirect_refused(&resp)))),
             Ok(resp) => {
                 if let Some(s) = resp.header("mcp-session-id") {
                     *lock(&self.session) = Some(s.to_string());
@@ -169,7 +241,7 @@ impl Inner {
             }
         };
         if ctype.contains("text/event-stream") {
-            read_events(reply.resp.into_reader(), |data| {
+            read_events(reply.resp.into_reader(), MAX_MESSAGE, |data| {
                 let Ok(v) = serde_json::from_str::<Value>(data) else { return false };
                 match v.as_array() {
                     // Every message must be handled, so no short-circuiting `any`.
@@ -177,10 +249,14 @@ impl Inner {
                     Some(batch) => batch.iter().map(|m| take(self, m, &mut answer)).fold(false, |a, b| a || b),
                     None => take(self, &v, &mut answer),
                 }
-            });
+            })
+            .map_err(RpcError::Closed)?;
         } else if ctype.contains("application/json") {
             let mut text = String::new();
-            reply.resp.into_reader().take(64 * 1024 * 1024).read_to_string(&mut text).map_err(|e| RpcError::Closed(format!("reading the response failed: {e}")))?;
+            reply.resp.into_reader().take(MAX_MESSAGE as u64 + 1).read_to_string(&mut text).map_err(|e| RpcError::Closed(format!("reading the response failed: {e}")))?;
+            if text.len() > MAX_MESSAGE {
+                return Err(RpcError::Closed(format!("the server sent a JSON answer larger than {}", size(MAX_MESSAGE))));
+            }
             let v: Value = serde_json::from_str(&text).map_err(|e| RpcError::Closed(format!("the server answered with invalid JSON: {e}")))?;
             match v.as_array() {
                 Some(batch) => batch.iter().for_each(|m| {
@@ -248,15 +324,22 @@ impl Inner {
             if self.stop.load(Ordering::Relaxed) {
                 return;
             }
-            match self.build("GET", None).call() {
+            match self.send("GET", None, None) {
+                Ok(resp) if (300..400).contains(&resp.status()) => {
+                    crate::log_warn!("mcp", "{}: notification stream: {}", self.url, redirect_refused(&resp));
+                    return;
+                }
                 Ok(resp) => {
                     backoff = 1;
-                    read_events(resp.into_reader(), |data| {
+                    let read = read_events(resp.into_reader(), MAX_MESSAGE, |data| {
                         if let Ok(v) = serde_json::from_str::<Value>(data) {
                             self.dispatch(&v, Duration::from_secs(10));
                         }
                         self.stop.load(Ordering::Relaxed)
                     });
+                    if let Err(e) = read {
+                        crate::log_warn!("mcp", "{}: notification stream: {e}; reconnecting", self.url);
+                    }
                 }
                 Err(ureq::Error::Status(400 | 401 | 403 | 404 | 405 | 406 | 501, _)) => return,
                 Err(_) => {}
@@ -281,7 +364,7 @@ impl HttpClient {
             headers: opts.headers,
             oauth: opts.oauth,
             app_dir: opts.app_dir,
-            agent: ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(15)).redirects(3).build(),
+            agent: ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(15)).redirects(0).build(),
             session: Mutex::new(None),
             version: Mutex::new(None),
             next: AtomicU64::new(1),
@@ -355,7 +438,7 @@ impl McpConn for HttpClient {
         }
         // End the session politely; servers may answer 405 and that is fine.
         if lock(&self.inner.session).is_some() {
-            let _ = self.inner.build("DELETE", Some(Duration::from_secs(2))).call();
+            let _ = self.inner.send("DELETE", Some(Duration::from_secs(2)), None);
         }
     }
 }
@@ -511,6 +594,76 @@ mod tests {
         let e = HttpClient::connect(o2, Duration::from_secs(5)).err().unwrap();
         assert!(matches!(e, ConnectError::Failed(m) if m.starts_with("initialize failed")));
         let _ = std::fs::remove_dir_all(app);
+    }
+
+    #[test]
+    fn redirects_are_followed_on_the_same_host_only() {
+        use crate::provider::testserver::{error, serve};
+        let Some(fake) = Fake::start(&[]) else { return eprintln!("skipped: python3 not available") };
+        let app = tmp();
+        // The same origin: /old answers 307 to /mcp, and the same request goes there with its headers.
+        let (o, _rx) = opts(&fake, false, &app, &[("X-Custom", "hello")]);
+        let c = HttpClient::connect(HttpOptions { url: fake.url().replace("/mcp", "/old"), ..o }, Duration::from_secs(10)).unwrap();
+        assert_eq!(call(&c, "echo", json!({"text": "moved"})).unwrap()["content"][0]["text"], "echo: moved");
+        assert!(fake.count("redirected POST /old") >= 2 && fake.count("custom=hello") >= 2, "{}", fake.log());
+        wait_for("the GET stream through the redirect", || fake.log().contains("GET stream opened"));
+        fake.clean();
+        c.shutdown();
+        wait_for("the session to be closed", || fake.log().contains("DELETE session=sess-1"));
+        // Another origin (here another port) is not followed, so the configured headers stay with the configured server.
+        let away = serve(vec![error(307, "", vec![("Location", fake.url())])]);
+        let (o, _rx) = opts(&fake, false, &app, &[("X-Custom", "secret")]);
+        let e = HttpClient::connect(HttpOptions { url: format!("{}/mcp", away.url), ..o }, Duration::from_secs(5)).err().unwrap();
+        assert!(matches!(&e, ConnectError::Failed(m) if m.contains(&format!("redirect (HTTP 307 to {})", fake.url())) && m.contains("same host")), "{e:?}");
+        assert!(away.requests.lock().unwrap()[0].0.contains("X-Custom: secret"));
+        assert!(!fake.log().contains("custom=secret"), "the redirect target never saw the header:\n{}", fake.log());
+        let _ = std::fs::remove_dir_all(app);
+    }
+
+    #[test]
+    fn same_origin_resolves_relative_locations_and_compares_scheme_host_and_port() {
+        assert_eq!(same_origin("http://h:8/a/mcp", "/mcp/").as_deref(), Some("http://h:8/mcp/"));
+        assert_eq!(same_origin("http://h:8/a/mcp", "next").as_deref(), Some("http://h:8/a/next"));
+        assert_eq!(same_origin("https://h/mcp", "https://h:443/x").as_deref(), Some("https://h/x"));
+        for other in ["http://h:9/mcp", "https://h:8/mcp", "http://evil:8/mcp", "//evil/mcp"] {
+            assert_eq!(same_origin("http://h:8/mcp", other), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn pkce_verifiers_come_from_the_system_rng() {
+        // 32 random bytes as unpadded base64url, different every time (`oauth::random_b64` uses getrandom).
+        let (a, b) = (oauth::pkce().0, oauth::pkce().0);
+        assert_eq!(a.len(), 43);
+        assert!(a.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'), "{a}");
+        assert_ne!(a, b);
+    }
+
+    fn events(input: &str, limit: usize) -> (Vec<String>, Result<(), String>) {
+        let mut seen = vec![];
+        let r = read_events(input.as_bytes(), limit, |d| {
+            seen.push(d.to_string());
+            d == "stop"
+        });
+        (seen, r)
+    }
+
+    #[test]
+    fn sse_lines_and_events_are_capped() {
+        // Within the cap: data lines joined, CRLF endings, a final unterminated event, stopping when asked.
+        assert_eq!(events("data: a\r\ndata:b\r\n\r\n: comment\n\ndata: 0123456789\n", 16), (vec!["a\nb".into(), "0123456789".into()], Ok(())));
+        assert_eq!(events("data: stop\n\ndata: never\n\n", 16).0, ["stop"]);
+        // A line exactly at the cap is fine; one byte more ends the stream with an error, before any later event.
+        assert_eq!(events("data:0123456789\n\n", 15), (vec!["0123456789".into()], Ok(())));
+        let (seen, r) = events("data: ok\n\ndata:01234567890\n\ndata: later\n\n", 15);
+        assert_eq!((seen, r), (vec!["ok".to_string()], Err("the server sent an SSE line larger than 15 bytes".to_string())));
+        // A line that never ends is cut off at the cap, not read to the end.
+        let (seen, r) = events(&format!("data:{}", "x".repeat(1000)), 64);
+        assert_eq!((seen.len(), r), (0, Err("the server sent an SSE line larger than 64 bytes".to_string())));
+        // Many short lines that add up to too much in one event.
+        let (seen, r) = events(&"data: 0123456789\n".repeat(10), 64);
+        assert_eq!((seen.len(), r), (0, Err("the server sent an SSE event larger than 64 bytes".to_string())));
+        assert_eq!(size(MAX_MESSAGE), "64 MiB");
     }
 
     // ---- OAuth -------------------------------------------------------------------------------------------

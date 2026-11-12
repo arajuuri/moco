@@ -76,9 +76,18 @@ class H(BaseHTTPRequestHandler):
             self.end_headers()
         return ok
 
+    def moved(self, method):
+        """/old is where the endpoint used to be: a same-origin redirect to /mcp."""
+        if method != "GET":
+            self.body()
+        log("redirected %s /old" % method)
+        self.empty(307, {"Location": "/mcp"})
+
     # --- routing
     def do_GET(self):
         u = urlparse(self.path)
+        if u.path == "/old":
+            return self.moved("GET")
         if u.path == "/.well-known/oauth-protected-resource" and "--no-metadata" not in FLAGS:
             return self.send_json(200, {"resource": base() + "/mcp", "authorization_servers": [base()], "scopes_supported": ["mcp.read"]})
         if u.path == "/.well-known/oauth-authorization-server" and "--no-metadata" not in FLAGS:
@@ -92,6 +101,8 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urlparse(self.path)
+        if u.path == "/old":
+            return self.moved("POST")
         if u.path == "/register":
             reg = json.loads(self.body())
             if not any(r.startswith("http://127.0.0.1:") for r in reg.get("redirect_uris", [])):
@@ -108,6 +119,8 @@ class H(BaseHTTPRequestHandler):
         self.empty(404)
 
     def do_DELETE(self):
+        if urlparse(self.path).path == "/old":
+            return self.moved("DELETE")
         log("DELETE session=%s" % self.headers.get("Mcp-Session-Id"))
         self.empty(200)
 

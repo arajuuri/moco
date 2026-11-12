@@ -28,7 +28,7 @@ minimum from about 1.86); #99 has the measurements.
 | ratatui / crossterm | 0.29 / 0.28 | ratatui 0.30 needs Rust 1.88. Its `lru` stays at 0.12.5, which has two soundness advisories (RUSTSEC-2026-0002, -0253) fixed only in 0.16.3 / 0.18.2; ratatui 0.29 requires `^0.12` and calls neither affected method (#126) |
 | rusqlite | 0.41 down to 0.32.1 (libsqlite3-sys 0.30.1) | Newest that builds on 1.78: rusqlite 0.33+ uses `#[expect]` (1.81) and libsqlite3-sys 0.31+ fails too; none of 0.30–0.39 declares its MSRV, so `~0.32.1` is capped in `Cargo.toml` (#103). The bundled SQLite is 3.46.0 (RUSTSEC-2026-0459, fixed in 3.54; risk accepted in #126) |
 | ignore / globset | Capped at 0.4.23 / 0.4.15 | Newer releases are edition 2024 and declare no MSRV |
-| getrandom (via ring) | Uses the `getentropy` shim in the binary | 0.2.11+ calls `getentropy()` directly. The shim forwards to the system function on 10.12+ and falls back to `/dev/urandom` on Lion |
+| getrandom 0.2 (via ring; also used directly for the MCP OAuth `state` and PKCE verifier) | Uses the `getentropy` shim in the binary | 0.2.11+ calls `getentropy()` directly. The shim forwards to the system function on 10.12+ and falls back to `/dev/urandom` on Lion |
 | std back-ports | `crates/moco-core/src/compat.rs`: `Option::is_none_or`, unsigned `is_multiple_of` | Methods added after 1.78 (the 1.73 back-ports of `inspect`, `inspect_err` and `File::set_modified` went with #100) |
 | Ratatui back-ports | Removed `crates/moco/src/tui/compat.rs`; ratatui 0.29 provides the previously back-ported methods | |
 | Small edits | `AtomicU64::try_update` to `fetch_update`, `iter::repeat_n` to `repeat().take()`, `Set<'static>` to `Set` | No back-port possible or needed |

@@ -177,7 +177,9 @@ data/tui-history     prompt history of the full-screen UI
 One adapter per wire protocol: Anthropic Messages, OpenAI-compatible Chat Completions, OpenAI Responses and Gemini. The last
 two are experimental and have never run against the live services. `provider/registry.rs` builds a client for every catalog
 provider that has a key, wrapped in `Logged`. The catalog (`catalog.rs`) comes from models.dev and gives context limits,
-prices and capabilities; config can add or override providers.
+prices and capabilities; config can add or override providers. A downloaded catalog cannot change the base URL, key
+variables or protocol of a provider in the embedded snapshot (`Catalog::pin_builtins`). The shared HTTP agent
+(`provider::new_agent`) follows no redirects, because ureq would carry custom key headers to the redirect target.
 
 **Prompt caching is a design constraint.** Every request of a turn must extend the previous one byte for byte, because
 `anthropic.rs` sets cache breakpoints on the last tool, the system prompt and the last messages, and a test
