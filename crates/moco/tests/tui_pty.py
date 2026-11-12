@@ -3,7 +3,7 @@
 
 Usage: tui_pty.py MOCO CONFIG HOME WORKDIR SCENARIO    (SCENARIO: chat | sigterm | hangup | hangup-idle | idle | steer | config | mode | suggest | newsession | panic)
 Exits 0 when everything held; otherwise prints what went wrong and the screen text so far."""
-import fcntl, json, os, pty, re, select, signal, struct, sys, termios, time
+import fcntl, json, os, pty, re, select, signal, struct, sys, termios, time, unicodedata
 
 moco, config, home, work, scenario = sys.argv[1:6]
 env = dict(os.environ, MOCO_CONFIG=config, MOCO_HOME=home, TERM="xterm-256color")
@@ -46,6 +46,28 @@ def squashed():
     return re.sub(r"\s+", "", text())
 
 
+def screen():
+    # The rows the terminal shows now, replayed from the output. Typed text can reach moco in pieces, each drawn by its
+    # own frame with other changes in between, so the stream need not hold it in one run; the screen does. Handles what
+    # moco writes: cursor moves (CSI row;col H), full clears, the alternate screen, text; other sequences are skipped.
+    rows, cols = 30, 130  # the largest size any scenario sets; a resize clears the screen
+    grid = [[" "] * cols for _ in range(rows)]
+    r = c = 0
+    for m in re.finditer(r"\x1b\[([0-9;?]*)([A-Za-z])|\x1b\][^\x07]*\x07|\x1b[()][A-Z0-9]|\x1b[=>]|([^\x1b]+)", raw.decode("utf-8", "replace")):
+        args, cmd, run = m.groups()
+        if run is not None:
+            for ch in run:
+                if 0 <= r < rows and 0 <= c < cols:
+                    grid[r][c] = ch
+                c += 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+        elif cmd == "H":
+            p = args.split(";") + [""]
+            r, c = int(p[0] or 1) - 1, int(p[1] or 1) - 1
+        elif (cmd == "J" and args == "2") or (cmd in ("h", "l") and args == "?1049"):
+            grid = [[" "] * cols for _ in range(rows)]
+    return ["".join(row) for row in grid]
+
+
 def fail(msg):
     try:
         os.kill(pid, signal.SIGKILL)
@@ -63,6 +85,16 @@ def wait_for(pattern, timeout=15):
             return
         pump(0.1)
     fail("timeout waiting for %r" % pattern)
+
+
+def wait_for_on_screen(pattern, timeout=15):
+    # Like wait_for, but matches the current screen (each row without whitespace), for text that was just typed.
+    end = time.time() + timeout
+    while time.time() < end:
+        if re.search(pattern, "\n".join(re.sub(r"\s+", "", row) for row in screen())):
+            return
+        pump(0.1)
+    fail("timeout waiting for %r on the screen:\n%s" % (pattern, "\n".join(row.rstrip() for row in screen())))
 
 
 def wait_for_response(user_text, timeout=15):
@@ -253,7 +285,7 @@ elif scenario == "idle":
 
     quiet_for(3)
     send(b"hello")
-    wait_for(r"hello")  # keys still draw
+    wait_for_on_screen(r"hello")  # keys still draw
     quiet_for(2)
     send(b"\x15")  # Ctrl-U clears the composer
     pump(0.5)
