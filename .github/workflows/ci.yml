@@ -48,7 +48,8 @@ jobs:
   # and the dependencies, not the profile, so the release build (`scripts/install.sh`) is not compiled here.
   # It runs on pushes to `main` and on manual dispatch, not on every PR push.
   #
-  # The classic linker (`-ld_classic`) is needed for an LC_UNIXTHREAD entry point, as in release.yml (#113).
+  # The classic linker (`-ld_classic`) is needed for an LC_UNIXTHREAD entry point, as in release.yml (#113), and
+  # std is rebuilt for a Core 2 CPU without SSE4.1, also as in release.yml, so the SSE4 check passes.
   #
   # Disabled to avoid macOS runner costs: remove `false &&` to turn it on.
   macos:
@@ -56,15 +57,18 @@ jobs:
     runs-on: macos-15-intel
     env:
       MACOSX_DEPLOYMENT_TARGET: "10.7"
-      RUSTFLAGS: "-C link-arg=-ld_classic" # LC_UNIXTHREAD, not LC_MAIN, so Lion can start the binary (#113)
+      RUSTFLAGS: "-C link-arg=-ld_classic -C target-cpu=core2" # LC_UNIXTHREAD (#113); no SSE4.1 (release.yml)
+      RUSTC_BOOTSTRAP: "1" # for -Zbuild-std only
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false # nothing here pushes
       - uses: dtolnay/rust-toolchain@d2e383c7f7a2470b3f766fe5611d0bc4ffe2fd71 # 1.78.0 branch; keep in sync with rust-toolchain.toml
+        with:
+          components: rust-src # -Zbuild-std compiles std from it
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }} # PR runs reuse main's cache instead of storing their own
-      - run: cargo test --locked --workspace # python3 is preinstalled; the fake MCP/LLM servers need it
-      - name: Check minos <= 10.7, an LC_UNIXTHREAD entry point and nothing newer than Lion linked
-        run: scripts/check-macos-binary.sh target/debug/moco
+      - run: cargo test --locked --workspace -Zbuild-std --target x86_64-apple-darwin # python3 is preinstalled; the fake MCP/LLM servers need it
+      - name: Check minos <= 10.7, an LC_UNIXTHREAD entry point, nothing newer than Lion linked and no SSE4 code
+        run: scripts/check-macos-binary.sh target/x86_64-apple-darwin/debug/moco

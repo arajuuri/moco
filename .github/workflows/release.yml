@@ -12,6 +12,12 @@
 # build uses the classic linker (`-ld_classic`), which writes LC_UNIXTHREAD for a 10.7 target. Apple has deprecated
 # it; if a runner image drops it, the build or the entry-point check fails and nothing is published.
 #
+# rustc's x86_64-apple-darwin target assumes a Penryn CPU (SSE4.1), and so does the std that rustup ships. The first
+# Core 2 Duo Macs (Merom, 2006-2007) run Lion but have no SSE4.1, and such a binary dies there with "Illegal
+# instruction: 4". The build therefore uses `-C target-cpu=core2` and rebuilds std with it
+# (`-Zbuild-std`, which on a stable compiler needs RUSTC_BOOTSTRAP=1 and the rust-src component); the binary lands in
+# target/x86_64-apple-darwin/release. scripts/check-macos-binary.sh fails if SSE4 code shows up again.
+#
 # Supply chain (#126): the `macos` job compiles every dependency's build scripts and proc macros, so it gets a
 # read-only token and keeps no git credentials. Only the `publish` job, which runs no third-party Rust code, can
 # write: it re-creates the same tag, pushes it and uploads the files `macos` built. Third-party actions are pinned
@@ -30,7 +36,9 @@ permissions: {} # each job asks for what it needs
 env:
   CARGO_TERM_COLOR: always
   MACOSX_DEPLOYMENT_TARGET: "10.7"
-  RUSTFLAGS: "-C link-arg=-ld_classic" # LC_UNIXTHREAD, not LC_MAIN, so Lion can start the binary (#113)
+  # -ld_classic: LC_UNIXTHREAD, not LC_MAIN, so Lion can start the binary (#113). core2: no SSE4.1 (see above).
+  RUSTFLAGS: "-C link-arg=-ld_classic -C target-cpu=core2"
+  RUSTC_BOOTSTRAP: "1" # for -Zbuild-std only
 
 jobs:
   macos:
@@ -49,6 +57,8 @@ jobs:
           fetch-depth: 0 # git describe needs the history and the tags
           persist-credentials: false # nothing in this job pushes; build scripts must not find a token in .git/config
       - uses: dtolnay/rust-toolchain@d2e383c7f7a2470b3f766fe5611d0bc4ffe2fd71 # 1.78.0 branch; keep in sync with rust-toolchain.toml
+        with:
+          components: rust-src # -Zbuild-std compiles std from it
 
       - name: Tag the commit (locally)
         id: tag
@@ -68,15 +78,16 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
-      - run: cargo build --release --locked -p moco
+      # std's own dependencies come from the rust-src lockfile, so --locked holds for them too.
+      - run: cargo build --release --locked -p moco -Zbuild-std=std,panic_abort --target x86_64-apple-darwin
 
       - name: Check the binary
         env:
           VERSION: ${{ steps.tag.outputs.version }}
         run: |
-          scripts/check-macos-binary.sh target/release/moco
-          target/release/moco --version
-          first=$(target/release/moco --version | head -1)
+          scripts/check-macos-binary.sh target/x86_64-apple-darwin/release/moco
+          target/x86_64-apple-darwin/release/moco --version
+          first=$(target/x86_64-apple-darwin/release/moco --version | head -1)
           [ "$first" = "moco $VERSION" ] || { echo "::error::binary reports '$first', expected 'moco $VERSION'"; exit 1; }
 
       - name: Package
@@ -86,7 +97,7 @@ jobs:
         run: |
           name="moco-$VERSION-macos-x86_64"
           mkdir -p "dist/$name"
-          cp target/release/moco README.md LICENSE-opencode NOTICE "dist/$name/"
+          cp target/x86_64-apple-darwin/release/moco README.md LICENSE-opencode NOTICE "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
           cat "dist/$name.tar.gz.sha256"
