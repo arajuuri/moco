@@ -1,6 +1,7 @@
 #!/bin/bash
 # Check that a macOS moco binary loads on 10.7 (Lion): minimum OS 10.7, an LC_UNIXTHREAD entry point, only libSystem
-# and libiconv linked, and no symbols newer than 10.7. See docs/14-macos-10.7.md. Used by CI and the release workflow.
+# and libiconv linked, no symbols newer than 10.7, and no SSE4 code for the oldest Core 2 Duos. See docs/14-macos-10.7.md.
+# Used by CI and the release workflow.
 #
 #   scripts/check-macos-binary.sh target/release/moco
 set -eu
@@ -19,3 +20,17 @@ libs=$(otool -L "$bin" | tail -n +2 | awk '{print $1}' | grep -vE '^/usr/lib/(li
 [ -z "$libs" ] || { echo "links more than libSystem and libiconv:"; echo "$libs"; exit 1; }
 newer=$(nm -u "$bin" | grep -E 'getentropy|clock_gettime|os_unfair_lock|ulock' || true)
 [ -z "$newer" ] || { echo "uses symbols newer than 10.7:"; echo "$newer"; exit 1; }
+# The oldest Macs that run Lion (Core 2 Duo "Merom", 2006-2007) stop at SSSE3. rustc's default for this target is
+# Penryn, which adds SSE4.1, and such a binary dies there with "Illegal instruction: 4"; builds need
+# `-C target-cpu=core2` and a std rebuilt with it (release.yml). This lists SSE4.1, SSE4.2 and POPCNT instructions
+# per function, leaving out code that checks the CPU before it runs (ALLOWED). Needs symbols (no `strip`).
+sse4='^(pblendvb|blendvp[sd]|blendp[sd]|pblendw|ptest|pmulld|pmuldq|pcmpeqq|pcmpgtq|packusdw|pmin(sb|sd|ud|uw)|pmax(sb|sd|ud|uw)|pmov[sz]x[bwd][wdq]|pextr[bdq]|pinsr[bdq]|extractps|insertps|round[sp][sd]|dpp[sd]|mpsadbw|phminposuw|movntdqa|pcmp[ei]str[im]|crc32[bwlq]?|popcnt[wlq]?)$'
+# Dispatched at run time: sha2 (SHA-NI), crc32fast (PCLMULQDQ), ring's AES-NI and SSE4.1 assembly
+# (process_extra_in_trailer is a label inside the latter).
+ALLOWED='^(__ZN4sha26sha2563x86|__ZN9crc32fast11specialized9pclmulqdq|_ring_core_[0-9_]+__(aes_hw_|chacha20_poly1305_(open|seal)_sse41)|process_extra_in_trailer:)'
+found=$(otool -tvV "$bin" | awk -F'\t' -v re="$sse4" -v allowed="$ALLOWED" '
+  NF == 1 && /:$/ { fn = $1; next }
+  NF >= 2 && $2 ~ re && fn !~ allowed { n[fn]++ }
+  END { for (f in n) print n[f] "\t" f }')
+[ -z "$found" ] || { echo "SSE4 instructions, which Merom Core 2 Duos lack (count, function):"; echo "$found" | sort -k2 | head -50; exit 1; }
+echo "sse4=none outside CPU-checked code"

@@ -33,7 +33,7 @@ minimum from about 1.86); #99 has the measurements.
 | Ratatui back-ports | Removed `crates/moco/src/tui/compat.rs`; ratatui 0.29 provides the previously back-ported methods | |
 | Small edits | `AtomicU64::try_update` to `fetch_update`, `iter::repeat_n` to `repeat().take()`, `Set<'static>` to `Set` | No back-port possible or needed |
 | Lints | `unstable_name_collisions`, four clippy 1.73 lints and three clippy 1.78 lints that newer clippy does not raise on this code are allowed at crate level | Keeps code written for newer clippy unchanged |
-| `scripts/install.sh` | Deployment target 10.7; minos check accepts 10.7 or older | |
+| `scripts/install.sh` | Deployment target 10.7; minos check accepts 10.7 or older; on macOS with rustup, `target-cpu=core2` with std rebuilt | The oldest Core 2 Duos have no SSE4.1 ("CPU" under Building) |
 
 The remaining compatibility imports are for Rust standard-library back-ports: `use crate::compat::*;` (front end:
 `use moco_core::compat::*;`). Ratatui call sites use the native 0.29 APIs.
@@ -45,12 +45,25 @@ works), with the binary copied to Lion. A clean release build on the Mojave test
 9m24s with 2 (2026-11-08):
 
 ```
-rustup toolchain install 1.78.0          # rust-toolchain.toml selects it inside the repo
-MACOSX_DEPLOYMENT_TARGET=10.7 CARGO_TARGET_DIR=$HOME/moco-target-107 cargo build --release --locked
+rustup toolchain install 1.78.0 --component rust-src   # rust-toolchain.toml selects it inside the repo
+export MACOSX_DEPLOYMENT_TARGET=10.7 CARGO_TARGET_DIR=$HOME/moco-target-107
+export RUSTFLAGS="-C target-cpu=core2" RUSTC_BOOTSTRAP=1      # see "CPU" below
+cargo build --release --locked -Zbuild-std=std,panic_abort --target x86_64-apple-darwin
 # In a copy without .git, also pass MOCO_GIT_DESCRIBE (CONTRIBUTING.md "Versions and releases"), or the
 # version reads 0.1.0-unknown.
-otool -l $HOME/moco-target-107/release/moco | grep -A3 -E 'LC_VERSION_MIN_MACOSX|LC_BUILD_VERSION'   # must say 10.7
+otool -l $HOME/moco-target-107/x86_64-apple-darwin/release/moco | grep -A3 -E 'LC_VERSION_MIN_MACOSX|LC_BUILD_VERSION'   # must say 10.7
 ```
+
+**CPU.** rustc's `x86_64-apple-darwin` target assumes a Penryn CPU, and rustup's prebuilt std is compiled for it, so
+both use SSE4.1. The first Core 2 Duo Macs (Merom, 2006-2007) run Lion but stop at SSSE3, and such a binary dies
+there with "Illegal instruction: 4": moco 0.2.0 crashed that way on a 2007 MacBook (Core 2 Duo T7500) right after
+printing its `--version` line (2026-11-12). `-C target-cpu=core2` covers moco and its dependencies, and
+`-Zbuild-std` rebuilds std with it (rustc's own integer formatting used SSE4.1). `-Zbuild-std` is unstable;
+`RUSTC_BOOTSTRAP=1` enables it on the pinned 1.78 compiler, and it needs the `rust-src` component and an explicit
+`--target`, which puts the binary under `x86_64-apple-darwin/`. Build scripts and proc macros still use the prebuilt
+std, which is fine: they only run on the build machine. `scripts/install.sh` and the release workflow build this way.
+MacPorts' Rust (below) already targets `core2`, std included. `scripts/check-macos-binary.sh` fails on SSE4.1,
+SSE4.2 or POPCNT instructions outside code that checks the CPU first.
 
 Before copying the binary, also check that it links nothing newer than Lion has. `otool -L` should list only
 `libSystem` and `libiconv`. `nm -u <binary> | grep -E 'getentropy|clock_gettime|os_unfair_lock|ulock'` should print

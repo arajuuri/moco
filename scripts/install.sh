@@ -130,12 +130,28 @@ say "$(cargo --version)"
 step "Building moco (a few minutes the first time)"
 say "build cache: ${TARGET_DIR}"
 mkdir -p "$TARGET_DIR"
-if [ "$OS" = "Darwin" ]; then export MACOSX_DEPLOYMENT_TARGET=10.7; fi
 export CARGO_TARGET_DIR="$TARGET_DIR"
 LOCKED=""
 [ -f "${SRC}/Cargo.lock" ] && LOCKED="--locked"
-( cd "$SRC" && cargo build --release -p moco $LOCKED )
 BUILT="${TARGET_DIR}/release/moco"
+STD_ARGS=""
+if [ "$OS" = "Darwin" ]; then
+  export MACOSX_DEPLOYMENT_TARGET=10.7
+  # rustc and rustup's prebuilt std assume a Penryn CPU (SSE4.1); the first Core 2 Duo Macs (Merom) lack it and such a
+  # binary dies there with "Illegal instruction: 4". Build for core2 and, with rustup, rebuild std for it too (as
+  # release.yml does). MacPorts' Rust (Lion) already builds for core2 and has no rust-src to rebuild std from.
+  export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-C target-cpu=core2"
+  if ! command -v rustup >/dev/null 2>&1; then
+    :
+  elif (cd "$SRC" && rustup component add rust-src >/dev/null 2>&1); then
+    export RUSTC_BOOTSTRAP=1
+    STD_ARGS="-Zbuild-std=std,panic_abort --target x86_64-apple-darwin"
+    BUILT="${TARGET_DIR}/x86_64-apple-darwin/release/moco"
+  else
+    say "note: could not add rust-src, so std is not rebuilt for core2: the binary may not run on 2006-2007 Core 2 Duo Macs"
+  fi
+fi
+( cd "$SRC" && cargo build --release -p moco $LOCKED $STD_ARGS )
 [ -x "$BUILT" ] || die "the build finished but ${BUILT} is missing"
 
 if [ "$OS" = "Darwin" ] && command -v otool >/dev/null 2>&1; then
