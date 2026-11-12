@@ -250,8 +250,10 @@ pub enum Row {
     User(String),
     Assistant(String),
     Tool { id: String, depth: usize, agent: String, name: String, summary: String, state: ToolState, detail: Option<String>, output: String, auto: Option<String> },
-    /// The model's reasoning, shown according to the detail level.
-    Reasoning(String),
+    /// The model's reasoning, shown according to the detail level. `open` shows it whole at the normal level too:
+    /// set when a turn ends with reasoning but no answer (a token-limit stop, an error, an interrupt), because then
+    /// the reasoning is all the model produced.
+    Reasoning { text: String, open: bool },
     /// The welcome card at the top of a session.
     Banner { title: String, model: String, agent: String, cwd: String },
     Todos(Vec<Todo>),
@@ -519,6 +521,7 @@ impl App {
                     Ok(Busy) => self.rows.push(Row::Error("session is busy".into())),
                     Err(e) => self.rows.push(Row::Error(e)), // already says what failed ("store error: ...", "the engine crashed: ...")
                 }
+                self.open_unanswered_reasoning();
                 self.finish_usage();
                 if finished && self.suggestions {
                     self.clear_suggestion();
@@ -554,6 +557,20 @@ impl App {
         match self.focused {
             Some(f) => !f,
             None => self.last_input.elapsed() >= self.away_after,
+        }
+    }
+
+    /// If the last prompt got reasoning but no answer text, open its last reasoning block: it is the only output.
+    fn open_unanswered_reasoning(&mut self) {
+        for r in self.rows.iter_mut().rev() {
+            match r {
+                Row::User(_) | Row::Assistant(_) => return,
+                Row::Reasoning { open, .. } => {
+                    *open = true;
+                    return;
+                }
+                _ => {}
+            }
         }
     }
 
@@ -608,8 +625,8 @@ impl App {
             Ev::Reasoning(t) => {
                 if depth == 0 {
                     match self.rows.last_mut() {
-                        Some(Row::Reasoning(s)) => s.push_str(&t),
-                        _ => self.rows.push(Row::Reasoning(t)),
+                        Some(Row::Reasoning { text, .. }) => text.push_str(&t),
+                        _ => self.rows.push(Row::Reasoning { text: t, open: false }),
                     }
                 }
             }
@@ -1416,6 +1433,12 @@ impl App {
         (tail.into_iter().flatten().collect(), complete)
     }
 
+    /// "Ctrl-O shows all", naming the key bound to the detail action; empty when it is unbound.
+    fn more_hint(&self) -> String {
+        let key = self.keymap.label(KeyAction::Detail);
+        if key == "(unbound)" { String::new() } else { format!("{key} shows all") }
+    }
+
     fn block_lines(&self, first: usize, end: usize, width: usize) -> Vec<Line<'static>> {
         let t = &self.theme;
         let g = self.glyphs;
@@ -1455,13 +1478,23 @@ impl App {
                     out.push(Line::from(spans));
                 }
             }
-            Row::Reasoning(s) => match self.level {
+            Row::Reasoning { text: s, open } => match self.level {
                 0 => {}
-                1 => {
+                1 if !open => {
                     let lines = s.lines().filter(|l| !l.trim().is_empty()).count();
                     let head = s.split_whitespace().collect::<Vec<_>>().join(" ");
-                    let label = format!("thinking{}{} ", if lines > 1 { format!(" ({lines} lines)") } else { String::new() }, "");
-                    let room = width.saturating_sub(M.len() + 2 + label.len() + 2);
+                    // Say how to read the rest, with the key the detail action is bound to.
+                    let more = self.more_hint();
+                    let label = |hint: bool| match (lines > 1, hint && !more.is_empty()) {
+                        (true, true) => format!("thinking ({lines} lines, {more}) "),
+                        (true, false) => format!("thinking ({lines} lines) "),
+                        (false, true) => format!("thinking ({more}) "),
+                        (false, false) => "thinking ".to_string(),
+                    };
+                    let room = |label: &str| width.saturating_sub(M.len() + 2 + display_width(label) + 2);
+                    let fits = display_width(&head) <= room(&label(false));
+                    let label = label(lines > 1 || !fits);
+                    let room = room(&label);
                     let head = if display_width(&head) > room { format!("{}{}", clip_width(&head, room.saturating_sub(1)), g.ellipsis) } else { head };
                     out.push(Line::from(vec![Span::raw(M), Span::styled(format!("{} ", g.think), t.accent.add_modifier(Modifier::DIM)), Span::styled(label, dim.add_modifier(Modifier::ITALIC)), Span::styled(head, dim.add_modifier(Modifier::ITALIC))]));
                 }
@@ -1524,7 +1557,9 @@ impl App {
                         }
                     }
                     if lines.len() > cap {
-                        out.push(Line::styled(format!("{indent}{} {} more lines (Ctrl-O shows all)", g.ellipsis, lines.len() - cap), dim));
+                        let more = self.more_hint();
+                        let more = if more.is_empty() { String::new() } else { format!(" ({more})") };
+                        out.push(Line::styled(format!("{indent}{} {} more lines{more}", g.ellipsis, lines.len() - cap), dim));
                     }
                 }
                 if let ToolState::Failed(msg) = state {
@@ -1922,7 +1957,7 @@ fn row_group(r: &Row) -> u8 {
     match r {
         Row::User(_) => 0,
         Row::Assistant(_) => 1,
-        Row::Tool { .. } | Row::Reasoning(_) => 2,
+        Row::Tool { .. } | Row::Reasoning { .. } => 2,
         Row::Usage(_) => 3,
         Row::Todos(_) => 5,
         _ => 4,
@@ -2840,8 +2875,21 @@ mod tests {
         text(&mut a, Ev::Reasoning(" more".into()));
         text(&mut a, Ev::Text("Answer".into()));
         assert_eq!(a.rows.len(), 2); // reasoning chunks join into one row
-        let s = screen(&mut a, 70, 10).join("\n");
-        assert!(s.contains("thinking (2 lines) Let me think about the *edge* case more") && s.contains("Answer"), "{s}");
+        // The collapsed line says how to read the rest, with the bound key.
+        let s = screen(&mut a, 90, 10).join("\n");
+        assert!(s.contains("thinking (2 lines, Ctrl-O shows all) Let me think about the *edge* case more") && s.contains("Answer"), "{s}");
+        let keys = serde_json::json!({"detail": "f2"}).as_object().unwrap().clone().into_iter().collect();
+        a.keymap = Keymap::from_config(&keys, &Default::default()).0;
+        let s = screen(&mut a, 90, 10).join("\n");
+        assert!(s.contains("thinking (2 lines, F2 shows all) Let me think"), "{s}");
+        let keys = serde_json::json!({"detail": null}).as_object().unwrap().clone().into_iter().collect();
+        a.keymap = Keymap::from_config(&keys, &Default::default()).0;
+        let s = screen(&mut a, 90, 10).join("\n");
+        assert!(s.contains("thinking (2 lines) Let me think") && !s.contains("shows all"), "{s}");
+        a.keymap = Keymap::default();
+        // Narrow: the hint stays and the text gives way.
+        let s = screen(&mut a, 50, 10).join("\n");
+        assert!(s.contains("thinking (2 lines, Ctrl-O shows all) Let me…"), "{s}");
         a.level = 2;
         let s = screen(&mut a, 40, 10).join("\n");
         assert!(s.contains("Let me think") && s.contains("about the *edge* case more") && !s.contains("thinking ("), "{s}");
@@ -2852,6 +2900,52 @@ mod tests {
         a.update(AppEvent::Engine { depth: 1, agent: "x".into(), ev: Ev::Reasoning("secret".into()) });
         a.level = 2;
         assert!(!screen(&mut a, 40, 10).join("\n").contains("secret"));
+    }
+
+    #[test]
+    fn short_reasoning_needs_no_hint() {
+        let mut a = App::new("m", "build");
+        text(&mut a, Ev::Reasoning("Easy.".into()));
+        let s = screen(&mut a, 60, 6).join("\n");
+        assert!(s.contains("thinking Easy.") && !s.contains("shows all"), "{s}");
+        // One long line that has to be clipped gets the hint.
+        text(&mut a, Ev::Text("ok".into()));
+        text(&mut a, Ev::Reasoning("word ".repeat(40)));
+        let s = screen(&mut a, 60, 8).join("\n");
+        assert!(s.contains("thinking (Ctrl-O shows all) word word"), "{s}");
+    }
+
+    #[test]
+    fn reasoning_without_an_answer_opens_when_the_turn_ends() {
+        let mut a = App::new("m", "build");
+        a.push_user("first");
+        text(&mut a, Ev::Reasoning("Answered thought one\nline two".into()));
+        text(&mut a, Ev::Text("Answer".into()));
+        a.push_user("second");
+        text(&mut a, Ev::Reasoning("Early idea".into()));
+        text(&mut a, Ev::Tool { id: String::new(), name: "read".into(), summary: "a.rs".into(), detail: None });
+        text(&mut a, Ev::ToolDone { name: "read".into(), ok: true, msg: String::new(), output: String::new() });
+        text(&mut a, Ev::Reasoning("Pondering the edge case\nat length".into()));
+        a.running = true;
+        // While the turn runs, the reasoning stays collapsed.
+        let s = screen(&mut a, 80, 24).join("\n");
+        assert!(s.contains("thinking (2 lines, Ctrl-O shows all) Pondering"), "{s}");
+        text(&mut a, Ev::Notice("response stopped at the output token limit".into()));
+        a.update(AppEvent::RunDone(Ok(RunOutcome::Idle)));
+        // The turn ended without an answer: its last reasoning is shown whole; answered and earlier ones stay collapsed.
+        let s = screen(&mut a, 80, 24).join("\n");
+        assert!(s.contains("Pondering the edge case") && s.contains("at length") && !s.contains("thinking (2 lines, Ctrl-O shows all) Pondering"), "{s}");
+        assert!(s.contains("thinking (2 lines, Ctrl-O shows all) Answered thought one") && s.contains("thinking Early idea"), "{s}");
+        // Compact still hides reasoning.
+        a.level = 0;
+        assert!(!screen(&mut a, 80, 24).join("\n").contains("Pondering"));
+        // A turn that answered leaves its reasoning collapsed.
+        a.level = 1;
+        a.push_user("third");
+        text(&mut a, Ev::Reasoning("Quick check\ndone".into()));
+        text(&mut a, Ev::Text("Fine".into()));
+        a.update(AppEvent::RunDone(Ok(RunOutcome::Idle)));
+        assert!(screen(&mut a, 80, 30).join("\n").contains("thinking (2 lines, Ctrl-O shows all) Quick check done"));
     }
 
     fn file(path: &str, patch: &str) -> ViewFile {

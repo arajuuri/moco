@@ -127,7 +127,7 @@ fn gallery() {
         let mut a = App::new("anthropic/claude-sonnet-5-5", "build");
         a.theme = theme.clone();
         a.push_user("Show me what markdown looks like.");
-        a.rows.push(Row::Reasoning("The user wants a tour of the rendering. I will include a heading, nested lists, a quote, a table and a code block.\nThen keep it short.".into()));
+        a.rows.push(Row::Reasoning { text: "The user wants a tour of the rendering. I will include a heading, nested lists, a quote, a table and a code block.\nThen keep it short.".into(), open: false });
         a.rows.push(Row::Assistant("# Markdown tour\n\nSome **bold**, some *italic*, `inline code` and a [link](https://example.com).\n\n## Lists\n\n1. First step\n2. Second step with a very long description that has to wrap onto the next line nicely\n   - nested bullet\n   - another one\n\n> A quote from somewhere that is long enough to wrap around the edge of the terminal window.\n\n### A table\n\n| Tool | Calls | Failed |\n|---|---:|---:|\n| read | 12 | 0 |\n| shell | 4 | 1 |\n\n---\n\n```python\ndef greet(name):\n    return f\"hi {name}\"\n```\n\nDone.".into()));
         scenes.insert(format!("{tname}-markdown"), dump(&mut a, 100, 44));
 
