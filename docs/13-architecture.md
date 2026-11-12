@@ -64,6 +64,7 @@ tooling, so the code is synchronous Rust on OS threads. HTTP is `ureq`, the data
 | Tools | `tools/mod.rs` | `Tool`, `ToolCtx`, `Host`, `Permitter`, path helpers, the tool list |
 | | `tools/*.rs` | `read write edit patch glob grep shell jobs webfetch websearch todowrite question subagent skill` |
 | | `tools/shellparse.rs`, `tools/fsio.rs` | Command line to permission resources; atomic writes and per-file locks |
+| | `nofollow.rs` | Opening, creating, renaming and removing files by a checked path without following symlinks |
 | Safety | `permission.rs`, `wildcard.rs` | Rule model, modes, presets, evaluation |
 | | `saved_permissions.rs` | Listing and removing saved "always allow" rules (`/permissions`, `moco permissions`) |
 | | `sandbox.rs` | macOS Seatbelt wrapper for `shell` |
@@ -232,6 +233,14 @@ Details that matter:
   classifier can only turn ask into allow. Timeouts, errors and garbled replies ask the user.
 - **Paths** are compared with symlinks resolved (`tools/mod.rs::is_internal`), so a symlinked project is one project and a
   symlink that leads out of it is external. Anything outside the project asks under `external_directory`.
+- **Check, then use the same file** (#165). The file tools resolve a path once (`real_path`), pass it to the checks
+  (`ToolCtx::permit_path_at`, `check_external_file_at`) and then use exactly that symlink-free path through `nofollow.rs`,
+  which refuses a symlink anywhere in it, so a link swapped in after the check (by a background shell, say) is not followed.
+  With `openat` (Linux, macOS 10.10+, looked up with `dlsym` because 10.7 to 10.9 lack it) a folder is opened component by
+  component with `O_NOFOLLOW` and the file is opened, created, renamed and removed relative to it. On 10.7 to 10.9 the same
+  calls go by full path with `O_NOFOLLOW` on the last component, and the folder is checked again afterwards (no symlink, same
+  device and inode); only a folder swapped out and back between two system calls slips past that. Opened files are `fstat`ed
+  (a FIFO or device is refused without blocking). Tests swap links in at `nofollow::between_check_and_use`.
 - **Shell** (`tools/shell.rs`) runs in its own process group so it can be killed whole. `shellparse.rs` splits a command line
   into permission resources and "always" patterns, and forces a prompt for opaque constructs (`eval`, `$(...)`, `base64 -d | sh`)
   and obvious file writes (in-place `sed`/`perl`, Python `open(..., 'w')`, and output redirections except `/dev/null`). With
@@ -242,7 +251,8 @@ Details that matter:
   exits and otherwise every 100 ms to check `stop()` and the output cap; `try_reap` still decides whether the child exited. Without
   the watch (other platforms, or setup failed) it polls every 15 ms. See `15-idle-cpu.md`.
 - **Output** is bounded to 2000 lines or 50 KiB; the rest is saved under `data/tool-output/` and the model is told the path.
-- **Edits** (`edit`, `write`, `patch`) write atomically under a per-file lock (`fsio.rs`), then run the configured
+- **Edits** (`edit`, `write`, `patch`) write atomically under a per-file lock (`fsio.rs`; the temporary file and the rename
+  stay in the checked folder, opened through `nofollow.rs`), then run the configured
   formatter (`format.rs`). After a step that changed files, configured checks (`check.rs`) run once and their report is added
   to the tool result.
 
@@ -270,7 +280,8 @@ session and the front end is told through the engine's notifier.
   at most one checkpoint. It runs on `/compact`, when a request nears the model's limit, and once after a provider's
   context-overflow error.
 - **Snapshots** (`snapshot.rs`) are `git`-free: a manifest of every non-ignored file with its SHA-256 and mode, contents stored
-  once as blobs, only changed files re-hashed. One is taken before every step and its id is stored on the assistant message.
+  once as blobs, only changed files re-hashed. Symlinks are not followed or recorded; a file the walk saw is read through
+  `nofollow.rs`, so a link swapped in before it is read is skipped as unreadable (#165). One is taken before every step and its id is stored on the assistant message.
   `/undo` restores files and hides the messages; `/diff` compares the current tree with the session's first snapshot. A project
   with too many files turns snapshots off for that session with one notice. Files too large to store are reported as skipped.
 - **Limits** (`engine/limits.rs`). A step allowance per run (the last allowed step forbids tools and adds the `MAX_STEPS`

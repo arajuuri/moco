@@ -7,6 +7,8 @@ pub mod html;
 pub mod jobs;
 pub mod patch;
 pub mod question;
+#[cfg(test)]
+mod race_tests;
 pub mod read;
 pub mod shell;
 pub mod shellparse;
@@ -248,7 +250,11 @@ impl ToolCtx<'_> {
     /// resolved: a project reached through a symlinked parent is internal under either name, and a symlink inside the
     /// project that leads out of it is not.
     pub fn is_internal(&self, p: &Path) -> bool {
-        let real = real_path(p);
+        self.is_internal_real(&real_path(p))
+    }
+
+    /// `is_internal` for a path already resolved by `real_path`.
+    fn is_internal_real(&self, real: &Path) -> bool {
         [&self.cwd, &self.project_root, &self.spill_dir].iter().any(|root| real.starts_with(real_path(root)))
     }
 
@@ -278,7 +284,14 @@ impl ToolCtx<'_> {
     /// (a linked final component or a linked parent), the place they lead to. A rule such as `read .env` therefore
     /// applies to `safe.txt -> .env`, and a deny on the target cannot be bypassed through a link.
     pub fn permit_path(&self, action: &str, path: &Path, save: Vec<String>) -> Result<(), ToolError> {
-        self.permit(action, self.path_resources(path), save)
+        self.permit_path_at(action, path, &real_path(path), save)
+    }
+
+    /// `permit_path` with the path's target already resolved (`real_path`). The file tools resolve once, check, and
+    /// then use exactly `real` through `crate::nofollow`, which refuses any symlink in it, so a link swapped in after
+    /// the check is not followed (#165).
+    pub fn permit_path_at(&self, action: &str, path: &Path, real: &Path, save: Vec<String>) -> Result<(), ToolError> {
+        self.permit(action, self.path_resources_at(path, real), save)
     }
 
     /// The rules' verdict on `action` for a path, named as `permit_path` names it, without prompting (`Permitter::evaluate`).
@@ -288,6 +301,10 @@ impl ToolCtx<'_> {
 
     /// The permission resources for a path: its name as given and, when links lead elsewhere, what they lead to.
     fn path_resources(&self, path: &Path) -> Vec<String> {
+        self.path_resources_at(path, &real_path(path))
+    }
+
+    fn path_resources_at(&self, path: &Path, real: &Path) -> Vec<String> {
         // The name as given: a link that lives in the project keeps its relative name even when it points outside
         // (`display` would resolve it and show it absolute); the target is checked as its own resource below.
         let lexical = normalize(path);
@@ -297,9 +314,8 @@ impl ToolCtx<'_> {
             .map(|r| r.to_string_lossy().into_owned())
             .unwrap_or_else(|| self.display(path));
         let mut resources = vec![name];
-        let real = real_path(path);
         if real != normalize(path) {
-            let target = self.display(&real);
+            let target = self.display(real);
             if !resources.contains(&target) {
                 resources.push(target);
             }
@@ -310,14 +326,18 @@ impl ToolCtx<'_> {
     /// Anything outside the working directory and project root needs `external_directory`.
     /// `dir` is the directory being touched (the parent for a file).
     pub fn check_external(&self, dir: &Path) -> Result<(), ToolError> {
-        if self.is_internal(dir) {
-            return Ok(());
-        }
         // The symlink-free name, so what the user allows once or always holds for every spelling of the directory. The
         // rules see only this name, so the user's own temp directory, which the mode rules allow
         // (`permission::temp_dir_rules`), cannot be used to reach anything else through a link in it.
-        let dir = real_path(dir);
-        let root = always_root_of(&dir);
+        self.check_external_at(&real_path(dir))
+    }
+
+    /// `check_external` for a directory already resolved by `real_path`: the one name both judged and then used.
+    pub fn check_external_at(&self, dir: &Path) -> Result<(), ToolError> {
+        if self.is_internal_real(dir) {
+            return Ok(());
+        }
+        let root = always_root_of(dir);
         self.permit(
             "external_directory",
             vec![format!("{}/*", dir.display())],
@@ -328,11 +348,16 @@ impl ToolCtx<'_> {
     /// `check_external` for a file a tool reads or writes: its folder, and, when the file is a symlink, the folder of
     /// what it points to (a link inside the project can lead out of it).
     pub fn check_external_file(&self, path: &Path) -> Result<(), ToolError> {
-        let dir = path.parent().unwrap_or(path);
-        self.check_external(dir)?;
-        let target = real_path(path);
-        match target.parent() {
-            Some(t) if t != real_path(dir) => self.check_external(t),
+        self.check_external_file_at(path, &real_path(path))
+    }
+
+    /// `check_external_file` with the file's target already resolved (`real_path`), as `permit_path_at` takes it.
+    /// The folder of `real` is always the one judged, whatever the links in `path` lead to by now.
+    pub fn check_external_file_at(&self, path: &Path, real: &Path) -> Result<(), ToolError> {
+        let dir = real_path(path.parent().unwrap_or(path));
+        self.check_external_at(&dir)?;
+        match real.parent() {
+            Some(t) if t != dir => self.check_external_at(t),
             _ => Ok(()),
         }
     }

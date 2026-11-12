@@ -67,30 +67,49 @@ pub fn lock_files<P: AsRef<Path>>(paths: impl IntoIterator<Item = P>) -> FileLoc
 
 static TMP: AtomicU64 = AtomicU64::new(0);
 
-/// Write `bytes` to `path` by renaming a finished temporary file over it. The file keeps its permissions, and a
-/// symlink is written through to its target instead of being replaced. When the directory does not allow new files the
-/// bytes are written in place, as before.
+/// Write `bytes` to `path` by renaming a finished temporary file over it. The file keeps its permissions. `path` is the
+/// symlink-free path the permission check approved (`real_path`, so a file reached through a symlink is written
+/// through to its target): the temporary file and the rename go to that folder, opened without following symlinks,
+/// and a symlink found in the path now (swapped in after the check) is refused rather than followed or replaced
+/// (#165). When the directory does not allow new files the bytes are written in place, as before.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let dir = target.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    let name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let tmp = dir.join(format!(".{name}.moco-{}-{}.tmp", std::process::id(), TMP.fetch_add(1, Ordering::Relaxed)));
-    let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{}: not a file path", path.display())));
+    };
+    let dir = crate::nofollow::Dir::open(dir)?;
+    // The file being replaced, opened without following a link, for its mode. Opening only for writing covers a
+    // write-only file; one we can neither read nor write is replaced with the default mode.
+    let existing = match dir.open_file(name, libc::O_RDONLY | libc::O_NONBLOCK, 0) {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => dir.open_file(name, libc::O_WRONLY | libc::O_NONBLOCK, 0),
+        r => r,
+    };
+    let mode = match existing {
+        Ok(f) => Some(f.metadata()?.permissions()),
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied) => None,
+        Err(e) => return Err(e),
+    };
+    let tmp = std::ffi::OsString::from(format!(".{}.moco-{}-{}.tmp", name.to_string_lossy(), std::process::id(), TMP.fetch_add(1, Ordering::Relaxed)));
+    let mut file = match dir.open_file(&tmp, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, 0o666) {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return std::fs::write(&target, bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            // Truncated only once `open_file` has confirmed this is the file at the checked path.
+            let mut f = dir.open_file(name, libc::O_WRONLY | libc::O_CREAT | libc::O_NONBLOCK, 0o666)?;
+            f.set_len(0)?;
+            return f.write_all(bytes);
+        }
         Err(e) => return Err(e),
     };
     let result = (|| {
         file.write_all(bytes)?;
-        if let Ok(meta) = std::fs::metadata(&target) {
-            file.set_permissions(meta.permissions())?;
+        if let Some(mode) = mode {
+            file.set_permissions(mode)?;
         }
         file.sync_all()?;
-        std::fs::rename(&tmp, &target)
+        dir.rename(&tmp, name)
     })();
     drop(file);
     if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = dir.remove_file(&tmp);
     }
     result
 }
@@ -161,7 +180,8 @@ mod tests {
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(crate::id::new_id(tag));
         std::fs::create_dir_all(&d).unwrap();
-        d
+        // Symlink-free, as the tools pass it (on macOS the temp dir is under the /var -> /private/var link).
+        std::fs::canonicalize(d).unwrap()
     }
 
     #[test]
@@ -181,13 +201,28 @@ mod tests {
     }
 
     #[test]
-    fn a_symlink_is_written_through_not_replaced() {
+    fn a_symlink_at_the_path_is_refused_not_followed_or_replaced() {
+        // The tools pass the resolved path; a link there now was swapped in after their check (#165).
         let dir = tmp("fsio-link");
         std::fs::write(dir.join("real.txt"), "old").unwrap();
         std::os::unix::fs::symlink(dir.join("real.txt"), dir.join("link.txt")).unwrap();
-        write_atomic(&dir.join("link.txt"), b"new").unwrap();
+        let e = write_atomic(&dir.join("link.txt"), b"new").unwrap_err().to_string();
+        assert!(e.contains("symlink"), "{e}");
         assert!(std::fs::symlink_metadata(dir.join("link.txt")).unwrap().file_type().is_symlink(), "still a link");
-        assert_eq!(std::fs::read_to_string(dir.join("real.txt")).unwrap(), "new");
+        assert_eq!(std::fs::read_to_string(dir.join("real.txt")).unwrap(), "old");
+        let left: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(left.len(), 2, "no temporary file is left: {left:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_folder_swapped_for_a_link_is_refused() {
+        let dir = tmp("fsio-dirlink");
+        std::fs::create_dir_all(dir.join("out")).unwrap();
+        std::fs::create_dir_all(dir.join("proj")).unwrap();
+        std::os::unix::fs::symlink(dir.join("out"), dir.join("proj/sub")).unwrap();
+        assert!(write_atomic(&dir.join("proj/sub/f.txt"), b"x").unwrap_err().to_string().contains("symlink"));
+        assert_eq!(std::fs::read_dir(dir.join("out")).unwrap().count(), 0, "nothing written through the link");
         let _ = std::fs::remove_dir_all(dir);
     }
 

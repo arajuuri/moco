@@ -61,19 +61,22 @@ If a call fails, the error says what is closest in the file: correct the call an
                 return Err(ToolError::fail(format!("{}newString must be different from oldString", label(i))));
             }
         }
-        ctx.check_external_file(&path)?;
-        ctx.permit_path("edit", &path, vec!["*".into()])?;
+        // Resolved once: the checks judge this name and the edit uses exactly it, refusing any symlink found in it by
+        // then (one swapped in after the check, #165).
+        let real = real_path(&path);
+        ctx.check_external_file_at(&path, &real)?;
+        ctx.permit_path_at("edit", &path, &real, vec!["*".into()])?;
         // An edit shows what the file holds: whether oldString matches and how often, and on a miss the closest
         // text in the file. So it is a `read` too, checked as the read tool checks it: `.env` asks even where edits
         // do not. Ordinary files pass silently (`read *` is allowed in every mode).
-        if path.is_file() {
-            ctx.permit_path("read", &path, vec!["*".into()])?;
+        if real.is_file() {
+            ctx.permit_path_at("read", &path, &real, vec!["*".into()])?;
         }
-        // Use what was authorized: the resolved target, so a link swapped in after the check is not followed.
-        let path = real_path(&path);
+        crate::nofollow::between_check_and_use();
+        let path = real;
         // From here to the end of formatting no other call may change this file (issue #6).
         let _locks = fsio::lock_files([&path]);
-        let bytes = std::fs::read(&path).map_err(|e| ToolError::fail(format!("{}: {e}", path.display())))?;
+        let bytes = crate::nofollow::read(&path).map_err(|e| super::read::file_error(&path, e))?;
         let (bom, body) = match bytes.strip_prefix(&[0xef, 0xbb, 0xbf]) {
             Some(rest) => (true, rest),
             None => (false, &bytes[..]),
@@ -109,7 +112,7 @@ If a call fails, the error says what is closest in the file: correct the call an
             out.extend_from_slice(&[0xef, 0xbb, 0xbf]);
         }
         out.extend_from_slice(&updated);
-        fsio::write_atomic(&path, &out).map_err(|e| ToolError::fail(format!("{}: {e}", path.display())))?;
+        fsio::write_atomic(&path, &out).map_err(|e| super::read::file_error(&path, e))?;
         let note = ctx.format_file(&path, &out).map(|n| format!("\n{n}")).unwrap_or_default();
         let plural = |n: usize, w: &str| format!("{n} {w}{}", if n == 1 { "" } else { "s" });
         let what = if multi { format!("{}, {}", plural(changes.len(), "edit"), plural(replacements, "replacement")) } else { plural(replacements, "replacement") };

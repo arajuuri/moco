@@ -24,6 +24,7 @@ pub mod markdown;
 pub mod mcp;
 pub mod media;
 pub mod mentions;
+pub mod nofollow;
 pub mod permission;
 pub mod provider;
 pub mod sandbox;
