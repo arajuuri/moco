@@ -13,10 +13,8 @@ pub fn put(app_dir: &Path, bytes: &[u8]) -> std::io::Result<String> {
     let hash: String = Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect();
     let p = path(app_dir, &hash).expect("a sha256 hex digest is a valid blob name");
     if !p.exists() {
-        std::fs::create_dir_all(p.parent().unwrap())?;
-        let tmp = p.with_extension(format!("tmp{}", std::process::id()));
-        std::fs::write(&tmp, bytes)?;
-        std::fs::rename(&tmp, &p)?;
+        // Attachments can be anything the user pasted (a screenshot of a key, a `.env`): 0600 in 0700 directories.
+        crate::auth::write_private(&p, bytes)?;
     }
     Ok(hash)
 }

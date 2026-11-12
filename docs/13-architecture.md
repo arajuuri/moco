@@ -161,6 +161,15 @@ data/mcp-trust.json  approved project MCP servers, formatters and shells
 data/tui-history     prompt history of the full-screen UI
 ```
 
+Permissions (#164): the app dir, `data/` and every directory below it are 0700, and the files written there (and
+`auth.json`, `mcp-auth.json`) are 0600, through `auth::create_private_dir`, `auth::write_private` (atomic
+replace-by-rename) and `auth::create_private` (files written in place: logs, spill files, job logs). `cache/` holds only
+the public catalog and keeps the umask default. The database file is created 0600 before SQLite opens it,
+because SQLite gives `-wal` and `-shm` the main file's mode; the process umask is never changed, since shell commands
+would inherit it. At session start `auth::secure_app_dir` tightens an older, looser `data/` and its known subdirectories
+to 0700, and the app dir itself when it is the default location. A looser `$MOCO_HOME` is only warned about: the user may
+share it on purpose. Session exports (`moco sessions export -o`, `/export`) are created 0600; an existing file keeps its mode.
+
 ## 5. Providers
 
 `provider/mod.rs` defines a protocol-neutral request and event model:
@@ -271,7 +280,9 @@ session and the front end is told through the engine's notifier.
 ## 9. Extensibility
 
 - **Config** (`config.rs`): `moco.json[c]` files from the user directory, each ancestor of the working directory and
-  `$MOCO_CONFIG`, merged lowest to highest priority, with `{env:NAME}` and `{file:path}` substitution. Objects merge by key,
+  `$MOCO_CONFIG`, merged lowest to highest priority, with `{env:NAME}` and `{file:path}` substitution (`{file:}` reads
+  only a regular file of at most 1 MiB, opened non-blocking and checked with fstat, so a device or FIFO cannot hang or
+  exhaust startup; a refused token drops that config file with a warning naming it). Objects merge by key,
   `permissions` and `instructions` arrays concatenate, everything else is replaced. Some settings are read **only** from the
   user's own files: a provider's `base_url`, `env`, `protocol` and `headers`, and `permission_classifier`. A project config
   that sets them is ignored with a warning, and a project's `permissions` can only add `deny` rules.

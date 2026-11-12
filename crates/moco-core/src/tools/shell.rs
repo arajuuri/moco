@@ -124,9 +124,9 @@ pub(crate) fn tail(text: &str) -> Option<(String, usize, usize)> {
 /// `sandbox_root` is `Some(project root)` to run it inside the sandbox (when one is active; see `sandbox.rs`).
 pub(crate) fn spawn(command: &str, workdir: &Path, out_path: &Path, sandbox_root: Option<&Path>, provider_key_env_vars: &[String]) -> Result<Child, ToolError> {
     if let Some(dir) = out_path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| ToolError::fail(e.to_string()))?;
+        crate::auth::create_private_dir(dir).map_err(|e| ToolError::fail(e.to_string()))?;
     }
-    let file = std::fs::File::create(out_path).map_err(|e| ToolError::fail(e.to_string()))?;
+    let file = crate::auth::create_private(out_path, false).map_err(|e| ToolError::fail(e.to_string()))?;
     let err_file = file.try_clone().map_err(|e| ToolError::fail(e.to_string()))?;
     let shell = shell_program();
     let mut cmd = match sandbox_root.and_then(|root| crate::sandbox::wrap(&shell, command, root)) {

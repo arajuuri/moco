@@ -276,9 +276,7 @@ pub fn approve(app_dir: &Path, fingerprint: &str) -> std::io::Result<()> {
     if !list.iter().any(|f| f == fingerprint) {
         list.push(fingerprint.to_string());
     }
-    let p = store(app_dir);
-    std::fs::create_dir_all(p.parent().unwrap())?;
-    std::fs::write(&p, serde_json::json!({"approved": list}).to_string())
+    crate::auth::write_private(&store(app_dir), serde_json::json!({"approved": list}).to_string().as_bytes())
 }
 
 /// Is a server defined in `origin` (a config file) trusted without asking? True for the user's own config.

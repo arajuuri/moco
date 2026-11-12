@@ -173,12 +173,31 @@ fn now_ms() -> i64 {
 /// How long a recorded automatic allow is kept: as long as the log files (seven days).
 const AUTO_ALLOW_KEEP_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
+/// The database holds every prompt and tool result, so it is 0600 (#164). SQLite creates the `-wal` and `-shm` files
+/// with the main file's mode, so creating that one 0600 before SQLite opens it covers all three without touching the
+/// process umask (which the shell tool's children would inherit). Files from an older moco are tightened. Failures
+/// are left for `Connection::open` to report.
+fn make_db_private(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = crate::auth::create_private(path, true);
+    for suffix in ["", "-wal", "-shm"] {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(suffix);
+        if let Ok(m) = std::fs::metadata(&name) {
+            if m.is_file() && m.permissions().mode() & 0o077 != 0 {
+                let _ = std::fs::set_permissions(&name, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(dir) = path.parent() {
             // The real cause (permissions, a file in the way) beats the "unable to open database file" that follows.
-            std::fs::create_dir_all(dir).map_err(|e| rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN), Some(format!("could not create the data directory {}: {e}", dir.display()))))?;
+            crate::auth::create_private_dir(dir).map_err(|e| rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN), Some(format!("could not create the data directory {}: {e}", dir.display()))))?;
         }
+        make_db_private(path);
         let conn = Connection::open(path)?;
         conn.query_row("pragma journal_mode=wal", [], |_| Ok(()))?;
         Self::init(conn)

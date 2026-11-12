@@ -212,9 +212,10 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 /// Write a content-addressed file (blob or manifest). If the write fails but the content is already there
-/// (another writer got there first), that is success.
+/// (another writer got there first), that is success. Mode 0600: a snapshot holds whatever is in the working tree,
+/// `.env` files included.
 fn write_addressed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    match write_atomic(path, bytes) {
+    match crate::auth::write_private(path, bytes) {
         Err(e) if !path.exists() => Err(e),
         _ => Ok(()),
     }
