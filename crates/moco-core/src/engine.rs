@@ -763,11 +763,12 @@ impl Engine {
                 None => {
                     let c = st.create_child_session(parent, &agent.id).map_err(store_err)?;
                     st.set_title(&c.id, &req.description).map_err(store_err)?;
-                    // A subagent works under the permission mode its parent had when it started.
-                    st.set_permission_mode(&c.id, Some(eng.permission_mode_of(parent).name())).map_err(store_err)?;
                     c
                 }
             };
+            // A subagent works under its parent's permission mode as it is now, also when an earlier subagent session is
+            // continued: one created in auto mode must not keep auto rules after the user switched to manual (#166).
+            st.set_permission_mode(&child.id, Some(eng.permission_mode_of(parent).name())).map_err(store_err)?;
             // A model chosen for this conversation carries over unless the call names one.
             if let Some(m) = req.model.as_ref().or(parent.model.as_ref()) { st.set_model(&child.id, Some(m)).map_err(store_err)? }
             child
@@ -2664,6 +2665,28 @@ mod tests {
         let reqs = f.fake.requests.lock().unwrap();
         let child = f.engine.store().session(&child_id(&reqs[2])).unwrap().unwrap();
         assert_eq!(child.permission_mode.as_deref(), Some("auto"));
+    }
+
+    /// #166: continuing an earlier subagent session used to keep the mode it was created with.
+    #[test]
+    fn a_continued_subagent_follows_its_parents_current_mode() {
+        let f = fixture(vec![sub("t1", "general", "do it"), text("child"), text("parent done")]);
+        let st = || f.engine.store();
+        st().set_permission_mode(&f.session.id, Some("auto")).unwrap();
+        f.say("delegate");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        let child = child_id(&f.fake.requests.lock().unwrap()[2]);
+        assert_eq!(st().session(&child).unwrap().unwrap().permission_mode.as_deref(), Some("auto"));
+        let resume = |mode: &str| {
+            st().set_permission_mode(&f.session.id, Some(mode)).unwrap();
+            let parent = st().session(&f.session.id).unwrap().unwrap();
+            let req = SubagentRequest { agent: "general".into(), description: "do it".into(), prompt: "more".into(), model: None, session_id: Some(child.clone()) };
+            let c = f.engine.begin_subagent(&parent, &req).unwrap();
+            assert_eq!(c.id, child, "the same session is continued");
+            st().session(&child).unwrap().unwrap().permission_mode
+        };
+        assert_eq!(resume("manual").as_deref(), Some("manual"), "switched to manual: the continued subagent asks again");
+        assert_eq!(resume("auto").as_deref(), Some("auto"), "and follows the parent back");
     }
 
     #[test]
