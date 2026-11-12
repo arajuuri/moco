@@ -77,7 +77,7 @@ fn the_rules_stop_the_well_known_destructive_commands() {
     for c in &model_only {
         println!("  model-only: {}", c.command);
     }
-    for must in ["rm -rf build", "rm -rf /", "git push", "git push --force", "dd if=/dev/zero of=/dev/sda", "sudo rm file", "kill -9 1", "killall node", "find . -name '*.log' -delete", "chmod -R 777 .", "shutdown -h now"] {
+    for must in ["rm -rf build", "rm -rf /", "git push", "git push --force", "dd if=/dev/zero of=/dev/sda", "sudo rm file", "kill -9 1", "killall node", "find . -name '*.log' -delete", "chmod -R 777 .", "shutdown -h now", "truncate -s 0 data.db", "rsync -a --delete build/ /Volumes/backup/site/"] {
         assert!(never_classify(&parse(must)), "{must} must never reach the model");
         assert!(all.iter().any(|c| c.command == must), "{must} is in the set");
     }
