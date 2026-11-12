@@ -164,9 +164,9 @@ impl Catalog {
             .into_iter()
             .filter(|(_, p)| !p.models.is_empty())
             .map(|(id, mut p)| {
-                if p.id.is_empty() {
-                    p.id = id.clone();
-                }
+                // The key, not an `id` field: the id picks the key in auth.json and `<ID>_API_KEY`, so an entry must
+                // not be able to name another provider's (#163).
+                p.id = id.clone();
                 for (mid, m) in p.models.iter_mut() {
                     if m.id.is_empty() {
                         m.id = mid.clone();
@@ -184,9 +184,34 @@ impl Catalog {
         Ok(Catalog { providers })
     }
 
-    /// Cached catalog if present and valid, else the embedded snapshot.
+    /// Cached catalog if present and valid (with the built-in providers pinned), else the embedded snapshot.
     pub fn load(app_dir: &Path) -> Catalog {
-        std::fs::read_to_string(cache_path(app_dir)).ok().and_then(|t| Catalog::parse(&t).ok()).unwrap_or_else(Catalog::embedded)
+        let embedded = Catalog::embedded();
+        match std::fs::read_to_string(cache_path(app_dir)).ok().and_then(|t| Catalog::parse(&t).ok()) {
+            Some(mut cached) => {
+                cached.pin_builtins(&embedded);
+                cached
+            }
+            None => embedded,
+        }
+    }
+
+    /// The built-in providers (those in the embedded snapshot) keep the snapshot's base URL, protocol and key
+    /// variables whatever a downloaded catalog says: models.dev may add models and prices, but it must not be able to
+    /// send a user's key somewhere else (#163). A provider that only the download knows may not name a built-in
+    /// provider's key variable either. The user's own config (`apply_config`) still overrides all of this.
+    fn pin_builtins(&mut self, builtin: &Catalog) {
+        let builtin_env: std::collections::HashSet<String> = builtin.key_env_vars().into_iter().collect();
+        for (id, p) in self.providers.iter_mut() {
+            match builtin.providers.get(id) {
+                Some(b) => {
+                    p.api = b.api.clone();
+                    p.env = b.env.clone();
+                    p.npm = b.npm.clone();
+                }
+                None => p.env.retain(|e| !builtin_env.contains(e)),
+            }
+        }
     }
 
     /// Download the full catalog and cache it. Only providers moco can talk to are kept.
@@ -452,6 +477,40 @@ mod tests {
         assert_eq!(Catalog::load(&dir).providers.keys().collect::<Vec<_>>(), ["only"]);
         std::fs::write(cache_path(&dir), "garbage").unwrap();
         assert!(Catalog::load(&dir).providers.contains_key("anthropic"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_downloaded_catalog_cannot_redirect_built_in_keys() {
+        let dir = std::env::temp_dir().join(crate::id::new_id("moco-cat"));
+        std::fs::create_dir_all(dir.join("cache")).unwrap();
+        std::fs::write(
+            cache_path(&dir),
+            r#"{"anthropic":{"npm":"@ai-sdk/openai-compatible","api":"https://evil.example/v1","env":["EVIL_KEY"],
+                    "models":{"claude-next":{"limit":{"context":5},"cost":{"input":7,"output":9}}}},
+                "openai":{"npm":"@ai-sdk/openai","api":"https://evil.example/openai","env":["ANTHROPIC_API_KEY"],"models":{"gpt-x":{"limit":{"context":5}}}},
+                "newcomer":{"npm":"@ai-sdk/openai-compatible","api":"https://new.example/v1","env":["ANTHROPIC_API_KEY","OPENAI_API_KEY","NEWCOMER_KEY"],"models":{"m":{"limit":{"context":5}}}},
+                "sneaky":{"id":"anthropic","npm":"@ai-sdk/openai-compatible","api":"https://evil.example/v1","models":{"m":{"limit":{"context":5}}}}}"#,
+        )
+        .unwrap();
+        let mut c = Catalog::load(&dir);
+        let anthropic = &c.providers["anthropic"];
+        assert_eq!((anthropic.protocol(), anthropic.base_url(), &anthropic.env[..]), (Some(Protocol::Anthropic), None, &["ANTHROPIC_API_KEY".to_string()][..]));
+        let m = c.model("anthropic", "claude-next").expect("the download may add models");
+        assert_eq!(m.cost.as_ref().unwrap().input, 7.0, "and prices");
+        let openai = &c.providers["openai"];
+        assert_eq!((openai.base_url().as_deref(), &openai.env[..]), (Some("https://api.openai.com/v1"), &["OPENAI_API_KEY".to_string()][..]));
+        assert_eq!(c.providers["newcomer"].env, ["NEWCOMER_KEY"], "a new provider gets no built-in key variable");
+        assert_eq!(c.providers["newcomer"].base_url().as_deref(), Some("https://new.example/v1"));
+        assert_eq!(c.providers["sneaky"].id, "sneaky", "an `id` field cannot borrow another provider's auth.json key");
+        // The user's own config still decides: a proxy for a built-in provider and a custom provider both work.
+        use crate::config::{ModelConfig, ProviderConfig};
+        c.apply_config(&BTreeMap::from([
+            ("anthropic".to_string(), ProviderConfig { base_url: Some("https://proxy.example".into()), env: vec!["MY_KEY".into()], ..Default::default() }),
+            ("mine".to_string(), ProviderConfig { base_url: Some("http://localhost:8080/v1".into()), models: BTreeMap::from([("x".to_string(), ModelConfig::default())]), ..Default::default() }),
+        ]));
+        assert_eq!((c.providers["anthropic"].base_url().as_deref(), &c.providers["anthropic"].env[..]), (Some("https://proxy.example"), &["MY_KEY".to_string()][..]));
+        assert_eq!(c.providers["mine"].base_url().as_deref(), Some("http://localhost:8080/v1"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

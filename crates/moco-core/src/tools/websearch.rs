@@ -195,6 +195,11 @@ impl WebSearch {
             (None, None) => req.call(),
         };
         match result {
+            Ok(r) if (300..400).contains(&r.status()) => Err(ToolError::fail(format!(
+                "The search service redirected to {} (HTTP {}); moco does not follow redirects on requests that carry an API key. Set `websearch.url` to the final address.",
+                r.header("location").unwrap_or("?"),
+                r.status()
+            ))),
             Ok(r) => Self::read(r),
             Err(ureq::Error::Status(code, r)) => {
                 let detail = Self::read(r).unwrap_or_default();
@@ -212,6 +217,9 @@ impl WebSearch {
     pub fn search(&self, query: &str, count: usize) -> Result<Vec<Hit>, ToolError> {
         let s = &self.settings;
         let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(20)).build();
+        // Requests with a key follow no redirects: ureq would pass `X-Subscription-Token` and `x-api-key` on to the
+        // redirect target (#163). `call` reports the 3xx instead.
+        let keyed = ureq::AgentBuilder::new().timeout(Duration::from_secs(20)).redirects(0).build();
         let base = |default: &str| s.url.clone().unwrap_or_else(|| default.to_string());
         let json_of = |text: String| serde_json::from_str::<Value>(&text).map_err(|e| ToolError::fail(format!("The search service sent something that is not JSON: {e}")));
         let hits = match s.provider.as_str() {
@@ -226,16 +234,16 @@ impl WebSearch {
             "brave" => {
                 let key = self.key()?;
                 let url = format!("{}?q={}&count={count}", base("https://api.search.brave.com/res/v1/web/search"), percent_encode(query));
-                parse_brave(&json_of(self.call(agent.get(&url).set("Accept", "application/json").set("X-Subscription-Token", &key), None, None)?)?)
+                parse_brave(&json_of(self.call(keyed.get(&url).set("Accept", "application/json").set("X-Subscription-Token", &key), None, None)?)?)
             }
             "tavily" => {
                 let key = self.key()?;
-                let req = agent.post(&base("https://api.tavily.com/search")).set("Authorization", &format!("Bearer {key}"));
+                let req = keyed.post(&base("https://api.tavily.com/search")).set("Authorization", &format!("Bearer {key}"));
                 parse_tavily(&json_of(self.call(req, Some(json!({"query": query, "max_results": count, "include_answer": false})), None)?)?)
             }
             "exa" => {
                 let key = self.key()?;
-                let req = agent.post(&base("https://api.exa.ai/search")).set("x-api-key", &key);
+                let req = keyed.post(&base("https://api.exa.ai/search")).set("x-api-key", &key);
                 parse_exa(&json_of(self.call(req, Some(json!({"query": query, "numResults": count, "contents": {"highlights": {"numSentences": 2}}})), None)?)?)
             }
             "searxng" => {
@@ -382,6 +390,22 @@ mod tests {
         std::env::remove_var("EXA_API_KEY");
         let err = tool("exa", None).run(&json!({"query": "q"}), &env.ctx()).unwrap_err();
         assert!(err.message().contains("needs an API key") && err.message().contains("EXA_API_KEY") && err.message().contains("moco auth exa"), "{}", err.message());
+    }
+
+    #[test]
+    fn keyed_providers_do_not_follow_redirects_with_the_key() {
+        let env = Env::new();
+        std::env::set_var("BRAVE_API_KEY", "brave-key");
+        std::env::set_var("EXA_API_KEY", "exa-key");
+        let target = serve(vec![ok("application/json", r#"{"results":[]}"#)]);
+        for provider in ["brave", "exa"] {
+            let s = serve(vec![error(302, "", vec![("Location", format!("{}/stolen", target.url))])]);
+            let err = tool(provider, Some(format!("{}/search", s.url))).run(&json!({"query": "q"}), &env.ctx()).unwrap_err();
+            assert!(err.message().contains(&format!("redirected to {}/stolen (HTTP 302)", target.url)) && err.message().contains("websearch.url"), "{}", err.message());
+            assert_eq!(s.requests.lock().unwrap().len(), 1);
+        }
+        assert!(target.requests.lock().unwrap().is_empty(), "the redirect target never saw a key");
+        std::env::remove_var("EXA_API_KEY");
     }
 
     #[test]

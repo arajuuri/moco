@@ -296,9 +296,11 @@ pub(crate) const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// Read timeout of the shared HTTP agent (also bounds a stalled stream).
 pub(crate) const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// The HTTP agent every adapter uses, so timeouts are configured in one place.
+/// The HTTP agent every adapter uses, so timeouts are configured in one place. It follows no redirects: ureq strips
+/// only `authorization` and `cookie` on a redirect, so `x-api-key`, `x-goog-api-key` and configured headers would
+/// reach the redirect target (#163). `open_lines` fails a 3xx answer instead.
 pub(crate) fn new_agent() -> ureq::Agent {
-    ureq::AgentBuilder::new().timeout_connect(CONNECT_TIMEOUT).timeout_read(READ_TIMEOUT).build()
+    ureq::AgentBuilder::new().timeout_connect(CONNECT_TIMEOUT).timeout_read(READ_TIMEOUT).redirects(0).build()
 }
 
 /// Map a transport failure from `ureq` to a neutral error (shared by the adapters).
@@ -370,6 +372,15 @@ pub(crate) fn open_lines(
                 return;
             }
         };
+        if (300..400).contains(&resp.status()) {
+            let to = resp.header("location").unwrap_or("?").to_string();
+            let message = format!(
+                "the provider answered with a redirect (HTTP {} to {to}); moco does not follow redirects on requests that carry an API key. Set the provider's base URL to the final address.",
+                resp.status()
+            );
+            let _ = tx.send(Msg::Failed(ProviderError::InvalidRequest(message)));
+            return;
+        }
         if tx.send(Msg::Head).is_err() {
             return;
         }
@@ -488,6 +499,22 @@ mod agent_tests {
         assert_eq!(READ_TIMEOUT, std::time::Duration::from_secs(120));
         // ureq exposes no getters, so just check the agent builds and can prepare a request.
         let _ = new_agent().post("http://127.0.0.1:1/");
+    }
+
+    #[test]
+    fn a_redirect_is_not_followed_and_the_key_headers_stay_home() {
+        use super::testserver::*;
+        let target = serve(vec![sse("data: {\"type\":\"message_stop\"}\n\n")]);
+        for status in [301, 302, 303, 307, 308] {
+            let server = serve(vec![error(status, "", vec![("Location", format!("{}/v1/messages", target.url))])]);
+            let p = anthropic::Anthropic::new("sk-ant-SECRET".into(), Some(server.url.clone()));
+            let req = Request { model: "m".into(), messages: vec![ChatMessage { role: Role::User, content: vec![Block::Text("hi".into())] }], ..Default::default() };
+            let err = p.stream(&req, &AtomicBool::new(false), &mut |_| {}).unwrap_err();
+            assert!(matches!(&err, ProviderError::InvalidRequest(m) if m.contains(&format!("redirect (HTTP {status} to {}", target.url))), "{err:?}");
+            assert!(!err.retryable());
+            assert!(server.requests.lock().unwrap()[0].0.contains("sk-ant-SECRET"), "the configured server got the key");
+        }
+        assert!(target.requests.lock().unwrap().is_empty(), "the redirect target was never contacted");
     }
 }
 

@@ -105,8 +105,11 @@ fn query(q: &str) -> Vec<(String, String)> {
     q.split('&').filter(|p| !p.is_empty()).map(|p| p.split_once('=').map(|(k, v)| (dec(k), dec(v))).unwrap_or((dec(p), String::new()))).collect()
 }
 
+/// `bytes` random bytes from the OS (`getentropy` on macOS, through `libc_shim.rs` on 10.7), base64url-encoded. The
+/// `state` and the PKCE verifier must be unguessable, which `fastrand` is not.
 fn random_b64(bytes: usize) -> String {
-    let raw: Vec<u8> = (0..bytes).map(|_| fastrand::u8(..)).collect();
+    let mut raw = vec![0u8; bytes];
+    getrandom::getrandom(&mut raw).expect("the system random number generator failed");
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
 }
 
