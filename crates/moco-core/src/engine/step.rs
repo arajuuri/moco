@@ -151,7 +151,16 @@ impl Engine {
         }
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         let lazy: Vec<PathBuf> = self.store().instruction_paths(sid)?.into_iter().map(PathBuf::from).collect();
-        let ins = instructions::render(&instructions::load(&self.cfg.app_dir, std::path::Path::new(&session.directory), &self.cfg.instructions, &lazy));
+        let loaded = instructions::load(&self.cfg.app_dir, std::path::Path::new(&session.directory), &self.cfg.instructions, &lazy);
+        if step == 0 {
+            // Once per turn, not on every step of it.
+            for p in &loaded.rejected {
+                let msg = format!("ignored instruction file {}: it resolves outside the project", p.display());
+                crate::log_warn!("instructions", "{msg}");
+                ui.event(&UiEvent::Notice(&msg));
+            }
+        }
+        let ins = instructions::render(&loaded.items);
         let (provider, provider_id, model_id) = match self.resolve_model(&session, &agent) {
             Ok(r) => r,
             Err(msg) => {
