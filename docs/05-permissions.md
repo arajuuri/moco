@@ -92,7 +92,7 @@ Not done: the automatic check that is meant to replace the prompt in auto mode.
 | shell | one per parsed command, e.g. `git push origin main` | arity-based prefix + ` *`, e.g. `git push *` |
 | external_directory | `<dir>/*` | `<project root of dir>/*` (in a shared temp dir: the user's scratch folder, see above) |
 
-Tools that show a file's content also check `read` on it, as the read tool does (moco, #119): `grep` on a file path, `edit` of an existing file, and a patch `Update File` (with or without `Move to`) of an existing file. Ordinary files pass silently because `read *` is allowed in both modes; `.env` asks even where edits are allowed. A `grep` directory walk does not prompt: files the built-in `.env` rules protect are left out and listed in a note, and grepping or reading one by path asks. Config rules apply to the paths a tool names; a walk cannot see them without prompting.
+Tools that show a file's content also check `read` on it, as the read tool does (moco, #119): `grep` on a file path, `edit` of an existing file, and a patch `Update File` (with or without `Move to`) of an existing file. Ordinary files pass silently because `read *` is allowed in both modes; `.env` asks even where edits are allowed. A `grep` directory walk does not prompt: each file it finds is judged by the same rules as a `read` of it (configured, agent, preset, saved and built-in, under the name as reached and the symlink-resolved one, `Permitter::evaluate`), and files those rules deny or would ask about are left out and listed in a note. Grepping or reading an asked-about file by path asks (moco, #147).
 
 ### Shell command scanning (`shell/parse.ts`)
 
