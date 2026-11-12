@@ -51,7 +51,7 @@ moco has two modes. The default is `manual`. The mode sets the starting rules of
 - Plain chat: `/mode [manual|auto]`.
 - `--permission-mode manual|auto` sets it for this session and is the default for new ones. `permission_mode` in config sets the default when no flag is given.
 
-A switch applies from the next step of a run: a tool call already running is not interrupted, and the next step's prompts follow the new mode. A subagent takes the mode its parent had when it started.
+A switch applies from the next step of a run: a tool call already running is not interrupted, and the next step's prompts follow the new mode. A subagent takes its parent's mode each time it starts, including when an earlier subagent session is continued: one created in `auto` mode asks again after you switch to `manual` (#166).
 
 - **manual** (default): `*` asks. Allowed without a prompt: `read`, `glob`, `grep`, `question`, `todowrite`, `skill`. Reading `.env` files asks, `.env.example` is allowed, `websearch` asks, and so does `external_directory` (it falls under `*`).
 - **auto**: the upstream default ruleset below. Everything is allowed except `.env` reads and `websearch`.
