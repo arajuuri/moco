@@ -235,19 +235,30 @@ impl Tool for Patch {
         // Resolve and permission-check every path before touching anything.
         let mut resources = vec![];
         let mut files: Vec<PathBuf> = vec![];
+        // Each op's paths resolved once, in order (`path`, then `move_to`): what is checked here is what is used
+        // below, which refuses any symlink found in it by then (one swapped in after the check, #165).
+        let mut resolved: Vec<Vec<PathBuf>> = vec![];
         for op in &ops {
             let paths: Vec<&String> = match op {
                 Op::Add { path, .. } | Op::Delete { path } => vec![path],
                 Op::Update { path, move_to, .. } => std::iter::once(path).chain(move_to).collect(),
             };
+            let mut reals = vec![];
             for p in paths {
                 let abs = ctx.resolve(p);
-                ctx.check_external_file(&abs)?;
-                resources.push(ctx.display(&abs));
-                // A link in the path (final component or parent) is authorized as what it leads to as well.
-                resources.push(ctx.display(&real_path(&abs)));
+                // A link in the path (final component or parent) is authorized as what it leads to as well. Delete
+                // removes a symlink itself, never its target, so only its folder is resolved.
+                let real = match (op, abs.parent(), abs.file_name()) {
+                    (Op::Delete { .. }, Some(dir), Some(name)) => real_path(dir).join(name),
+                    _ => real_path(&abs),
+                };
+                ctx.check_external_file_at(&abs, &real)?;
+                // Named as the other file tools name it: as given, then (when links lead elsewhere) the target.
+                resources.extend(ctx.path_resources_at(&abs, &real));
                 files.push(abs);
+                reals.push(real);
             }
+            resolved.push(reals);
         }
         let mut seen = std::collections::HashSet::new();
         resources.retain(|r| seen.insert(r.clone()));
@@ -257,14 +268,15 @@ impl Tool for Patch {
         // starts from is a `read` too, checked as the read tool checks it: `.env` asks even where edits do not.
         // Ordinary files pass silently (`read *` is allowed in every mode). Add and Delete show nothing of a file.
         let mut read_checked = std::collections::HashSet::new();
-        for op in &ops {
+        for (op, reals) in ops.iter().zip(&resolved) {
             if let Op::Update { path, .. } = op {
-                let abs = ctx.resolve(path);
-                if abs.is_file() && read_checked.insert(abs.clone()) {
-                    ctx.permit_path("read", &abs, vec!["*".into()])?;
+                let (abs, real) = (ctx.resolve(path), &reals[0]);
+                if real.is_file() && read_checked.insert(real.clone()) {
+                    ctx.permit_path_at("read", &abs, real, vec!["*".into()])?;
                 }
             }
         }
+        crate::nofollow::between_check_and_use();
         // Every file this patch touches is ours until it is written and formatted (issue #6). Taken after the
         // prompt, which can take minutes, and before the first read.
         let _locks = super::fsio::lock_files(&files);
@@ -276,10 +288,10 @@ impl Tool for Patch {
         let read = |staged: &HashMap<PathBuf, Option<Vec<u8>>>, p: &Path| -> Result<Option<Vec<u8>>, ToolError> {
             match staged.get(p) {
                 Some(v) => Ok(v.clone()),
-                None => match std::fs::read(p) {
+                None => match crate::nofollow::read(p) {
                     Ok(b) => Ok(Some(b)),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                    Err(e) => Err(ToolError::fail(format!("{}: {e}", p.display()))),
+                    Err(e) => Err(super::read::file_error(p, e)),
                 },
             }
         };
@@ -289,10 +301,10 @@ impl Tool for Patch {
             }
             staged.insert(p, v);
         };
-        for op in &ops {
+        for (op, reals) in ops.iter().zip(&resolved) {
             match op {
                 Op::Add { path, lines } => {
-                    let abs = real_path(&ctx.resolve(path));
+                    let abs = reals[0].clone();
                     if read(&staged, &abs)?.is_some() {
                         return Err(ToolError::fail(format!("Add File {path}: the file already exists; use Update File")));
                     }
@@ -304,15 +316,20 @@ impl Tool for Patch {
                     summary.push(format!("A {path}"));
                 }
                 Op::Delete { path } => {
-                    let abs = real_path(&ctx.resolve(path));
-                    if read(&staged, &abs)?.is_none() {
+                    // The name itself: a symlink exists (and is deleted) even when what it points to does not.
+                    let abs = reals[0].clone();
+                    let exists = match staged.get(&abs) {
+                        Some(v) => v.is_some(),
+                        None => std::fs::symlink_metadata(&abs).is_ok(),
+                    };
+                    if !exists {
                         return Err(ToolError::fail(format!("Delete File {path}: no such file")));
                     }
                     stage(&mut staged, abs, None);
                     summary.push(format!("D {path}"));
                 }
                 Op::Update { path, move_to, hunks } => {
-                    let abs = real_path(&ctx.resolve(path));
+                    let abs = reals[0].clone();
                     let bytes = read(&staged, &abs)?.ok_or_else(|| ToolError::fail(format!("Update File {path}: no such file")))?;
                     let (bom, body) = match bytes.strip_prefix(&BOM) {
                         Some(r) => (true, r),
@@ -324,7 +341,7 @@ impl Tool for Patch {
                     out.extend_from_slice(new_text.as_bytes());
                     match move_to {
                         Some(dest) => {
-                            let dest_abs = real_path(&ctx.resolve(dest));
+                            let dest_abs = reals[1].clone();
                             if dest_abs != abs && read(&staged, &dest_abs)?.is_some() {
                                 return Err(ToolError::fail(format!("Move to {dest}: the destination already exists")));
                             }
@@ -348,13 +365,14 @@ impl Tool for Patch {
             match &staged[p] {
                 Some(bytes) => {
                     if let Some(dir) = p.parent() {
-                        std::fs::create_dir_all(dir).map_err(|e| ToolError::fail(e.to_string()))?;
+                        crate::nofollow::Dir::create(dir).map_err(|e| super::read::file_error(dir, e))?;
                     }
-                    super::fsio::write_atomic(p, bytes).map_err(|e| ToolError::fail(format!("{}: {e}", p.display())))?;
+                    super::fsio::write_atomic(p, bytes).map_err(|e| super::read::file_error(p, e))?;
                 }
-                None => {
-                    let _ = std::fs::remove_file(p);
-                }
+                None => match crate::nofollow::remove_file(p) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(super::read::file_error(p, e)),
+                    _ => {}
+                },
             }
         }
         // Format what was written (not what was deleted); say so for each file the formatter changed or choked on.

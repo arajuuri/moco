@@ -16,24 +16,31 @@ For partial changes, use the edit tool instead.".into()
     fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let path = ctx.resolve(str_arg(input, "path")?);
         let content = str_arg(input, "content")?;
-        ctx.check_external_file(&path)?;
-        ctx.permit_path("edit", &path, vec!["*".into()])?;
-        // Use what was authorized: the resolved target, so a link swapped in after the check is not followed.
-        let path = real_path(&path);
+        // Resolved once: the check judges this name and the write uses exactly it, refusing any symlink found in it by
+        // then (one swapped in after the check, #165).
+        let real = real_path(&path);
+        ctx.check_external_file_at(&path, &real)?;
+        ctx.permit_path_at("edit", &path, &real, vec!["*".into()])?;
+        crate::nofollow::between_check_and_use();
+        let path = real;
         // No other call may change this file between the read below and the end of formatting (issue #6).
         let _locks = super::fsio::lock_files([&path]);
-        let existing = std::fs::read(&path).ok();
+        let existing = match crate::nofollow::read(&path) {
+            Ok(b) => Some(b),
+            Err(e) if e.raw_os_error().is_some() => None, // missing, or not a file: the write below says what is wrong
+            Err(e) => return Err(ToolError::fail(e.to_string())),
+        };
         let existed = existing.is_some();
         let bom = existing.as_deref().is_some_and(|b| b.starts_with(&[0xef, 0xbb, 0xbf]));
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| ToolError::fail(e.to_string()))?;
+            crate::nofollow::Dir::create(dir).map_err(|e| super::read::file_error(dir, e))?;
         }
         let mut bytes = Vec::with_capacity(content.len() + 3);
         if bom && !content.starts_with('\u{feff}') {
             bytes.extend_from_slice(&[0xef, 0xbb, 0xbf]);
         }
         bytes.extend_from_slice(content.as_bytes());
-        super::fsio::write_atomic(&path, &bytes).map_err(|e| ToolError::fail(format!("{}: {e}", path.display())))?;
+        super::fsio::write_atomic(&path, &bytes).map_err(|e| super::read::file_error(&path, e))?;
         let note = ctx.format_file(&path, &bytes).map(|n| format!("\n{n}")).unwrap_or_default();
         Ok(ToolOutput {
             text: format!("{} {}{note}", if existed { "Overwrote" } else { "Created" }, ctx.display(&path)),

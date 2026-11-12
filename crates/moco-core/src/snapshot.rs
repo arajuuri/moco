@@ -290,6 +290,21 @@ impl Snapshots {
         std::fs::read(self.blob_path(hash)).map_err(|_| SnapError::Missing(format!("file content {}", &hash[..12])))
     }
 
+    /// The content and metadata of the regular file at the symlink-free `path`, or `None` if it cannot be read or a
+    /// symlink is found on the way. `open_dir` keeps the folder of the previous file open for the next one.
+    fn read_nofollow(&self, path: &Path, open_dir: &mut Option<crate::nofollow::Dir>) -> Option<(Vec<u8>, std::fs::Metadata)> {
+        use std::io::Read;
+        let (parent, name) = (path.parent()?, path.file_name()?);
+        if open_dir.as_ref().map(|d| d.path()) != Some(parent) {
+            *open_dir = None;
+            *open_dir = Some(crate::nofollow::Dir::open(parent).ok()?);
+        }
+        let (mut file, meta) = open_dir.as_ref()?.open_read(name).ok()?;
+        let mut bytes = Vec::with_capacity(meta.len() as usize);
+        file.read_to_end(&mut bytes).ok()?;
+        Some((bytes, meta))
+    }
+
     /// Snapshot `dir` as it is now. `prev` (an earlier snapshot of the same directory) lets unchanged files skip hashing.
     pub fn capture(&self, dir: &Path, prev_id: Option<&str>) -> Result<String, SnapError> {
         // Taken before anything is read, so an entry judged settled (`racy`) was settled before its file was read.
@@ -303,6 +318,18 @@ impl Snapshots {
         let prev = prev_id.and_then(|p| self.manifest_in_use(p).ok()).unwrap_or_default();
         let mut files = BTreeMap::new();
         let mut skipped: Vec<Skipped> = vec![];
+        let stamp = |meta: &std::fs::Metadata| {
+            #[allow(unused_mut)]
+            let mut st = Stamp::of(meta);
+            #[cfg(test)]
+            if let Some((_, t)) = self.fake_times {
+                (st.mtime_ns, st.ctime_ns) = (t, t);
+            }
+            st
+        };
+        // Files are read by their symlink-free name, through folders opened without following symlinks.
+        let real_dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        let mut open_dir = None;
         let walker = WalkBuilder::new(dir)
             .hidden(false)
             .git_ignore(true)
@@ -333,22 +360,18 @@ impl Snapshots {
             if files.len() >= self.max_files {
                 return Err(SnapError::TooManyFiles(self.max_files));
             }
-            #[allow(unused_mut)]
-            let mut st = Stamp::of(&meta);
-            #[cfg(test)]
-            if let Some((_, t)) = self.fake_times {
-                (st.mtime_ns, st.ctime_ns) = (t, t);
-            }
-            let mtime_ns = st.mtime_ns;
-            let mode = meta.permissions().mode() & 0o777;
+            let st = stamp(&meta);
             // Only entries recorded as settled (nonzero ctime) are trusted, so an old manifest's entries are re-read once.
             let cached = prev.files.get(&rel).filter(|e| e.ctime_ns != 0 && Stamp { size: e.size, mtime_ns: e.mtime_ns, ctime_ns: e.ctime_ns } == st);
             // A cached entry's blob is not stat'ed: `prev` was just marked in use, so prune keeps the blobs it refers to.
-            let hash = match cached {
-                Some(e) => e.hash.clone(),
+            let (hash, meta, st) = match cached {
+                Some(e) => (e.hash.clone(), meta, st),
                 None => {
-                    let Ok(bytes) = std::fs::read(entry.path()) else {
-                        skipped.push(Skipped { path: rel, reason: SkipReason::Unreadable, size: meta.len(), mtime_ns });
+                    // The walk saw a regular file. It is opened without following a symlink swapped in since (at the
+                    // file or a folder above it), and recorded as the file actually read (#165).
+                    crate::nofollow::between_check_and_use();
+                    let Some((bytes, meta)) = self.read_nofollow(&real_dir.join(&rel), &mut open_dir) else {
+                        skipped.push(Skipped { path: rel, reason: SkipReason::Unreadable, size: meta.len(), mtime_ns: st.mtime_ns });
                         continue;
                     };
                     let h = sha(&bytes);
@@ -357,11 +380,13 @@ impl Snapshots {
                     if !touch(&bp) {
                         write_addressed(&bp, &bytes)?;
                     }
-                    h
+                    let st = stamp(&meta);
+                    (h, meta, st)
                 }
             };
+            let (mtime_ns, mode) = (st.mtime_ns, meta.permissions().mode() & 0o777);
             let ctime_ns = if racy(&st, start_ns) { 0 } else { st.ctime_ns };
-            files.insert(rel, Entry { hash, size: meta.len(), mode, mtime_ns, ctime_ns });
+            files.insert(rel, Entry { hash, size: st.size, mode, mtime_ns, ctime_ns });
         }
         let mut hasher = Sha256::new();
         let mut line = String::new();
@@ -602,6 +627,44 @@ mod tests {
         std::os::unix::fs::symlink(t.dir().join("src/main.rs"), t.dir().join("link.rs")).unwrap();
         let m = t.snaps.manifest(&t.cap(None)).unwrap();
         assert_eq!(m.files.keys().map(String::as_str).collect::<Vec<_>>(), [".github/ci.yml", ".gitignore", "src/main.rs"]);
+    }
+
+    #[test]
+    fn a_link_swapped_in_after_the_walk_saw_a_file_is_not_followed() {
+        // #165: the walk stats `a.txt` (a regular file), then a link to an outside secret takes its place, or a folder
+        // above a file becomes a link to an outside folder, before the file is read.
+        crate::nofollow::both_modes(|| {
+            let t = Tree::new();
+            let outside = t.root.join("outside");
+            std::fs::create_dir_all(&outside).unwrap();
+            std::fs::write(outside.join("a.txt"), "SECRET").unwrap();
+            t.put("a.txt", "mine");
+            let (file, secret) = (t.dir().join("a.txt"), outside.join("a.txt"));
+            crate::nofollow::on_next_use(move || {
+                std::fs::remove_file(&file).unwrap();
+                std::os::unix::fs::symlink(secret, file).unwrap();
+            });
+            let m = t.snaps.manifest(&t.cap(None)).unwrap();
+            assert!(!m.files.contains_key("a.txt"), "{:?}", m.files);
+            assert!(m.skipped.iter().any(|s| s.path == "a.txt" && s.reason == SkipReason::Unreadable), "{:?}", m.skipped);
+            assert!(t.snaps.blob(&sha(b"SECRET")).is_err(), "the secret is not stored");
+
+            std::fs::remove_file(t.dir().join("a.txt")).unwrap();
+            t.put("sub/a.txt", "mine");
+            let (sub, out) = (t.dir().join("sub"), outside.clone());
+            crate::nofollow::on_next_use(move || {
+                std::fs::rename(&sub, sub.with_file_name("sub.moved")).unwrap();
+                std::os::unix::fs::symlink(out, sub).unwrap();
+            });
+            let m = t.snaps.manifest(&t.cap(None)).unwrap();
+            assert!(!m.files.contains_key("sub/a.txt"), "{:?}", m.files);
+            assert!(t.snaps.blob(&sha(b"SECRET")).is_err(), "the secret is not stored");
+            // Untouched, the same file is captured as usual.
+            std::fs::remove_file(t.dir().join("sub")).unwrap();
+            std::fs::rename(t.dir().join("sub.moved"), t.dir().join("sub")).unwrap();
+            let m = t.snaps.manifest(&t.cap(None)).unwrap();
+            assert_eq!(m.files["sub/a.txt"].hash, sha(b"mine"));
+        });
     }
 
     #[test]

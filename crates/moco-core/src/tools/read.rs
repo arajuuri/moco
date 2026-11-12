@@ -23,24 +23,32 @@ Prefer one larger read over many small slices, and use grep to find specific con
         if !path.exists() {
             path = fuzzy_sibling(&path).ok_or_else(|| ToolError::fail(format!("File not found: {}", path.display())))?;
         }
-        if path.is_dir() {
-            ctx.check_external(&path)?;
+        // Resolved once: the check judges this name and the read below uses exactly it, refusing any symlink found in
+        // it by then (one swapped in after the check, #165).
+        let real = real_path(&path);
+        let is_dir = real.is_dir();
+        if is_dir {
+            ctx.check_external_at(&real)?;
         } else {
-            ctx.check_external_file(&path)?;
+            ctx.check_external_file_at(&path, &real)?;
         }
-        ctx.permit_path("read", &path, vec!["*".into()])?;
-        // Use what was authorized: the resolved target, so a link swapped in after the check is not followed.
-        let path = real_path(&path);
+        ctx.permit_path_at("read", &path, &real, vec!["*".into()])?;
+        crate::nofollow::between_check_and_use();
+        let path = real;
 
         let offset = opt_u64(input, "offset").unwrap_or(1).max(1) as usize;
         let limit = opt_u64(input, "limit").unwrap_or(2000).clamp(1, 2000) as usize;
 
-        if path.is_dir() {
+        if is_dir {
+            // Listed by name, so the folder is checked before and after: still the one judged, no symlink in it.
+            let fail = |e: std::io::Error| ToolError::fail(format!("{}: {e}", path.display()));
+            let dir = crate::nofollow::Dir::open(&path).map_err(fail)?;
             let mut names: Vec<String> = std::fs::read_dir(&path)
                 .map_err(|e| ToolError::fail(e.to_string()))?
                 .filter_map(|e| e.ok())
                 .map(|e| format!("{}{}", e.file_name().to_string_lossy(), if e.path().is_dir() { "/" } else { "" }))
                 .collect();
+            dir.still_there().map_err(fail)?;
             names.sort();
             if offset > names.len().max(1) {
                 return Err(ToolError::fail(format!("offset {offset} is beyond the end ({} entries)", names.len())));
@@ -49,16 +57,19 @@ Prefer one larger read over many small slices, and use grep to find specific con
             return Ok(ToolOutput::text(page.join("\n")));
         }
 
-        // A FIFO, socket or character device (`/dev/zero`) has no end: reading it blocks or never stops.
+        // A FIFO, socket or character device (`/dev/zero`) has no end: reading it blocks or never stops. Checked by
+        // name first so a device is not even opened, then again on the opened file.
         let meta = std::fs::metadata(&path).map_err(|e| ToolError::fail(format!("{}: {e}", path.display())))?;
         if !meta.is_file() {
             return Err(ToolError::fail(format!("{} is not a regular file (a device, pipe or socket); use shell to inspect it", path.display())));
         }
+        let (mut file, meta) = crate::nofollow::open_read(&path).map_err(|e| file_error(&path, e))?;
         if meta.len() > MAX_WHOLE_FILE {
-            return read_streaming(&path, meta.len(), offset, limit, ctx);
+            return read_streaming(file, &path, meta.len(), offset, limit, ctx);
         }
 
-        let bytes = std::fs::read(&path).map_err(|e| ToolError::fail(format!("{}: {e}", path.display())))?;
+        let mut bytes = Vec::with_capacity(meta.len() as usize);
+        std::io::Read::read_to_end(&mut file, &mut bytes).map_err(|e| ToolError::fail(format!("{}: {e}", path.display())))?;
         if let Some(s) = crate::media::sniff(&bytes) {
             // Images and PDFs go to the model as media, judged by their bytes (the extension may lie).
             let name = ctx.display(&path);
@@ -107,11 +118,20 @@ Prefer one larger read over many small slices, and use grep to find specific con
 /// Files bigger than this are not loaded whole: lines are streamed and the total is not counted.
 const MAX_WHOLE_FILE: u64 = 10 * 1024 * 1024;
 
-/// Read the lines `offset..offset+limit` of a big text file in constant memory.
-fn read_streaming(path: &Path, len: u64, offset: usize, limit: usize, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
+/// An error opening a file through `crate::nofollow`: its own messages (a symlink refused, not a regular file) name
+/// the path already; a system error gets the path in front.
+pub(crate) fn file_error(path: &Path, e: std::io::Error) -> ToolError {
+    if e.raw_os_error().is_some() {
+        ToolError::fail(format!("{}: {e}", path.display()))
+    } else {
+        ToolError::fail(e.to_string())
+    }
+}
+
+/// Read the lines `offset..offset+limit` of a big text file (`file`, open at `path`) in constant memory.
+fn read_streaming(mut file: std::fs::File, path: &Path, len: u64, offset: usize, limit: usize, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
     use std::io::{Read, Seek, SeekFrom};
     let fail = |e: std::io::Error| ToolError::fail(format!("{}: {e}", path.display()));
-    let mut file = std::fs::File::open(path).map_err(fail)?;
     let mut head = Vec::new();
     (&mut file).take(8192).read_to_end(&mut head).map_err(fail)?;
     let name = ctx.display(path);
