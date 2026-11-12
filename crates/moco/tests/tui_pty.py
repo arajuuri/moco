@@ -297,6 +297,24 @@ elif scenario == "idle":
     quiet_for(3)  # the turn is over: the spinner stops and so does the output
     send(b"\x04")
     check_restored(wait_exit())
+elif scenario in ("jobresume", "jobresume-off"):
+    # #150: a background job that finishes after the turn has ended lets the assistant react without a key press
+    # (unless `jobs.auto_resume` is off: then Enter on an empty line does it).
+    send(b"BACKGROUND-JOB start it\r")
+    wait_for(r"permissionneeded:shell")
+    send(b"y")
+    wait_for(r"Startedit;waitingfortheresult\.")
+    if scenario == "jobresume":
+        wait_for(r"ThejobprintedJOB-RESULT-42\.", timeout=20)
+    else:
+        wait_for(r"\[background")  # the job ended while idle
+        pump(3)
+        if re.search(r"ThejobprintedJOB-RESULT-42", squashed()):
+            fail("auto_resume is off, but the assistant was run without a key press")
+        send(b"\r")
+        wait_for(r"ThejobprintedJOB-RESULT-42\.", timeout=20)
+    send(b"\x04")
+    check_restored(wait_exit())
 elif scenario == "newsession":
     # A prompt typed after /new must run in the new session (it used to be queued in the old one, so nothing happened).
     send(b"/new\r")

@@ -148,7 +148,7 @@ If the formatter changes the file, the model is told to re-read it before editin
 
 ## Background work
 
-The model can run a long command in the background (`shell` with `background: true`: a dev server, a long build or test run) or start a subagent in the background, and carry on with other things. It is told when the job ends, together with the result, so it does not poll. While a turn is running that happens at its next step; while the chat is idle you see a dim `[background ...]` line, and the assistant reacts with your next message or when you press Enter on an empty line. `moco -p` waits for background jobs after the turn and lets the assistant report. Background subagents cannot ask you for permission (anything that would ask is refused). Everything still running is stopped when moco exits.
+The model can run a long command in the background (`shell` with `background: true`: a dev server, a long build or test run) or start a subagent in the background, and carry on with other things. It is told when the job ends, together with the result, so it does not poll. While a turn is running that happens at its next step. While the TUI is idle you see a dim `[background ...]` line and the assistant reacts to it at once (after you close a picker, viewer or dialog you have open; text you are typing is left alone). `"jobs": {"auto_resume": false}` turns that off; then, as always in the line-based chat (`--plain`), the assistant reacts with your next message or when you press Enter on an empty line. `moco -p` waits for background jobs after the turn and lets the assistant report. Background subagents cannot ask you for permission (anything that would ask is refused). Everything still running is stopped when moco exits.
 
 ## Tools the model has
 

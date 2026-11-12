@@ -551,6 +551,13 @@ impl App {
         !was_tick || self.animating()
     }
 
+    /// May a run start on its own now (a background job's result arrived while idle, #150)? Not while a turn runs, and
+    /// not while the user is in a picker, a viewer or a dialog: the run starts when that closes. Text in the composer is
+    /// left alone either way.
+    pub fn can_resume(&self) -> bool {
+        !self.running && self.picker.is_none() && self.viewer.is_none() && self.dialogs.is_empty() && self.forms.is_empty()
+    }
+
     /// Is the user probably not looking? The terminal's own focus reports decide when it sends them;
     /// otherwise a stretch without key presses does.
     pub fn away(&self) -> bool {
@@ -3081,6 +3088,21 @@ mod tests {
         a.update(AppEvent::RunDone(Ok(RunOutcome::Idle)));
         let joined = screen(&mut a, 120, 24).join("\n");
         assert!(joined.contains("$0.0050 · session $0.0156 + classifier $0.0006"), "{joined}");
+    }
+
+    #[test]
+    fn a_job_result_may_start_a_run_only_when_nothing_is_in_the_way() {
+        let mut a = App::new("anthropic/sonnet", "build");
+        a.input = "half-typed".into();
+        assert!(a.can_resume(), "idle, with text in the composer: the run leaves the composer alone");
+        a.running = true;
+        assert!(!a.can_resume());
+        a.running = false;
+        a.open_picker(Picker::new(PickKind::Command, "commands", items(&["/diff"]), ""));
+        assert!(!a.can_resume(), "not under a picker (the palette, /diff, /sessions...)");
+        a.update(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(a.picker.is_none() && a.can_resume(), "once it closes");
+        assert_eq!(a.input, "half-typed");
     }
 
     #[test]

@@ -110,6 +110,11 @@ impl Engine {
         *self.jobs.limits.lock().unwrap_or_else(|e| e.into_inner()) = limits;
     }
 
+    /// The current `jobs` settings (see `set_job_limits`).
+    pub fn job_limits(&self) -> crate::config::JobLimits {
+        *self.jobs.limits.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn job_limit(&self, kind: Kind) -> usize {
         let l = *self.jobs.limits.lock().unwrap_or_else(|e| e.into_inner());
         if kind == Kind::Shell { l.max_shells } else { l.max_subagents }
@@ -542,7 +547,7 @@ mod tests {
 
     #[test]
     fn shell_cap_is_a_tool_error_and_frees_up_when_a_job_stops() {
-        let (eng, s, dir) = engine(crate::config::JobLimits { max_shells: 2, max_subagents: 4 });
+        let (eng, s, dir) = engine(crate::config::JobLimits { max_shells: 2, max_subagents: 4, ..Default::default() });
         let work = dir.join("work");
         let a = eng.start_shell_job(&s, "sleep 31", &work, None, true).unwrap().0;
         eng.start_shell_job(&s, "sleep 32", &work, None, true).unwrap();
@@ -560,7 +565,7 @@ mod tests {
 
     #[test]
     fn subagent_cap_applies_to_subagents_only() {
-        let (eng, _s, dir) = engine(crate::config::JobLimits { max_shells: 1, max_subagents: 0 });
+        let (eng, _s, dir) = engine(crate::config::JobLimits { max_shells: 1, max_subagents: 0, ..Default::default() });
         assert!(eng.check_background_slot(true).unwrap_err().message().contains("background subagents"));
         assert!(eng.check_background_slot(false).is_ok());
         let _ = std::fs::remove_dir_all(dir);

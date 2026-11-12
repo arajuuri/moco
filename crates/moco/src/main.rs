@@ -958,8 +958,10 @@ fn main() {
     }
     engine.set_notifier(std::sync::Arc::new(|line| {
         if AT_PROMPT.load(Ordering::Relaxed) {
-            // Redraw the prompt line underneath the notice.
-            print!("\r\x1b[2K{DIM}[{line}]{RESET}\n> ");
+            // Redraw the prompt line underneath the notice. The line reader can't be woken, so say how to let the
+            // assistant react to a job's result (#150; the TUI does it by itself).
+            let hint = if line.starts_with("background ") { " (press Enter to let the assistant continue)" } else { "" };
+            print!("\r\x1b[2K{DIM}[{line}]{hint}{RESET}\n> ");
         } else {
             println!("\n{DIM}[{line}]{RESET}");
         }
