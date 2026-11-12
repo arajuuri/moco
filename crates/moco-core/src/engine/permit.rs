@@ -83,6 +83,9 @@ impl EnginePermitter<'_> {
 }
 
 impl Permitter for EnginePermitter<'_> {
+    fn evaluate(&self, req: &PermReq) -> Effect {
+        self.effect(req)
+    }
     fn check(&self, req: &PermReq) -> Result<(), ToolError> {
         if self.declined.load(Ordering::Relaxed) {
             return Err(ToolError::Declined);
@@ -155,5 +158,31 @@ mod tests {
         crate::saved_permissions::manage(&store.lock().unwrap(), &project_id, "/permissions", "remove 1").unwrap();
         assert!(matches!(p.check(&req), Err(ToolError::Corrected(_))), "asked again, and the test UI refused");
         assert_eq!(ui.0.lock().unwrap().as_slice(), ["osascript -e 'beep'"]);
+    }
+
+    /// #147: a directory grep judges each file it finds by the engine's rules (configured and saved), without prompting.
+    #[test]
+    fn a_directory_grep_applies_configured_and_saved_read_rules() {
+        use crate::tools::testutil::Env;
+        let env = Env::new();
+        env.file("secret.txt", b"FAKE_DENIED_CONTENT\n");
+        env.file("keys/api.txt", b"FAKE_ASKED_CONTENT\n");
+        env.file("keys/saved.txt", b"FAKE_SAVED_CONTENT\n");
+        let store = Store::open(&env.dir.join("moco.db")).unwrap();
+        let project_id = store.project_for(&env.work().to_string_lossy()).unwrap();
+        store.save_permission(&project_id, "read", "keys/saved.txt").unwrap();
+        // A saved "always" never overrides a configured deny.
+        store.save_permission(&project_id, "read", "secret.txt").unwrap();
+        let store = Mutex::new(store);
+        let mut rules = permission::mode_rules(PermissionMode::Manual);
+        rules.extend([Rule::new("read", "secret.txt", Effect::Deny), Rule::new("read", "keys/*", Effect::Ask)]);
+        let (ui, declined, ask_lock, notified) = (Refuse::default(), AtomicBool::new(false), Mutex::new(()), Mutex::new(HashSet::new()));
+        let p = EnginePermitter { rules, project_id, store: &store, ui: &ui, declined: &declined, ask_lock: &ask_lock, notified: &notified, classify: None, cache: Mutex::new(None) };
+        let ctx = ToolCtx { permitter: &p, ..env.ctx() };
+        let t = tools::grep::Grep.run(&json!({"pattern":"FAKE","path":"."}), &ctx).unwrap().text;
+        assert!(t.starts_with("keys/saved.txt:1: FAKE_SAVED_CONTENT"), "{t}");
+        assert!(!t.contains("FAKE_DENIED_CONTENT") && !t.contains("FAKE_ASKED_CONTENT"), "{t}");
+        assert!(t.contains("needs permission: keys/api.txt.") && t.contains("deny reading them: secret.txt."), "{t}");
+        assert!(ui.0.lock().unwrap().is_empty(), "a walk does not prompt");
     }
 }

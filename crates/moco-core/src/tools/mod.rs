@@ -138,6 +138,12 @@ pub struct PermReq {
 /// Implemented by the agent loop: evaluates rules, prompts the user, blocks until answered.
 pub trait Permitter: Sync {
     fn check(&self, req: &PermReq) -> Result<(), ToolError>;
+    /// What `check` would decide from the rules (configured, agent and saved), without prompting anyone. For files a
+    /// tool finds rather than is given (a directory grep), which cannot each be a prompt. A permitter that cannot tell
+    /// says `Ask`, so such files are left out.
+    fn evaluate(&self, _req: &PermReq) -> crate::permission::Effect {
+        crate::permission::Effect::Ask
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -272,6 +278,16 @@ impl ToolCtx<'_> {
     /// (a linked final component or a linked parent), the place they lead to. A rule such as `read .env` therefore
     /// applies to `safe.txt -> .env`, and a deny on the target cannot be bypassed through a link.
     pub fn permit_path(&self, action: &str, path: &Path, save: Vec<String>) -> Result<(), ToolError> {
+        self.permit(action, self.path_resources(path), save)
+    }
+
+    /// The rules' verdict on `action` for a path, named as `permit_path` names it, without prompting (`Permitter::evaluate`).
+    pub fn path_effect(&self, action: &str, path: &Path) -> crate::permission::Effect {
+        self.permitter.evaluate(&PermReq { action: action.into(), resources: self.path_resources(path), save: vec![], force_ask: false, command: None, call_id: self.call_id.into() })
+    }
+
+    /// The permission resources for a path: its name as given and, when links lead elsewhere, what they lead to.
+    fn path_resources(&self, path: &Path) -> Vec<String> {
         // The name as given: a link that lives in the project keeps its relative name even when it points outside
         // (`display` would resolve it and show it absolute); the target is checked as its own resource below.
         let lexical = normalize(path);
@@ -288,7 +304,7 @@ impl ToolCtx<'_> {
                 resources.push(target);
             }
         }
-        self.permit(action, resources, save)
+        resources
     }
 
     /// Anything outside the working directory and project root needs `external_directory`.
@@ -926,6 +942,10 @@ pub(crate) mod testutil {
         fn check(&self, req: &PermReq) -> Result<(), ToolError> {
             self.asked.lock().unwrap().push(req.clone());
             self.reply.lock().unwrap().clone()
+        }
+        /// Allows without recording when every request is allowed, otherwise asks.
+        fn evaluate(&self, _req: &PermReq) -> crate::permission::Effect {
+            if self.reply.lock().unwrap().is_ok() { crate::permission::Effect::Allow } else { crate::permission::Effect::Ask }
         }
     }
 
