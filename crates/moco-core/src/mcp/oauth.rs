@@ -69,7 +69,7 @@ pub fn remove(app_dir: &Path, server_url: &str) -> Result<bool, String> {
     if all.remove(server_url).is_none() {
         return Ok(false);
     }
-    std::fs::write(path(app_dir), serde_json::to_string_pretty(&Value::Object(all)).unwrap_or_default()).map_err(|e| format!("could not forget the stored tokens ({}): {e}", path(app_dir).display()))?;
+    crate::auth::write_private(&path(app_dir), serde_json::to_string_pretty(&Value::Object(all)).unwrap_or_default().as_bytes()).map_err(|e| format!("could not forget the stored tokens ({}): {e}", path(app_dir).display()))?;
     crate::log_info!("mcp", "oauth: stored tokens for {server_url} removed");
     Ok(true)
 }

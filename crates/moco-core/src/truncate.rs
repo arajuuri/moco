@@ -39,9 +39,9 @@ pub fn truncate(text: &str, spill_dir: &Path) -> std::io::Result<Truncated> {
         kept = text[..cut].to_string();
         n = 1;
     }
-    std::fs::create_dir_all(spill_dir)?;
+    crate::auth::create_private_dir(spill_dir)?;
     let path = spill_dir.join(format!("{}.txt", crate::id::new_id("out")));
-    std::fs::write(&path, text)?;
+    std::io::Write::write_all(&mut crate::auth::create_private(&path, false)?, text.as_bytes())?;
     let notice = format!("\n\n[showing lines 1-{n} of {total_lines}; full output saved to {}]", path.display());
     Ok(Truncated { text: kept + &notice, output_path: Some(path) })
 }

@@ -282,7 +282,8 @@ pub fn run(host: &Host, app: &mut App, sid: &str, agent: &str, name: &str, args:
             let path = if args.is_empty() { format!("moco-{}.md", crate::short(sid)) } else { args.to_string() };
             let path = std::path::Path::new(&host.cwd).join(path);
             let text = moco_core::export::export(&engine.store.lock().unwrap(), sid, &moco_core::export::Options::default()).map_err(|e| e.to_string());
-            match text.and_then(|t| std::fs::write(&path, t).map_err(|e| e.to_string())) {
+            let write = |t: String| moco_core::auth::create_private(&path, false).and_then(|mut f| std::io::Write::write_all(&mut f, t.as_bytes())).map_err(|e| e.to_string());
+            match text.and_then(write) {
                 Ok(()) => app.push_info(format!("exported to {} (not redacted: check it for secrets before sharing)", crate::tilde(&path.to_string_lossy()))),
                 Err(e) => err(app, format!("export failed: {e}")),
             }

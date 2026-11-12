@@ -502,6 +502,33 @@ fn substitution_tokens(raw: &str) -> Vec<&str> {
     out
 }
 
+/// The most a `{file:}` token reads: a key, a token or a prompt, not a data file.
+pub const MAX_SUBSTITUTED_FILE: u64 = 1024 * 1024;
+
+/// Read a `{file:}` target (#164): a regular file (symlinks followed) of at most `MAX_SUBSTITUTED_FILE` bytes.
+/// `/dev/zero` would exhaust memory and a FIFO would block startup forever, so anything else is refused. It is opened
+/// non-blocking (opening a FIFO with no writer otherwise waits) and checked with fstat on the open descriptor, so a
+/// path swapped after a check cannot slip through; the read is capped as well in case the file grows meanwhile.
+fn read_substituted_file(p: &Path) -> Result<String, String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(p).map_err(|e| e.to_string())?;
+    let m = f.metadata().map_err(|e| e.to_string())?;
+    if !m.is_file() {
+        let what = if m.is_dir() { "a directory" } else { "not a regular file (a device, FIFO or socket)" };
+        return Err(format!("{what}; only regular files are read"));
+    }
+    if m.len() > MAX_SUBSTITUTED_FILE {
+        return Err(format!("{} bytes, over the {} KiB limit", m.len(), MAX_SUBSTITUTED_FILE / 1024));
+    }
+    let mut bytes = vec![];
+    f.take(MAX_SUBSTITUTED_FILE + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > MAX_SUBSTITUTED_FILE {
+        return Err(format!("over the {} KiB limit", MAX_SUBSTITUTED_FILE / 1024));
+    }
+    String::from_utf8(bytes).map_err(|_| "not valid UTF-8".to_string())
+}
+
 /// Replace `{env:NAME}` (empty if unset) and `{file:path}` (contents, relative to `base`) in raw text.
 /// Values are JSON-escaped so they are safe inside a string literal. `load` runs it on the user's own config files
 /// only: in a project's config a token could put any environment variable or readable file (API keys, `~/.ssh`)
@@ -522,7 +549,7 @@ pub fn substitute(raw: &str, base: &Path) -> Result<String, String> {
                 } else {
                     let p = expand_home(arg.trim());
                     let p = if p.is_absolute() { p } else { base.join(p) };
-                    std::fs::read_to_string(&p).map_err(|e| format!("{{file:{}}}: {e}", p.display()))?.trim_end_matches(['\n', '\r']).to_string()
+                    read_substituted_file(&p).map_err(|e| format!("{{file:{arg}}} ({}): {e}", p.display()))?.trim_end_matches(['\n', '\r']).to_string()
                 };
                 out.push_str(&json_escape(&value));
                 rest = &tail[end + 1..];
@@ -923,6 +950,50 @@ mod tests {
         let v: Value = serde_json::from_str(&substitute(raw, &dir).unwrap()).unwrap();
         assert_eq!(v, json!({"a":"va\"lue","b":"line1\n\"quoted\"","c":"","d":"{not a var}"}));
         assert!(substitute(r#"{"a":"{file:missing.txt}"}"#, &dir).unwrap_err().contains("missing.txt"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Run `f` on a thread and fail (instead of hanging the test run) if it takes more than 10 s.
+    fn within_10s<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(f()));
+        rx.recv_timeout(std::time::Duration::from_secs(10)).expect("hung")
+    }
+
+    #[test]
+    fn file_tokens_read_only_regular_files_of_bounded_size() {
+        let dir = tmp();
+        std::fs::create_dir_all(dir.join("adir")).unwrap();
+        let fifo = dir.join("pipe");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
+        std::fs::File::create(dir.join("big")).unwrap().set_len(MAX_SUBSTITUTED_FILE + 1).unwrap();
+        std::fs::write(dir.join("max"), "x".repeat(MAX_SUBSTITUTED_FILE as usize)).unwrap();
+        std::os::unix::fs::symlink(dir.join("max"), dir.join("link")).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", dir.join("zero-link")).unwrap();
+        for (token, why) in [
+            ("{file:/dev/zero}", "not a regular file"),
+            ("{file:zero-link}", "not a regular file"),
+            ("{file:pipe}", "not a regular file"),
+            ("{file:adir}", "a directory"),
+            ("{file:big}", "over the 1024 KiB limit"),
+        ] {
+            let (raw, d) = (format!(r#"{{"a":"{token}"}}"#), dir.clone());
+            let err = within_10s(move || substitute(&raw, &d)).unwrap_err();
+            assert!(err.starts_with(token) && err.contains(why), "{token}: {err}");
+        }
+        let (d, raw) = (dir.clone(), r#"{"a":"{file:link}"}"#);
+        let v: Value = serde_json::from_str(&within_10s(move || substitute(raw, &d)).unwrap()).unwrap();
+        assert_eq!(v["a"].as_str().unwrap().len(), MAX_SUBSTITUTED_FILE as usize, "a symlink to a regular file at the limit is read");
+
+        // Through `load`: the warning names the config file and the token, and startup goes on.
+        let (app, proj) = (dir.join("app"), dir.join("proj"));
+        std::fs::create_dir_all(app.join("config")).unwrap();
+        std::fs::create_dir_all(&proj).unwrap();
+        let cfg = app.join("config/moco.json");
+        std::fs::write(&cfg, format!(r#"{{"model": "a/b", "agents": {{"build": {{"system": "{{file:{}}}"}}}}}}"#, fifo.display())).unwrap();
+        let l = within_10s(move || load(&app, &proj));
+        assert!(l.warnings.iter().any(|w| w.starts_with(&cfg.display().to_string()) && w.contains(&format!("{{file:{}}}", fifo.display())) && w.contains("not a regular file")), "{:?}", l.warnings);
         let _ = std::fs::remove_dir_all(dir);
     }
 

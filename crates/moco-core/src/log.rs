@@ -287,12 +287,11 @@ impl Sink {
     }
 
     fn open(&mut self, day: &str, now: i64) {
-        use std::os::unix::fs::OpenOptionsExt;
         self.file = None;
         self.day = day.to_string();
         self.capped = false;
         self.failed = false;
-        let opened = std::fs::create_dir_all(&self.dir).and_then(|_| std::fs::OpenOptions::new().append(true).create(true).mode(0o600).open(self.dir.join(file_name(day))));
+        let opened = crate::auth::create_private_dir(&self.dir).and_then(|_| crate::auth::create_private(&self.dir.join(file_name(day)), true));
         match opened {
             Ok(f) => {
                 self.file = Some(f);

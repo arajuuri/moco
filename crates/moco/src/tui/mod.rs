@@ -93,9 +93,9 @@ fn append_history(path: &std::path::Path, entry: &str) {
     use moco_core::log::LogErr;
     // The history is a convenience: a failure is logged (with the real cause) and never interrupts the session.
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).log_err("tui", "creating the prompt-history directory");
+        moco_core::auth::create_private_dir(dir).log_err("tui", "creating the prompt-history directory");
     }
-    if let Some(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path).log_err("tui", "opening the prompt history") {
+    if let Some(mut f) = moco_core::auth::create_private(path, true).log_err("tui", "opening the prompt history") {
         writeln!(f, "{}", serde_json::Value::String(entry.to_string())).log_err("tui", "writing the prompt history");
     }
 }

@@ -642,7 +642,8 @@ fn main() {
                     let text = moco_core::export::export(&store, &ses.id, &opts).unwrap_or_else(|e| die(&format!("export: {e}")));
                     match file {
                         Some(f) => {
-                            std::fs::write(f, &text).unwrap_or_else(|e| die(&format!("{f}: {e}")));
+                            // A transcript is not redacted: a new file is created 0600.
+                            auth::create_private(std::path::Path::new(f), false).and_then(|mut out| std::io::Write::write_all(&mut out, text.as_bytes())).unwrap_or_else(|e| die(&format!("{f}: {e}")));
                             eprintln!("wrote {f}");
                         }
                         None => print!("{text}"),
@@ -805,6 +806,9 @@ fn main() {
     // Only a run that starts a session logs. `--help`, `--version` and the subcommands (`logs`, `models`, `auth`,
     // `sessions`, `permissions`) never touch the log directory, so `moco logs` cannot create the file it is about to show.
     moco_core::log::init(&app_dir);
+    if let Some(w) = auth::secure_app_dir(&app_dir) {
+        eprintln!("warning: {w}");
+    }
     if let Some(w) = auth::permissions_warning(&app_dir) {
         eprintln!("warning: {w}");
     }

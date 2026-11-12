@@ -156,7 +156,7 @@ The model can run a long command in the background (`shell` with `background: tr
 
 ## Configuration
 
-Files named `moco.json` or `moco.jsonc` (comments and trailing commas allowed), merged from lowest to highest priority: `~/Library/Application Support/moco/config/`, then every parent directory of the working directory (and its `.moco/` subdirectory) outermost first, then `$MOCO_CONFIG`. `{env:NAME}` and `{file:path}` are substituted in the text of your own config files (not in a project's, so a cloned repository cannot read your keys or files into a URL or header it chooses). A project's config also cannot change `websearch` (except `false` and `max_results`), provider endpoints, keys, headers or request overlays, or name `instructions` files outside the project; such keys are ignored with a warning. Objects merge by key; `permissions` and `instructions` lists add up.
+Files named `moco.json` or `moco.jsonc` (comments and trailing commas allowed), merged from lowest to highest priority: `~/Library/Application Support/moco/config/`, then every parent directory of the working directory (and its `.moco/` subdirectory) outermost first, then `$MOCO_CONFIG`. `{env:NAME}` and `{file:path}` are substituted in the text of your own config files (not in a project's, so a cloned repository cannot read your keys or files into a URL or header it chooses). `{file:}` reads only regular files (a symlink to one is fine) up to 1 MiB; a directory, device (`/dev/zero`), FIFO or larger file is refused with a warning naming the config file and the token, and that config file is skipped. A project's config also cannot change `websearch` (except `false` and `max_results`), provider endpoints, keys, headers or request overlays, or name `instructions` files outside the project; such keys are ignored with a warning. Objects merge by key; `permissions` and `instructions` lists add up.
 
 ```jsonc
 {
@@ -198,7 +198,7 @@ Only a run that starts a session creates a log: `--help`, `--version`, `logs`, `
 
 ## Where things are stored
 
-Everything is under `~/Library/Application Support/moco/` (`MOCO_HOME` overrides): `auth.json` (keys), `config/`, `cache/models.json` (refreshed catalog), `data/moco.db` (sessions, SQLite), `data/snapshots/` (undo data, pruned after 30 idle days), `data/tool-output/`, `data/logs/` (diagnostic log, 7 days). Nothing is sent anywhere except to the model provider you chose and the URLs the model fetches.
+Everything is under `~/Library/Application Support/moco/` (`MOCO_HOME` overrides): `auth.json` (keys), `config/`, `cache/models.json` (refreshed catalog), `data/moco.db` (sessions, SQLite), `data/snapshots/` (undo data, pruned after 30 idle days), `data/tool-output/`, `data/logs/` (diagnostic log, 7 days). The directory and what moco keeps about you there (`auth.json`, `mcp-auth.json` and all of `data/`) are private to you: directories 0700, files 0600. An older install's `data/` is tightened at the next start, and so is the directory itself in its default location; a looser `MOCO_HOME` is left as you set it, with a warning suggesting `chmod 700`. `moco sessions export -o FILE` and `/export` create new files 0600, since transcripts are not redacted. Nothing is sent anywhere except to the model provider you chose and the URLs the model fetches.
 
 ## Environment variables
 
