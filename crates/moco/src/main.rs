@@ -232,6 +232,14 @@ impl Ui for Terminal {
                 r.steps += 1;
                 return;
             }
+            UiEvent::ContextUsage { context_tokens, context_limit, session_cost } => {
+                // After compaction: not a step, so `steps` stays as it is and no summary line is forced.
+                let mut r = moco_core::engine::lock(&self.run);
+                r.session_cost = *session_cost;
+                r.context = *context_tokens;
+                r.limit = *context_limit;
+                return;
+            }
             UiEvent::ClassifierUsage { cost, session_cost, .. } => {
                 let mut r = moco_core::engine::lock(&self.run);
                 r.classifier += cost;

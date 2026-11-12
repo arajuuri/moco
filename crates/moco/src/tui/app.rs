@@ -30,6 +30,8 @@ pub enum Ev {
     AutoAllowed { call_id: String, command: String, risk: String, reason: String },
     /// A permission-classifier call: its cost, the session total (which includes it) and the classifier's share of it.
     ClassifierUsage { cost: f64, session_cost: f64, classifier_cost: f64 },
+    /// The context was re-estimated outside a step (after compaction): no tokens were spent in a step.
+    Context { context: u64, limit: Option<u64>, session_cost: f64 },
     Notice(String),
     Status(String),
     Todos(Vec<Todo>),
@@ -306,6 +308,8 @@ pub struct App {
     pub cost_limits: moco_core::config::Limits,
     pub context: u64,
     pub limit: Option<u64>,
+    /// `context` is our estimate after compaction, not the provider's count; shown with a `~` until the next step.
+    pub context_estimated: bool,
     pub hint: Option<String>,
     pub tick: u64,
     pub queued: Vec<Queued>,
@@ -377,6 +381,7 @@ impl App {
             cost_limits: Default::default(),
             context: 0,
             limit: None,
+            context_estimated: false,
             hint: None,
             tick: 0,
             queued: vec![],
@@ -624,6 +629,15 @@ impl App {
                     self.session_cost = session_cost;
                     self.context = context;
                     self.limit = limit;
+                    self.context_estimated = false;
+                }
+            }
+            Ev::Context { context, limit, session_cost } => {
+                if depth == 0 {
+                    self.session_cost = session_cost;
+                    self.context = context;
+                    self.limit = limit;
+                    self.context_estimated = true;
                 }
             }
             Ev::ClassifierUsage { cost, session_cost, classifier_cost } => {
@@ -1747,12 +1761,13 @@ impl App {
                 Some(l) if l > 0 => (self.context * 100 / l).min(100) as usize,
                 _ => 0,
             };
+            let approx = if self.context_estimated { "~" } else { "" };
             let mut spans = vec![Span::styled(" context ", t.dim)];
             if self.limit.is_some() {
                 spans.extend(self.gauge(pct, w.saturating_sub(16).clamp(4, 14), Style::new()));
-                spans.push(Span::raw(format!(" {pct}%")));
+                spans.push(Span::raw(format!(" {approx}{pct}%")));
             } else {
-                spans.push(Span::raw(human(self.context)));
+                spans.push(Span::raw(format!("{approx}{}", human(self.context))));
             }
             v.push(Line::from(spans));
         }
@@ -1840,14 +1855,15 @@ impl App {
             segs.push((4, vec![Span::styled(format!(" {} ", clip_width(title, 36)), bar.add_modifier(Modifier::DIM))]));
         }
         if self.context > 0 {
+            let approx = if self.context_estimated { "~" } else { "" };
             let mut spans = vec![Span::styled(" ctx ", bar)];
             match self.limit {
                 Some(l) if l > 0 => {
                     let pct = (self.context * 100 / l).min(100) as usize;
                     spans.extend(self.gauge(pct, 8, bar));
-                    spans.push(Span::styled(format!(" {pct}% "), bar));
+                    spans.push(Span::styled(format!(" {approx}{pct}% "), bar));
                 }
-                _ => spans.push(Span::styled(format!("{} ", human(self.context)), bar)),
+                _ => spans.push(Span::styled(format!("{approx}{} ", human(self.context)), bar)),
             }
             segs.push((2, spans));
         }
@@ -2971,6 +2987,24 @@ mod tests {
         a.update(AppEvent::RunDone(Ok(RunOutcome::Idle)));
         let joined = screen(&mut a, 120, 24).join("\n");
         assert!(joined.contains("$0.0050 · session $0.0156 + classifier $0.0006"), "{joined}");
+    }
+
+    #[test]
+    fn compaction_updates_the_context_fill_without_counting_a_step() {
+        // #151: `/compact` used to leave the pre-compaction fill on screen until the next message.
+        let mut a = App::new("anthropic/sonnet", "build");
+        text(&mut a, Ev::Usage { usage: Usage { input: 10, output: 5, cache_read: 0, cache_write: 0 }, cost: Some(0.01), session_cost: 0.01, context: 900, limit: Some(1000) });
+        assert!(screen(&mut a, 120, 24).join("\n").contains(" 90% "));
+        let steps = a.run.steps;
+        text(&mut a, Ev::Context { context: 200, limit: Some(1000), session_cost: 0.015 });
+        assert_eq!((a.context, a.limit, a.session_cost, a.run.steps), (200, Some(1000), 0.015, steps));
+        let s = screen(&mut a, 120, 24).join("\n");
+        assert!(s.contains(" ~20% ") && !s.contains(" 90% "), "an estimate until the next step:\n{s}");
+        text(&mut a, Ev::Usage { usage: Usage { input: 10, output: 5, cache_read: 0, cache_write: 0 }, cost: Some(0.01), session_cost: 0.025, context: 250, limit: Some(1000) });
+        let s = screen(&mut a, 120, 24).join("\n");
+        assert!(s.contains(" 25% ") && !s.contains('~'), "the provider's count replaces it:\n{s}");
+        a.update(AppEvent::Engine { depth: 1, agent: "general".into(), ev: Ev::Context { context: 5, limit: Some(10), session_cost: 9.0 } });
+        assert_eq!((a.context, a.session_cost), (250, 0.025), "a subagent's compaction is about its own context");
     }
 
     #[test]

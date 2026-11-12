@@ -134,6 +134,7 @@ impl TuiUi {
             UiEvent::StepUsage { usage, cost, session_cost, context_tokens, context_limit } => {
                 Ev::Usage { usage: *usage, cost: *cost, session_cost: *session_cost, context: *context_tokens, limit: *context_limit }
             }
+            UiEvent::ContextUsage { context_tokens, context_limit, session_cost } => Ev::Context { context: *context_tokens, limit: *context_limit, session_cost: *session_cost },
             UiEvent::ClassifierUsage { cost, session_cost, classifier_cost } => Ev::ClassifierUsage { cost: *cost, session_cost: *session_cost, classifier_cost: *classifier_cost },
             UiEvent::AutoAllowed { call_id, command, risk, reason } => Ev::AutoAllowed { call_id: call_id.to_string(), command: command.to_string(), risk: risk.to_string(), reason: reason.to_string() },
             UiEvent::Notice(n) => Ev::Notice(n.to_string()),
