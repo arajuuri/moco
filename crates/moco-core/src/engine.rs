@@ -2522,6 +2522,53 @@ mod tests {
         assert_eq!(notices_containing(&ui, "stopped at the output token limit"), 0);
     }
 
+    fn refused(events: Vec<Event>, why: &str) -> Scripted {
+        let mut events = events;
+        events.push(Event::Finish { reason: FinishReason::Refusal(why.into()), usage: Usage { input: 10, output: 7, ..Default::default() } });
+        Scripted::Events(events)
+    }
+
+    /// #153: a refusal used to end the turn silently, like a finished answer.
+    #[test]
+    fn a_refusal_ends_the_turn_visibly_and_its_partial_text_is_not_replayed() {
+        let f = fixture(vec![refused(vec![Event::TextDelta("| 8 | 28 · ".into())], "cyber"), text("fresh answer")]);
+        f.say("count the matrices");
+        let ui = TestUi::default();
+        let RunOutcome::Failed(msg) = f.run(&ui) else { panic!("a refusal is not a finished answer") };
+        assert!(msg.contains("declined") && msg.contains("(cyber)") && msg.contains("incomplete"), "{msg}");
+        assert_eq!(f.fake.calls(), 1, "not retried or continued");
+        assert_eq!(notices_containing(&ui, "declined to continue"), 1);
+        assert!(ui.log().contains(&"usage".to_string()), "the refused call's tokens are still counted");
+        let stored = f.msgs().into_iter().rfind(|m| m.kind == "assistant").unwrap();
+        assert_eq!(stored.data["finish"], "refusal");
+        assert_eq!(stored.data["parts"][0]["text"], "| 8 | 28 · ", "the user's record keeps what was shown");
+
+        f.say("try again");
+        assert_eq!(f.run(&TestUi::default()), RunOutcome::Idle);
+        let reqs = f.fake.requests.lock().unwrap();
+        assert!(!reqs[1].messages.iter().any(|m| m.content.iter().any(|b| matches!(b, Block::Text(t) if t.contains("28 ·")))), "the model does not see the refused text: {:?}", reqs[1].messages);
+    }
+
+    /// The reported case: the refusal came on a #148 continuation. It must stop the continuations.
+    #[test]
+    fn a_refusal_during_a_continuation_stops_it() {
+        let f = fixture(vec![cut_off(vec![Event::TextDelta("part one".into())]), refused(vec![Event::TextDelta("part two".into())], ""), text("never asked")]);
+        f.say("write a lot");
+        let ui = TestUi::default();
+        let RunOutcome::Failed(msg) = f.run(&ui) else { panic!() };
+        assert!(msg.contains("declined to continue;"), "no empty parentheses: {msg}");
+        assert_eq!(f.fake.calls(), 2);
+    }
+
+    #[test]
+    fn an_unknown_stop_reason_is_mentioned() {
+        let f = fixture(vec![Scripted::Events(vec![Event::TextDelta("hi".into()), Event::Finish { reason: FinishReason::Other("pause_everything".into()), usage: Usage::default() }])]);
+        f.say("go");
+        let ui = TestUi::default();
+        assert_eq!(f.run(&ui), RunOutcome::Idle);
+        assert_eq!(notices_containing(&ui, "unexpected stop reason (pause_everything)"), 1);
+    }
+
     /// The reported case: thinking used up the whole budget and no answer was written.
     #[test]
     fn a_reply_that_only_thought_before_the_limit_is_asked_to_answer() {

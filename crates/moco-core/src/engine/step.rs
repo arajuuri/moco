@@ -341,8 +341,29 @@ impl Engine {
                 ui.event(&UiEvent::Notice(&format!("error: {}", e.message())));
                 StepOutcome::Stop(RunOutcome::Failed(e.message()))
             }
+            Ok(()) if matches!(result.finish, Some((FinishReason::Refusal(_), _))) => {
+                // #153: a refusal used to end the turn like a finished answer. Don't continue or retry: the same request
+                // would most likely be declined again. What streamed before it stays visible but is incomplete, and
+                // `chat.rs` leaves it out of what the model sees next.
+                let why = match &result.finish {
+                    Some((FinishReason::Refusal(w), _)) if !w.is_empty() => format!(" ({w})"),
+                    _ => String::new(),
+                };
+                let msg = format!("the model declined to continue{why}; anything it wrote before that is incomplete");
+                data["finish"] = json!("refusal");
+                crate::log_warn!("engine", "refusal session={sid} step={step} model={provider_id}/{model_id}{why}");
+                ui.event(&UiEvent::Notice(&msg));
+                StepOutcome::Stop(RunOutcome::Failed(msg))
+            }
             Ok(()) if result.declined => StepOutcome::Stop(RunOutcome::Declined),
             Ok(()) => {
+                if let Some((FinishReason::Other(reason), _)) = &result.finish {
+                    if tool_calls == 0 {
+                        // A stop reason we don't know ended the turn: say so instead of looking like a normal answer.
+                        crate::log_warn!("engine", "unknown stop reason session={sid} step={step} model={provider_id}/{model_id} reason={reason}");
+                        ui.event(&UiEvent::Notice(&format!("the response ended with an unexpected stop reason ({reason}), so it may be incomplete")));
+                    }
+                }
                 if matches!(result.finish, Some((FinishReason::MaxTokens, _))) && tool_calls == 0 {
                     let answered = result.parts.iter().any(|p| p["type"] == "text" && p["text"].as_str().is_some_and(|t| !t.trim().is_empty()));
                     StepOutcome::CutOff { answered }
