@@ -184,7 +184,7 @@ Actions are `read`, `edit` (write, edit and patch), `glob`, `grep`, `shell`, `we
 
 **Output budget**: each request asks for the model's own output limit (`limit.output` in the catalog, or set per model as in the `ollama` example), 16,000 when the limit is unknown. `max_tokens` caps it (and is the budget for models without a limit). Only the tokens written are billed. Thinking counts against it. A reply cut off at the budget is continued automatically, up to twice in a row.
 
-**Project instructions**: `AGENTS.md` (or `CLAUDE.md` where there is no `AGENTS.md`) in the project root down to the working directory, `config/AGENTS.md` globally, plus `instructions` files. They are re-read every step.
+**Project instructions**: `AGENTS.md` (or `CLAUDE.md` where there is no `AGENTS.md`) in the project root down to the working directory, `config/AGENTS.md` globally, plus `instructions` files. They are re-read every step. A project file (including a relative `instructions` entry) that is a symlink, or sits under one, resolving outside the project is not read; moco shows a notice naming it instead. Absolute and `~/` entries from your own config may point anywhere.
 
 ## Logging
 
