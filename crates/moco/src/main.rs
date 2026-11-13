@@ -960,6 +960,15 @@ fn main() {
     let n_sources = loaded.sources.len();
     let engine = Engine::with_providers(store, providers, engine_cfg).share();
     engine.set_job_limits(cfg.jobs);
+    // A level the model does not offer stays the session's choice (another model may offer it) but is not sent; say so
+    // instead of silently running at the provider's default (#186).
+    if let (Some(e), Ok(Some(s))) = (&effort_arg, engine.store().session(&session.id)) {
+        let info = engine.effort_info(&s);
+        if !info.offered {
+            let has = if info.levels.is_empty() { "no reasoning levels".to_string() } else { format!("only {}", info.levels.join(", ")) };
+            eprintln!("warning: --effort {e}: {} offers {has}, so it is not sent", engine.model_ref_for(&s));
+        }
+    }
     if let Some(cases) = eval_classifier {
         return eval_classifier_cases(&engine, &cases, &cwd_str);
     }

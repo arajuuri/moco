@@ -112,7 +112,7 @@ MCP servers add tools (and prompts and resources) from other programs. Declare t
 
 ## Reasoning effort
 
-Models that can think more or less offer *levels*: `/effort` shows the ones the current model has and `/effort high` (or `/effort default`) sets it for the session; `moco --effort high` sets it at start; in the full-screen UI Ctrl-T steps through the levels and the status bar shows `think high`. Leader `e` opens the level list. A level the model does not have is ignored, so you can switch models freely. Defaults come from the config:
+Models that can think more or less offer *levels*: `/effort` shows the ones the current model has and `/effort high` (or `/effort default`) sets it for the session; `moco --effort high` sets it at start; in the full-screen UI Ctrl-T steps through the levels and the status bar shows `think high`. Leader `e` opens the level list. A level the model does not have is ignored (`--effort` warns about it), so you can switch models freely. Defaults come from the config:
 
 ```jsonc
 { "effort": "medium",                                   // for every session
@@ -121,7 +121,7 @@ Models that can think more or less offer *levels*: `/effort` shows the ones the 
       "request":  { "headers": { "x-team": "me" } },    // sent with every request to this model
       "variants": { "deep": { "body": { "reasoning": { "effort": "high" } } } } } } } } }  // a level of your own
 ```
-Anthropic's current models take `low` to `max` (and `none` where thinking can be switched off); OpenAI's reasoning models `minimal` to `high`; Gemini a budget. Reasoning is shown in the transcript as one summary line (Ctrl-O for the full text; a turn that ends without an answer shows its last reasoning in full). More about how each provider is asked: `docs/07`.
+Anthropic's current models take `low` to `max` (and `none` where thinking can be switched off); OpenAI's depend on the model (`minimal` to `high` for gpt-5, `none` to `xhigh` for gpt-5.2 and later, `max` too on the Responses protocol from gpt-5.6); Gemini a budget. Reasoning is shown in the transcript as one summary line (Ctrl-O for the full text; a turn that ends without an answer shows its last reasoning in full). More about how each provider is asked: `docs/07`.
 
 ## Web search
 
