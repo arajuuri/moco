@@ -98,7 +98,8 @@ pub struct ProviderInfo {
 pub enum Protocol {
     Anthropic,
     OpenAiChat,
-    /// OpenAI Responses API. Experimental (not verified against the live service); opt in with `protocol: "openai-responses"`.
+    /// OpenAI Responses API. The default for the built-in `openai` provider (newer OpenAI models take tools with
+    /// reasoning only there, #185); other servers opt in with `protocol: "openai-responses"`.
     OpenAiResponses,
     /// Google Gemini API. Verified live with Gemini 3.x and 4 models (2026-11-13).
     Gemini,
@@ -107,7 +108,9 @@ pub enum Protocol {
 impl Protocol {
     /// Written from documentation and tested against local servers only.
     pub fn experimental(self) -> bool {
-        matches!(self, Protocol::OpenAiResponses)
+        // None at the moment: OpenAI Responses (#185) and Gemini (#181) are verified live. Kept for the next new adapter.
+        let _ = self;
+        false
     }
 }
 
@@ -131,6 +134,9 @@ impl ProviderInfo {
         match self.npm.as_deref()? {
             "@ai-sdk/anthropic" => Some(Protocol::Anthropic),
             "@ai-sdk/google" => Some(Protocol::Gemini),
+            // OpenAI's own API only: GPT-6-era models refuse function tools with reasoning on /chat/completions and
+            // codex models are not served there at all (#185). Other `@ai-sdk/openai` providers stay on Chat.
+            "@ai-sdk/openai" if self.id == "openai" => Some(Protocol::OpenAiResponses),
             "@ai-sdk/openai-compatible" | "@ai-sdk/openai" | "@openrouter/ai-sdk-provider" | "@ai-sdk/groq" | "@ai-sdk/xai" | "@ai-sdk/mistral"
             | "@ai-sdk/cerebras" | "@ai-sdk/togetherai" | "@ai-sdk/deepinfra" => Some(Protocol::OpenAiChat),
             _ => None,
@@ -367,7 +373,7 @@ mod tests {
         assert_eq!((m.limit.context, m.limit.output), (1_000_000, 128_000));
         assert_eq!(m.cost.as_ref().unwrap().input, 2.0);
         assert_eq!(c.providers["anthropic"].protocol(), Some(Protocol::Anthropic));
-        assert_eq!(c.providers["openai"].protocol(), Some(Protocol::OpenAiChat));
+        assert_eq!(c.providers["openai"].protocol(), Some(Protocol::OpenAiResponses));
         assert_eq!(c.providers["openai"].base_url().as_deref(), Some("https://api.openai.com/v1"));
         assert_eq!(c.providers["deepseek"].base_url().as_deref(), Some("https://api.deepseek.com"));
         assert_eq!(c.providers["fireworks-ai"].base_url().as_deref(), Some("https://api.fireworks.ai/inference/v1"), "trailing slash trimmed");
@@ -384,18 +390,32 @@ mod tests {
     #[test]
     fn protocol_selection_defaults_and_opt_ins() {
         let mut c = Catalog::embedded();
-        assert_eq!(c.providers["openai"].protocol(), Some(Protocol::OpenAiChat), "OpenAI stays on Chat Completions unless you opt in");
+        assert_eq!(c.providers["openai"].protocol(), Some(Protocol::OpenAiResponses), "OpenAI's own API uses Responses by default (#185)");
+        // Only the provider id `openai`: anything else built on the OpenAI package or a compatible server stays on Chat.
+        let openai_like = |id: &str, npm: &str| ProviderInfo { id: id.into(), npm: Some(npm.into()), ..Default::default() }.protocol();
+        assert_eq!(openai_like("my-openai-proxy", "@ai-sdk/openai"), Some(Protocol::OpenAiChat));
+        assert_eq!(openai_like("openai", "@ai-sdk/openai-compatible"), Some(Protocol::OpenAiChat));
+        for (id, p) in &c.providers {
+            if id != "openai" && p.protocol() == Some(Protocol::OpenAiResponses) {
+                panic!("{id} switched to Responses");
+            }
+        }
         let google = &c.providers["google"];
         assert_eq!((google.protocol(), google.base_url().as_deref()), (Some(Protocol::Gemini), Some("https://generativelanguage.googleapis.com/v1beta")));
         assert!(google.env.iter().any(|e| e == "GEMINI_API_KEY"));
-        assert!(!Protocol::Gemini.experimental() && Protocol::OpenAiResponses.experimental() && !Protocol::OpenAiChat.experimental() && !Protocol::Anthropic.experimental());
+        assert!(!Protocol::Gemini.experimental() && !Protocol::OpenAiResponses.experimental() && !Protocol::OpenAiChat.experimental() && !Protocol::Anthropic.experimental());
         let cfg = |proto: &str| BTreeMap::from([("openai".to_string(), crate::config::ProviderConfig { protocol: Some(proto.into()), ..Default::default() })]);
         c.apply_config(&cfg("openai-responses"));
         assert_eq!(c.providers["openai"].protocol(), Some(Protocol::OpenAiResponses));
         c.apply_config(&cfg("gemini"));
         assert_eq!(c.providers["openai"].protocol(), Some(Protocol::Gemini));
         c.apply_config(&cfg("openai-chat"));
-        assert_eq!(c.providers["openai"].protocol(), Some(Protocol::OpenAiChat));
+        assert_eq!(c.providers["openai"].protocol(), Some(Protocol::OpenAiChat), "config can opt back into Chat Completions");
+        // A config entry for `openai` without `protocol` (a proxy, extra headers) keeps the default.
+        let mut c = Catalog::embedded();
+        let proxy = crate::config::ProviderConfig { base_url: Some("https://proxy.example/v1".into()), ..Default::default() };
+        c.apply_config(&BTreeMap::from([("openai".to_string(), proxy)]));
+        assert_eq!(c.providers["openai"].protocol(), Some(Protocol::OpenAiResponses));
     }
 
     #[test]

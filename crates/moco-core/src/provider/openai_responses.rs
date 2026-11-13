@@ -1,5 +1,6 @@
-//! OpenAI Responses API (`POST {base}/responses`, SSE). EXPERIMENTAL: written from the public API documentation and
-//! tested against a local server replaying the documented stream shapes; not verified against the live service.
+//! OpenAI Responses API (`POST {base}/responses`, SSE), the default protocol for the built-in `openai` provider (#185).
+//! Verified against api.openai.com (#182: plain replies, tool turns with reasoning replay, effort levels, `--continue`);
+//! `docs/07-providers.md` lists what has not been tried live yet.
 //!
 //! Stateless (`store: false`): the conversation is sent in full every time. Reasoning items are requested with
 //! `include: ["reasoning.encrypted_content"]`, kept as `Block::Native` and replayed, together with the function-call
@@ -346,6 +347,58 @@ mod tests {
         assert_eq!(i[2], json!({"type":"function_call","call_id":"call_1","name":"read","arguments":"{\"path\":\"a.rs\"}"}));
         r.tools_disabled = true;
         assert_eq!(build_body(&r)["tool_choice"], "none");
+    }
+
+    /// Sessions started before Responses became OpenAI's default (#185) hold Chat Completions history (`call_` ids, no
+    /// replay data), and a session may have run on Anthropic first (`toolu_` ids, thinking blocks). Both must continue:
+    /// every call becomes a plain `function_call` item (no `fc_` id, which the API would check) followed by its output.
+    #[test]
+    fn history_from_chat_completions_and_anthropic_continues_on_responses() {
+        let thinking = Block::Native { provider: "anthropic".into(), data: json!({"type":"thinking","thinking":"hm","signature":"sig","model":"claude-x"}) };
+        let call = |id: &str, path: &str| Block::ToolUse { id: id.into(), name: "read".into(), input: json!({"path": path}) };
+        let result = |id: &str| Block::ToolResult { id: id.into(), content: format!("out {id}"), is_error: false };
+        let user = |content: Vec<Block>| ChatMessage { role: Role::User, content };
+        let assistant = |content: Vec<Block>| ChatMessage { role: Role::Assistant, content };
+        let r = Request {
+            model: "gpt-6-luna".into(),
+            messages: vec![
+                user(vec![Block::Text("read both".into())]),
+                // Anthropic: thinking, text and two parallel calls.
+                assistant(vec![thinking.clone(), Block::Text("Reading.".into()), call("toolu_01A", "a.rs"), call("toolu_01B", "b.rs")]),
+                user(vec![result("toolu_01A"), result("toolu_01B")]),
+                // A message that was only Anthropic replay data plus text.
+                assistant(vec![thinking, Block::Text("Both read.".into())]),
+                user(vec![Block::Text("again".into())]),
+                // Chat Completions: a call with no text, then the answer.
+                assistant(vec![call("call_abc123", "a.rs")]),
+                user(vec![result("call_abc123")]),
+                assistant(vec![Block::Text("Same.".into())]),
+                user(vec![Block::Text("next".into())]),
+            ],
+            tools: vec![ToolDef { name: "read".into(), description: "d".into(), schema: json!({"type":"object"}) }],
+            max_tokens: 100,
+            ..Default::default()
+        };
+        let b = build_body(&r);
+        let fc = |id: &str, path: &str| json!({"type":"function_call","call_id":id,"name":"read","arguments":json!({"path": path}).to_string()});
+        let out = |id: &str| json!({"type":"function_call_output","call_id":id,"output":format!("out {id}")});
+        let said = |role: &str, kind: &str, t: &str| json!({"role":role,"content":[{"type":kind,"text":t}]});
+        let expected = vec![
+            said("user", "input_text", "read both"),
+            said("assistant", "output_text", "Reading."),
+            fc("toolu_01A", "a.rs"),
+            fc("toolu_01B", "b.rs"),
+            out("toolu_01A"),
+            out("toolu_01B"),
+            said("assistant", "output_text", "Both read."),
+            said("user", "input_text", "again"),
+            fc("call_abc123", "a.rs"),
+            out("call_abc123"),
+            said("assistant", "output_text", "Same."),
+            said("user", "input_text", "next"),
+        ];
+        assert_eq!(b["input"], json!(expected));
+        assert!(!b.to_string().contains("signature"), "no Anthropic replay data leaks into the request");
     }
 
     fn sse_body(chunks: &[&str]) -> String {
