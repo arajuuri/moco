@@ -66,9 +66,8 @@ The status line shows the session's permission mode (`manual`, or `auto` in a wa
 
 ## Other providers and protocols
 
-Anthropic and OpenAI-compatible Chat Completions servers are the well-trodden paths.
+Anthropic and OpenAI-compatible Chat Completions servers are the well-trodden paths. **OpenAI** itself (`moco auth openai` or `OPENAI_API_KEY`) uses the OpenAI Responses protocol: newer models (GPT-6 era, codex) take tools only there, and reasoning models keep their reasoning between turns. To use Chat Completions for it instead, set `{ "providers": { "openai": { "protocol": "openai-chat" } } }` (newer models such as gpt-6-luna and gpt-5.3-codex then fail with tools). Another server that implements the Responses endpoint can opt in with `"protocol": "openai-responses"`.
 - **Google Gemini**: `moco auth google` (or `GEMINI_API_KEY`), then `--model google/gemini-3.8-flash`. Verified live with Gemini 3.x and 4 models. Google no longer serves the 2.5 models to new API keys.
-- **OpenAI Responses** (**experimental**: written from the documentation, not yet tried against the live service, labelled `[experimental protocol]` in `moco models`): opt in with `{ "providers": { "openai": { "protocol": "openai-responses" } } }`. Reasoning models then keep their reasoning between turns.
 If one misbehaves, `/model` back to another provider and report the error text.
 
 ## Skills, commands and mentions
