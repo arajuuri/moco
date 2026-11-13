@@ -109,12 +109,30 @@ fn classify(status: u16, code: &str, msg: String, retry_after_ms: Option<u64>) -
     }
     match status {
         401 | 403 => ProviderError::Auth(msg),
-        // Out of credit is not transient.
-        429 if code == "insufficient_quota" || lower.contains("insufficient_quota") || lower.contains("exceeded your current quota") => ProviderError::InvalidRequest(msg),
+        // Out of credit is not transient, whether it comes as a 429 or inside the stream (status 0).
+        _ if out_of_credit(code, &msg) => no_credit(msg),
         429 => ProviderError::RateLimit { retry_after_ms, message: msg },
         408 | 500..=599 => ProviderError::Internal { retry_after_ms, message: msg },
         _ if code == "content_filter" => ProviderError::ContentFilter(msg),
         _ => ProviderError::InvalidRequest(msg),
+    }
+}
+
+/// Whether an error means the account has run out of credit or quota, which waiting will not fix. OpenAI sends these
+/// as 429 like a rate limit. Genuine rate-limit messages also mention billing ("increase your rate limit by adding a
+/// payment method ... /account/billing"), so "billing" and "payment method" alone are not matched.
+pub(super) fn out_of_credit(code: &str, msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    matches!(code, "insufficient_quota" | "billing_hard_limit_reached" | "billing_not_active")
+        || ["insufficient_quota", "exceeded your current quota", "no credits remaining", "add credits"].iter().any(|p| lower.contains(p))
+}
+
+/// The error for an out-of-credit account: not retried, and pointing at billing when the provider's message doesn't.
+pub(super) fn no_credit(msg: String) -> ProviderError {
+    if msg.to_lowercase().contains("billing") {
+        ProviderError::InvalidRequest(msg)
+    } else {
+        ProviderError::InvalidRequest(format!("{msg} (the account is out of credit or quota; check its billing with the provider)"))
     }
 }
 
@@ -338,6 +356,8 @@ mod tests {
     fn errors_inside_the_stream() {
         let e = parse(&[r#"{"error":{"message":"The server had an error","type":"server_error"}}"#]).unwrap_err();
         assert!(e.retryable() || matches!(e, ProviderError::InvalidRequest(_)));
+        let e = parse(&[r#"{"error":{"message":"You have no credits remaining. Add credits to continue using the API.","code":"insufficient_quota"}}"#]).unwrap_err();
+        assert!(matches!(&e, ProviderError::InvalidRequest(m) if m.contains("billing")), "{e:?}");
         assert!(matches!(parse(&[r#"{"choices":[{"delta":{},"finish_reason":"content_filter"}]}"#]), Err(ProviderError::ContentFilter(_))));
         let bad = parse(&[r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c","function":{"name":"read","arguments":"{\"a\":"}}]},"finish_reason":"tool_calls"}]}"#]).unwrap();
         assert!(bad.iter().any(|e| matches!(e, Event::BadToolCall { id, .. } if id == "c")), "invalid arguments are returned to the model: {bad:?}");
@@ -349,6 +369,21 @@ mod tests {
         assert!(matches!(classify_http(401, &b("invalid_api_key", "bad key"), None), ProviderError::Auth(_)));
         assert!(matches!(classify_http(429, &b("rate_limit_exceeded", "slow down"), Some(3)), ProviderError::RateLimit { retry_after_ms: Some(3000), .. }));
         assert!(matches!(classify_http(429, &b("insufficient_quota", "You exceeded your current quota"), None), ProviderError::InvalidRequest(_)), "out of credit is not retried");
+        // Issue #187: the newer out-of-credit message, with or without a code.
+        let no_credits = "You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.";
+        for code in ["", "insufficient_quota", "rate_limit_exceeded"] {
+            let e = classify_http(429, &b(code, no_credits), None);
+            assert!(matches!(&e, ProviderError::InvalidRequest(m) if m == no_credits), "code {code:?}: {e:?}");
+        }
+        let e = classify_http(429, &b("insufficient_quota", "out of credit"), None);
+        assert!(matches!(&e, ProviderError::InvalidRequest(m) if m.contains("billing")), "a hint when the message has none: {e:?}");
+        // A genuine RPM limit mentions billing and a payment method too, and is still retried.
+        let rpm = "Rate limit reached for gpt-6.1-terra in organization org-abc on requests per min (RPM): Limit 3, Used 3, Requested 1. Please try again in 20s. Visit https://platform.openai.com/account/rate-limits to learn more. You can increase your rate limit by adding a payment method to your account at https://platform.openai.com/account/billing.";
+        assert!(matches!(classify_http(429, &b("rate_limit_exceeded", rpm), Some(20)), ProviderError::RateLimit { retry_after_ms: Some(20000), .. }));
+        assert!(matches!(classify_http(429, &b("", rpm), None), ProviderError::RateLimit { .. }));
+        // OpenAI-compatible providers (OpenRouter etc.) keep their classification.
+        assert!(matches!(classify_http(429, r#"{"error":{"message":"Rate limit exceeded: free-models-per-min","code":429}}"#, None), ProviderError::RateLimit { .. }));
+        assert!(matches!(classify_http(402, r#"{"error":{"message":"Insufficient credits. Add more using https://openrouter.ai/settings/credits","code":402}}"#, None), ProviderError::InvalidRequest(_)));
         assert!(matches!(classify_http(503, "upstream down", None), ProviderError::Internal { .. }));
         assert!(matches!(classify_http(400, &b("context_length_exceeded", "This model's maximum context length is 128000 tokens"), None), ProviderError::ContextOverflow(_)));
         assert!(matches!(classify_http(400, &b("", "bad param"), None), ProviderError::InvalidRequest(_)));

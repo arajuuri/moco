@@ -111,10 +111,12 @@ fn classify_event(code: &str, message: &str) -> ProviderError {
     if code == "context_length_exceeded" || lower.contains("context window") || lower.contains("maximum context length") {
         return ProviderError::ContextOverflow(msg);
     }
+    if super::openai_chat::out_of_credit(code, &msg) {
+        return super::openai_chat::no_credit(msg);
+    }
     match code {
         "invalid_api_key" | "authentication_error" | "permission_denied" => ProviderError::Auth(msg),
         "rate_limit_exceeded" => ProviderError::RateLimit { retry_after_ms: None, message: msg },
-        "insufficient_quota" => ProviderError::InvalidRequest(msg),
         "server_error" | "overloaded" | "internal_error" | "service_unavailable" | "timeout" => ProviderError::Internal { retry_after_ms: None, message: msg },
         _ => ProviderError::InvalidRequest(msg),
     }
@@ -294,6 +296,16 @@ mod tests {
         assert!(matches!(end(r#"{"type":"response.failed","response":{"error":{"code":"server_error","message":"oops"}}}"#), Err(ProviderError::Internal { .. })));
         assert!(matches!(end(r#"{"type":"error","code":"invalid_api_key","message":"bad key"}"#), Err(ProviderError::Auth(_))));
         assert!(matches!(end(r#"{"type":"error","code":"insufficient_quota","message":"out of credit"}"#), Err(ProviderError::InvalidRequest(_))), "not retried");
+        // Issue #187: the newer out-of-credit message is not retried whatever code it carries.
+        let no_credits = "You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.";
+        for code in ["", "insufficient_quota", "rate_limit_exceeded"] {
+            let failed = format!(r#"{{"type":"response.failed","response":{{"error":{{"code":"{code}","message":"{no_credits}"}}}}}}"#);
+            assert!(matches!(end(&failed), Err(ProviderError::InvalidRequest(m)) if m == no_credits), "response.failed code {code:?}");
+            let error = format!(r#"{{"type":"error","code":"{code}","message":"{no_credits}"}}"#);
+            assert!(matches!(end(&error), Err(ProviderError::InvalidRequest(_))), "error code {code:?}");
+        }
+        let rpm = "Rate limit reached for gpt-6.1-terra on requests per min (RPM). You can increase your rate limit by adding a payment method to your account at https://platform.openai.com/account/billing.";
+        assert!(matches!(end(&format!(r#"{{"type":"error","code":"rate_limit_exceeded","message":"{rpm}"}}"#)), Err(ProviderError::RateLimit { .. })), "a real rate limit is still retried");
         let bad = end(r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"c","name":"read","arguments":"{\"a\":"}}"#).unwrap();
         assert!(matches!(bad.as_slice(), [Event::BadToolCall { id, name, raw, .. }] if id == "c" && name == "read" && raw == "{\"a\":"), "{bad:?}");
         assert_eq!(end(r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"c","name":"glob","arguments":""}}"#).unwrap()[1], Event::ToolCall { id: "c".into(), name: "glob".into(), input: json!({}) });
