@@ -100,14 +100,14 @@ pub enum Protocol {
     OpenAiChat,
     /// OpenAI Responses API. Experimental (not verified against the live service); opt in with `protocol: "openai-responses"`.
     OpenAiResponses,
-    /// Google Gemini API. Experimental (not verified against the live service).
+    /// Google Gemini API. Verified live with Gemini 3.x and 4 models (2026-11-13).
     Gemini,
 }
 
 impl Protocol {
     /// Written from documentation and tested against local servers only.
     pub fn experimental(self) -> bool {
-        matches!(self, Protocol::OpenAiResponses | Protocol::Gemini)
+        matches!(self, Protocol::OpenAiResponses)
     }
 }
 
@@ -388,7 +388,7 @@ mod tests {
         let google = &c.providers["google"];
         assert_eq!((google.protocol(), google.base_url().as_deref()), (Some(Protocol::Gemini), Some("https://generativelanguage.googleapis.com/v1beta")));
         assert!(google.env.iter().any(|e| e == "GEMINI_API_KEY"));
-        assert!(Protocol::Gemini.experimental() && Protocol::OpenAiResponses.experimental() && !Protocol::OpenAiChat.experimental() && !Protocol::Anthropic.experimental());
+        assert!(!Protocol::Gemini.experimental() && Protocol::OpenAiResponses.experimental() && !Protocol::OpenAiChat.experimental() && !Protocol::Anthropic.experimental());
         let cfg = |proto: &str| BTreeMap::from([("openai".to_string(), crate::config::ProviderConfig { protocol: Some(proto.into()), ..Default::default() })]);
         c.apply_config(&cfg("openai-responses"));
         assert_eq!(c.providers["openai"].protocol(), Some(Protocol::OpenAiResponses));
