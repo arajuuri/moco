@@ -24,7 +24,7 @@ Remaining ideas, not planned: syntax highlighting of code, mouse support, `/mcp 
 
 - Phase 3 is committed through slice G (MCP over Streamable HTTP with OAuth, `553deef`); the plan and spike are `14ef6ee`. Working tree clean. 300 unit + 2 protocol tests pass on Linux and on the Mojave machine.
 - Next step: slice 1 (skeleton) below. Not started; the user had not yet said "go".
-- Open items: the manual Terminal.app/iTerm2 look-and-feel pass is still to do; OpenAI Responses, Gemini and MCP HTTP/OAuth remain verified only against local fakes.
+- Open items: the manual Terminal.app/iTerm2 look-and-feel pass is still to do; OpenAI Responses and MCP HTTP/OAuth remain verified only against local fakes (Gemini was verified live on 2026-11-13).
 - Mac scratch: `~/moco-target` and `~/spike-tui-target` build dirs (fine to keep); temp driver files were removed.
 
 ## Feasibility result (spike-tui)

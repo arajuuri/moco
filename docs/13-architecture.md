@@ -184,8 +184,8 @@ share it on purpose. Session exports (`moco sessions export -o`, `/export`) are 
 - Provider-private data (OpenAI reasoning items, Gemini thought signatures, Anthropic thinking blocks) travels as
   `Block::Native` / `Event::Native`, is stored with the assistant message, and only its own adapter replays it.
 
-One adapter per wire protocol: Anthropic Messages, OpenAI-compatible Chat Completions, OpenAI Responses and Gemini. The last
-two are experimental and have never run against the live services. `provider/registry.rs` builds a client for every catalog
+One adapter per wire protocol: Anthropic Messages, OpenAI-compatible Chat Completions, OpenAI Responses and Gemini. OpenAI
+Responses is experimental and has never run against the live service; Gemini has been verified live. `provider/registry.rs` builds a client for every catalog
 provider that has a key, wrapped in `Logged`. The catalog (`catalog.rs`) comes from models.dev and gives context limits,
 prices and capabilities; config can add or override providers. A downloaded catalog cannot change the base URL, key
 variables or protocol of a provider in the embedded snapshot (`Catalog::pin_builtins`). The shared HTTP agent

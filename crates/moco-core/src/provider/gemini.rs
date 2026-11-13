@@ -1,6 +1,6 @@
-//! Google Gemini API (`POST {base}/models/{model}:streamGenerateContent?alt=sse`). EXPERIMENTAL: written from the
-//! public API documentation and tested against a local server replaying the documented stream shapes; not verified
-//! against the live service.
+//! Google Gemini API (`POST {base}/models/{model}:streamGenerateContent?alt=sse`). Written from the public API
+//! documentation and verified live on 2026-11-13 with gemini-3.5-flash, gemini-3.8-flash and gemini-4-hydrogen. The
+//! 2.x thinking-budget path is untested live: Google no longer serves 2.5 models to new API keys.
 //!
 //! Gemini identifies a function result by the function's *name* and gives calls no ids, so moco makes up ids for calls
 //! and maps them back to names when building a request. Thought signatures that come with function calls are kept as
