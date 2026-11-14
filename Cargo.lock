@@ -673,7 +673,7 @@ dependencies = [
 
 [[package]]
 name = "moco"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "crossterm",
  "ignore",
@@ -687,7 +687,7 @@ dependencies = [
 
 [[package]]
 name = "moco-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "base64",
  "fastrand",

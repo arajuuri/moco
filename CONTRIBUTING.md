@@ -115,8 +115,12 @@ To strict semver tools `0.1.0-12-g...` reads as a pre-release of 0.1.0; it is on
 
 - Release when a build is installed on the test machines for ongoing use, or when a batch of merged issues changes
   how moco behaves for users (a new feature, a changed key, a changed default).
-- Bump the minor number (`0.1.0` -> `0.2.0`) for features and user-visible changes, the patch number
-  (`0.2.0` -> `0.2.1`) for releases that only fix things. Below 1.0 there is no compatibility promise.
+- Bump the minor number (`0.1.0` -> `0.2.0`) for major new features. Bump the patch number (`0.2.0` -> `0.2.1`)
+  for everything else: fixes, smaller features, changed keys or defaults. A patch release can change what users
+  see; it is not fix-only. Below 1.0 there is no compatibility promise.
+- A fourth number for releases that only fix things (`0.2.1.1`) may be added later. It is not supported yet:
+  `Cargo.toml` takes a three-part semver number, and the release workflow and `git describe` matching expect
+  `vX.Y.Z` tags, so it needs changes there first.
 
 **How to release:**
 
