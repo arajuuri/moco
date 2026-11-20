@@ -235,7 +235,7 @@ impl EngineConfig {
         }
     }
 
-    /// Keep the catalog's provider key variables out of formatters and checks, as `shell` does (#122).
+    /// Keep the catalog's provider key variables out of formatters and checks, as `shell` does (archive#122).
     fn hiding_provider_keys(mut self) -> Self {
         let keys = self.catalog.key_env_vars();
         self.formatters = self.formatters.with_provider_keys(keys.clone());
@@ -416,7 +416,7 @@ impl Engine {
         o
     }
 
-    /// Output tokens to ask `model` for (#148). Thinking counts against this budget too, so it follows the model's own
+    /// Output tokens to ask `model` for (archive#148). Thinking counts against this budget too, so it follows the model's own
     /// output limit from the catalog (capped at the configured `max_tokens`, if any); a fixed 16k used to leave an
     /// always-thinking model at high effort nothing for its answer. Only the tokens written are billed, so a large budget
     /// costs nothing by itself.
@@ -767,7 +767,7 @@ impl Engine {
                 }
             };
             // A subagent works under its parent's permission mode as it is now, also when an earlier subagent session is
-            // continued: one created in auto mode must not keep auto rules after the user switched to manual (#166).
+            // continued: one created in auto mode must not keep auto rules after the user switched to manual (archive#166).
             st.set_permission_mode(&child.id, Some(eng.permission_mode_of(parent).name())).map_err(store_err)?;
             // A model chosen for this conversation carries over unless the call names one.
             if let Some(m) = req.model.as_ref().or(parent.model.as_ref()) { st.set_model(&child.id, Some(m)).map_err(store_err)? }
@@ -1070,7 +1070,7 @@ mod tests {
         assert_eq!(ui.log(), ["start:read", "done:read:true", "usage", "text:it says hi", "usage"]);
     }
 
-    /// Issue #6 through the whole engine: a model that sends one `edit` per hunk for the same file in one step gets
+    /// Issue archive#6 through the whole engine: a model that sends one `edit` per hunk for the same file in one step gets
     /// every hunk applied, however the threads are scheduled.
     #[test]
     fn parallel_edits_to_one_file_in_one_step_all_land() {
@@ -1089,7 +1089,7 @@ mod tests {
         assert!(results.iter().all(|b| matches!(b, Block::ToolResult { is_error: false, .. })), "{results:?}");
     }
 
-    /// Issue #26: a step with several edits runs each matching check once, afterwards, and the model sees the
+    /// Issue archive#26: a step with several edits runs each matching check once, afterwards, and the model sees the
     /// diagnostics in the last matching tool's result.
     fn two_edits_and_a_note(f: &Fixture) -> Vec<Scripted> {
         f.file("a.txt", "one\ntwo\n");
@@ -1332,7 +1332,7 @@ mod tests {
 
     #[test]
     fn a_heredoc_body_needs_no_permission_of_its_own() {
-        // Issue #84: each body line was its own resource, so a saved `cat *` still asked, and "always" saved junk
+        // Issue archive#84: each body line was its own resource, so a saved `cat *` still asked, and "always" saved junk
         // rules such as `tell *` for the body lines.
         let cmd = "cat <<'EOF'\ntell application \"Chess\"\n  don't click here\nend tell\nEOF";
         let script = vec![tool_call("t1", "shell", json!({"command": cmd})), tool_call("t2", "shell", json!({"command": "printf x | cat <<'EOF'\nset g to 1\nEOF"})), text("done")];
@@ -1926,7 +1926,7 @@ mod tests {
 
     #[test]
     fn manual_compaction_reports_the_new_context_fill() {
-        // #151: without a step afterwards, nothing else would tell the UI that the context shrank.
+        // archive#151: without a step afterwards, nothing else would tell the UI that the context shrank.
         let f = fixture_cfg(vec![text(SUMMARY)], |c| small_window(c, 3000, 1000));
         seed(&f, 4);
         let ui = TestUi::default();
@@ -2085,7 +2085,7 @@ mod tests {
         assert_eq!(f.run(&TestUi::replying(vec![Reply::Reject(None)])), RunOutcome::Declined);
     }
 
-    /// `decide_now` (for `@` mentions, #124): the session's mode and agent, its config rules, then the saved ones.
+    /// `decide_now` (for `@` mentions, archive#124): the session's mode and agent, its config rules, then the saved ones.
     #[test]
     fn decide_now_follows_the_session_rules_without_asking() {
         let cfg: config::Config = serde_json::from_value(json!({"permissions":[{"action":"read","resource":"*secret*","effect":"deny"}]})).unwrap();
@@ -2329,7 +2329,7 @@ mod tests {
         for part in ["decision=allow", "model_verdict=allow", "risk=read-only", "model=anthropic/claude-haiku-5-5", " ms=", " input=10 output=5 ", "cost=", "reason=because", "command=echo hi"] {
             assert!(lines[0].contains(part), "{part} missing from {}", lines[0]);
         }
-        // Issue #71: `tokens_in=` matched the secret-assignment rule, so the counts were logged as `[redacted]`.
+        // Issue archive#71: `tokens_in=` matched the secret-assignment rule, so the counts were logged as `[redacted]`.
         assert!(!lines[0].contains("[redacted]"), "nothing in a classifier line about `echo hi` is secret: {}", lines[0]);
         assert!(lines[1].contains("decision=allow cached=true") && lines[1].contains("command=echo hi"), "{}", lines[1]);
         assert!(!classifier_log(sid, "DEBUG").is_empty(), "the raw reply is kept at debug: {:?}", crate::log::capture::global_lines(&format!("session={sid}")));
@@ -2506,7 +2506,7 @@ mod tests {
         m.content.iter().filter_map(|b| if let Block::Text(t) = b { Some(t.as_str()) } else { None }).collect::<Vec<_>>().join("\n")
     }
 
-    /// #148: an answer cut off at the output token limit is continued, with the partial text kept in the conversation.
+    /// archive#148: an answer cut off at the output token limit is continued, with the partial text kept in the conversation.
     #[test]
     fn an_answer_cut_off_at_the_output_limit_is_continued() {
         let f = fixture(vec![cut_off(vec![Event::TextDelta("part one".into())]), text("part two")]);
@@ -2529,7 +2529,7 @@ mod tests {
         Scripted::Events(events)
     }
 
-    /// #153: a refusal used to end the turn silently, like a finished answer.
+    /// archive#153: a refusal used to end the turn silently, like a finished answer.
     #[test]
     fn a_refusal_ends_the_turn_visibly_and_its_partial_text_is_not_replayed() {
         let f = fixture(vec![refused(vec![Event::TextDelta("| 8 | 28 · ".into())], "cyber"), text("fresh answer")]);
@@ -2550,7 +2550,7 @@ mod tests {
         assert!(!reqs[1].messages.iter().any(|m| m.content.iter().any(|b| matches!(b, Block::Text(t) if t.contains("28 ·")))), "the model does not see the refused text: {:?}", reqs[1].messages);
     }
 
-    /// The reported case: the refusal came on a #148 continuation. It must stop the continuations.
+    /// The reported case: the refusal came on a archive#148 continuation. It must stop the continuations.
     #[test]
     fn a_refusal_during_a_continuation_stops_it() {
         let f = fixture(vec![cut_off(vec![Event::TextDelta("part one".into())]), refused(vec![Event::TextDelta("part two".into())], ""), text("never asked")]);
@@ -2667,7 +2667,7 @@ mod tests {
         assert_eq!(child.permission_mode.as_deref(), Some("auto"));
     }
 
-    /// #166: continuing an earlier subagent session used to keep the mode it was created with.
+    /// archive#166: continuing an earlier subagent session used to keep the mode it was created with.
     #[test]
     fn a_continued_subagent_follows_its_parents_current_mode() {
         let f = fixture(vec![sub("t1", "general", "do it"), text("child"), text("parent done")]);

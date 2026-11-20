@@ -1,4 +1,4 @@
-//! `moco --version` says which build this is (issue #94): the version, then the commit and what it was built for.
+//! `moco --version` says which build this is (issue archive#94): the version, then the commit and what it was built for.
 use std::process::Command;
 
 #[test]

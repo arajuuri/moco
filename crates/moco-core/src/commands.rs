@@ -118,7 +118,7 @@ pub fn discover(app_dir: &Path, cwd: &Path, configured: &BTreeMap<String, Comman
     found.into_values().collect()
 }
 
-/// Warnings for built-in commands (`/review`, `/init`) that a project's command file or config replaced (#168): the
+/// Warnings for built-in commands (`/review`, `/init`) that a project's command file or config replaced (archive#168): the
 /// replacement runs whenever the user types the familiar name, so it should not go unnoticed. The user's own
 /// replacements are not mentioned.
 pub fn project_overrides(found: &[Command], app_dir: &Path, origins: &BTreeMap<String, std::path::PathBuf>) -> Vec<String> {
@@ -211,7 +211,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(r);
     }
 
-    /// #168: a project that replaces /review or /init is named; the user's own replacement is not.
+    /// archive#168: a project that replaces /review or /init is named; the user's own replacement is not.
     #[test]
     fn a_project_replacing_a_built_in_command_is_named() {
         let r = tree();
@@ -230,7 +230,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(r);
     }
 
-    /// Whose words a command's `@` mentions are (#124): the user's own commands and the built-ins, not a project's.
+    /// Whose words a command's `@` mentions are (archive#124): the user's own commands and the built-ins, not a project's.
     #[test]
     fn only_the_users_own_commands_count_as_typed_by_the_user() {
         use crate::mentions::Origin;

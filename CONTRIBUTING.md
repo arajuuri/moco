@@ -5,6 +5,11 @@ How moco's issues are classified, prioritized, sized and tracked. Work lives in
 [Moco](https://github.com/orgs/arajuuri/projects/1). Code conventions and commands are in
 [AGENTS.md](AGENTS.md).
 
+**Issue references in the code and docs.** moco's tracker started over when the repository was made
+public, and the earlier history lives in a private archive. A reference written `archive#113` is an
+issue or pull request from that archive: it no longer links anywhere, but the comment around it says
+what it was about. A plain `#12` is an issue in this repository.
+
 **Principle: use GitHub's structured fields, not labels or title prefixes.** Type, priority,
 status, size and estimate each have a field. Don't encode them in labels or in the title.
 
@@ -14,10 +19,10 @@ Set the issue **Type** (an organization-level field). Every issue has exactly on
 
 | Type | Use for | Examples |
 |---|---|---|
-| **Bug** | Existing code does the wrong thing: wrong results, crashes, hangs, data loss, security holes, silently swallowed errors. | #6 lost updates, #9 panic leaves session claimed, #1 credential redirect |
-| **Feature** | A new capability that did not exist. | #25 spending limits, #26 check hooks, #28 shell classifier |
-| **Enhancement** | An improvement to something that already works: performance, ergonomics, robustness that is not a defect. | #14 snapshot cost, #22 edit-tool robustness, #23 `sessions export` |
-| **Task** | Work with no user-visible behavior change: cleanup, refactor, tooling, CI. | #20 duplicated transport code, #21 CI, #30 doc comment cleanup |
+| **Bug** | Existing code does the wrong thing: wrong results, crashes, hangs, data loss, security holes, silently swallowed errors. | archive#6 lost updates, archive#9 panic leaves session claimed, archive#1 credential redirect |
+| **Feature** | A new capability that did not exist. | archive#25 spending limits, archive#26 check hooks, archive#28 shell classifier |
+| **Enhancement** | An improvement to something that already works: performance, ergonomics, robustness that is not a defect. | archive#14 snapshot cost, archive#22 edit-tool robustness, archive#23 `sessions export` |
+| **Task** | Work with no user-visible behavior change: cleanup, refactor, tooling, CI. | archive#20 duplicated transport code, archive#21 CI, archive#30 doc comment cleanup |
 
 Rules of thumb:
 
@@ -131,7 +136,7 @@ To strict semver tools `0.1.0-12-g...` reads as a pre-release of 0.1.0; it is on
    gh workflow run release.yml --ref main
    ```
    It tags the head of `main` `v0.2.0` (from the `Cargo.toml` number), builds the macOS binary at that tag (so it
-   reports exactly `0.2.0`) with the classic linker that Lion needs (#113), runs the 10.7 checks
+   reports exactly `0.2.0`) with the classic linker that Lion needs (archive#113), runs the 10.7 checks
    (`scripts/check-macos-binary.sh`), and only then a separate `publish` job, the only one with write access, pushes
    the tag and publishes a GitHub release with `moco-0.2.0-macos-x86_64.tar.gz` and its SHA-256. A failed run leaves no tag. If
    `v0.2.0` already tags another commit, the run stops: bump the version. Running it again on the tagged commit
@@ -168,9 +173,9 @@ and the tests needed:
 | XL | Too big. Split it before starting. | none yet |
 
 **Estimate** is a number of **hours of focused work, including tests and review**. Start from the
-table, then adjust per issue: concurrency work gets a little more for careful tests (#7, #8,
-#13 at 10), well-trodden fixes a little less (#1, #3, #17, #21 at 6), and an issue that begins
-with an investigation more (#22 at 24).
+table, then adjust per issue: concurrency work gets a little more for careful tests (archive#7, archive#8,
+archive#13 at 10), well-trodden fixes a little less (archive#1, archive#3, archive#17, archive#21 at 6), and an issue that begins
+with an investigation more (archive#22 at 24).
 
 - Estimates are guesses from reading the issue. For L items expect to be off by a factor of
   two.

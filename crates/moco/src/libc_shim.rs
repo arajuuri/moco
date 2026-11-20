@@ -1,5 +1,5 @@
 //! Stand-ins for the C library functions that Rust 1.78's std imports but macOS 10.7 (Lion) lacks: `getentropy` and
-//! `clock_gettime`, both 10.12+ (issue #100). Defining them in the binary makes the linker bind std's calls here instead
+//! `clock_gettime`, both 10.12+ (issue archive#100). Defining them in the binary makes the linker bind std's calls here instead
 //! of importing them from libSystem, so dyld on Lion finds nothing missing. System libraries are not affected: with
 //! two-level namespaces their own calls stay bound to libSystem.
 //!

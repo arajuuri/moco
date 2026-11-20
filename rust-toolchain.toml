@@ -1,6 +1,6 @@
 # moco supports macOS 10.7 (Lion) through 10.14. 1.78 is the newest Rust every build machine can run (rustup on Linux and
 # Mojave, MacPorts on Lion); its std needs getentropy/clock_gettime, which crates/moco/src/libc_shim.rs supplies for 10.7
-# (issue #100). Keep the version in .github/workflows/*.yml in sync.
+# (issue archive#100). Keep the version in .github/workflows/*.yml in sync.
 [toolchain]
 channel = "1.78.0"
 components = ["clippy"]

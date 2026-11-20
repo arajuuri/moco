@@ -1,4 +1,4 @@
-//! Check hooks (issue #26): after a step in which the model changed files, each configured check (a compiler, linter or
+//! Check hooks (issue archive#26): after a step in which the model changed files, each configured check (a compiler, linter or
 //! type-checker) that covers a changed file runs once, and what it reports goes back to the model in the same tool
 //! result. A check that times out or cannot start becomes a one-line note, never a tool failure.
 use crate::config::CheckConfig;

@@ -45,7 +45,7 @@ jobs:
   # and the dependencies, not the profile, so the release build (`scripts/install.sh`) is not compiled here.
   # It runs on pushes to `main` and on manual dispatch, not on every PR push.
   #
-  # The classic linker (`-ld_classic`) is needed for an LC_UNIXTHREAD entry point, as in release.yml (#113), and
+  # The classic linker (`-ld_classic`) is needed for an LC_UNIXTHREAD entry point, as in release.yml (archive#113), and
   # std is rebuilt for a Core 2 CPU without SSE4.1, also as in release.yml, so the SSE4 check passes.
   #
   # Disabled to avoid macOS runner costs: remove `false &&` to turn it on.
@@ -54,7 +54,7 @@ jobs:
     runs-on: macos-15-intel
     env:
       MACOSX_DEPLOYMENT_TARGET: "10.7"
-      RUSTFLAGS: "-C link-arg=-ld_classic -C target-cpu=core2" # LC_UNIXTHREAD (#113); no SSE4.1 (release.yml)
+      RUSTFLAGS: "-C link-arg=-ld_classic -C target-cpu=core2" # LC_UNIXTHREAD (archive#113); no SSE4.1 (release.yml)
       RUSTC_BOOTSTRAP: "1" # for -Zbuild-std only
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

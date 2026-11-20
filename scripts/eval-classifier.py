@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure the shell-command classifier against the golden set (issue #28).
+"""Measure the shell-command classifier against the golden set (issue archive#28).
 
     scripts/eval-classifier.py                       # the newest moco it finds, the configured classifier model
     scripts/eval-classifier.py --runs 3              # three passes: a command counts as allowed if ANY pass allowed it

@@ -1,5 +1,5 @@
-//! OpenAI Responses API (`POST {base}/responses`, SSE), the default protocol for the built-in `openai` provider (#185).
-//! Verified against api.openai.com (#182: plain replies, tool turns with reasoning replay, effort levels, `--continue`);
+//! OpenAI Responses API (`POST {base}/responses`, SSE), the default protocol for the built-in `openai` provider (archive#185).
+//! Verified against api.openai.com (#6: plain replies, tool turns with reasoning replay, effort levels, `--continue`);
 //! `docs/07-providers.md` lists what has not been tried live yet.
 //!
 //! Stateless (`store: false`): the conversation is sent in full every time. Reasoning items are requested with
@@ -297,7 +297,7 @@ mod tests {
         assert!(matches!(end(r#"{"type":"response.failed","response":{"error":{"code":"server_error","message":"oops"}}}"#), Err(ProviderError::Internal { .. })));
         assert!(matches!(end(r#"{"type":"error","code":"invalid_api_key","message":"bad key"}"#), Err(ProviderError::Auth(_))));
         assert!(matches!(end(r#"{"type":"error","code":"insufficient_quota","message":"out of credit"}"#), Err(ProviderError::InvalidRequest(_))), "not retried");
-        // Issue #187: the newer out-of-credit message is not retried whatever code it carries.
+        // Issue archive#187: the newer out-of-credit message is not retried whatever code it carries.
         let no_credits = "You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.";
         for code in ["", "insufficient_quota", "rate_limit_exceeded"] {
             let failed = format!(r#"{{"type":"response.failed","response":{{"error":{{"code":"{code}","message":"{no_credits}"}}}}}}"#);
@@ -361,7 +361,7 @@ mod tests {
         assert_eq!(build_body(&r)["tool_choice"], "none");
     }
 
-    /// Sessions started before Responses became OpenAI's default (#185) hold Chat Completions history (`call_` ids, no
+    /// Sessions started before Responses became OpenAI's default (archive#185) hold Chat Completions history (`call_` ids, no
     /// replay data), and a session may have run on Anthropic first (`toolu_` ids, thinking blocks). Both must continue:
     /// every call becomes a plain `function_call` item (no `fc_` id, which the API would check) followed by its output.
     #[test]

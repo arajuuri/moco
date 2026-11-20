@@ -111,7 +111,7 @@ fn gemini_round_trip_with_thought_signature_replay() {
     run("gemini", "/v1beta");
 }
 
-/// `moco models` labels only the protocols still unverified live: OpenAI (on Responses since #185) is not one of them.
+/// `moco models` labels only the protocols still unverified live: OpenAI (on Responses since archive#185) is not one of them.
 #[test]
 fn moco_models_shows_no_experimental_label() {
     let dir = std::env::temp_dir().join(format!("moco-models-label-{}", std::process::id()));
@@ -129,7 +129,7 @@ fn moco_models_shows_no_experimental_label() {
     let text = String::from_utf8_lossy(&out.stdout).to_string();
     assert!(out.status.success(), "{text}");
     let line = |id: &str| text.lines().find(|l| l.split_whitespace().next() == Some(id)).unwrap_or_else(|| panic!("no {id} line in:\n{text}")).to_string();
-    // No protocol is experimental any more (OpenAI Responses #185, Gemini #181).
+    // No protocol is experimental any more (OpenAI Responses archive#185, Gemini archive#181).
     assert!(!line("openai").contains("experimental") && !line("google").contains("experimental"), "{text}");
     let _ = std::fs::remove_dir_all(dir);
 }

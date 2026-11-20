@@ -1,4 +1,4 @@
-//! The suggested next message after a turn (issue #66; `suggest.rs` has the prompt). Asked for by the TUI.
+//! The suggested next message after a turn (issue archive#66; `suggest.rs` has the prompt). Asked for by the TUI.
 use super::*;
 
 impl Engine {

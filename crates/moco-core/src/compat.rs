@@ -1,4 +1,4 @@
-//! Back-ports of standard-library methods newer than Rust 1.78, the toolchain moco is pinned to (issue #100): the newest
+//! Back-ports of standard-library methods newer than Rust 1.78, the toolchain moco is pinned to (issue archive#100): the newest
 //! one that every build machine, Lion included, can run.
 //! Call sites stay identical to `main`; bring them into scope with `use crate::compat::*;`
 //! (`use moco_core::compat::*;` in the front end). On a newer compiler the inherent methods win and these are unused.

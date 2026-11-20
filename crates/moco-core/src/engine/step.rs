@@ -34,7 +34,7 @@ pub(super) enum StepOutcome {
     Continue,
     Done,
     /// The model stopped at the output token limit without calling a tool; `answered` says whether any answer text
-    /// came before the cut (otherwise thinking used up the budget). `drain` asks it to go on (#148).
+    /// came before the cut (otherwise thinking used up the budget). `drain` asks it to go on (archive#148).
     CutOff { answered: bool },
     Stop(RunOutcome),
 }
@@ -342,7 +342,7 @@ impl Engine {
                 StepOutcome::Stop(RunOutcome::Failed(e.message()))
             }
             Ok(()) if matches!(result.finish, Some((FinishReason::Refusal(_), _))) => {
-                // #153: a refusal used to end the turn like a finished answer. Don't continue or retry: the same request
+                // archive#153: a refusal used to end the turn like a finished answer. Don't continue or retry: the same request
                 // would most likely be declined again. What streamed before it stays visible but is incomplete, and
                 // `chat.rs` leaves it out of what the model sees next.
                 let why = match &result.finish {

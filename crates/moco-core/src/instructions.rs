@@ -39,7 +39,7 @@ pub struct Loaded {
 ///
 /// Files that come from the project (discovered `AGENTS.md`/`CLAUDE.md`, lazily discovered ones and relative
 /// `instructions` entries, the only kind a project config can name) must resolve, symlinks included, inside the
-/// project root; the others are listed in `Loaded::rejected` instead of being sent to the model (#146). The global
+/// project root; the others are listed in `Loaded::rejected` instead of being sent to the model (archive#146). The global
 /// file and absolute or `~/` entries can only come from the user's own config and are trusted wherever they point.
 /// The file read is the resolved path that was checked.
 pub fn load(app_dir: &Path, cwd: &Path, extra: &[String], lazy: &[PathBuf]) -> Loaded {

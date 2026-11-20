@@ -99,7 +99,7 @@ pub enum Protocol {
     Anthropic,
     OpenAiChat,
     /// OpenAI Responses API. The default for the built-in `openai` provider (newer OpenAI models take tools with
-    /// reasoning only there, #185); other servers opt in with `protocol: "openai-responses"`.
+    /// reasoning only there, archive#185); other servers opt in with `protocol: "openai-responses"`.
     OpenAiResponses,
     /// Google Gemini API. Verified live with Gemini 3.x and 4 models (2026-11-13).
     Gemini,
@@ -108,7 +108,7 @@ pub enum Protocol {
 impl Protocol {
     /// Written from documentation and tested against local servers only.
     pub fn experimental(self) -> bool {
-        // None at the moment: OpenAI Responses (#185) and Gemini (#181) are verified live. Kept for the next new adapter.
+        // None at the moment: OpenAI Responses (archive#185) and Gemini (archive#181) are verified live. Kept for the next new adapter.
         let _ = self;
         false
     }
@@ -135,7 +135,7 @@ impl ProviderInfo {
             "@ai-sdk/anthropic" => Some(Protocol::Anthropic),
             "@ai-sdk/google" => Some(Protocol::Gemini),
             // OpenAI's own API only: GPT-6-era models refuse function tools with reasoning on /chat/completions and
-            // codex models are not served there at all (#185). Other `@ai-sdk/openai` providers stay on Chat.
+            // codex models are not served there at all (archive#185). Other `@ai-sdk/openai` providers stay on Chat.
             "@ai-sdk/openai" if self.id == "openai" => Some(Protocol::OpenAiResponses),
             "@ai-sdk/openai-compatible" | "@ai-sdk/openai" | "@openrouter/ai-sdk-provider" | "@ai-sdk/groq" | "@ai-sdk/xai" | "@ai-sdk/mistral"
             | "@ai-sdk/cerebras" | "@ai-sdk/togetherai" | "@ai-sdk/deepinfra" => Some(Protocol::OpenAiChat),
@@ -171,7 +171,7 @@ impl Catalog {
             .filter(|(_, p)| !p.models.is_empty())
             .map(|(id, mut p)| {
                 // The key, not an `id` field: the id picks the key in auth.json and `<ID>_API_KEY`, so an entry must
-                // not be able to name another provider's (#163).
+                // not be able to name another provider's (archive#163).
                 p.id = id.clone();
                 for (mid, m) in p.models.iter_mut() {
                     if m.id.is_empty() {
@@ -204,7 +204,7 @@ impl Catalog {
 
     /// The built-in providers (those in the embedded snapshot) keep the snapshot's base URL, protocol and key
     /// variables whatever a downloaded catalog says: models.dev may add models and prices, but it must not be able to
-    /// send a user's key somewhere else (#163). A provider that only the download knows may not name a built-in
+    /// send a user's key somewhere else (archive#163). A provider that only the download knows may not name a built-in
     /// provider's key variable either. The user's own config (`apply_config`) still overrides all of this.
     fn pin_builtins(&mut self, builtin: &Catalog) {
         let builtin_env: std::collections::HashSet<String> = builtin.key_env_vars().into_iter().collect();
@@ -390,7 +390,7 @@ mod tests {
     #[test]
     fn protocol_selection_defaults_and_opt_ins() {
         let mut c = Catalog::embedded();
-        assert_eq!(c.providers["openai"].protocol(), Some(Protocol::OpenAiResponses), "OpenAI's own API uses Responses by default (#185)");
+        assert_eq!(c.providers["openai"].protocol(), Some(Protocol::OpenAiResponses), "OpenAI's own API uses Responses by default (archive#185)");
         // Only the provider id `openai`: anything else built on the OpenAI package or a compatible server stays on Chat.
         let openai_like = |id: &str, npm: &str| ProviderInfo { id: id.into(), npm: Some(npm.into()), ..Default::default() }.protocol();
         assert_eq!(openai_like("my-openai-proxy", "@ai-sdk/openai"), Some(Protocol::OpenAiChat));

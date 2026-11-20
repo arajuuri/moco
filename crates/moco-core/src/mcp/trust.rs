@@ -116,7 +116,7 @@ static ABSENT: Value = Value::Null;
 fn secret_value(effective: &str, raw: Option<Option<&str>>) -> String {
     let n = effective.chars().count();
     match raw {
-        // Project configs are never substituted (#116), so there the template is what is sent.
+        // Project configs are never substituted (archive#116), so there the template is what is sent.
         Some(Some(r)) if substituted(r) && r == effective => format!("{}   (sent as written; {{env:}} and {{file:}} are only expanded in your own config)", shown(r)),
         Some(Some(r)) if substituted(r) => format!("{}   (substituted when used)", shown(r)),
         Some(Some(_)) => shown(effective),
@@ -465,7 +465,7 @@ mod tests {
         let text = describe_server(&proj, &cfg, None).join("\n");
         assert!(text.contains("TOKEN=<9 chars, not shown>") && !text.contains("sk-secret"), "without the raw text a value's length is all that shows: {text}");
 
-        // A project config is not substituted (#116): the template itself is the value, and the prompt says so.
+        // A project config is not substituted (archive#116): the template itself is the value, and the prompt says so.
         let literal = McpServerConfig { environment: [("TOKEN".to_string(), "{env:GH_TOKEN}".to_string())].into(), ..cfg.clone() };
         let text = describe_server(&proj, &literal, Some(&raw)).join("\n");
         assert!(text.contains("TOKEN={env:GH_TOKEN}   (sent as written; {env:} and {file:} are only expanded in your own config)"), "{text}");

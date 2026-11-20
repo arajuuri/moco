@@ -24,7 +24,7 @@ Prefer one larger read over many small slices, and use grep to find specific con
             path = fuzzy_sibling(&path).ok_or_else(|| ToolError::fail(format!("File not found: {}", path.display())))?;
         }
         // Resolved once: the check judges this name and the read below uses exactly it, refusing any symlink found in
-        // it by then (one swapped in after the check, #165).
+        // it by then (one swapped in after the check, archive#165).
         let real = real_path(&path);
         let is_dir = real.is_dir();
         if is_dir {

@@ -368,7 +368,7 @@ impl Snapshots {
                 Some(e) => (e.hash.clone(), meta, st),
                 None => {
                     // The walk saw a regular file. It is opened without following a symlink swapped in since (at the
-                    // file or a folder above it), and recorded as the file actually read (#165).
+                    // file or a folder above it), and recorded as the file actually read (archive#165).
                     crate::nofollow::between_check_and_use();
                     let Some((bytes, meta)) = self.read_nofollow(&real_dir.join(&rel), &mut open_dir) else {
                         skipped.push(Skipped { path: rel, reason: SkipReason::Unreadable, size: meta.len(), mtime_ns: st.mtime_ns });
@@ -631,7 +631,7 @@ mod tests {
 
     #[test]
     fn a_link_swapped_in_after_the_walk_saw_a_file_is_not_followed() {
-        // #165: the walk stats `a.txt` (a regular file), then a link to an outside secret takes its place, or a folder
+        // archive#165: the walk stats `a.txt` (a regular file), then a link to an outside secret takes its place, or a folder
         // above a file becomes a link to an outside folder, before the file is read.
         crate::nofollow::both_modes(|| {
             let t = Tree::new();
@@ -870,7 +870,7 @@ mod tests {
 
     #[test]
     fn same_second_same_size_edit_is_noticed_with_whole_second_timestamps() {
-        // HFS+ (#97): every file's mtime and ctime is the same whole second as the capture, so v1 -> v2 keeps the stamp.
+        // HFS+ (archive#97): every file's mtime and ctime is the same whole second as the capture, so v1 -> v2 keeps the stamp.
         let mut t = Tree::new();
         t.snaps.fake_times = Some((T + NS / 2, T));
         t.put("a.txt", "v1");

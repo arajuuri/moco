@@ -1,4 +1,4 @@
-// Turns `git describe` output into moco's version (issue #94). Plain std only: `build.rs` includes this file with
+// Turns `git describe` output into moco's version (issue archive#94). Plain std only: `build.rs` includes this file with
 // `include!`, and the library compiles it as a module so the rules are unit-tested.
 //
 // The input is the output of

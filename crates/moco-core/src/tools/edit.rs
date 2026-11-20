@@ -62,7 +62,7 @@ If a call fails, the error says what is closest in the file: correct the call an
             }
         }
         // Resolved once: the checks judge this name and the edit uses exactly it, refusing any symlink found in it by
-        // then (one swapped in after the check, #165).
+        // then (one swapped in after the check, archive#165).
         let real = real_path(&path);
         ctx.check_external_file_at(&path, &real)?;
         ctx.permit_path_at("edit", &path, &real, vec!["*".into()])?;
@@ -74,7 +74,7 @@ If a call fails, the error says what is closest in the file: correct the call an
         }
         crate::nofollow::between_check_and_use();
         let path = real;
-        // From here to the end of formatting no other call may change this file (issue #6).
+        // From here to the end of formatting no other call may change this file (issue archive#6).
         let _locks = fsio::lock_files([&path]);
         let bytes = crate::nofollow::read(&path).map_err(|e| super::read::file_error(&path, e))?;
         let (bom, body) = match bytes.strip_prefix(&[0xef, 0xbb, 0xbf]) {
@@ -621,7 +621,7 @@ mod tests {
         assert!(o.text.contains("no need to read the file again"), "{}", o.text);
     }
 
-    /// Issue #6: several `edit` calls on one file in a step run on separate threads; every one of them must land.
+    /// Issue archive#6: several `edit` calls on one file in a step run on separate threads; every one of them must land.
     #[test]
     fn parallel_edits_of_one_file_all_land() {
         let env = Env::new();
@@ -651,7 +651,7 @@ mod tests {
         assert_eq!(std::fs::read(&p).unwrap(), b"keep");
     }
 
-    /// Issue #119: a guessed oldString must not get the real line of a `.env` file back in the error, nor tell by
+    /// Issue archive#119: a guessed oldString must not get the real line of a `.env` file back in the error, nor tell by
     /// succeeding or failing what the file holds, unless reading it is allowed.
     #[test]
     fn editing_a_file_the_read_rules_protect_asks_for_read_first() {

@@ -2,7 +2,7 @@
 //!
 //! * **One writer per file at a time.** The tools read a file, change it in memory and write it back; models often send
 //!   several `edit` calls for the same file in one step and the engine runs them on separate threads, so without a lock
-//!   the second write silently drops the first (issue #6). `lock_files` serializes everything between the read and the
+//!   the second write silently drops the first (issue archive#6). `lock_files` serializes everything between the read and the
 //!   end of formatting.
 //! * **Replace by rename.** `write_atomic` writes a temporary file next to the target and renames it over the target, so
 //!   a crash or a kill in the middle never leaves a truncated user file (`std::fs::write` truncates in place).
@@ -71,7 +71,7 @@ static TMP: AtomicU64 = AtomicU64::new(0);
 /// symlink-free path the permission check approved (`real_path`, so a file reached through a symlink is written
 /// through to its target): the temporary file and the rename go to that folder, opened without following symlinks,
 /// and a symlink found in the path now (swapped in after the check) is refused rather than followed or replaced
-/// (#165). When the directory does not allow new files the bytes are written in place, as before.
+/// (archive#165). When the directory does not allow new files the bytes are written in place, as before.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{}: not a file path", path.display())));
@@ -202,7 +202,7 @@ mod tests {
 
     #[test]
     fn a_symlink_at_the_path_is_refused_not_followed_or_replaced() {
-        // The tools pass the resolved path; a link there now was swapped in after their check (#165).
+        // The tools pass the resolved path; a link there now was swapped in after their check (archive#165).
         let dir = tmp("fsio-link");
         std::fs::write(dir.join("real.txt"), "old").unwrap();
         std::os::unix::fs::symlink(dir.join("real.txt"), dir.join("link.txt")).unwrap();

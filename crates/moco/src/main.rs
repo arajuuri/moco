@@ -1,12 +1,12 @@
 //! moco: terminal chat (full screen on a terminal; line based with --plain, with -p or when piped).
 #![allow(clippy::type_complexity)]
-#![allow(unstable_name_collisions)] // compat.rs back-ports std methods newer than the pinned Rust 1.78 (issue #100)
+#![allow(unstable_name_collisions)] // compat.rs back-ports std methods newer than the pinned Rust 1.78 (issue archive#100)
 #![allow(clippy::format_collect, clippy::needless_borrow, clippy::search_is_some, clippy::single_char_pattern)] // clippy 1.73 lints that later clippy (main) dropped or made opt-in
 #![allow(clippy::assigning_clones, clippy::blocks_in_conditions, clippy::needless_borrows_for_generic_args)] // clippy 1.78 lints that newer clippy does not raise on this code
 use moco_core::compat::*;
 mod tui;
 #[cfg(target_os = "macos")]
-mod libc_shim; // getentropy and clock_gettime for macOS 10.7 (issue #100)
+mod libc_shim; // getentropy and clock_gettime for macOS 10.7 (issue archive#100)
 use moco_core::catalog::{Catalog, ProviderInfo};
 use moco_core::mcp::{self, oauth::LoginIo, trust, Manager, ServerSpec};
 use moco_core::tools::SubagentRequest;
@@ -929,7 +929,7 @@ fn main() {
     for w in &mcp_warnings {
         eprintln!("warning: {w}");
     }
-    // The merged catalog's key variables, so providers defined only in config are kept from MCP servers too (#122).
+    // The merged catalog's key variables, so providers defined only in config are kept from MCP servers too (archive#122).
     let manager: Option<std::sync::Arc<Manager>> = (!mcp_specs.is_empty()).then(|| Manager::start_with_provider_keys(mcp_specs, &cfg.mcp.timeout, &app_dir, engine_cfg.catalog.key_env_vars()));
     if let Some(m) = &manager {
         // Tools are fixed once a conversation starts, so wait for the servers instead of letting them appear mid-way.
@@ -961,7 +961,7 @@ fn main() {
     let engine = Engine::with_providers(store, providers, engine_cfg).share();
     engine.set_job_limits(cfg.jobs);
     // A level the model does not offer stays the session's choice (another model may offer it) but is not sent; say so
-    // instead of silently running at the provider's default (#186).
+    // instead of silently running at the provider's default (archive#186).
     if let (Some(e), Ok(Some(s))) = (&effort_arg, engine.store().session(&session.id)) {
         let info = engine.effort_info(&s);
         if !info.offered {
@@ -975,7 +975,7 @@ fn main() {
     engine.set_notifier(std::sync::Arc::new(|line| {
         if AT_PROMPT.load(Ordering::Relaxed) {
             // Redraw the prompt line underneath the notice. The line reader can't be woken, so say how to let the
-            // assistant react to a job's result (#150; the TUI does it by itself).
+            // assistant react to a job's result (archive#150; the TUI does it by itself).
             let hint = if line.starts_with("background ") { " (press Enter to let the assistant continue)" } else { "" };
             print!("\r\x1b[2K{DIM}[{line}]{hint}{RESET}\n> ");
         } else {
@@ -1015,7 +1015,7 @@ fn main() {
 
     // Expand @mentions of files, directories, skills and agents, tell the user what was attached, then queue the prompt.
     let caps_of = |sid: &str| engine.store().session(sid).ok().flatten().map(|s| engine.current_media_caps(&s)).unwrap_or_default();
-    // `origin` says who wrote the text: mentions in a project's command or an MCP prompt are checked (#124).
+    // `origin` says who wrote the text: mentions in a project's command or an MCP prompt are checked (archive#124).
     let expand_mentions = |sid: &str, text: &str, origin: &mentions::Origin| {
         let subagents = engine.subagent_names();
         let caps = caps_of(sid);

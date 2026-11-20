@@ -1,4 +1,4 @@
-//! A symlink swapped in between a file tool's permission check and its use of the file is not followed (#165). The
+//! A symlink swapped in between a file tool's permission check and its use of the file is not followed (archive#165). The
 //! swap happens at `nofollow::between_check_and_use`, deterministically, and each case runs with `openat` and with the
 //! full-path fallback of macOS 10.7 to 10.9, and with the project given by its own name and through a symlinked
 //! parent (as `/tmp` -> `/private/tmp` on macOS).

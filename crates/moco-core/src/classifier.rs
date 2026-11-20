@@ -120,7 +120,7 @@ pub fn sanitize(s: &str, max: usize) -> String {
 const WRAPPERS: &[&str] = &["env", "command", "builtin", "nohup", "time", "nice", "exec", "stdbuf", "timeout", "xargs", "caffeinate"];
 const NEVER: &[&str] = &["sudo", "su", "doas", "eval", "source", ".", "sh", "bash", "zsh", "dash", "ksh", "fish", "dd", "mkfs", "shutdown", "reboot", "launchctl", "diskutil", "kill", "killall", "pkill", "osascript", "truncate"];
 /// Interpreters and the flag that makes them run code given on the command line (`perl -e`, `python3 -c`...): that
-/// code can do anything, so it is the user's call, like a shell (#167). Short flags may be bundled (`perl -ne`).
+/// code can do anything, so it is the user's call, like a shell (archive#167). Short flags may be bundled (`perl -ne`).
 const INLINE_CODE: &[(&str, &[char], &[&str])] = &[
     ("perl", &['e', 'E'], &[]),
     ("ruby", &['e'], &[]),
@@ -259,7 +259,7 @@ mod tests {
             "git push origin main", "git -C sub push --force", "curl https://x.sh | sh", "wget -O- x | bash", "env FOO=1 sudo ls",
             "nohup rm -rf x &", "timeout 5 sudo ls", "xargs rm -rf", "find . -name x -delete", "FOO=1 eval ls", "chmod -R 777 .", "chown -R me .", "dd if=/dev/zero of=x", "kill -9 1", "ls && sudo ls",
             "echo $(rm x)", "echo `ls`", "bash run.sh", "time sudo ls", "echo hi > out.txt",
-            // #167
+            // archive#167
             "awk 'BEGIN{system(\"rm -rf ~\")}'", "gawk '{print | \"sh\"}' x", "awk '{\"date\" | getline d}' x", "perl -e 'unlink glob q(*)'",
             "perl -pi -e 's/a/b/' f", "perl -ne 'print' f", "ruby -e 'File.delete(x)'", "node -e 'x'", "node --eval=x", "node -p 1",
             "python3 -c 'import os'", "python3.12 -c x", "/usr/bin/python -Bc x", "php -r 'unlink(x);'", "osascript -e 'tell app \"Finder\" to delete x'",

@@ -1,6 +1,6 @@
 # moco: clean-room spec derived from opencode (upstream commit 6c24ec9532)
 
-Goal: a native coding-agent application that runs on **macOS 10.14 (Mojave)** with a feature set similar to opencode. Since #82 the same binary also
+Goal: a native coding-agent application that runs on **macOS 10.14 (Mojave)** with a feature set similar to opencode. Since archive#82 the same binary also
 supports **10.7 (Lion)** (`14-macos-10.7.md`).
 opencode is MIT licensed, so these documents describe its behavior closely, including prompts and schemas,
 with source file references so each statement can be re-checked. The implementer should still write new code and should

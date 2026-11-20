@@ -1,4 +1,4 @@
-//! Which build this is (issue #94), recorded by `build.rs` from `git describe`. "Versions and releases" in
+//! Which build this is (issue archive#94), recorded by `build.rs` from `git describe`. "Versions and releases" in
 //! CONTRIBUTING.md says what the numbers mean and when to make a release.
 
 /// What moco shows: `0.1.0` exactly at a release, `0.1.0-12-g1a2b3c4d5e` (12 commits after v0.1.0, at that commit)

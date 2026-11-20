@@ -1,8 +1,8 @@
-//! Diagnostic log (docs/10-roadmap.md, issue #27): a small file logger with no dependencies.
+//! Diagnostic log (docs/10-roadmap.md, issue archive#27): a small file logger with no dependencies.
 //!
 //! * `MOCO_LOG` (or the `log` config key) is an env_logger-style filter: a level for everything
 //!   (`error|warn|info|debug|trace|off`, default `warn`) and optional per-target levels, e.g. `warn,mcp=debug`.
-//!   The `classifier` target defaults to `info` so that every automatic permission verdict is on record (issue #28)
+//!   The `classifier` target defaults to `info` so that every automatic permission verdict is on record (issue archive#28)
 //!   without turning the whole log up; name it in the filter to change that.
 //! * Lines go to `<app_dir>/data/logs/moco-YYYY-MM-DD.log` (UTC days, mode 0600). Files older than 7 days are
 //!   deleted when a file is opened, and one file stops growing at 16 MiB. **Nothing is ever written to the
@@ -617,7 +617,7 @@ mod tests {
 
     #[test]
     fn moco_s_own_usage_counts_are_not_redacted() {
-        // Issue #71: `tokens_in=`, `tokens_out=` and `approx_tokens=` matched the secret-assignment rule (any name with
+        // Issue archive#71: `tokens_in=`, `tokens_out=` and `approx_tokens=` matched the secret-assignment rule (any name with
         // `token` in it), so the counts were logged as `[redacted]`. The keys were renamed rather than the rule relaxed:
         // a numeric value can still be a credential.
         for line in [

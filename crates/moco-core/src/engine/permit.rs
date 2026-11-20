@@ -160,7 +160,7 @@ mod tests {
         assert_eq!(ui.0.lock().unwrap().as_slice(), ["osascript -e 'beep'"]);
     }
 
-    /// #147: a directory grep judges each file it finds by the engine's rules (configured and saved), without prompting.
+    /// archive#147: a directory grep judges each file it finds by the engine's rules (configured and saved), without prompting.
     #[test]
     fn a_directory_grep_applies_configured_and_saved_read_rules() {
         use crate::tools::testutil::Env;

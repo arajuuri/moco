@@ -236,7 +236,7 @@ impl Tool for Patch {
         let mut resources = vec![];
         let mut files: Vec<PathBuf> = vec![];
         // Each op's paths resolved once, in order (`path`, then `move_to`): what is checked here is what is used
-        // below, which refuses any symlink found in it by then (one swapped in after the check, #165).
+        // below, which refuses any symlink found in it by then (one swapped in after the check, archive#165).
         let mut resolved: Vec<Vec<PathBuf>> = vec![];
         for op in &ops {
             let paths: Vec<&String> = match op {
@@ -277,7 +277,7 @@ impl Tool for Patch {
             }
         }
         crate::nofollow::between_check_and_use();
-        // Every file this patch touches is ours until it is written and formatted (issue #6). Taken after the
+        // Every file this patch touches is ours until it is written and formatted (issue archive#6). Taken after the
         // prompt, which can take minutes, and before the first read.
         let _locks = super::fsio::lock_files(&files);
 
@@ -516,7 +516,7 @@ mod tests {
         assert_eq!(names, ["other.txt", "run.sh"], "{names:?}");
     }
 
-    /// A patch and an edit that touch the same file at the same time both land (issue #6).
+    /// A patch and an edit that touch the same file at the same time both land (issue archive#6).
     #[test]
     fn a_patch_and_edits_on_one_file_do_not_lose_each_other() {
         let env = Env::new();
@@ -571,7 +571,7 @@ mod tests {
         assert!(!env.work().join("x.txt").exists());
     }
 
-    /// Issue #119: moving `.env` to a readable name, or probing it with hunks, needs the read permission that
+    /// Issue archive#119: moving `.env` to a readable name, or probing it with hunks, needs the read permission that
     /// reading it would.
     #[test]
     fn updating_a_file_the_read_rules_protect_asks_for_read_first() {
