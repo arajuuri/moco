@@ -23,15 +23,15 @@ Most current coding agents need a runtime (Node, Bun, Electron) that these syste
 
 ## Install
 
-Download the latest binary from the [releases page](https://github.com/arajuuri/moco/releases/latest) (Intel x86_64), check it against the `.sha256` file, unpack it and put `moco` on your `PATH`.
-
-Or build from a checkout on a Mac with the Xcode command line tools (the build needs Mojave or another 10.12+ release; the binary it produces runs on 10.7 and newer):
+Short version, once you have downloaded and unpacked the [latest release](https://github.com/arajuuri/moco/releases/latest) (Intel x86_64):
 
 ```
-scripts/install.sh --add-to-path
+sudo mkdir -p /usr/local/bin
+sudo cp moco-*-macos-x86_64/moco /usr/local/bin/moco
+moco --version
 ```
 
-See [docs/11-usage.md](docs/11-usage.md) for the options and for building by hand.
+Step-by-step instructions, including checking the download, a no-`sudo` option, Lion's download limits, the macOS "unidentified developer" prompt, updating and uninstalling, are in **[INSTALL.md](INSTALL.md)**. To build from source instead, see `scripts/install.sh` and [docs/11-usage.md](docs/11-usage.md).
 
 ## Quick start
 
@@ -56,6 +56,7 @@ moco is young and moves quickly. The Anthropic, OpenAI and Gemini providers have
 
 ## Documentation
 
+- [INSTALL.md](INSTALL.md): installing moco
 - [docs/11-usage.md](docs/11-usage.md): using moco
 - [docs/00-overview.md](docs/00-overview.md): design and specification; [docs/10-roadmap.md](docs/10-roadmap.md): build order and what is left
 - [docs/13-architecture.md](docs/13-architecture.md): the code as built
