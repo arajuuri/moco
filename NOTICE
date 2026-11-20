@@ -1,3 +1,5 @@
+moco is licensed under the MIT License (see LICENSE).
+
 moco's specifications in docs/ are derived from the opencode project
 (https://github.com/anomalyco/opencode), commit 6c24ec9532, which is MIT licensed.
 Prompts, tool descriptions and tables quoted from it remain under that license.
