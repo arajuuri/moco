@@ -40,6 +40,9 @@ xattr -d com.apple.quarantine ./moco
 | `moco --agent ID` | Agent for this session (`build` default, `plan` read-only); only primary agents can be chosen |
 | `moco --permission-mode manual\|auto` | Mode for this session: ask before acting (`manual`, the default) or run tools without asking (`auto`); also the default for new sessions, overriding `permission_mode` in config |
 | `moco --dir PATH` | Work in another directory |
+| `moco --max-cost USD` / `--max-steps N` | Stop the run when it has cost that much, or taken that many steps (see `limits` in config) |
+| `moco --effort LEVEL` | Reasoning effort for this session (see Reasoning effort) |
+| `moco --plain` / `--tui` | Force the line-based chat, or the full-screen UI |
 | `moco models [filter] [--refresh]` | Providers with connection state, or models with context size and price; `--refresh` downloads the full catalog |
 | `moco auth PROVIDER` | Store an API key |
 | `moco sessions [--all] [--archived]` | List sessions; `rename ID TITLE`, `archive ID`, `unarchive ID`; `export ID [--md\|--json\|--jsonl] [--children] [--include-hidden] [-o FILE]` writes a transcript (Markdown by default, to stdout without `-o`; read-only, safe while the session runs). Exports are **not redacted**: pasted keys and tool output appear as stored |
@@ -72,7 +75,7 @@ xattr -d com.apple.quarantine ./moco
 
 `Ctrl-C` interrupts a running turn (running commands are killed); `Ctrl-D` at the prompt quits.
 
-The status line shows the session's permission mode (`manual`, or `auto` in a warning colour). **Permission prompts** show the action and what it touches: `y` allow once, `a` allow always (saved for this project with a pattern such as `git push *`; `/permissions` lists these and `/permissions remove <n>` forgets one), `n` reject and stop, or type feedback to reject and tell the model why. In the default `manual` mode, anything that changes files, runs a command, or fetches from the web asks; reads and searches do not. In `auto` mode everything is allowed except reading `.env` files and web searches. Your own rules (below) apply in both modes. The `question` tool shows a numbered form; Enter dismisses it.
+The status line shows the session's permission mode (`manual`, or `auto` in a warning colour). **Permission prompts** show the action and what it touches: `y` allow once, `a` allow always (saved for this project with a pattern such as `git push *`; `/permissions` lists these and `/permissions remove <n>` forgets one), `n` reject and stop, or type feedback to reject and tell the model why. In the default `manual` mode, anything that changes files, runs a command, or fetches from the web asks; reads and searches do not. In `auto` mode tools run without asking, except where the rules ask: `.env` reads, web searches, `webfetch`, paths outside the project, risky shell commands (anything not on the read-only and build allow-list, and always `git push`, `rm -rf` and `sudo`) and edits of protected files. For shell commands that only hit a default ask, the permission classifier (see Configuration) may allow them. Your own rules (below) apply in both modes. The `question` tool shows a numbered form; Enter dismisses it.
 
 ## Other providers and protocols
 
@@ -161,7 +164,7 @@ The model can run a long command in the background (`shell` with `background: tr
 
 ## Tools the model has
 
-`read`, `write`, `edit`, `patch`, `glob`, `grep`, `shell`, `jobs`, `webfetch`, `todowrite`, `question`, `subagent` (agents `general` and `explore`), `skill` when skills exist, and `<server>_<tool>` for each tool of a configured MCP server. Paths outside the project ask for an `external_directory` permission in `manual` mode and are allowed in `auto` mode. Long output is cut to 2000 lines or 50 KiB and the full text is saved under `data/tool-output/`.
+`read`, `write`, `edit`, `patch`, `glob`, `grep`, `shell`, `jobs`, `webfetch`, `todowrite`, `question`, `subagent` (agents `general` and `explore`), `skill` when skills exist, and `<server>_<tool>` for each tool of a configured MCP server. Paths outside the project ask for an `external_directory` permission in both modes (the `careful` preset that auto mode uses asks too). Long output is cut to 2000 lines or 50 KiB and the full text is saved under `data/tool-output/`.
 
 ## Configuration
 
@@ -170,7 +173,7 @@ Files named `moco.json` or `moco.jsonc` (comments and trailing commas allowed), 
 ```jsonc
 {
   "model": "anthropic/claude-sonnet-5-5",
-  "small_model": "anthropic/claude-haiku-5-5",          // titles
+  "small_model": "anthropic/claude-haiku-5-5",          // titles, suggestions and the classifier fallback; default: the session's model
   "default_agent": "build",
   "permission_mode": "manual",                           // default for new sessions (a project's config may only say manual)
   "shell": "/bin/zsh",
@@ -195,6 +198,10 @@ Actions are `read`, `edit` (write, edit and patch), `glob`, `grep`, `shell`, `we
 
 **Project instructions**: `AGENTS.md` (or `CLAUDE.md` where there is no `AGENTS.md`) in the project root down to the working directory, `config/AGENTS.md` globally, plus `instructions` files. They are re-read every step. A project file (including a relative `instructions` entry) that is a symlink, or sits under one, resolving outside the project is not read; moco shows a notice naming it instead. Absolute and `~/` entries from your own config may point anywhere.
 
+**Permission classifier**: on by default, and used only in `auto` mode. When a `shell` command only hits a default ask, a small model call decides whether it is routine enough to run without asking you; it can only turn such an ask into an allow, and anything unclear, slow or failed asks you. It sends the command, the working directory and the OS (not your conversation) to the model and is billed like any other call (shown as a separate "classifier" amount in the session cost). It uses `permission_classifier.model`, else `small_model`, else the session's model, so with no `small_model` set it runs on your main model. Set a cheap model from your own provider to reduce the cost. Settings, read only from your own config: `"permission_classifier": {"enabled": true, "model": "provider/model", "timeout": 5000, "background": true}`; `"enabled": false` turns it off, and `auto` mode then asks instead.
+
+**Other settings**: `limits` (`maxCostPerRun`, `maxCostPerSession`, `maxSteps`; a project can only lower them), `sandbox`, `permission_preset`, `checks`, `jobs` (`max_shells`, `max_subagents`) and `tui`. `Config` in `crates/moco-core/src/config.rs` lists every key.
+
 ## Logging
 
 moco writes a diagnostic log, never to the terminal. `MOCO_LOG=error|warn|info|debug|trace` (or the `log` config key; the variable wins) sets the level, `warn` by default. `warn,mcp=trace` sets one target; the targets are `provider`, `engine`, `tool`, `shell`, `jobs`, `mcp`, `store`, `snapshot`, `classifier`, `main` and `log`. Files are `data/logs/moco-YYYY-MM-DD.log` (mode 600), one per day, seven days kept, 16 MiB at most per day file (the cap is shared by all moco processes). The first line says which moco, OS and kernel wrote it. `moco logs` shows the end of the newest file.
@@ -211,4 +218,4 @@ Everything is under `~/Library/Application Support/moco/` (`MOCO_HOME` overrides
 
 ## Environment variables
 
-`ANTHROPIC_API_KEY` and the other provider keys, `MOCO_HOME`, `MOCO_MODEL`, `MOCO_CONFIG`, `MOCO_SHELL`, `MOCO_LOG`, `ANTHROPIC_BASE_URL`.
+`ANTHROPIC_API_KEY` and the other provider keys, `MOCO_HOME`, `MOCO_MODEL`, `MOCO_CONFIG`, `MOCO_SHELL`, `MOCO_LOG`, `MOCO_ASCII`, `MOCO_TRUST_PROJECT_CONFIG` (older name: `MOCO_TRUST_PROJECT_MCP`), `ANTHROPIC_BASE_URL`.

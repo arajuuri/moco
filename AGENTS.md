@@ -52,7 +52,7 @@ Things that take several files to understand:
 ## Pitfalls
 
 - Nothing from upstream's runtime (Bun, Electron, current Node, Go 1.21+) loads on 10.7 or 10.14. No SwiftUI/Combine/async-await. Keep dependencies buildable with Xcode 11.3.1, Rust 1.78 and a 10.7 deployment target, and don't import symbols newer than 10.7 (e.g. `getentropy`, `clock_gettime`, `os_unfair_lock`; checked by `nm -u`; `libc_shim.rs` defines the first two).
-- std and ratatui APIs newer than Rust 1.78 / ratatui 0.25 don't compile. Use or extend the back-ports in `crates/moco-core/src/compat.rs` and `crates/moco/src/tui/compat.rs` rather than rewriting call sites.
+- std and ratatui APIs newer than Rust 1.78 / ratatui 0.29 don't compile. Use or extend the back-ports in `crates/moco-core/src/compat.rs` rather than rewriting call sites.
 - Don't build upstream's HTTP/SSE client-server API, plugin system, LSP or event sourcing (moco does not reproduce them from opencode).
 - Tests that look for a process by command line (`alive()` in `engine.rs`, which lists `ps -A -o args=` because Lion has no `pgrep`) must build the pattern from the process id (`uniq()`), or they match the command line that launched them. Test timing that compares mtimes must allow whole seconds (HFS+).
 - `docs/` quotes upstream prompts and tool descriptions verbatim. Keep `LICENSE-opencode` and `NOTICE` intact, keep the MIT notice in any file that copies substantial upstream text, and don't reuse upstream names or logos.
