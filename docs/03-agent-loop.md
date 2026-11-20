@@ -79,7 +79,7 @@ Any attempt to use tools is a critical violation. Respond with text ONLY.
 ## Compaction (`session/compaction.ts`)
 
 Settings: `auto` (bool), `buffer` (percent or tokens; default keep 15% and at least 16k free), `keep` (tokens of recent conversation kept verbatim),
-`precompute` (summarize in the background as context nears the threshold).
+`precompute` (summarize in the background as context nears the threshold; not implemented in moco).
 
 Triggers: `auto` (estimate over threshold), `overflow` (provider rejected context), `manual` (`/compact`).
 
@@ -133,7 +133,7 @@ Snapshots are content-addressed trees of the working tree with `capture`, `files
 
 ## moco implementation notes (Phase 2, compaction slice)
 
-Code: `compaction.rs` (pure logic, prompts) and `engine.rs` (`compact_inner`, `prepare`, `run_step_inner`).
+Code: `compaction.rs` (pure logic, prompts) and `engine/compact.rs` and `engine/step.rs` (`compact_inner`, `prepare`, `run_step_inner`).
 - **Storage**: a `compaction` message `{summary, keepFrom, trigger, replaced}`. Nothing is deleted. The model's view of history is `compaction::effective`: after the latest compaction, `[checkpoint as a synthetic user message, messages from keepFrom on]`. The checkpoint merges with the next user message into one request message.
 - **Cut point**: the longest suffix of the effective history within `keep` tokens (default 20,000, estimated at 4 characters per token), always including the last message. Any message boundary is allowed, because an assistant message holds its tool calls and results together. Nothing happens if everything already fits, or if only the existing checkpoint precedes the tail.
 - **Triggers**: `auto` before a step when the prompt size passes `limit - max(buffer, min(16k, limit/2))` (default buffer 15%; the size is the provider-reported total of the previous step plus an estimate of what followed, or an estimate of the whole request when nothing has been reported); `overflow` when the provider rejects the prompt before producing anything (compact once, then retry the step; a second overflow in the same step is surfaced); `manual` via `/compact`. Auto needs a known context limit from the catalog. If auto compaction fails, it is not retried for the rest of that run and the step proceeds.
@@ -142,7 +142,7 @@ Code: `compaction.rs` (pure logic, prompts) and `engine.rs` (`compact_inner`, `p
 
 ## moco implementation notes (Phase 2, snapshots slice)
 
-Code: `snapshot.rs` (the store) and `engine.rs` (`take_snapshot`, `undo`, `redo`, `commit_pending`, `session_diff`, `prune_snapshots`).
+Code: `snapshot.rs` (the store) and `engine/undo.rs` (`take_snapshot`, `undo`, `redo`, `commit_pending`, `session_diff`, `prune_snapshots`).
 - **Store**: not a private git dir (the option the spec suggests) but a small content-addressed store under `<app dir>/data/snapshots/<project id>/`: SHA-256 blobs plus one manifest per snapshot (`path -> hash, size, mode, mtime/ctime hint`). The snapshot id is the hash of the file list, so identical trees share an id. No external `git` is needed, and it behaves the same on Linux and the Mojave machine. Capture walks the directory honoring `.gitignore`/`.ignore` files, includes hidden files, skips `.git`, symlinks and files over 2 MiB, and fails with a notice (snapshots off for that session) beyond 50,000 files, so a home directory is never swept up. Files whose size, mtime and ctime match the previous snapshot are not re-read, unless they changed too close to that snapshot for the timestamps to tell a later edit apart (within 2 s for whole-second timestamps such as HFS+, 100 ms otherwise; archive#97).
 - **When**: a snapshot is taken synchronously before every step (the spec takes it in parallel with the request, before tools run) and stored as `snapshot` on that step's assistant message, so it is the state before the step's tools ran. Subagent sessions snapshot too, using the parent's last snapshot as the hash cache. Config `snapshots: false` turns it all off.
 - **Undo**: `undo` takes the latest user turn not yet hidden, restores the working tree to the snapshot of that turn's first step, and stores `{messageId, redo}` in the session (`revert` column). The first undo also records the pre-undo state as `redo`; further undos go back one turn each. Messages from `messageId` on are hidden by the marker, not deleted. `redo` restores the `redo` snapshot and clears the marker. The next `run` (any new prompt) or `compact` calls `commit_pending`, which deletes the hidden messages for good. A turn without a snapshot (older sessions, snapshots off) is rolled back in the conversation only, and the UI says so. Restore writes changed files (mode included), deletes files that did not exist at the snapshot, removes directories that become empty, and never touches ignored files or paths outside the directory (manifest paths are validated).

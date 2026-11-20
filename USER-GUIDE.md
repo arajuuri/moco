@@ -99,7 +99,7 @@ or `moco auth openai`, or `moco auth google`.
 The key is stored in a private file that only your Mac account can read.
 
 - **Anthropic:** nothing more to do.
-- **OpenAI or Google:** moco starts with an Anthropic model, so you must name a model once. Run `moco models openai` (or `moco models google`) to see the list, then start moco with `moco --model openai/MODEL` using a name from that list, for example `google/gemini-3.8-flash`. Section 9 shows how to make that permanent.
+- **OpenAI or Google:** you do not need an Anthropic key. moco starts with an Anthropic model unless you name another one, so you must name a model once. Run `moco models openai` (or `moco models google`) to see the list, then start moco with `moco --model openai/MODEL` using a name from that list, for example `google/gemini-3.8-flash`. Section 9 shows how to make that permanent.
 
 ## 6. Your first session
 
