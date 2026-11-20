@@ -4,6 +4,14 @@ A coding agent for the terminal that runs on old Intel Macs: **macOS 10.7 (Lion)
 
 Most current coding agents need a runtime (Node, Bun, Electron) that these systems cannot load. moco is built with Rust 1.78 and `MACOSX_DEPLOYMENT_TARGET=10.7`, and the same binary runs on every release in that range. Details are in [docs/14-macos-10.7.md](docs/14-macos-10.7.md).
 
+> **Disclaimer: this software was written by AI and has not been reviewed by humans.**
+> moco was built almost entirely by AI coding agents working from a written specification. No
+> person has read the source code line by line. It has automated tests and has been run on real
+> machines, but that is not a review, and it may contain bugs, security holes and unsafe behavior
+> that nobody has noticed. It runs shell commands and edits files on your computer. Use it at your
+> own risk, in a version-controlled directory and preferably a disposable one, and read the
+> [Safety](#safety) section. There is no warranty (see [LICENSE](LICENSE)).
+
 ## Features
 
 - Full-screen terminal UI (ratatui), a plain line chat (`--plain`), and one-shot mode (`moco -p "prompt"`)
@@ -37,6 +45,8 @@ moco -p "explain this repo"   # one request, then exit
 The [usage guide](docs/11-usage.md) covers commands, configuration, permissions, skills and MCP.
 
 ## Safety
+
+Because no human has reviewed the code, treat every safeguard below as untested by a person: the permission system, the sandbox and the secret-handling rules were all written and checked by the same AI that wrote the rest.
 
 moco runs shell commands and edits files on your machine. The default permission mode asks before each action. Auto mode runs tools without asking and applies a "careful" rule preset plus a model-based classifier for routine shell commands, but it is not a security boundary. Review what it does, work in a version-controlled directory, and consider enabling the sandbox. Provider API keys are not passed to shell commands, MCP servers or formatters unless you say so.
 
