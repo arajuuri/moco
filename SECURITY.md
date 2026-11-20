@@ -11,6 +11,9 @@ I'll acknowledge a report within a week and keep you updated until it is fixed. 
 maintained by one person, so fix times vary with the severity. If you want credit, say how you
 would like to be named in the release notes.
 
+moco was written by AI and has not been reviewed by a human (see the README), so expect to find
+real problems. Reports are welcome and appreciated.
+
 ## Supported versions
 
 Only the [latest release](https://github.com/arajuuri/moco/releases/latest) gets fixes.
