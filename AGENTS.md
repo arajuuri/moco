@@ -1,6 +1,6 @@
 # AGENTS.md
 
-moco is a native coding agent for **macOS 10.7 (Lion) through 10.14 (Mojave), Intel x86_64**. One binary, built with `MACOSX_DEPLOYMENT_TARGET=10.7` and Rust **1.78.0** (the newest toolchain every build machine runs; `crates/moco/src/libc_shim.rs` supplies the two 10.12+ functions its std imports), runs on both. `docs/14-macos-10.7.md` lists the resulting pins (ratatui 0.29, rusqlite 0.32...) and the `compat.rs` back-ports. moco is a clean-room Rust reimplementation of opencode (upstream commit `6c24ec9532`, MIT). `docs/` is the specification; read `docs/00-overview.md`, then `docs/10-roadmap.md` (phases, results, what is left). `docs/13-architecture.md` describes the code as built (modules, run lifecycle, storage, invariants); keep it in step with structural changes. Phases 0 to 2 are done and Phase 3 (extensibility) is being built slice by slice. Source paths cited in the docs are relative to an opencode checkout, not this repo.
+moco is a native coding agent for **macOS 10.7 (Lion) through 10.14 (Mojave), Intel x86_64**. One binary, built with `MACOSX_DEPLOYMENT_TARGET=10.7` and Rust **1.78.0** (the newest toolchain every build machine runs; `crates/moco/src/libc_shim.rs` supplies the two 10.12+ functions its std imports), runs on both. `docs/14-macos-10.7.md` lists the resulting pins (ratatui 0.29, rusqlite 0.32...) and the `compat.rs` back-ports. moco is a clean-room Rust reimplementation of opencode (upstream commit `6c24ec9532`, MIT). `docs/` is the specification; read `docs/00-overview.md`, then `docs/13-architecture.md`, which describes the code as built (modules, run lifecycle, storage, invariants); keep it in step with structural changes. Phases 0 to 2 are done and Phase 3 (extensibility) is being built slice by slice. Source paths cited in the docs are relative to an opencode checkout, not this repo.
 
 ## Commands
 
@@ -36,7 +36,7 @@ Track work with GitHub's fields, not labels or title prefixes: issue Type (Bug, 
 
 ## Architecture
 
-`crates/moco-core` is the UI-independent engine. `crates/moco` is the front end: line-based chat and one-shot in `main.rs`, and the ratatui UI in `tui/`. `app.rs` is a pure model (`update`/`render`, tested via `TestBackend`) and `mod.rs` is the event loop with the engine on a worker thread. Pty tests are `tests/tui.rs` + `tui_pty.py`; the plan is `docs/12-tui-plan.md`. `spike/` and `spike-tui/` are standalone probes with their own workspaces. Don't build them as part of the workspace.
+`crates/moco-core` is the UI-independent engine. `crates/moco` is the front end: line-based chat and one-shot in `main.rs`, and the ratatui UI in `tui/`. `app.rs` is a pure model (`update`/`render`, tested via `TestBackend`) and `mod.rs` is the event loop with the engine on a worker thread. Pty tests are `tests/tui.rs` + `tui_pty.py`; the TUI design is in `docs/09-ui.md`. `spike/` and `spike-tui/` are standalone probes with their own workspaces. Don't build them as part of the workspace.
 
 Things that take several files to understand:
 
@@ -53,6 +53,6 @@ Things that take several files to understand:
 
 - Nothing from upstream's runtime (Bun, Electron, current Node, Go 1.21+) loads on 10.7 or 10.14. No SwiftUI/Combine/async-await. Keep dependencies buildable with Xcode 11.3.1, Rust 1.78 and a 10.7 deployment target, and don't import symbols newer than 10.7 (e.g. `getentropy`, `clock_gettime`, `os_unfair_lock`; checked by `nm -u`; `libc_shim.rs` defines the first two).
 - std and ratatui APIs newer than Rust 1.78 / ratatui 0.25 don't compile. Use or extend the back-ports in `crates/moco-core/src/compat.rs` and `crates/moco/src/tui/compat.rs` rather than rewriting call sites.
-- Don't build upstream's HTTP/SSE client-server API, plugin system, LSP or event sourcing (see "Deliberately dropped" in `docs/10-roadmap.md`).
+- Don't build upstream's HTTP/SSE client-server API, plugin system, LSP or event sourcing (see "Out of scope" in `docs/00-overview.md`).
 - Tests that look for a process by command line (`alive()` in `engine.rs`, which lists `ps -A -o args=` because Lion has no `pgrep`) must build the pattern from the process id (`uniq()`), or they match the command line that launched them. Test timing that compares mtimes must allow whole seconds (HFS+).
 - `docs/` quotes upstream prompts and tool descriptions verbatim. Keep `LICENSE-opencode` and `NOTICE` intact, keep the MIT notice in any file that copies substantial upstream text, and don't reuse upstream names or logos.

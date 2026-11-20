@@ -124,7 +124,7 @@ message with the result is inserted and the session resumed. Instruct the model 
 ## Title and summary generation
 
 First user message triggers the hidden `title` agent (no tools) to produce a 3-5 word title. After a run, the `summary` agent can write a PR-style 2-3 sentence summary.
-Prompts in `06-agents-and-prompts.md`.
+The prompts are in `crates/moco-core/src/agent.rs` and `title.rs`.
 
 ## Revert (undo)
 

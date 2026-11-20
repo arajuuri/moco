@@ -61,7 +61,7 @@ moco is young and moves quickly. The Anthropic, OpenAI and Gemini providers have
 - [USER-GUIDE.md](USER-GUIDE.md): a step-by-step manual for non-technical users
 - [INSTALL.md](INSTALL.md): installing moco
 - [docs/11-usage.md](docs/11-usage.md): using moco
-- [docs/00-overview.md](docs/00-overview.md): design and specification; [docs/10-roadmap.md](docs/10-roadmap.md): build order and what is left
+- [docs/00-overview.md](docs/00-overview.md): design and specification
 - [docs/13-architecture.md](docs/13-architecture.md): the code as built
 - [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md): working on moco
 
