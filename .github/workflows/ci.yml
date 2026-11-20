@@ -2,14 +2,11 @@
 # so enabling it needs a one-off `cargo fmt` commit first.
 name: ci
 
-# Docs-only changes run nothing. If a required status check is ever added for `main`, these filters would leave it
-# pending on such PRs; switch to a job-level check then.
+# No path filters: `main` requires the `linux` check, and a filtered-out run would leave it pending on docs-only PRs.
 on:
   push:
     branches: [main]
-    paths-ignore: ["docs/**", "**/*.md", "LICENSE*", "NOTICE"]
   pull_request:
-    paths-ignore: ["docs/**", "**/*.md", "LICENSE*", "NOTICE"]
   # Run the macOS job for any branch: `gh workflow run ci.yml --ref <branch>`.
   workflow_dispatch:
 
