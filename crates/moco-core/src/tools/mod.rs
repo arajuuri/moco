@@ -289,7 +289,7 @@ impl ToolCtx<'_> {
 
     /// `permit_path` with the path's target already resolved (`real_path`). The file tools resolve once, check, and
     /// then use exactly `real` through `crate::nofollow`, which refuses any symlink in it, so a link swapped in after
-    /// the check is not followed (#165).
+    /// the check is not followed (archive#165).
     pub fn permit_path_at(&self, action: &str, path: &Path, real: &Path, save: Vec<String>) -> Result<(), ToolError> {
         self.permit(action, self.path_resources_at(path, real), save)
     }
@@ -391,7 +391,7 @@ impl ToolCtx<'_> {
 
 /// Nearest ancestor containing a `.git` the user owns, else the directory itself. A `.git` at `/`, in the home
 /// directory or above it (a dotfiles repo) does not count, nor does one owned by someone else (planted in `/tmp`):
-/// everything under the root is internal, so either would turn off the external-directory checks there (#120).
+/// everything under the root is internal, so either would turn off the external-directory checks there (archive#120).
 pub fn project_root_of(dir: &Path) -> PathBuf {
     let home = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
     project_root_in(dir, home.as_deref(), &owned_by_user)
@@ -419,7 +419,7 @@ fn owned_by_user(p: &Path) -> bool {
 
 /// What an "always" answer to `external_directory` covers: the project root of `dir`, or, when `dir` has none and lies
 /// in a scratch folder of the user's in a shared temp directory (`/private/tmp/moco_head/src`), that whole scratch
-/// folder (`/private/tmp/moco_head`), so the next subfolder does not ask again (#67). `dir` is symlink-free.
+/// folder (`/private/tmp/moco_head`), so the next subfolder does not ask again (archive#67). `dir` is symlink-free.
 fn always_root_of(dir: &Path) -> PathBuf {
     let root = project_root_of(dir);
     if root != dir {
@@ -439,7 +439,7 @@ fn scratch_folder_of(dir: &Path, me: u32) -> Option<PathBuf> {
     (m.is_dir() && m.uid() == me && m.mode() & 0o022 == 0).then(|| top.to_path_buf())
 }
 
-/// `external_directory` is allowed in the user's own temp directory (`user_temp_dir`, #67): a long session works in
+/// `external_directory` is allowed in the user's own temp directory (`user_temp_dir`, archive#67): a long session works in
 /// scratch folders there and would otherwise ask again and again. These are rules, not an exemption in
 /// `check_external`, and `config::resolve_agents_in` places them right after the mode's and the preset's rules, so
 /// whatever comes later still wins: the explore agent's `external_directory * ask` (it reads the most untrusted text,
@@ -463,7 +463,7 @@ fn temp_dir_rules_for(tmp: Option<&Path>, app_dir: &Path) -> Vec<crate::permissi
 
 /// The user's own temp directory, `$TMPDIR` with symlinks resolved (on macOS the per-user, mode 700
 /// `/private/var/folders/xx/.../T`), if it is safe to let the file tools into it without an `external_directory`
-/// prompt (#67). It must be a directory the user owns that no one else can write to, under parents that only root or
+/// prompt (archive#67). It must be a directory the user owns that no one else can write to, under parents that only root or
 /// the user can change (or that are sticky, like `/tmp` for `/tmp/me`), and it must not be `/`, the home directory or
 /// above it. The shared `/tmp` itself fails these checks (it is world-writable), and so does an unset `TMPDIR`.
 pub fn user_temp_dir() -> Option<PathBuf> {
@@ -1058,7 +1058,7 @@ pub(crate) mod testutil {
     }
 }
 
-/// #67: the user's own temp directory needs no `external_directory` prompt; the shared `/tmp` still asks.
+/// archive#67: the user's own temp directory needs no `external_directory` prompt; the shared `/tmp` still asks.
 #[cfg(test)]
 mod temp_dir_tests {
     use super::grep::tests::Rules;

@@ -17,13 +17,13 @@ For partial changes, use the edit tool instead.".into()
         let path = ctx.resolve(str_arg(input, "path")?);
         let content = str_arg(input, "content")?;
         // Resolved once: the check judges this name and the write uses exactly it, refusing any symlink found in it by
-        // then (one swapped in after the check, #165).
+        // then (one swapped in after the check, archive#165).
         let real = real_path(&path);
         ctx.check_external_file_at(&path, &real)?;
         ctx.permit_path_at("edit", &path, &real, vec!["*".into()])?;
         crate::nofollow::between_check_and_use();
         let path = real;
-        // No other call may change this file between the read below and the end of formatting (issue #6).
+        // No other call may change this file between the read below and the end of formatting (issue archive#6).
         let _locks = super::fsio::lock_files([&path]);
         let existing = match crate::nofollow::read(&path) {
             Ok(b) => Some(b),

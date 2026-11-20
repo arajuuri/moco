@@ -1,4 +1,4 @@
-//! The suggested next message shown as ghost text in the TUI composer after a turn (issue #66). A small model reads
+//! The suggested next message shown as ghost text in the TUI composer after a turn (issue archive#66). A small model reads
 //! the last prompt, the reply and any open to-dos and proposes one short message the user might send next. The user
 //! takes it with Tab or ignores it by typing; it is never sent on its own.
 

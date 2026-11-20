@@ -1,4 +1,4 @@
-//! `@` mentions in slash commands through the real binary (#124): a project's command file cannot attach a file
+//! `@` mentions in slash commands through the real binary (archive#124): a project's command file cannot attach a file
 //! outside the project, the user's own command (in their config dir) can. Uses the fake OpenAI Responses server of
 //! `tests/fake_llm.py`; needs `python3` and is skipped without it.
 use std::io::{BufRead, BufReader};

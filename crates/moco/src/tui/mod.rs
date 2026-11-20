@@ -234,7 +234,7 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
 
     std::thread::scope(|scope| -> std::io::Result<()> {
         // Terminal events. Polls with a timeout so it can stop when the UI loop ends. Deliberately not a scoped
-        // thread: if crossterm ever fails to return (it spins on a hung-up tty, issue #87), the UI must still be able
+        // thread: if crossterm ever fails to return (it spins on a hung-up tty, issue archive#87), the UI must still be able
         // to restore the terminal and let the process exit instead of waiting for this thread forever.
         let key_tx = tx.clone();
         let stop_input = stop.clone();
@@ -338,7 +338,7 @@ pub fn run(mut host: Host) -> std::io::Result<()> {
         let mut actions: VecDeque<Action> = VecDeque::new();
         let mut quit = false;
         // A background job's result may be waiting in the inbox while the chat is idle: let the assistant react to it
-        // without a key press, as soon as no picker, viewer or dialog is in the way (#150, `jobs.auto_resume`).
+        // without a key press, as soon as no picker, viewer or dialog is in the way (archive#150, `jobs.auto_resume`).
         let auto_resume = engine.job_limits().auto_resume;
         let mut resume_wanted = false;
         // Draw only when the screen can have changed (see `App::wants_redraw`), not on every idle tick.

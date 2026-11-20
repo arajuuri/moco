@@ -138,7 +138,7 @@ fn redirect_refused(resp: &ureq::Response) -> String {
 impl Inner {
     /// Send one request, following up to `MAX_REDIRECTS` redirects within the same origin by sending the same request
     /// (method and body included) to the new address. The agent itself follows none: ureq strips only `authorization`
-    /// and `cookie`, so the configured headers and the session id would reach any host (#163). A redirect to another
+    /// and `cookie`, so the configured headers and the session id would reach any host (archive#163). A redirect to another
     /// origin, or one too many, is returned unfollowed and the caller refuses it (`redirect_refused`).
     #[allow(clippy::result_large_err)] // the same `Result` as ureq's own `call`, which the callers match on
     fn send(&self, method: &str, timeout: Option<Duration>, body: Option<&str>) -> Result<ureq::Response, ureq::Error> {

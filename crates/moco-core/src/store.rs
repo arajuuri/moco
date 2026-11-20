@@ -66,7 +66,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (6, "alter table session add column permission_mode text;"),
     // The part of `cost` that went to the permission classifier (it is also counted in `cost`).
     (7, "alter table session add column classifier_cost real not null default 0;"),
-    // Shell commands the permission classifier allowed without asking (the `/permissions` listing; issue #28).
+    // Shell commands the permission classifier allowed without asking (the `/permissions` listing; issue archive#28).
     (
         8,
         "create table auto_allow(
@@ -74,7 +74,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         at integer not null, command text not null, risk text not null, reason text not null, model text not null);
      create index auto_allow_session on auto_allow(session_id);",
     ),
-    // Which process holds the execution claim, so another start can tell a live run from a crash (issue #7).
+    // Which process holds the execution claim, so another start can tell a live run from a crash (issue archive#7).
     (9, "alter table session add column claim_pid integer;"),
     // Small key/value state, e.g. when snapshots were last pruned.
     (10, "create table meta(key text primary key, value text not null);"),
@@ -173,7 +173,7 @@ fn now_ms() -> i64 {
 /// How long a recorded automatic allow is kept: as long as the log files (seven days).
 const AUTO_ALLOW_KEEP_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
-/// The database holds every prompt and tool result, so it is 0600 (#164). SQLite creates the `-wal` and `-shm` files
+/// The database holds every prompt and tool result, so it is 0600 (archive#164). SQLite creates the `-wal` and `-shm` files
 /// with the main file's mode, so creating that one 0600 before SQLite opens it covers all three without touching the
 /// process umask (which the shell tool's children would inherit). Files from an older moco are tightened. Failures
 /// are left for `Connection::open` to report.
@@ -1313,7 +1313,7 @@ mod tests {
     }
 
     /// A database at the first schema version, written without `Store` (as the earliest builds left it), opens with
-    /// every later migration applied and its rows intact. Guards SQLite and rusqlite upgrades (#103) as well as new
+    /// every later migration applied and its rows intact. Guards SQLite and rusqlite upgrades (archive#103) as well as new
     /// migrations.
     #[test]
     fn a_version_1_database_migrates_to_the_current_schema() {

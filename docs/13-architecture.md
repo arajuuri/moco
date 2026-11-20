@@ -114,9 +114,9 @@ This is the path every request takes, from keystroke to stored answer.
 9. **Decide.** Tool calls present: `Continue` (another step, after the cost limits are checked). None: `Done`, and the loop
    delivers any queued input or returns `Idle`. A reply that stopped at the output token limit without a tool call is
    `CutOff`: `drain` stores a synthetic message asking the model to go on (or, if thinking used up the budget, to answer)
-   and runs another step, at most twice in a row (#148). A refusal (`FinishReason::Refusal`, Anthropic's
+   and runs another step, at most twice in a row (archive#148). A refusal (`FinishReason::Refusal`, Anthropic's
    `stop_reason: "refusal"`) is `Failed` with a notice. It is never retried or continued, and the message is stored with
-   `finish: "refusal"` so `chat.rs` leaves its text out of later requests (#153). Any other unknown stop reason ends the
+   `finish: "refusal"` so `chat.rs` leaves its text out of later requests (archive#153). Any other unknown stop reason ends the
    turn with a notice. `Declined`, `Interrupted`, `Failed` and `LimitReached` stop the run.
 
 Cancellation is an `AtomicBool` passed down through the engine, the provider adapters (which check it at every read and
@@ -162,7 +162,7 @@ data/mcp-trust.json  approved project MCP servers, formatters and shells
 data/tui-history     prompt history of the full-screen UI
 ```
 
-Permissions (#164): the app dir, `data/` and every directory below it are 0700, and the files written there (and
+Permissions (archive#164): the app dir, `data/` and every directory below it are 0700, and the files written there (and
 `auth.json`, `mcp-auth.json`) are 0600, through `auth::create_private_dir`, `auth::write_private` (atomic
 replace-by-rename) and `auth::create_private` (files written in place: logs, spill files, job logs). `cache/` holds only
 the public catalog and keeps the umask default. The database file is created 0600 before SQLite opens it,
@@ -185,7 +185,7 @@ share it on purpose. Session exports (`moco sessions export -o`, `/export`) are 
   `Block::Native` / `Event::Native`, is stored with the assistant message, and only its own adapter replays it.
 
 One adapter per wire protocol: Anthropic Messages, OpenAI-compatible Chat Completions, OpenAI Responses and Gemini.
-Responses is the default for the built-in `openai` provider (`ProviderInfo::protocol`, #185); Gemini has been
+Responses is the default for the built-in `openai` provider (`ProviderInfo::protocol`, archive#185); Gemini has been
 verified live. `provider/registry.rs` builds a client for every catalog
 provider that has a key, wrapped in `Logged`. The catalog (`catalog.rs`) comes from models.dev and gives context limits,
 prices and capabilities; config can add or override providers. A downloaded catalog cannot change the base URL, key
@@ -234,7 +234,7 @@ Details that matter:
   classifier can only turn ask into allow. Timeouts, errors and garbled replies ask the user.
 - **Paths** are compared with symlinks resolved (`tools/mod.rs::is_internal`), so a symlinked project is one project and a
   symlink that leads out of it is external. Anything outside the project asks under `external_directory`.
-- **Check, then use the same file** (#165). The file tools resolve a path once (`real_path`), pass it to the checks
+- **Check, then use the same file** (archive#165). The file tools resolve a path once (`real_path`), pass it to the checks
   (`ToolCtx::permit_path_at`, `check_external_file_at`) and then use exactly that symlink-free path through `nofollow.rs`,
   which refuses a symlink anywhere in it, so a link swapped in after the check (by a background shell, say) is not followed.
   With `openat` (Linux, macOS 10.10+, looked up with `dlsym` because 10.7 to 10.9 lack it) a folder is opened component by
@@ -247,7 +247,7 @@ Details that matter:
   and obvious file writes (in-place `sed`/`perl`, Python `open(..., 'w')`, and output redirections except `/dev/null`). With
   `sandbox.enabled` the command runs under `sandbox-exec` with a profile that denies writes outside the project, temp directories
   and `sandbox.writable`, keeps code-running paths inside them read-only (`.git/hooks`, `.git/config`, `.moco`, shell
-  startup files, the cargo registry) and denies reading credentials (#123). `unsandboxed: true` asks under the `shell.unsandboxed` action. Waiting for a command (`wait_capped`,
+  startup files, the cargo registry) and denies reading credentials (archive#123). `unsandboxed: true` asks under the `shell.unsandboxed` action. Waiting for a command (`wait_capped`,
   shared by foreground shells and background jobs) sleeps on a kqueue `NOTE_EXIT` watch on macOS, so it wakes when the command
   exits and otherwise every 100 ms to check `stop()` and the output cap; `try_reap` still decides whether the child exited. Without
   the watch (other platforms, or setup failed) it polls every 15 ms. See `15-idle-cpu.md`.
@@ -282,7 +282,7 @@ session and the front end is told through the engine's notifier.
   context-overflow error.
 - **Snapshots** (`snapshot.rs`) are `git`-free: a manifest of every non-ignored file with its SHA-256 and mode, contents stored
   once as blobs, only changed files re-hashed. Symlinks are not followed or recorded; a file the walk saw is read through
-  `nofollow.rs`, so a link swapped in before it is read is skipped as unreadable (#165). One is taken before every step and its id is stored on the assistant message.
+  `nofollow.rs`, so a link swapped in before it is read is skipped as unreadable (archive#165). One is taken before every step and its id is stored on the assistant message.
   `/undo` restores files and hides the messages; `/diff` compares the current tree with the session's first snapshot. A project
   with too many files turns snapshots off for that session with one notice. Files too large to store are reported as skipped.
 - **Limits** (`engine/limits.rs`). A step allowance per run (the last allowed step forbids tools and adds the `MAX_STEPS`
@@ -324,7 +324,7 @@ the `Engine`, and picks a mode:
 - `app.rs` is a pure model. `App::update(AppEvent) -> Action` and `render(Frame, &mut App)` touch no terminal and no engine,
   so tests drive them with scripted events and read ratatui's `TestBackend`.
 - `mod.rs` is the event loop. The UI thread owns the terminal. An input thread turns crossterm events into `AppEvent`s. It is
-  not scoped, so leaving the UI never waits for it: crossterm 0.27 spun forever on a hung-up tty (#87). Until that behavior
+  not scoped, so leaving the UI never waits for it: crossterm 0.27 spun forever on a hung-up tty (archive#87). Until that behavior
   is verified with crossterm 0.28 on Lion, before each poll the thread checks the tty with `term::tty_gone` (`select` plus
   `FIONREAD`; macOS `poll` does not work on ttys) and, when the terminal is gone, ends the UI the way SIGHUP and SIGTERM do
   (`SIGNALLED`). The loop draws only when the screen can have changed: any event but `Tick`, a `Tick` while `App::animating()`

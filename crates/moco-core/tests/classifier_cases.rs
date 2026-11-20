@@ -1,4 +1,4 @@
-//! The golden set for the shell-command classifier (`classifier_cases.jsonl`, issue #28) checked against the part that
+//! The golden set for the shell-command classifier (`classifier_cases.jsonl`, issue archive#28) checked against the part that
 //! needs no model: the rules that stop a command from ever reaching it. The model's own behavior is measured with
 //! `scripts/eval-classifier.py`.
 //!

@@ -1,4 +1,4 @@
--- How often the model edits files through the shell instead of the file tools (issue #22).
+-- How often the model edits files through the shell instead of the file tools (issue archive#22).
 --
 --   sqlite3 "$HOME/Library/Application Support/moco/data/moco.db" < scripts/edit-fallbacks.sql
 --

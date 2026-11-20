@@ -8,7 +8,7 @@
 # no tag behind. Running it again for a commit that already has its tag rebuilds and replaces the release files; a
 # tag that exists on another commit stops the run (bump the version instead).
 #
-# The runner's default linker (Xcode 15+) always writes an LC_MAIN entry point, which Lion cannot start (#113), so the
+# The runner's default linker (Xcode 15+) always writes an LC_MAIN entry point, which Lion cannot start (archive#113), so the
 # build uses the classic linker (`-ld_classic`), which writes LC_UNIXTHREAD for a 10.7 target. Apple has deprecated
 # it; if a runner image drops it, the build or the entry-point check fails and nothing is published.
 #
@@ -18,7 +18,7 @@
 # (`-Zbuild-std`, which on a stable compiler needs RUSTC_BOOTSTRAP=1 and the rust-src component); the binary lands in
 # target/x86_64-apple-darwin/release. scripts/check-macos-binary.sh fails if SSE4 code shows up again.
 #
-# Supply chain (#126): the `macos` job compiles every dependency's build scripts and proc macros, so it gets a
+# Supply chain (archive#126): the `macos` job compiles every dependency's build scripts and proc macros, so it gets a
 # read-only token and keeps no git credentials. Only the `publish` job, which runs no third-party Rust code, can
 # write: it re-creates the same tag, pushes it and uploads the files `macos` built. Third-party actions are pinned
 # to commit SHAs (Dependabot, `.github/dependabot.yml`, proposes updates).
@@ -36,7 +36,7 @@ permissions: {} # each job asks for what it needs
 env:
   CARGO_TERM_COLOR: always
   MACOSX_DEPLOYMENT_TARGET: "10.7"
-  # -ld_classic: LC_UNIXTHREAD, not LC_MAIN, so Lion can start the binary (#113). core2: no SSE4.1 (see above).
+  # -ld_classic: LC_UNIXTHREAD, not LC_MAIN, so Lion can start the binary (archive#113). core2: no SSE4.1 (see above).
   RUSTFLAGS: "-C link-arg=-ld_classic -C target-cpu=core2"
   RUSTC_BOOTSTRAP: "1" # for -Zbuild-std only
 

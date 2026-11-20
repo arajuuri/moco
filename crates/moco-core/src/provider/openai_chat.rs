@@ -369,7 +369,7 @@ mod tests {
         assert!(matches!(classify_http(401, &b("invalid_api_key", "bad key"), None), ProviderError::Auth(_)));
         assert!(matches!(classify_http(429, &b("rate_limit_exceeded", "slow down"), Some(3)), ProviderError::RateLimit { retry_after_ms: Some(3000), .. }));
         assert!(matches!(classify_http(429, &b("insufficient_quota", "You exceeded your current quota"), None), ProviderError::InvalidRequest(_)), "out of credit is not retried");
-        // Issue #187: the newer out-of-credit message, with or without a code.
+        // Issue archive#187: the newer out-of-credit message, with or without a code.
         let no_credits = "You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.";
         for code in ["", "insufficient_quota", "rate_limit_exceeded"] {
             let e = classify_http(429, &b(code, no_credits), None);

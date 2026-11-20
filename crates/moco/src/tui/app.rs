@@ -342,7 +342,7 @@ pub struct App {
     pub away_after: std::time::Duration,
     /// Ask for a suggested next message after each turn (`tui.suggestions`, default on).
     pub suggestions: bool,
-    /// The suggested next message, shown as ghost text in an empty composer; Tab takes it (issue #66).
+    /// The suggested next message, shown as ghost text in an empty composer; Tab takes it (issue archive#66).
     pub suggestion: Option<String>,
     /// Numbers the turns, so a suggestion that arrives after the user moved on is dropped.
     pub suggest_turn: u64,
@@ -551,7 +551,7 @@ impl App {
         !was_tick || self.animating()
     }
 
-    /// May a run start on its own now (a background job's result arrived while idle, #150)? Not while a turn runs, and
+    /// May a run start on its own now (a background job's result arrived while idle, archive#150)? Not while a turn runs, and
     /// not while the user is in a picker, a viewer or a dialog: the run starts when that closes. Text in the composer is
     /// left alone either way.
     pub fn can_resume(&self) -> bool {
@@ -2546,7 +2546,7 @@ mod tests {
         let mut a = App::new("m", "build");
         assert_eq!(a.permission_mode, PermissionMode::Manual, "manual is the default");
         assert!(screen(&mut a, 100, 4).last().unwrap().contains(" manual "));
-        assert_eq!(press(&mut a, KeyCode::Tab), Action::None, "plain Tab no longer switches it (issue #66)");
+        assert_eq!(press(&mut a, KeyCode::Tab), Action::None, "plain Tab no longer switches it (issue archive#66)");
         assert_eq!(press(&mut a, KeyCode::BackTab), Action::SetPermissionMode(PermissionMode::Auto));
         // The app shows the mode the engine confirms (set by the event loop).
         a.permission_mode = PermissionMode::Auto;
@@ -3107,7 +3107,7 @@ mod tests {
 
     #[test]
     fn compaction_updates_the_context_fill_without_counting_a_step() {
-        // #151: `/compact` used to leave the pre-compaction fill on screen until the next message.
+        // archive#151: `/compact` used to leave the pre-compaction fill on screen until the next message.
         let mut a = App::new("anthropic/sonnet", "build");
         text(&mut a, Ev::Usage { usage: Usage { input: 10, output: 5, cache_read: 0, cache_write: 0 }, cost: Some(0.01), session_cost: 0.01, context: 900, limit: Some(1000) });
         assert!(screen(&mut a, 120, 24).join("\n").contains(" 90% "));

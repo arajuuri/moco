@@ -298,7 +298,7 @@ pub(crate) const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 
 /// The HTTP agent every adapter uses, so timeouts are configured in one place. It follows no redirects: ureq strips
 /// only `authorization` and `cookie` on a redirect, so `x-api-key`, `x-goog-api-key` and configured headers would
-/// reach the redirect target (#163). `open_lines` fails a 3xx answer instead.
+/// reach the redirect target (archive#163). `open_lines` fails a 3xx answer instead.
 pub(crate) fn new_agent() -> ureq::Agent {
     ureq::AgentBuilder::new().timeout_connect(CONNECT_TIMEOUT).timeout_read(READ_TIMEOUT).redirects(0).build()
 }

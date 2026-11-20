@@ -1,6 +1,6 @@
 //! moco engine: UI-independent core (docs/00-overview.md).
 #![allow(clippy::type_complexity)]
-#![allow(unstable_name_collisions)] // compat.rs back-ports std methods newer than the pinned Rust 1.78 (issue #100)
+#![allow(unstable_name_collisions)] // compat.rs back-ports std methods newer than the pinned Rust 1.78 (issue archive#100)
 #![allow(clippy::format_collect, clippy::needless_borrow, clippy::search_is_some, clippy::single_char_pattern)] // clippy 1.73 lints that later clippy (main) dropped or made opt-in
 #![allow(clippy::assigning_clones, clippy::blocks_in_conditions, clippy::needless_borrows_for_generic_args)] // clippy 1.78 lints that newer clippy does not raise on this code
 pub mod agent;

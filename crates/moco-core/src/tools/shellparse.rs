@@ -9,7 +9,7 @@
 //!
 //! Rules match command text, so a command whose text hides what runs (`'git' push`, `/bin/rm`, `env rm`, `then rm`,
 //! `git -C . push`, `sudo rm`, `bash -c 'rm ...'`, `find -exec rm`) is followed by the command that really runs, as an
-//! extra entry with unquoted words and the program name normalized (issue #118). Each entry is a resource, and a
+//! extra entry with unquoted words and the program name normalized (issue archive#118). Each entry is a resource, and a
 //! request is allowed only when every resource is, so the extra entries can only add asks and denies.
 //!
 //! Constructs where the shell (bash, sh or zsh, whichever `$SHELL` is) reads more into the text than this parser does
@@ -26,7 +26,7 @@ pub struct Command {
     pub words: Vec<String>,
     /// Places that get the external-directory check: directory targets of cd/pushd/popd/chdir and `git
     /// -C`/`--git-dir`/`--work-tree`, input redirection targets, and the files and directories that read commands
-    /// (`cat`, `head`, `grep`, `rg`...) read (issue #117).
+    /// (`cat`, `head`, `grep`, `rg`...) read (issue archive#117).
     pub dirs: Vec<String>,
 }
 
@@ -567,7 +567,7 @@ fn short_has(w: &str, letters: &str, stop: &str) -> bool {
 }
 
 /// Options and scripts that make a command that looks read-only run another program or write a file that the command
-/// line does not show as a write (issue #117): `git log --output=~/.zshrc`, `git diff --ext-diff`, `git config`
+/// line does not show as a write (issue archive#117): `git log --output=~/.zshrc`, `git diff --ext-diff`, `git config`
 /// writes, `rg --pre sh`, `cargo test --config 'target.x.runner="..."'`, `sort -o`, `sed 'w file'` and `sed 'e cmd'`,
 /// awk's `system()`, `print > "file"` and pipes, `find -fprint`, `man -P`. Such a command is opaque, like `sed -i`.
 fn runs_or_writes_through_options(words: &[String]) -> bool {
@@ -1467,7 +1467,7 @@ mod tests {
 
     #[test]
     fn a_heredoc_body_belongs_to_its_command() {
-        // Issue #84: every body line used to be a command of its own.
+        // Issue archive#84: every body line used to be a command of its own.
         let cmd = "osascript <<'EOF' 2>&1\ntell application \"System Events\" to tell process \"Chess\"\n  set g to group 1 of window 1\n  click button \"white knight, b1\" of g\nend tell\nEOF";
         let p = parse(cmd);
         assert!(!p.opaque);
@@ -1475,7 +1475,7 @@ mod tests {
         assert_eq!(p.commands[0].text, cmd, "the body is part of the resource, so rules and the prompt see it");
         assert_eq!(p.commands[0].words, ["osascript", "<<EOF", "2>&1"]);
         // The body is a program, so "always" does not save `osascript *` (that would cover any `-e 'do shell script
-        // ...'`, #118); a rule the user wrote still covers it.
+        // ...'`, archive#118); a rule the user wrote still covers it.
         assert_eq!(save_pattern(&p.commands[0].words), "osascript <<EOF 2>&1");
         assert!(crate::wildcard::matches(&p.commands[0].text, "osascript *"), "a configured `osascript *` covers it");
 
@@ -1574,7 +1574,7 @@ mod tests {
 
     #[test]
     fn arithmetic_shifts_are_not_heredocs() {
-        // Issue #118: bash reads `<<` in arithmetic as a shift and runs the next line; it must stay a command.
+        // Issue archive#118: bash reads `<<` in arithmetic as a shift and runs the next line; it must stay a command.
         for c in [
             "((x=1<<2))\nrm -rf ~\n2",
             "for ((i=0; i<1<<2; i++)); do echo $i; done\nrm -rf ~\n2",
@@ -1637,7 +1637,7 @@ mod tests {
 
     #[test]
     fn options_that_run_programs_or_write_files_are_opaque() {
-        // Issue #117: the careful preset allows several of these programs, so an option or script that turns one into
+        // Issue archive#117: the careful preset allows several of these programs, so an option or script that turns one into
         // a file write or a program run must ask, and never reach the classifier.
         for c in [
             "git log -1 --format=%B --output=/home/u/.zshrc",

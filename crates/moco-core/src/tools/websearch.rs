@@ -218,7 +218,7 @@ impl WebSearch {
         let s = &self.settings;
         let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(20)).build();
         // Requests with a key follow no redirects: ureq would pass `X-Subscription-Token` and `x-api-key` on to the
-        // redirect target (#163). `call` reports the 3xx instead.
+        // redirect target (archive#163). `call` reports the 3xx instead.
         let keyed = ureq::AgentBuilder::new().timeout(Duration::from_secs(20)).redirects(0).build();
         let base = |default: &str| s.url.clone().unwrap_or_else(|| default.to_string());
         let json_of = |text: String| serde_json::from_str::<Value>(&text).map_err(|e| ToolError::fail(format!("The search service sent something that is not JSON: {e}")));

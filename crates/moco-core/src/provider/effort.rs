@@ -341,7 +341,7 @@ mod tests {
         assert_eq!(b.get("reasoning"), None, "no level: the API's default");
         let mut b = json!({"model": "gpt-6-luna"});
         shape_openai_chat(&mut b, &req("gpt-6-luna", Some("none")));
-        assert_eq!(b["reasoning_effort"], "none", "the only way to use tools with these models on Chat (#185)");
+        assert_eq!(b["reasoning_effort"], "none", "the only way to use tools with these models on Chat (archive#185)");
         let mut b = json!({"generationConfig": {"maxOutputTokens": 5}});
         shape_gemini(&mut b, &req("gemini-2.5-pro", Some("medium")));
         assert_eq!(b["generationConfig"], json!({"maxOutputTokens": 5, "thinkingConfig": {"thinkingBudget": 8192, "includeThoughts": true}}));

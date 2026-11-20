@@ -83,7 +83,7 @@ after the one failure described below.
 ## Known flake, not caused by this change
 
 `a_hung_up_terminal_ends_moco_during_a_dialog` fails intermittently with `moco was still running 8 s after its terminal hung up
-(cpu ~95%)`: the #87 symptom (crossterm spinning on a dead tty). It failed once in the first full `tui` run of this branch and
+(cpu ~95%)`: the archive#87 symptom (crossterm spinning on a dead tty). It failed once in the first full `tui` run of this branch and
 about 1 in 12 standalone runs, which raised the question of whether the redraw change caused it.
 
 It did not. The original `HEAD` (68e9a52), built the same way and run under identical conditions (`a_hung_up`, which runs
@@ -101,7 +101,7 @@ reader), in code this change does not touch, and it should be filed and fixed se
   200 ms and queries the store (the inbox, and the job list). It no longer forces a redraw, but it still costs wakeups and
   SQLite calls. Waiting on a condition instead would remove it.
 - **Input thread:** the 100 ms `event::poll` is unchanged. Raising it would add up to that much delay to noticing a dead
-  terminal (#87) for about 10 fewer wakeups a second.
+  terminal (archive#87) for about 10 fewer wakeups a second.
 - **While a turn runs:** the 150 ms tick still redraws, because the spinner moves. Only the idle case was optimized.
 - **Real use:** the numbers come from a scripted fake model and an empty session, not from a long transcript. Redraw cost grows
   with the amount of text on screen, so a full screen should save more per skipped redraw.

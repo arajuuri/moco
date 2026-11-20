@@ -1,35 +1,35 @@
 # macOS 10.7 (Lion) support
 
 moco supports **macOS 10.7 (Lion) through 10.14 (Mojave), Intel x86_64**, with one binary built for a 10.7 deployment
-target. This was built on the `macos-10.7` branch and merged into `main` (#82). This file records what supporting 10.7
+target. This was built on the `macos-10.7` branch and merged into `main` (archive#82). This file records what supporting 10.7
 changed and why, how to build, and what still needs checking on a real Lion machine.
 
 ## Why Rust 1.78
 
 Rust 1.74 raised the minimum macOS for `std` and the compiler to 10.12. The compiler itself only has to run on the
-build machine, but programs it builds inherit the minimum through what `std` imports. #82 therefore pinned 1.73.0, the
+build machine, but programs it builds inherit the minimum through what `std` imports. archive#82 therefore pinned 1.73.0, the
 last toolchain whose `std` imports nothing newer than 10.7.
 
-Since #100 moco pins **1.78.0**, the newest version that every build machine can run: rustup on Linux and Mojave,
-and MacPorts' `rust` port on Lion. Measured with a test program (#99), official 1.78 still writes a 10.7 minimum into
+Since archive#100 moco pins **1.78.0**, the newest version that every build machine can run: rustup on Linux and Mojave,
+and MacPorts' `rust` port on Lion. Measured with a test program (#1), official 1.78 still writes a 10.7 minimum into
 the binary but its `std` imports two functions Lion lacks, `getentropy` and `clock_gettime`.
 `crates/moco/src/libc_shim.rs` defines both in the binary, so the linker binds `std`'s calls there and nothing is
 imported. On 10.12+ the shim forwards to the system's functions; on Lion it falls back to `/dev/urandom` and
 `gettimeofday`/`mach_absolute_time`. Newer Rust needs more (`dirfd`, `CCRandomGenerateBytes`, and a forced 10.12
-minimum from about 1.86); #99 has the measurements.
+minimum from about 1.86); #1 has the measurements.
 
 ## What changed
 
 | Area | Change | Reason |
 |---|---|---|
-| Toolchain | `rust-toolchain.toml` and CI pin 1.78.0; `rust-version = "1.78"` in the workspace | Newest Rust every build machine runs (#100); 1.73 before that |
+| Toolchain | `rust-toolchain.toml` and CI pin 1.78.0; `rust-version = "1.78"` in the workspace | Newest Rust every build machine runs (archive#100); 1.73 before that |
 | libc shim | `crates/moco/src/libc_shim.rs`: `getentropy`, `clock_gettime` | 1.78's `std` imports them; both need 10.12+ |
 | `Cargo.lock` | Format version 3 | Cargo before 1.78 cannot read version 4; kept while dependencies are held back |
-| ratatui / crossterm | 0.29 / 0.28 | ratatui 0.30 needs Rust 1.88. Its `lru` stays at 0.12.5, which has two soundness advisories (RUSTSEC-2026-0002, -0253) fixed only in 0.16.3 / 0.18.2; ratatui 0.29 requires `^0.12` and calls neither affected method (#126) |
-| rusqlite | 0.41 down to 0.32.1 (libsqlite3-sys 0.30.1) | Newest that builds on 1.78: rusqlite 0.33+ uses `#[expect]` (1.81) and libsqlite3-sys 0.31+ fails too; none of 0.30–0.39 declares its MSRV, so `~0.32.1` is capped in `Cargo.toml` (#103). The bundled SQLite is 3.46.0 (RUSTSEC-2026-0459, fixed in 3.54; risk accepted in #126) |
+| ratatui / crossterm | 0.29 / 0.28 | ratatui 0.30 needs Rust 1.88. Its `lru` stays at 0.12.5, which has two soundness advisories (RUSTSEC-2026-0002, -0253) fixed only in 0.16.3 / 0.18.2; ratatui 0.29 requires `^0.12` and calls neither affected method (archive#126) |
+| rusqlite | 0.41 down to 0.32.1 (libsqlite3-sys 0.30.1) | Newest that builds on 1.78: rusqlite 0.33+ uses `#[expect]` (1.81) and libsqlite3-sys 0.31+ fails too; none of 0.30–0.39 declares its MSRV, so `~0.32.1` is capped in `Cargo.toml` (archive#103). The bundled SQLite is 3.46.0 (RUSTSEC-2026-0459, fixed in 3.54; risk accepted in archive#126) |
 | ignore / globset | Capped at 0.4.23 / 0.4.15 | Newer releases are edition 2024 and declare no MSRV |
 | getrandom 0.2 (via ring; also used directly for the MCP OAuth `state` and PKCE verifier) | Uses the `getentropy` shim in the binary | 0.2.11+ calls `getentropy()` directly. The shim forwards to the system function on 10.12+ and falls back to `/dev/urandom` on Lion |
-| std back-ports | `crates/moco-core/src/compat.rs`: `Option::is_none_or`, unsigned `is_multiple_of` | Methods added after 1.78 (the 1.73 back-ports of `inspect`, `inspect_err` and `File::set_modified` went with #100) |
+| std back-ports | `crates/moco-core/src/compat.rs`: `Option::is_none_or`, unsigned `is_multiple_of` | Methods added after 1.78 (the 1.73 back-ports of `inspect`, `inspect_err` and `File::set_modified` went with archive#100) |
 | Ratatui back-ports | Removed `crates/moco/src/tui/compat.rs`; ratatui 0.29 provides the previously back-ported methods | |
 | Small edits | `AtomicU64::try_update` to `fetch_update`, `iter::repeat_n` to `repeat().take()`, `Set<'static>` to `Set` | No back-port possible or needed |
 | Lints | `unstable_name_collisions`, four clippy 1.73 lints and three clippy 1.78 lints that newer clippy does not raise on this code are allowed at crate level | Keeps code written for newer clippy unchanged |
@@ -71,7 +71,7 @@ nothing (all of those need 10.12+). `scripts/check-macos-binary.sh <binary>` run
 
 The entry point must be `LC_UNIXTHREAD` (`otool -l <binary> | grep -E 'cmd LC_(MAIN|UNIXTHREAD)'`). `LC_MAIN` exists
 only from 10.8: Lion's kernel finds no entry point and the binary dies at launch with "Illegal instruction: 4" or
-"Segmentation fault: 11" (#113). Xcode 11's linker and MacPorts `ld64` write `LC_UNIXTHREAD` for a 10.7 target. The
+"Segmentation fault: 11" (archive#113). Xcode 11's linker and MacPorts `ld64` write `LC_UNIXTHREAD` for a 10.7 target. The
 linker in Xcode 15 and later always writes `LC_MAIN`; its classic linker still writes `LC_UNIXTHREAD`, so builds with
 a newer Xcode need `RUSTFLAGS="-C link-arg=-ld_classic"`. The release workflow does this on GitHub's
 `macos-15-intel` runner (Xcode 16.4, SDK 15.5); a v0.1.0 build made that way ran on Lion 10.7.5 (2026-11-10).
@@ -91,7 +91,7 @@ export RUSTFLAGS="-C link-arg=-Wl,/opt/local/lib/libMacportsLegacySupport.a"
 cargo build --release --locked     # pass MOCO_GIT_DESCRIBE too in a copy without .git
 ```
 
-A clean release build takes about 15 minutes on the 1-vCPU Lion VM (15m17s before #100, 15m41s with it). The result
+A clean release build takes about 15 minutes on the 1-vCPU Lion VM (15m17s before archive#100, 15m41s with it). The result
 passes the same checks as the Mojave build: `LC_VERSION_MIN_MACOSX` 10.7, `otool -L` lists only `libSystem` and
 `libiconv`, and the `nm -u` check prints nothing.
 
@@ -100,7 +100,7 @@ std too and run on Lion during the build, and the shim is only in the `moco` bin
 stops at the first proc macro (`zerofrom-derive`: undefined `_getentropy`). With both, the binary uses the shim's
 definitions and nothing clashes.
 
-Without rustup, `rust-toolchain.toml` is ignored. Since #100 the pin is MacPorts' version, 1.78.0, so a Lion build
+Without rustup, `rust-toolchain.toml` is ignored. Since archive#100 the pin is MacPorts' version, 1.78.0, so a Lion build
 uses the pinned compiler. MacPorts keeps Rust frozen at 1.78.0 for 10.11 and older; its newer releases need 10.12, so
 1.78 is the newest Rust that builds on Lion. The Lion test VM doesn't boot with 2 vCPUs (tried 2026-11-08), so it stays at 1.
 
@@ -124,7 +124,7 @@ the call site, then run `cargo build`, `cargo test` and `cargo clippy --workspac
 
 ## Verified, and not yet verified
 
-Verified with Rust 1.78.0 and the libc shim (#100, 2026-11-08):
+Verified with Rust 1.78.0 and the libc shim (archive#100, 2026-11-08):
 - Linux: clippy `-D warnings` passes and `cargo test` passes (604 tests).
 - Mojave 10.14.6, official 1.78.0 from rustup: clippy passes, `cargo test` passes (607 tests, including the shim's
   fallback tests), and a clean release build takes 7m44s with 2 vCPUs. The binary has `LC_VERSION_MIN_MACOSX` 10.7,
@@ -134,10 +134,10 @@ Verified with Rust 1.78.0 and the libc shim (#100, 2026-11-08):
   `invalid x-api-key`) and `sessions` work. Those paths run the shim's fallbacks: std seeds `HashMap` keys with
   `getentropy` and reads its clocks with `clock_gettime`.
 - Lion with MacPorts 1.78: the release build works (see "Building on Lion with MacPorts"). `cargo test` fails the same
-  9 `moco-core` tests as before #100 (#97, #98) and passes the rest (603), including the shim tests, which on Lion run
+  9 `moco-core` tests as before archive#100 (archive#97, archive#98) and passes the rest (603), including the shim tests, which on Lion run
   the fallbacks.
 
-The rest of this section was verified with Rust 1.73.0, before #100.
+The rest of this section was verified with Rust 1.73.0, before archive#100.
 
 Verified on Linux with Rust 1.73.0:
 - The workspace builds.
@@ -157,7 +157,7 @@ Verified on Lion 10.7.5 (11G63) with that binary:
   key, which gets `invalid x-api-key`). TLS is rustls/ring with the roots compiled in (`webpki-roots`), so Lion's old
   keychain and system TLS do not matter.
 - moco's exact Seatbelt profile works under Lion's `sandbox-exec`, `(remote unix-socket)` included: writes outside the
-  allowed subpaths are refused, `/tmp` is writable, and outbound network is blocked. The #123 profile (protected
+  allowed subpaths are refused, `/tmp` is writable, and outbound network is blocked. The archive#123 profile (protected
   `.git/hooks`, `.git/config`, `.moco` and the like, credential reads denied) was checked there on 2026-11-10 with git
   1.7.12: commits, branches and checkout work inside it, and writes to the protected paths, renaming `.git` or the
   project, a hard link to `.git/config` and reading `auth.json` are refused. The same checks pass on Mojave.
@@ -175,14 +175,14 @@ The same binary also runs on Mojave 10.14.6 (`--version`, `models --refresh`, `-
 - A clean `cargo test` on Lion. With the MacPorts toolchain ("Building on Lion with MacPorts"), `cargo test
   --workspace` (2026-11-08, 11 min at 1 vCPU) passes 597 tests and fails 9, all in `moco-core`:
   - Seven snapshot, undo, diff and prune tests fail because Lion's disk is HFS+, which keeps mtimes to the whole
-    second (APFS keeps nanoseconds). Six of them show a real gap (issue #97): snapshots reuse a file's hash when
+    second (APFS keeps nanoseconds). Six of them show a real gap (issue archive#97): snapshots reuse a file's hash when
     its size and mtime are unchanged, so an edit that keeps the size and lands in the same second as the previous
     snapshot is missed by undo and the session diff. This affects any HFS+ volume, not only Lion. The seventh
     assumed sub-second mtimes in its own timing.
   - Two background-job tests failed because they checked for the process with `pgrep`, which Lion lacks.
 
-  Issue #98 fixed the last three (the job tests use `ps -A -o args=`, the prune test backdates mtimes and allows
-  whole seconds). On 2026-11-09 they passed on Lion, and the full run (8 min at 1 vCPU) failed 5 of the 6 #97 tests
+  Issue archive#98 fixed the last three (the job tests use `ps -A -o args=`, the prune test backdates mtimes and allows
+  whole seconds). On 2026-11-09 they passed on Lion, and the full run (8 min at 1 vCPU) failed 5 of the 6 archive#97 tests
   (the count depends on timing) plus `a_hung_up_terminal_ends_moco_during_a_dialog`, which then passed three runs
   in a row on its own.
 - macOS 10.7.0 to 10.7.4 and 10.8 to 10.13.

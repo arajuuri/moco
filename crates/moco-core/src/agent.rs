@@ -69,7 +69,7 @@ const SECRET_FILES: &[&str] = &["auth.json", "mcp-auth.json", ".netrc", ".git-cr
 
 /// The explore agent's rules, appended after the mode rules and so also after the permission preset, which
 /// `config::resolve_agents_in` splices in right after the mode rules. They deny everything except searching and
-/// reading, and they never grant more than the parent agent gets (#115): what manual mode or the careful preset asks
+/// reading, and they never grant more than the parent agent gets (archive#115): what manual mode or the careful preset asks
 /// for (web fetches, directories outside the project) asks here too, and reading credentials always asks, because
 /// this agent reads the most untrusted text. Explore is stricter than its parent only in auto mode with
 /// `permission_preset: "trusted"`, where it still asks for these. Your own `permissions` come later and can allow them.
@@ -247,7 +247,7 @@ pub struct EnvInfo<'a> {
 pub fn system_prompt(agent: &Agent, tools: &[&dyn Tool], env: &EnvInfo) -> String {
     let has = |n: &str| tools.iter().any(|t| t.name() == n);
     let mut guidance = vec![];
-    // The tools that change files. With any of them, the shell is for running programs, not for editing (issue #22):
+    // The tools that change files. With any of them, the shell is for running programs, not for editing (issue archive#22):
     // a script edit skips the edit permission, the inline diff and the formatter, and costs more to review.
     let writers: Vec<&str> = ["edit", "write", "patch"].into_iter().filter(|n| has(n)).collect();
     if has("shell") {
@@ -348,7 +348,7 @@ mod tests {
         assert!(ex.system.as_deref().unwrap().starts_with("You are a file search specialist"));
     }
 
-    /// #115: explore's rules come after the mode and the preset, so they must not allow what those ask for.
+    /// archive#115: explore's rules come after the mode and the preset, so they must not allow what those ask for.
     #[test]
     fn explore_never_gets_more_than_its_parent() {
         use crate::permission::{evaluate, PermissionMode};

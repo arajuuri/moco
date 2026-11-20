@@ -26,7 +26,7 @@ pub fn env_names_for(provider: &str, env_names: &[String]) -> Vec<String> {
 
 /// Give a child process moco's environment without the provider key variables in `provider_keys` (moco's own
 /// credentials, from `Catalog::key_env_vars`), then `configured` on top: what the child's own config sets on purpose,
-/// so a key named there still reaches it. Shell commands, MCP servers, formatters and checks all start this way (#92, #122).
+/// so a key named there still reaches it. Shell commands, MCP servers, formatters and checks all start this way (archive#92, archive#122).
 pub fn child_env(cmd: &mut std::process::Command, provider_keys: &[String], configured: &std::collections::BTreeMap<String, String>) {
     for name in provider_keys {
         cmd.env_remove(name);
@@ -107,7 +107,7 @@ pub fn create_private(path: &Path, append: bool) -> std::io::Result<std::fs::Fil
 /// output and the logs.
 const PRIVATE_SUBDIRS: &[&str] = &["data", "data/blobs", "data/snapshots", "data/tool-output", "data/logs"];
 
-/// Make the data dir private at startup (#164). A missing one is created 0700. moco's own subdirectories (`data/`
+/// Make the data dir private at startup (archive#164). A missing one is created 0700. moco's own subdirectories (`data/`
 /// and those below it) are tightened to 0700 when they are looser: nothing else has a reason to read them. The
 /// data dir itself is tightened too when it is the default location. A `MOCO_HOME` the user chose may be shared on
 /// purpose, so for that one this returns a warning and leaves the mode alone; its secrets are covered anyway

@@ -82,7 +82,7 @@ pub fn input_tty() -> Option<(RawFd, Option<std::fs::File>)> {
 
 /// True when the terminal behind `fd` is gone (its other end closed: a dropped SSH connection, a killed `script`).
 /// crossterm 0.27 must not be called then: its reader retries a read that returns 0 or an error forever, at full CPU
-/// and without returning (issue #87).
+/// and without returning (issue archive#87).
 ///
 /// Uses `select`, not `poll`: macOS `poll` does not work on ttys (it reports `POLLNVAL`). A tty that is readable but
 /// has no bytes waiting is at end of file; one whose byte count cannot be read is hung up.

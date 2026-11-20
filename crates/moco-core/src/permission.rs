@@ -133,14 +133,14 @@ pub fn default_rules() -> Vec<Rule> {
         Rule::new("websearch", "*", Effect::Ask),
         // Running outside the shell sandbox is never covered by the blanket allow.
         Rule::new("shell.unsandboxed", "*", Effect::Ask),
-        // Nor is a fetch from this machine or its local network (`tools/webfetch.rs`, #115).
+        // Nor is a fetch from this machine or its local network (`tools/webfetch.rs`, archive#115).
         Rule::new("webfetch.private", "*", Effect::Ask),
     ]
 }
 
 /// Shell commands the careful preset runs without asking. Their options that run programs or write files
 /// (`git log --output=`, `rg --pre`, `cargo --config`...) make a command opaque (`shellparse`), the files they read
-/// get the external-directory check, and reading `.env` asks, so each of these only reads or builds (issue #117).
+/// get the external-directory check, and reading `.env` asks, so each of these only reads or builds (issue archive#117).
 /// Building and testing still run the project's own code (`build.rs`, tests); the sandbox is what contains that.
 pub const CAREFUL_SHELL_ALLOW: &[&str] = &[
     "ls", "cat", "head", "tail", "wc", "rg", "grep", "git status", "git diff", "git log", "git show", "cargo check", "cargo test", "cargo build",
@@ -290,7 +290,7 @@ mod tests {
 
     #[test]
     fn careful_preset_allows_reads_and_builds_but_not_what_their_options_hide() {
-        // Issue #117.
+        // Issue archive#117.
         let careful: Vec<Rule> = mode_rules(PermissionMode::Auto).into_iter().chain(preset_rules("careful").unwrap()).collect();
         let shell = |c: &str| {
             let p = crate::tools::shellparse::parse(c);

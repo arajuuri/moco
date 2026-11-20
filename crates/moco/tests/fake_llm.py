@@ -40,7 +40,7 @@ def responses(handler, body):
             {"type": "response.completed", "response": {"status": "completed", "usage": {"input_tokens": 5, "output_tokens": 3}}}], True)
     items = body["input"]
     outputs = [i for i in items if i.get("type") == "function_call_output"]
-    if "BACKGROUND-JOB" in json.dumps(items):  # #150: a background job that finishes after the turn has ended
+    if "BACKGROUND-JOB" in json.dumps(items):  # archive#150: a background job that finishes after the turn has ended
         return background_job(handler, items, outputs)
     if not outputs:
         if "SLOW" in json.dumps(items):

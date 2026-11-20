@@ -298,7 +298,7 @@ elif scenario == "idle":
     send(b"\x04")
     check_restored(wait_exit())
 elif scenario in ("jobresume", "jobresume-off"):
-    # #150: a background job that finishes after the turn has ended lets the assistant react without a key press
+    # archive#150: a background job that finishes after the turn has ended lets the assistant react without a key press
     # (unless `jobs.auto_resume` is off: then Enter on an empty line does it).
     send(b"BACKGROUND-JOB start it\r")
     wait_for(r"permissionneeded:shell")
@@ -337,7 +337,7 @@ elif scenario == "mode":
     send(b"\x04")
     check_restored(wait_exit())
 elif scenario == "suggest":
-    # After a turn the composer shows a suggested next message as ghost text (issue #66). It is never sent on its own;
+    # After a turn the composer shows a suggested next message as ghost text (issue archive#66). It is never sent on its own;
     # Tab takes it as typed text and Enter sends it. (The hint line is not checked: ratatui redraws only the cells
     # that changed, so a replaced hint never appears whole in the output.)
     import sqlite3
@@ -383,7 +383,7 @@ elif scenario == "sigterm":
     check_restored(status)
 elif scenario in ("hangup", "hangup-idle"):
     # The terminal goes away under moco, as when an SSH connection drops: close the pty master. moco must exit
-    # instead of spinning in crossterm's reader on the dead tty (issue #87). "hangup" drops it while a permission
+    # instead of spinning in crossterm's reader on the dead tty (issue archive#87). "hangup" drops it while a permission
     # dialog blocks a run, "hangup-idle" at an empty prompt.
     if scenario == "hangup":
         send(b"Read a.txt and tell me what it says.\r")

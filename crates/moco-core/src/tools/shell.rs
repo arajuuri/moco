@@ -479,7 +479,7 @@ mod tests {
 
     #[test]
     fn files_read_outside_the_project_ask_by_their_folder() {
-        // Issue #117: `cat ~/.ssh/id_rsa` must not pass as an allowed `cat *` without the external-directory check.
+        // Issue archive#117: `cat ~/.ssh/id_rsa` must not pass as an allowed `cat *` without the external-directory check.
         let env = Env::new();
         let outside = env.dir.join("outside");
         std::fs::create_dir_all(&outside).unwrap();

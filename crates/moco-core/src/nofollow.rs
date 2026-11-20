@@ -1,4 +1,4 @@
-//! Using a file by the path a permission check approved, without following a symlink swapped in after the check (#165).
+//! Using a file by the path a permission check approved, without following a symlink swapped in after the check (archive#165).
 //!
 //! The file tools decide on a symlink-free path (`tools::real_path`, resolved once, before the check) and then use
 //! that path. Between the two, another process (a background shell, say) could replace the file or one of its folders

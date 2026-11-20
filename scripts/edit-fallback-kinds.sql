@@ -1,4 +1,4 @@
--- Which kinds of file-changing shell command the model uses instead of the file tools (issue #22). Same evidence as
+-- Which kinds of file-changing shell command the model uses instead of the file tools (issue archive#22). Same evidence as
 -- scripts/edit-fallbacks.sql, one row per kind with how many calls, and one example (the first alphabetically, cut to
 -- 120 characters).
 --
