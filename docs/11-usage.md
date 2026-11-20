@@ -13,6 +13,16 @@ It checks the system, builds a release binary for macOS 10.7 and newer into `~/.
 
 By hand: `MACOSX_DEPLOYMENT_TARGET=10.7 CARGO_TARGET_DIR=<a directory outside the repo> cargo build --release --locked`, then check `otool -l moco | grep -A3 LC_VERSION_MIN_MACOSX` (must say 10.7). On Lion, rustup and `scripts/install.sh` don't work; build on a newer Mac and copy the binary over, or build with a MacPorts Rust toolchain (`docs/14-macos-10.7.md`). The binary needs no runtime besides the system libraries.
 
+### Running a downloaded release binary
+
+The release binary is not signed or notarized. A tarball downloaded in a browser carries the `com.apple.quarantine` attribute, and Gatekeeper on recent macOS (reported on a MacBook Air running macOS "Golden Gate") refuses to run `moco` until you remove it:
+
+```
+xattr -d com.apple.quarantine ./moco
+```
+
+`sudo` is only needed if you don't own the file. Downloading with `gh release download` or `curl`, or building from source, does not set the attribute.
+
 ## First run
 
 1. Give moco an API key: `moco auth anthropic` (reads the key from stdin, echo off) or set `ANTHROPIC_API_KEY`. Keys live in `~/Library/Application Support/moco/auth.json` (mode 600). Other providers: `moco auth openrouter`, or the env var shown by `moco models`. Shell commands, stdio MCP servers, formatters and checks do not inherit provider-key environment variables by default; pass one deliberately with an inline assignment such as `ANTHROPIC_API_KEY=... cmd`, or for a server, formatter or check in its `environment` config.
