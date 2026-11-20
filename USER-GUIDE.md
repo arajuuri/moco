@@ -86,6 +86,34 @@ moco --version
 
 You should see a line starting with `moco` and the version number. If you see `command not found`, close the Terminal window, open a new one and try again. If it still fails, repeat step 4.3.
 
+### 4.6 Other ways to install (optional)
+
+For people comfortable with the Terminal.
+
+**Download from the Terminal** (not on Lion, whose `curl` cannot make the secure connection GitHub needs):
+
+```
+cd ~/Downloads
+VERSION=0.2.2
+curl -LO https://github.com/arajuuri/moco/releases/download/v$VERSION/moco-$VERSION-macos-x86_64.tar.gz
+curl -LO https://github.com/arajuuri/moco/releases/download/v$VERSION/moco-$VERSION-macos-x86_64.tar.gz.sha256
+```
+
+On Lion, download the two files on another computer and copy them over with a USB stick, a shared folder or `scp`. Files fetched with `curl` or `scp` are never quarantined, so step 4.4 does not apply to them.
+
+**Install for your user only, without a password** (instead of the `sudo` lines in step 4.3):
+
+```
+mkdir -p ~/.local/bin
+cp moco-0.2.2-macos-x86_64/moco ~/.local/bin/moco
+chmod 755 ~/.local/bin/moco
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bash_profile
+```
+
+Use `~/.zprofile` instead of `~/.bash_profile` if your shell is zsh (`echo $SHELL` shows it), then open a new Terminal window. To remove it later, run `rm ~/.local/bin/moco`.
+
+**Build from source:** on a Mac with the Xcode command line tools (`xcode-select --install`), run `scripts/install.sh --add-to-path` from a checkout. It builds moco and installs it to `~/.local/bin`. Building needs Mojave or newer; on Lion, build on another Mac and copy the binary over (see [docs/macos-10.7.md](docs/macos-10.7.md)).
+
 ## 5. Connect moco to your AI provider
 
 Run the line for your provider. moco asks you to paste your API key. **Nothing appears on screen when you paste. That is normal.** Press Enter.
@@ -225,6 +253,5 @@ Your conversations, settings and API key are kept in `~/Library/Application Supp
 
 ## 12. Where to learn more
 
-- [INSTALL.md](INSTALL.md): the install steps in more detail, for people comfortable with the Terminal
-- [docs/11-usage.md](docs/11-usage.md): the full reference of commands and settings
+- [docs/usage.md](docs/usage.md): the full reference of commands and settings
 - [README.md](README.md): what moco is and its safety notes

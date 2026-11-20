@@ -1,4 +1,4 @@
-//! Working-tree snapshots for undo and diffs (docs/03-agent-loop.md "Revert").
+//! Working-tree snapshots for undo and diffs.
 //!
 //! A snapshot is a content-addressed manifest: every non-ignored file of a directory with its SHA-256 and mode,
 //! file contents stored once as blobs. Capturing walks the tree (honoring `.gitignore`, skipping `.git`) and

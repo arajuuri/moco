@@ -1,6 +1,6 @@
 #!/bin/bash
 # Check that a macOS moco binary loads on 10.7 (Lion): minimum OS 10.7, an LC_UNIXTHREAD entry point, only libSystem
-# and libiconv linked, no symbols newer than 10.7, and no SSE4 code for the oldest Core 2 Duos. See docs/14-macos-10.7.md.
+# and libiconv linked, no symbols newer than 10.7, and no SSE4 code for the oldest Core 2 Duos. See docs/macos-10.7.md.
 # Used by CI and the release workflow.
 #
 #   scripts/check-macos-binary.sh target/release/moco

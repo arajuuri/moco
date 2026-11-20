@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build moco from this source tree and install it. Written for macOS (bash 3.2) and works on Linux.
-# The binary targets macOS 10.7 (Lion) and runs on 10.7 through 10.14. See docs/14-macos-10.7.md.
+# The binary targets macOS 10.7 (Lion) and runs on 10.7 through 10.14. See docs/macos-10.7.md.
 #
 #   scripts/install.sh                  build and install to ~/.local/bin/moco
 #   scripts/install.sh --add-to-path    also put ~/.local/bin on your PATH (edits your shell profile, once)
@@ -92,7 +92,7 @@ if [ "$OS" = "Darwin" ]; then
   fi
   if [ "$MAJOR" = "10" ] && [ "${MINOR:-0}" -lt 12 ]; then
     say "note: rustup and the system curl do not work on macOS ${VERSION}; if the build below fails, build on a newer Mac"
-    say "      (this script there, or see docs/14-macos-10.7.md) and copy the binary over: it runs on 10.7 and newer"
+    say "      (this script there, or see docs/macos-10.7.md) and copy the binary over: it runs on 10.7 and newer"
   fi
   [ "$ARCH" = "x86_64" ] || say "note: moco is built and tested on Intel Macs; on ${ARCH} it runs through Rosetta only if you build for x86_64"
 else

@@ -1,4 +1,4 @@
-//! Model catalog (docs/07-providers.md): provider and model metadata from models.dev.
+//! Model catalog: provider and model metadata from models.dev.
 //! An embedded snapshot is the fallback; `refresh` stores a newer one in `<app dir>/cache/models.json`.
 use crate::provider::Usage;
 use serde::{Deserialize, Serialize};

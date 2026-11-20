@@ -4,7 +4,7 @@
 //! two-level namespaces their own calls stay bound to libSystem.
 //!
 //! On 10.12 and newer each function forwards to the system's own, looked up in libSystem on first use. On older systems
-//! it falls back to `/dev/urandom` and `gettimeofday`/`mach_absolute_time`. The `nm -u` check in docs/14-macos-10.7.md
+//! it falls back to `/dev/urandom` and `gettimeofday`/`mach_absolute_time`. The `nm -u` check in docs/macos-10.7.md
 //! catches any further import a toolchain or dependency update brings.
 use libc::{c_int, c_void, clockid_t, size_t, timespec};
 use std::sync::atomic::{AtomicUsize, Ordering};

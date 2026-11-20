@@ -1,4 +1,4 @@
-//! Wildcard matching for permission patterns (docs/05-permissions.md).
+//! Wildcard matching for permission patterns.
 //! `*` matches anything including `/`, `?` matches one char, whole-string match, `\` normalized to `/`.
 //! A pattern ending in ` *` also matches the bare command (`ls *` matches `ls`).
 

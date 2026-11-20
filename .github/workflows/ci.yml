@@ -40,7 +40,7 @@ jobs:
   # manual check.
   #
   # macOS minutes cost far more than Linux ones, so this is one job that compiles once: the tests are built with the
-  # Lion deployment target, and the deployment-target and link checks (docs/14-macos-10.7.md) run on the `moco`
+  # Lion deployment target, and the deployment-target and link checks (docs/macos-10.7.md) run on the `moco`
   # binary that `cargo test` builds for the integration tests. Those properties come from the target, the linker
   # and the dependencies, not the profile, so the release build (`scripts/install.sh`) is not compiled here.
   # It runs on pushes to `main` and on manual dispatch, not on every PR push.

@@ -1,4 +1,4 @@
-//! Credential lookup (docs/02-domain-model.md): environment variable first, then
+//! Credential lookup: environment variable first, then
 //! `<data dir>/auth.json` shaped `{"<provider-id>": {"key": "..."}}`.
 use std::path::{Path, PathBuf};
 

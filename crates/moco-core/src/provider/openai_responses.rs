@@ -1,6 +1,5 @@
 //! OpenAI Responses API (`POST {base}/responses`, SSE), the default protocol for the built-in `openai` provider (archive#185).
 //! Verified against api.openai.com (#6: plain replies, tool turns with reasoning replay, effort levels, `--continue`);
-//! `docs/07-providers.md` lists what has not been tried live yet.
 //!
 //! Stateless (`store: false`): the conversation is sent in full every time. Reasoning items are requested with
 //! `include: ["reasoning.encrypted_content"]`, kept as `Block::Native` and replayed, together with the function-call

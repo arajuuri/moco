@@ -11,7 +11,7 @@ scripts/install.sh --add-to-path
 ```
 It checks the system, builds a release binary for macOS 10.7 and newer into `~/.cache/moco/target` (the Xcode command line tools must be installed: `xcode-select --install`; if Rust is missing it offers to install it with rustup), verifies the binary's minimum macOS version, installs it to `~/.local/bin/moco` and, with `--add-to-path`, adds that directory to `~/.bash_profile` (or `~/.zprofile` for zsh) once. Open a new terminal afterwards, or `export PATH="$HOME/.local/bin:$PATH"`. Other options: `--prefix /usr/local` (installs to `/usr/local/bin`; you need write access), `--target-dir DIR` for the build cache, `--yes` to never ask. Running it again after a `git pull` updates the install. `scripts/install.sh --uninstall` removes the binary and keeps your sessions and keys (`--purge` removes those too). `moco --version` prints the version (for example `0.1.0-12-g1a2b3c4d5e`: 12 commits after release 0.1.0, at that commit; see "Versions and releases" in `CONTRIBUTING.md`), the commit and the minimum macOS.
 
-By hand: `MACOSX_DEPLOYMENT_TARGET=10.7 CARGO_TARGET_DIR=<a directory outside the repo> cargo build --release --locked`, then check `otool -l moco | grep -A3 LC_VERSION_MIN_MACOSX` (must say 10.7). On Lion, rustup and `scripts/install.sh` don't work; build on a newer Mac and copy the binary over, or build with a MacPorts Rust toolchain (`docs/14-macos-10.7.md`). The binary needs no runtime besides the system libraries.
+By hand: `MACOSX_DEPLOYMENT_TARGET=10.7 CARGO_TARGET_DIR=<a directory outside the repo> cargo build --release --locked`, then check `otool -l moco | grep -A3 LC_VERSION_MIN_MACOSX` (must say 10.7). On Lion, rustup and `scripts/install.sh` don't work; build on a newer Mac and copy the binary over, or build with a MacPorts Rust toolchain (`docs/macos-10.7.md`). The binary needs no runtime besides the system libraries.
 
 ### Running a downloaded release binary
 
@@ -172,7 +172,7 @@ Files named `moco.json` or `moco.jsonc` (comments and trailing commas allowed), 
   "model": "anthropic/claude-sonnet-5-5",
   "small_model": "anthropic/claude-haiku-5-5",          // titles
   "default_agent": "build",
-  "permission_mode": "manual",                           // default for new sessions (a project's config may only say manual): see docs/05-permissions.md
+  "permission_mode": "manual",                           // default for new sessions (a project's config may only say manual)
   "shell": "/bin/zsh",
   "permissions": [                                       // last matching rule wins
     { "action": "shell", "resource": "ls *", "effect": "allow" },
@@ -189,7 +189,7 @@ Files named `moco.json` or `moco.jsonc` (comments and trailing commas allowed), 
   "commands": { "ship": { "description": "Tag and push", "template": "Tag the release and push it. $ARGUMENTS", "agent": "build" } }
 }
 ```
-Actions are `read`, `edit` (write, edit and patch), `glob`, `grep`, `shell`, `webfetch`, `question`, `subagent`, `external_directory`. Details: `05-permissions.md`, `08-config-and-extensions.md`, `07-providers.md`.
+Actions are `read`, `edit` (write, edit and patch), `glob`, `grep`, `shell`, `webfetch`, `question`, `subagent`, `external_directory`. Details are in `architecture.md` and the code.
 
 **Output budget**: each request asks for the model's own output limit (`limit.output` in the catalog, or set per model as in the `ollama` example), 16,000 when the limit is unknown. `max_tokens` caps it (and is the budget for models without a limit). Only the tokens written are billed. Thinking counts against it. A reply cut off at the budget is continued automatically, up to twice in a row.
 

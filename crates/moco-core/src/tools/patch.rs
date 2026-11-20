@@ -1,4 +1,4 @@
-//! `patch`: multi-file edits in the `*** Begin Patch` format (docs/04-tools.md).
+//! `patch`: multi-file edits in the `*** Begin Patch` format.
 use super::*;
 use std::collections::HashMap;
 

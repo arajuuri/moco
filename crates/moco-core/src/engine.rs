@@ -1,4 +1,4 @@
-//! Session engine: the step loop (docs/03-agent-loop.md).
+//! Session engine: the step loop.
 //!
 //! `run` claims the session, then repeats: deliver inbox items allowed at this boundary, run one step
 //! (one LLM call, tools executing concurrently as their calls complete), continue while the step

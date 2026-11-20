@@ -1,7 +1,7 @@
 # Architecture of moco as built
 
-The other documents are the specification (derived from opencode), a usage reference and a roadmap. This one describes
-the code as it is: the pieces, how a prompt travels through them, what is stored where, and which rules hold the design
+The other documents are a usage reference (`usage.md`) and notes on supporting macOS 10.7 (`macos-10.7.md`). This one
+describes the code as it is: the pieces, how a prompt travels through them, what is stored where, and which rules hold the design
 together. When code and this document disagree, the code is right: fix the document.
 
 Paths are relative to the repository root. Line counts are left out on purpose; they go stale.
@@ -17,7 +17,7 @@ crates/moco        the front end: argument parsing, the line-based chat, and the
 
 The only way the engine talks to a front end is the `Ui` trait (`engine.rs`). The front end calls
 `Engine::run` and passes a `Ui`; the engine calls back with events, permission prompts, question forms and spending-limit
-questions. There is no HTTP/SSE boundary, no plugin system and no LSP (see "Out of scope" in `00-overview.md`).
+questions. There is no HTTP/SSE boundary, no plugin system and no LSP (moco does not reproduce them from opencode).
 
 ```
           crates/moco                               crates/moco-core
@@ -38,7 +38,7 @@ questions. There is no HTTP/SSE boundary, no plugin system and no LSP (see "Out 
 ```
 
 Targets: macOS 10.7 through 10.14 on Intel, one binary built with Xcode 11.3.1, Rust 1.78 and a 10.7 deployment target
-(`14-macos-10.7.md`). That rules out anything that needs a newer OS or async runtime
+(`macos-10.7.md`). That rules out anything that needs a newer OS or async runtime
 tooling, so the code is synchronous Rust on OS threads. HTTP is `ureq`, the database is bundled SQLite (`rusqlite`).
 
 ## 2. Modules of `moco-core`
@@ -196,7 +196,7 @@ variables or protocol of a provider in the embedded snapshot (`Catalog::pin_buil
 `anthropic.rs` sets cache breakpoints on the last tool, the system prompt and the last messages, and a test
 (`every_request_of_a_turn_extends_the_previous_one`) enforces it. That is why system prompt, tool schemas and tool-name
 spelling are stable within a turn. Text that has to change from step to step goes in `Request::tail`, which adapters append
-to the final user message after the breakpoints (see `07-providers.md`).
+to the final user message after the breakpoints.
 
 ## 6. Tools and the permission pipeline
 

@@ -1,4 +1,4 @@
-//! Config loading (docs/08-config-and-extensions.md): `moco.json[c]` (JSONC) files merged from
+//! Config loading: `moco.json[c]` (JSONC) files merged from
 //! lowest to highest priority, `{env:NAME}` / `{file:path}` substitution on the raw text (the user's own files only).
 //!
 //! Locations, lowest first: `<app dir>/config/moco.json[c]`; then for every ancestor of the working

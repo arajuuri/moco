@@ -6,7 +6,7 @@ rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 
-# macos-10.7 branch: versions are held to what builds with Rust 1.78 and runs on macOS 10.7 (docs/14-macos-10.7.md).
+# macos-10.7 branch: versions are held to what builds with Rust 1.78 and runs on macOS 10.7 (docs/macos-10.7.md).
 # `rust-version` makes Cargo's resolver prefer compatible releases (`CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback`
 # with a newer cargo), but several crates under-declare it, hence the explicit caps below.
 [dependencies]

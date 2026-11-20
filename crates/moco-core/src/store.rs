@@ -1,4 +1,4 @@
-//! SQLite store (docs/02-domain-model.md). WAL mode, migrations table, JSON columns for variable data.
+//! SQLite store. WAL mode, migrations table, JSON columns for variable data.
 use crate::compat::*;
 use crate::id::new_id;
 use crate::permission::{Effect, Rule};
