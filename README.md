@@ -36,11 +36,13 @@ Step-by-step instructions, including checking the download, a no-`sudo` option, 
 ## Quick start
 
 ```
-moco auth anthropic        # or set ANTHROPIC_API_KEY; other providers: see `moco models`
+moco auth anthropic           # or set ANTHROPIC_API_KEY
 cd your-project
-moco                       # interactive chat
+moco                          # interactive chat
 moco -p "explain this repo"   # one request, then exit
 ```
+
+With OpenAI or Google instead, store the key with `moco auth openai` or `moco auth google` and name a model: `moco --model openai/MODEL` or `moco --model google/MODEL` (`moco models` lists them). [INSTALL.md](INSTALL.md) has the details.
 
 The [usage guide](docs/11-usage.md) covers commands, configuration, permissions, skills and MCP.
 

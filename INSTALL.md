@@ -94,13 +94,43 @@ This prints the version, for example `moco 0.2.2`, and the macOS version it was 
 
 ## 7. First run
 
+moco needs an API key from one AI provider. Pick one. Each command asks for the key and does not show it as you type. It is stored in `~/Library/Application Support/moco/auth.json`, readable only by you.
+
+**Anthropic (Claude)** is the default, so nothing else is needed:
+
 ```
-moco auth anthropic        # paste your API key (it is not shown as you type)
+moco auth anthropic
 cd ~/my-project
-moco                       # starts the chat
+moco
 ```
 
-Other providers: run `moco models` to see them and the environment variable each one reads. See the [usage guide](docs/11-usage.md) for configuration, permissions and commands. moco runs commands and edits files on your behalf, so read the disclaimer and the Safety section in the [README](README.md) first.
+**OpenAI:**
+
+```
+moco auth openai
+moco models openai                  # list the models you can use
+cd ~/my-project
+moco --model openai/MODEL           # MODEL is a name from that list
+```
+
+**Google (Gemini):**
+
+```
+moco auth google
+moco models google
+cd ~/my-project
+moco --model google/MODEL
+```
+
+`--model` is needed because moco starts with an Anthropic model unless you say otherwise. To avoid typing it every time, set `MOCO_MODEL` (for example `export MOCO_MODEL=google/MODEL` in your `~/.bash_profile`), or put the model in the config file `~/Library/Application Support/moco/config/moco.json`:
+
+```
+{ "model": "openai/MODEL" }
+```
+
+Instead of `moco auth`, you can set the key in the environment: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` or `GEMINI_API_KEY`. Other providers (OpenRouter, DeepSeek and more) work the same way: `moco auth PROVIDER`, then `--model PROVIDER/MODEL`. `moco models` shows every provider and whether it is connected. You can switch models inside the chat with `/model`.
+
+See the [usage guide](docs/11-usage.md) for configuration, permissions and commands. moco runs commands and edits files on your behalf, so read the disclaimer and the Safety section in the [README](README.md) first.
 
 ## Updating
 
