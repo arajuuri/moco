@@ -1,4 +1,4 @@
-//! Built-in tools (docs/04-tools.md). Synchronous; cancellation via an `AtomicBool`.
+//! Built-in tools. Synchronous; cancellation via an `AtomicBool`.
 pub mod edit;
 pub mod fsio;
 pub mod glob;

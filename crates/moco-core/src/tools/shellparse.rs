@@ -1,4 +1,4 @@
-//! v1 shell command scanning (docs/05-permissions.md "Simplification for v1"): quote-aware split on
+//! v1 shell command scanning: quote-aware split on
 //! `;`, `&&`, `||`, `|`, `&`, newline. Command substitution (`$(...)`, backticks, `<(...)`) and
 //! unterminated quotes are not parsed: they mark the result `opaque`, which forces an ask.
 //!

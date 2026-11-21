@@ -2,7 +2,7 @@
 
 A coding agent for the terminal that runs on old Intel Macs: **macOS 10.7 (Lion) through 10.14 (Mojave)**. It is a single Rust binary with no runtime besides the system libraries, so it also works headless over SSH. moco is a clean-room reimplementation of [opencode](https://github.com/anomalyco/opencode), built from a written specification of it (see [NOTICE](NOTICE)).
 
-Most current coding agents need a runtime (Node, Bun, Electron) that these systems cannot load. moco is built with Rust 1.78 and `MACOSX_DEPLOYMENT_TARGET=10.7`, and the same binary runs on every release in that range. Details are in [docs/14-macos-10.7.md](docs/14-macos-10.7.md).
+Most current coding agents need a runtime (Node, Bun, Electron) that these systems cannot load. moco is built with Rust 1.78 and `MACOSX_DEPLOYMENT_TARGET=10.7`, and the same binary runs on every release in that range. Details are in [docs/macos-10.7.md](docs/macos-10.7.md).
 
 > **Disclaimer: this software was written by AI and has not been reviewed by humans.**
 > moco was built almost entirely by AI coding agents working from a written specification. No
@@ -31,7 +31,7 @@ sudo cp moco-*-macos-x86_64/moco /usr/local/bin/moco
 moco --version
 ```
 
-Step-by-step instructions, including checking the download, a no-`sudo` option, Lion's download limits, the macOS "unidentified developer" prompt, updating and uninstalling, are in **[INSTALL.md](INSTALL.md)**. To build from source instead, see `scripts/install.sh` and [docs/11-usage.md](docs/11-usage.md).
+Step-by-step instructions, including checking the download, a no-`sudo` option, Lion's download limits, the macOS "unidentified developer" prompt, updating and uninstalling, are in the **[user manual](USER-GUIDE.md)**. To build from source instead, see `scripts/install.sh` and [docs/usage.md](docs/usage.md).
 
 ## Quick start
 
@@ -42,9 +42,9 @@ moco                          # interactive chat
 moco -p "explain this repo"   # one request, then exit
 ```
 
-With OpenAI or Google instead, store the key with `moco auth openai` or `moco auth google` and name a model: `moco --model openai/MODEL` or `moco --model google/MODEL` (`moco models` lists them). [INSTALL.md](INSTALL.md) has the details.
+With OpenAI or Google instead, store the key with `moco auth openai` or `moco auth google` and name a model: `moco --model openai/MODEL` or `moco --model google/MODEL` (`moco models` lists them). The [user manual](USER-GUIDE.md) has the details.
 
-The [usage guide](docs/11-usage.md) covers commands, configuration, permissions, skills and MCP.
+The [usage guide](docs/usage.md) covers commands, configuration, permissions, skills and MCP.
 
 ## Safety
 
@@ -58,11 +58,9 @@ moco is young and moves quickly. The Anthropic, OpenAI and Gemini providers have
 
 ## Documentation
 
-- [USER-GUIDE.md](USER-GUIDE.md): a step-by-step manual for non-technical users
-- [INSTALL.md](INSTALL.md): installing moco
-- [docs/11-usage.md](docs/11-usage.md): using moco
-- [docs/00-overview.md](docs/00-overview.md): design and specification
-- [docs/13-architecture.md](docs/13-architecture.md): the code as built
+- [USER-GUIDE.md](USER-GUIDE.md): a step-by-step manual for installing and using moco, for non-technical users
+- [docs/usage.md](docs/usage.md): using moco
+- [docs/architecture.md](docs/architecture.md): the code as built
 - [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md): working on moco
 
 ## License

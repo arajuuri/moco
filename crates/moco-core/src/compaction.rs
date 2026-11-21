@@ -1,4 +1,4 @@
-//! Context compaction (docs/03-agent-loop.md "Compaction").
+//! Context compaction.
 //!
 //! A `compaction` message stores `{summary, keepFrom, trigger}`: everything before message `keepFrom` is
 //! replaced by the summary; messages from `keepFrom` on stay verbatim. A later compaction summarizes the

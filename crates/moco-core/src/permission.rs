@@ -1,4 +1,4 @@
-//! Permission rule model and evaluation (docs/05-permissions.md).
+//! Permission rule model and evaluation.
 use crate::wildcard;
 use serde::{Deserialize, Serialize};
 

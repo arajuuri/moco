@@ -1,4 +1,4 @@
-//! Provider abstraction (docs/07-providers.md): neutral request/stream types; one adapter per wire protocol.
+//! Provider abstraction: neutral request/stream types; one adapter per wire protocol.
 pub mod anthropic;
 pub mod effort;
 pub mod fake;

@@ -1,4 +1,4 @@
-//! Retry policy (docs/03-agent-loop.md): exponential from 2 s capped at 10 s, at most 10 retries,
+//! Retry policy: exponential from 2 s capped at 10 s, at most 10 retries,
 //! jittered; a provider retry-after raises the wait (capped at 15 min); timeouts get at most 3 retries.
 use super::{ProviderError, TransportKind};
 use std::time::Duration;
