@@ -8,7 +8,7 @@ Each phase ends with a demonstrable check. Test each on a real 10.14 machine or 
 - Secrets: decided, file (`auth.json`, mode 0600), no Keychain; it must work without a GUI session.
 - **Gate**: if TLS/cert validation fails on 10.14, bundle a TLS stack and CA bundle now.
 
-### Phase 0 results (spike in `spike/`, run on macOS 10.14.6, Intel Xeon X5670, Xcode 11.3.1)
+### Phase 0 results (throwaway spike, removed from the tree after Phase 0 and kept in git history; run on macOS 10.14.6, Intel Xeon X5670, Xcode 11.3.1)
 Toolchain decision: **Rust core** (option B in `01`). Rust 1.99.1 stable builds with `MACOSX_DEPLOYMENT_TARGET=10.14`; `otool -l` shows `minos 10.14`; the only dylibs linked are `libSystem` and `libiconv`.
 - TLS: `ureq` + rustls reaches api.anthropic.com, api.openai.com, generativelanguage.googleapis.com and models.dev, and rejects an expired certificate. Both bundled Mozilla roots and the system trust store (`native-certs` feature) validate every endpoint, so the gate did not trigger. Keep the system-roots feature available plus an option to load a PEM bundle, since the OS store is frozen.
 - SSE: a streaming Anthropic Messages request returned 8 events, first after about 560 ms. Not yet tested: an OpenAI-compatible stream.

@@ -36,7 +36,7 @@ Track work with GitHub's fields, not labels or title prefixes: issue Type (Bug, 
 
 ## Architecture
 
-`crates/moco-core` is the UI-independent engine. `crates/moco` is the front end: line-based chat and one-shot in `main.rs`, and the ratatui UI in `tui/`. `app.rs` is a pure model (`update`/`render`, tested via `TestBackend`) and `mod.rs` is the event loop with the engine on a worker thread. Pty tests are `tests/tui.rs` + `tui_pty.py`; the plan is `docs/12-tui-plan.md`. `spike/` and `spike-tui/` are standalone probes with their own workspaces. Don't build them as part of the workspace.
+`crates/moco-core` is the UI-independent engine. `crates/moco` is the front end: line-based chat and one-shot in `main.rs`, and the ratatui UI in `tui/`. `app.rs` is a pure model (`update`/`render`, tested via `TestBackend`) and `mod.rs` is the event loop with the engine on a worker thread. Pty tests are `tests/tui.rs` + `tui_pty.py`; the plan is `docs/12-tui-plan.md`.
 
 Things that take several files to understand:
 

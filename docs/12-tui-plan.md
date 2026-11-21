@@ -22,10 +22,10 @@ Remaining ideas, not planned: syntax highlighting of code, mouse support, `/mcp 
 
 ## Where we stopped (before slice 1)
 
-- Phase 3 is committed through slice G (MCP over Streamable HTTP with OAuth, `553deef`); the plan and spike are `14ef6ee`. Working tree clean. 300 unit + 2 protocol tests pass on Linux and on the Mojave machine.
+- Phase 3 is committed through slice G (MCP over Streamable HTTP with OAuth, `553deef`); the plan and the TUI spike (since removed from the tree) are `14ef6ee`. Working tree clean. 300 unit + 2 protocol tests pass on Linux and on the Mojave machine.
 - Next step: slice 1 (skeleton) below. Not started; the user had not yet said "go".
 - Open items: the manual Terminal.app/iTerm2 look-and-feel pass is still to do; MCP HTTP/OAuth remains verified only against local fakes (Gemini and OpenAI Responses were verified live on 2026-11-13, archive#181/#182).
-- Mac scratch: `~/moco-target` and `~/spike-tui-target` build dirs (fine to keep); temp driver files were removed.
+- Mac scratch: `~/moco-target` build dir (fine to keep); temp driver files were removed.
 
 ## Feasibility result (spike-tui)
 
@@ -51,7 +51,7 @@ ratatui 0.30 + crossterm build on the Mojave machine with `MACOSX_DEPLOYMENT_TAR
 ## Acceptance checks
 
 - `cargo test` covers `update`/`render` with `TestBackend` for each slice (streaming, scroll, dialog answers, queue/steer, resize), plus the existing suites unchanged.
-- A pty-driven script on the Mojave machine per slice (like the spike's) with a scripted fake LLM (`crates/moco/tests/fake_llm.py`): types a prompt, answers a permission dialog, interrupts, resizes, exits; asserts the terminal is restored (no leftover alternate screen or raw mode) even after SIGKILL of the worker and after a panic.
+- A pty-driven script on the Mojave machine per slice (like the TUI spike's, which lives in git history) with a scripted fake LLM (`crates/moco/tests/fake_llm.py`): types a prompt, answers a permission dialog, interrupts, resizes, exits; asserts the terminal is restored (no leftover alternate screen or raw mode) even after SIGKILL of the worker and after a panic.
 - `otool -l` still shows `minos 10.14`; the binary size and start-up time are noted in the roadmap.
 - Manual pass in Terminal.app and iTerm2 on the Mojave screen (colors, wide characters, copy/paste, resize); recorded as done or not done in this file.
 
