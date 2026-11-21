@@ -13,18 +13,14 @@ pins Electron 44 (macOS 12+). Nothing in this repo's runtime stack can be made t
 
 | File                          | Contents                                                           |
 |-------------------------------|--------------------------------------------------------------------|
-| `01-platform-macos-1014.md`   | What 10.14 allows, language/toolchain options, recommendation      |
 | `02-domain-model.md`          | Sessions, messages, inbox, events, storage schema                  |
 | `03-agent-loop.md`            | Step loop, tool execution, retry, max steps, compaction, subagents |
 | `04-tools.md`                 | Every built-in tool: name, input schema, behavior, limits          |
 | `05-permissions.md`           | Rule model, evaluation, shell command scanning, replies            |
-| `06-agents-and-prompts.md`    | Built-in agents, system prompts, reminders, title/summary prompts  |
 | `07-providers.md`             | Provider abstraction, wire protocols to implement, model catalog   |
 | `08-config-and-extensions.md` | Config files, instructions (AGENTS.md), skills, commands, MCP      |
 | `09-ui.md`                    | Screens, interactions, key bindings                                |
-| `10-roadmap.md`               | Phased build order with acceptance checks and results per phase    |
 | `11-usage.md`                 | User reference for the app as built: commands, config, storage     |
-| `12-tui-plan.md`              | Plan and status of the full-screen terminal UI                     |
 | `13-architecture.md`          | The code as built: modules, run lifecycle, storage, invariants     |
 | `14-macos-10.7.md`            | Supporting 10.7 (Lion): Rust 1.78 and its libc shim, pins, back-ports, building, tests |
 
@@ -37,8 +33,8 @@ snapshots/undo.
 
 Out of scope (the upstream repo has them; do not build first): the client/server HTTP API with ~170 endpoints, plugin system
 (Effect plugins, GUI plugins), Code Mode, remote workspaces, schedules, artifacts, voice, image/video generation,
-sharing/enterprise, pairing/tunnels, persistent PTY handoff, LSP, formatters, event-sourced replay.
-These are listed in section "Deliberately dropped" in `10-roadmap.md`.
+sharing/enterprise, pairing/tunnels, persistent PTY handoff, LSP, event-sourced replay.
+Also not reproduced: the roughly 45 provider protocol adapters beyond the few in `07`.
 
 ## Architecture to build
 

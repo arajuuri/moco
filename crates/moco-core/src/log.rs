@@ -1,4 +1,4 @@
-//! Diagnostic log (docs/10-roadmap.md, issue archive#27): a small file logger with no dependencies.
+//! Diagnostic log (issue archive#27): a small file logger with no dependencies.
 //!
 //! * `MOCO_LOG` (or the `log` config key) is an env_logger-style filter: a level for everything
 //!   (`error|warn|info|debug|trace|off`, default `warn`) and optional per-target levels, e.g. `warn,mcp=debug`.

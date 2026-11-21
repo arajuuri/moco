@@ -1,4 +1,4 @@
-//! Conversation titles (docs/06-agents-and-prompts.md "title"). The prompt is moco's own, written to the contract
+//! Conversation titles (the contract is in this file). The prompt is moco's own, written to the contract
 //! in the spec: one line, 3-5 words, no quotes or trailing period or "Title:" label, sentence case, identifiers
 //! preserved, the language of the message, naming the message rather than answering it, greetings -> "Greeting".
 

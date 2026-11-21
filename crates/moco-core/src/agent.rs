@@ -1,4 +1,4 @@
-//! Agents and the system prompt (docs/06-agents-and-prompts.md).
+//! Agents and the system prompt .
 use crate::permission::{Effect, PermissionMode, Rule};
 use crate::tools::Tool;
 

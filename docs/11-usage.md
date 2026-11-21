@@ -1,6 +1,6 @@
 # Using moco
 
-moco is a coding agent for the terminal. This is the reference for the app as built; the other documents describe the design. Phases 0-2 are implemented (see `10-roadmap.md` for results and what is left).
+moco is a coding agent for the terminal. This is the reference for the app as built; the other documents describe the design. All planned phases are implemented.
 
 ## Install
 
