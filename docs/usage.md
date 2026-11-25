@@ -57,7 +57,7 @@ xattr -d com.apple.quarantine ./moco
 | `/agent <id>` | Switch agent |
 | `/mode [manual\|auto]` | Show or switch the permission mode (Shift-Tab does the same in the full-screen chat) |
 | `/compact` | Summarize older messages to free up context (also automatic near the limit) |
-| `/undo`, `/redo` | Undo the last turn's file changes and messages (repeat to go back further) or bring them back; the next prompt makes an undo permanent |
+| `/undo`, `/redo` | Undo the last turn's file changes and messages (repeat to go back further) or bring them back; the next prompt makes an undo permanent. File undo needs the snapshot moco takes before each step; a directory with more than 50,000 files or 512 MiB to store (say, a folder above several repositories) gets none, with a notice, and `node_modules` and Cargo `target/` directories are never included |
 | `/diff` | Changes in the working tree since the session started |
 | `/sessions [all\|archived]`, `/resume <n\|id>` | List and continue sessions (numbers refer to the last list) |
 | `/export [path]` | Write this conversation as Markdown (default `moco-<id>.md` in the project directory; not redacted) |

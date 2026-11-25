@@ -283,8 +283,13 @@ session and the front end is told through the engine's notifier.
 - **Snapshots** (`snapshot.rs`) are `git`-free: a manifest of every non-ignored file with its SHA-256 and mode, contents stored
   once as blobs, only changed files re-hashed. Symlinks are not followed or recorded; a file the walk saw is read through
   `nofollow.rs`, so a link swapped in before it is read is skipped as unreadable (archive#165). One is taken before every step and its id is stored on the assistant message.
-  `/undo` restores files and hides the messages; `/diff` compares the current tree with the session's first snapshot. A project
-  with too many files turns snapshots off for that session with one notice. Files too large to store are reported as skipped.
+  `/undo` restores files and hides the messages; `/diff` compares the current tree with the session's first snapshot.
+  `.gitignore` files apply at every level (also in repositories below a non-git session directory), and `node_modules`
+  and directories tagged with `CACHEDIR.TAG` (Cargo's `target/`) are never entered. A capture first only stats the tree
+  and checks its budget (50,000 files, 512 MiB of files to store; `Snapshots::max_files`/`max_total_bytes`), so a
+  directory over it fails before any file is read or stored (#23); the step runs without a snapshot and snapshots are off
+  for that session (in this process) with one notice. Files over 2 MiB are not stored and are reported as skipped.
+  Interrupting the run cancels a capture in progress.
 - **Limits** (`engine/limits.rs`). A step allowance per run (the last allowed step forbids tools and adds the `MAX_STEPS`
   reminder), and cost limits per run and per session checked after each step that is followed by another. An attended UI is
   asked what to do, an unattended one or `-p` stops the run.

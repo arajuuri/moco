@@ -243,7 +243,7 @@ impl Engine {
         let caps = self.media_caps(provider_id, model_id);
         crate::log_debug!("engine", "step session={sid} step={step} agent={} model={provider_id}/{model_id} messages={} tools={}", agent.id, req.messages.len(), req.tools.len());
 
-        let snapshot = self.take_snapshot(&session, ui);
+        let snapshot = self.take_snapshot(&session, ui, cancel);
         let mut first = json!({ "parts": [] });
         if let Some(id) = &snapshot {
             first["snapshot"] = json!(id);

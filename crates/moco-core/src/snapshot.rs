@@ -1,9 +1,13 @@
 //! Working-tree snapshots for undo and diffs.
 //!
 //! A snapshot is a content-addressed manifest: every non-ignored file of a directory with its SHA-256 and mode,
-//! file contents stored once as blobs. Capturing walks the tree (honoring `.gitignore`, skipping `.git`) and
-//! re-hashes only files whose size, mtime or ctime changed since the previous snapshot (see `racy` for files changed
-//! too close to a capture to be trusted on their timestamps). Restoring writes back changed
+//! file contents stored once as blobs. Capturing walks the tree (honoring `.gitignore` files at every level, skipping
+//! `.git`, `node_modules` and tagged cache directories such as Cargo's `target/`, see `heavy_dir`) and re-hashes only
+//! files whose size, mtime or ctime changed since the previous snapshot (see `racy` for files changed too close to a
+//! capture to be trusted on their timestamps). The walk only stats files and checks the budget (`max_files`,
+//! `max_total_bytes`) before anything is read or stored, so a directory that is too big to snapshot (a home directory,
+//! a folder of repositories with their build trees, #23) fails in the time a stat walk takes, without writing blobs.
+//! A capture can be cancelled between files (`capture_cancellable`). Restoring writes back changed
 //! files and deletes files that did not exist; ignored files are never touched. Self-contained: no `git` needed.
 use crate::compat::*;
 use ignore::WalkBuilder;
@@ -13,13 +17,17 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SnapError {
     /// More files than `max_files`: probably not a project directory (a home directory, a build tree).
     TooManyFiles(usize),
+    /// The files to snapshot add up to more than `max_total_bytes`.
+    TooManyBytes(u64),
+    /// The capture was cancelled (the run was interrupted).
+    Cancelled,
     Missing(String),
     Io(String),
 }
@@ -28,6 +36,8 @@ impl std::fmt::Display for SnapError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SnapError::TooManyFiles(n) => write!(f, "more than {n} files; snapshots are skipped for this directory"),
+            SnapError::TooManyBytes(n) => write!(f, "more than {} MiB of files; snapshots are skipped for this directory", n / (1024 * 1024)),
+            SnapError::Cancelled => f.write_str("snapshot cancelled"),
             SnapError::Missing(m) => write!(f, "snapshot data missing: {m}"),
             SnapError::Io(m) => write!(f, "{m}"),
         }
@@ -173,8 +183,12 @@ pub struct RestoreReport {
 
 pub struct Snapshots {
     root: PathBuf,
+    /// More regular files than this (stored or skipped) and the capture fails before reading any of them.
     pub max_files: usize,
+    /// Larger files are not stored, only listed as skipped.
     pub max_file_bytes: u64,
+    /// The files to store may add up to this much; more and the capture fails before reading any of them.
+    pub max_total_bytes: u64,
     /// Prune never deletes blobs (or temp files) modified more recently than this, so it cannot remove the blobs
     /// of a capture in another process that has not written its manifest yet.
     pub blob_grace: Duration,
@@ -226,6 +240,20 @@ fn touch(path: &Path) -> bool {
     std::fs::File::options().write(true).open(path).and_then(|f| f.set_modified(SystemTime::now())).is_ok()
 }
 
+/// Directories a capture never enters even when no `.gitignore` covers them: `node_modules`, and cache directories
+/// tagged with a `CACHEDIR.TAG` file (https://bford.info/cachedir/), which Cargo writes into every `target/`. Both are
+/// regenerated build output, can hold gigabytes and are almost always ignored in a repository anyway; when a session runs
+/// in a folder above several repositories (#23), nothing else keeps them out.
+fn heavy_dir(path: &Path) -> bool {
+    use std::io::Read;
+    const SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
+    if path.file_name().is_some_and(|n| n == "node_modules") {
+        return true;
+    }
+    let mut head = [0u8; SIGNATURE.len()];
+    std::fs::File::open(path.join("CACHEDIR.TAG")).and_then(|mut f| f.read_exact(&mut head)).is_ok() && head == SIGNATURE
+}
+
 fn is_binary(b: &[u8]) -> bool {
     b[..b.len().min(8192)].contains(&0) || std::str::from_utf8(b).is_err()
 }
@@ -260,6 +288,7 @@ impl Snapshots {
             root,
             max_files: 50_000,
             max_file_bytes: 2 * 1024 * 1024,
+            max_total_bytes: 512 * 1024 * 1024,
             blob_grace: Duration::from_secs(3600),
             #[cfg(test)]
             fake_times: None,
@@ -307,6 +336,12 @@ impl Snapshots {
 
     /// Snapshot `dir` as it is now. `prev` (an earlier snapshot of the same directory) lets unchanged files skip hashing.
     pub fn capture(&self, dir: &Path, prev_id: Option<&str>) -> Result<String, SnapError> {
+        self.capture_cancellable(dir, prev_id, &AtomicBool::new(false))
+    }
+
+    /// `capture` that gives up with `SnapError::Cancelled` soon after `cancel` is set. Blobs already written stay until
+    /// prune removes them (nothing refers to them).
+    pub fn capture_cancellable(&self, dir: &Path, prev_id: Option<&str>, cancel: &AtomicBool) -> Result<String, SnapError> {
         // Taken before anything is read, so an entry judged settled (`racy`) was settled before its file was read.
         #[allow(unused_mut)]
         let mut start_ns = now_ns();
@@ -337,11 +372,21 @@ impl Snapshots {
             .git_exclude(true)
             .require_git(false)
             .follow_links(false)
-            .filter_entry(|e| e.file_name() != ".git")
+            .filter_entry(|e| e.file_name() != ".git" && !(e.file_type().is_some_and(|t| t.is_dir()) && e.depth() > 0 && heavy_dir(e.path())))
             .build();
+        // First only stat, so a tree over the budget is refused before any file is read or any blob written.
+        let (mut seen, mut total) = (0usize, 0u64);
+        let mut found: Vec<(String, std::fs::Metadata)> = vec![];
         for entry in walker.filter_map(|e| e.ok()) {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(SnapError::Cancelled);
+            }
             if !entry.file_type().is_some_and(|t| t.is_file()) {
                 continue;
+            }
+            seen += 1;
+            if seen > self.max_files {
+                return Err(SnapError::TooManyFiles(self.max_files));
             }
             let Ok(rel) = entry.path().strip_prefix(dir) else { continue };
             let Some(rel) = rel.to_str().map(String::from) else {
@@ -357,8 +402,15 @@ impl Snapshots {
                 skipped.push(Skipped { path: rel, reason: SkipReason::TooLarge, size: meta.len(), mtime_ns });
                 continue;
             }
-            if files.len() >= self.max_files {
-                return Err(SnapError::TooManyFiles(self.max_files));
+            total += meta.len();
+            if total > self.max_total_bytes {
+                return Err(SnapError::TooManyBytes(self.max_total_bytes));
+            }
+            found.push((rel, meta));
+        }
+        for (rel, meta) in found {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(SnapError::Cancelled);
             }
             let st = stamp(&meta);
             // Only entries recorded as settled (nonzero ctime) are trusted, so an old manifest's entries are re-read once.
@@ -676,6 +728,74 @@ mod tests {
         let mut s = Snapshots::new(t.root.join("store2"));
         s.max_files = 3;
         assert_eq!(s.capture(&t.dir(), None), Err(SnapError::TooManyFiles(3)));
+        assert!(!t.root.join("store2/blobs").exists(), "refused before any file was stored (#23)");
+        // Files too large to store count too: a tree of big build outputs is not walked and listed without end.
+        let mut s = Snapshots::new(t.root.join("store3"));
+        (s.max_files, s.max_file_bytes) = (5, 0);
+        assert_eq!(s.manifest(&s.capture(&t.dir(), None).unwrap()).unwrap().skipped.len(), 5);
+        t.put("f5", "x");
+        assert_eq!(s.capture(&t.dir(), None), Err(SnapError::TooManyFiles(5)));
+    }
+
+    #[test]
+    fn a_tree_over_the_byte_budget_is_refused_before_anything_is_stored() {
+        // #23: a folder of repositories with build trees wrote 1.6 GB of blobs and never finished. The budget is
+        // checked on the stat walk, so nothing is read or written.
+        let t = Tree::new();
+        t.put("a.txt", &"a".repeat(600));
+        t.put("b.txt", &"b".repeat(600));
+        let mut s = Snapshots::new(t.root.join("store2"));
+        s.max_total_bytes = 1000;
+        let err = s.capture(&t.dir(), None).unwrap_err();
+        assert_eq!(err, SnapError::TooManyBytes(1000));
+        assert!(err.to_string().contains("snapshots are skipped"), "{err}");
+        assert!(!t.root.join("store2/blobs").exists() && !t.root.join("store2/manifests").exists());
+        // Files above the per-file limit are skipped, not counted against the budget.
+        s.max_file_bytes = 500;
+        let m = s.manifest(&s.capture(&t.dir(), None).unwrap()).unwrap();
+        assert!(m.files.is_empty() && m.skipped.len() == 2, "{m:?}");
+        s.max_file_bytes = 2 * 1024 * 1024;
+        s.max_total_bytes = 1200;
+        assert_eq!(s.manifest(&s.capture(&t.dir(), None).unwrap()).unwrap().files.len(), 2, "exactly at the budget is fine");
+    }
+
+    #[test]
+    fn heavy_build_dirs_and_nested_repo_ignores_are_skipped_outside_a_repository() {
+        // #23: a session in a non-git folder above several repositories. Nested `.gitignore` files apply to their own
+        // repository, and Cargo `target/` (tagged CACHEDIR.TAG) and `node_modules` are skipped even when nothing ignores them.
+        let t = Tree::new();
+        t.put("notes.txt", "n");
+        t.put("app/.git/HEAD", "ref: refs/heads/main");
+        t.put("app/.gitignore", "/dist\n");
+        t.put("app/src/main.rs", "fn main() {}");
+        t.put("app/dist/bundle.js", "x");
+        t.put("lib/src/lib.rs", "");
+        t.put("lib/target/CACHEDIR.TAG", "Signature: 8a477f597d28d172789f06886806bc55\n# cargo\n");
+        t.put("lib/target/debug/lib.rlib", "x");
+        t.put("web/node_modules/pkg/index.js", "x");
+        t.put("web/index.js", "x");
+        // A directory with a CACHEDIR.TAG that lacks the signature is not a cache directory.
+        t.put("docs/CACHEDIR.TAG", "not a tag");
+        t.put("docs/target/readme.md", "x");
+        let m = t.snaps.manifest(&t.cap(None)).unwrap();
+        assert_eq!(
+            m.files.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["app/.gitignore", "app/src/main.rs", "docs/CACHEDIR.TAG", "docs/target/readme.md", "lib/src/lib.rs", "notes.txt", "web/index.js"]
+        );
+        // The session directory itself is snapshotted even if it is tagged (the user chose to work there).
+        t.put("CACHEDIR.TAG", "Signature: 8a477f597d28d172789f06886806bc55\n");
+        assert!(t.snaps.manifest(&t.cap(None)).unwrap().files.contains_key("notes.txt"));
+    }
+
+    #[test]
+    fn a_cancelled_capture_stops_and_writes_no_manifest() {
+        let t = Tree::new();
+        t.put("a.txt", "x");
+        let cancel = AtomicBool::new(true);
+        assert_eq!(t.snaps.capture_cancellable(&t.dir(), None, &cancel), Err(SnapError::Cancelled));
+        assert!(!t.root.join("store/manifests").exists() && !t.root.join("store/blobs").exists());
+        cancel.store(false, Ordering::Relaxed);
+        assert!(t.snaps.capture_cancellable(&t.dir(), None, &cancel).is_ok());
     }
 
     #[test]
