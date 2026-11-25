@@ -1,10 +1,16 @@
 //! `websearch`: look something up on the web through a configurable provider and return titles, links and
 //! snippets (the model reads a page with `webfetch`). Providers: DuckDuckGo's HTML page (needs no key and no
 //! account, the default), Brave Search, Tavily and Exa (API keys), and any SearXNG instance.
+//!
+//! Searches to one endpoint are paced (#11): a model that fans out a dozen parallel calls would otherwise trip the
+//! provider's rate limit or captcha. They run one at a time with a gap between them, and once the provider refuses
+//! (a captcha or HTTP 429), the endpoint is paused so queued and later searches fail at once without a request.
 use super::*;
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 const UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36";
 const MAX_BODY: usize = 2 * 1024 * 1024;
@@ -26,11 +32,124 @@ pub struct Settings {
     /// Extra environment variables to read the API key from (after `<PROVIDER>_API_KEY`).
     pub key_env: Vec<String>,
     pub app_dir: PathBuf,
+    /// Replaces the provider's default pacing (tests).
+    pub pace: Option<Pace>,
+}
+
+/// How searches to one endpoint are spaced out, and how long it stays paused after the provider refuses one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pace {
+    /// Minimum time from the end of one request to the start of the next.
+    pub gap: Duration,
+    /// Pause after a captcha, or after an HTTP 429 without `Retry-After`.
+    pub cooldown: Duration,
+}
+
+impl Pace {
+    pub fn for_provider(provider: &str) -> Pace {
+        let secs = |gap_ms, cooldown| Pace { gap: Duration::from_millis(gap_ms), cooldown: Duration::from_secs(cooldown) };
+        match provider {
+            // The HTML page is meant for people; it answers bursts with a captcha that lasts minutes.
+            "duckduckgo" | "ddg" => secs(2000, 180),
+            // Brave's free plan allows one query per second; public SearXNG instances limit similarly.
+            "brave" | "searxng" => secs(1000, 60),
+            _ => secs(500, 60),
+        }
+    }
+}
+
+struct Lane {
+    busy: bool,
+    next: Instant,
+    paused: Option<(Instant, String)>,
+}
+
+fn lanes() -> &'static (Mutex<HashMap<String, Lane>>, Condvar) {
+    static LANES: OnceLock<(Mutex<HashMap<String, Lane>>, Condvar)> = OnceLock::new();
+    LANES.get_or_init(|| (Mutex::new(HashMap::new()), Condvar::new()))
+}
+
+fn human(d: Duration) -> String {
+    let s = d.as_secs() + u64::from(d.subsec_nanos() > 0);
+    if s >= 60 { format!("{}m {:02}s", s / 60, s % 60) } else { format!("{s}s") }
+}
+
+/// The error for a search refused without a request because its endpoint is paused.
+fn paused_error(provider: &str, until: Instant, why: &str) -> ToolError {
+    ToolError::fail(format!(
+        "Not searched: {provider} searches are paused for another {} because {why}. Don't retry before then; continue with the results you have, read known pages with webfetch, or configure another provider with `websearch.provider`.",
+        human(until.saturating_duration_since(Instant::now()))
+    ))
+}
+
+/// The right to send one request to an endpoint; dropping it lets the next search go after the gap.
+struct Turn {
+    key: String,
+    gap: Duration,
+}
+
+impl Turn {
+    /// Waits until no other search to this endpoint is running and the gap since the last one has passed. Fails at
+    /// once while the endpoint is paused, and with `Interrupted` when the run is cancelled while waiting.
+    fn take(key: &str, provider: &str, gap: Duration, cancelled: &dyn Fn() -> bool) -> Result<Turn, ToolError> {
+        let (map, cv) = lanes();
+        let mut m = map.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            let now = Instant::now();
+            let lane = m.entry(key.to_string()).or_insert(Lane { busy: false, next: now, paused: None });
+            match &lane.paused {
+                Some((until, why)) if *until > now => return Err(paused_error(provider, *until, why)),
+                Some(_) => lane.paused = None,
+                None => {}
+            }
+            if !lane.busy && lane.next <= now {
+                lane.busy = true;
+                return Ok(Turn { key: key.to_string(), gap });
+            }
+            if cancelled() {
+                return Err(ToolError::Interrupted);
+            }
+            let wait = if lane.busy { Duration::from_millis(100) } else { (lane.next - now).min(Duration::from_millis(100)) };
+            m = cv.wait_timeout(m, wait).unwrap_or_else(|e| e.into_inner()).0;
+        }
+    }
+
+    /// Pauses this endpoint: searches waiting for it, and new ones, fail until `for_` has passed.
+    fn pause(&self, for_: Duration, why: &str) {
+        let mut m = lanes().0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(lane) = m.get_mut(&self.key) {
+            lane.paused = Some((Instant::now() + for_, why.to_string()));
+        }
+    }
+}
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        let (map, cv) = lanes();
+        let mut m = map.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(lane) = m.get_mut(&self.key) {
+            lane.busy = false;
+            lane.next = Instant::now() + self.gap;
+        }
+        cv.notify_all();
+    }
+}
+
+/// Why a search failed: the provider refused it for sending too many (pause the endpoint), or anything else.
+enum Failure {
+    Limited { message: String, why: &'static str, retry_after: Option<Duration> },
+    Other(ToolError),
+}
+
+impl From<ToolError> for Failure {
+    fn from(e: ToolError) -> Self {
+        Failure::Other(e)
+    }
 }
 
 impl Settings {
     pub fn default_for(app_dir: PathBuf) -> Settings {
-        Settings { provider: "duckduckgo".into(), url: None, max_results: 8, key_env: vec![], app_dir }
+        Settings { provider: "duckduckgo".into(), url: None, max_results: 8, key_env: vec![], app_dir, pace: None }
     }
 
     /// From config: `None` when switched off (`"websearch": false`).
@@ -188,33 +307,66 @@ impl WebSearch {
         Ok(String::from_utf8_lossy(&buf).into_owned())
     }
 
-    fn call(&self, req: ureq::Request, body: Option<Value>, form: Option<&[(&str, &str)]>) -> Result<String, ToolError> {
+    fn call(&self, req: ureq::Request, body: Option<Value>, form: Option<&[(&str, &str)]>) -> Result<String, Failure> {
         let result = match (body, form) {
             (Some(b), _) => req.set("Content-Type", "application/json").send_string(&b.to_string()),
             (None, Some(f)) => req.send_form(f),
             (None, None) => req.call(),
         };
         match result {
-            Ok(r) if (300..400).contains(&r.status()) => Err(ToolError::fail(format!(
+            Ok(r) if (300..400).contains(&r.status()) => Err(Failure::Other(ToolError::fail(format!(
                 "The search service redirected to {} (HTTP {}); moco does not follow redirects on requests that carry an API key. Set `websearch.url` to the final address.",
                 r.header("location").unwrap_or("?"),
                 r.status()
-            ))),
-            Ok(r) => Self::read(r),
+            )))),
+            Ok(r) => Ok(Self::read(r)?),
+            Err(ureq::Error::Status(429, r)) => {
+                let retry_after = r.header("retry-after").and_then(|v| v.trim().parse::<u64>().ok()).map(|s| Duration::from_secs(s.clamp(1, 900)));
+                let detail = Self::read(r).unwrap_or_default();
+                Err(Failure::Limited { message: format!("The search service answered with status 429 (rate limited). {}", clip(&plain(&detail), 200)), why: "the service rate-limited them (HTTP 429)", retry_after })
+            }
             Err(ureq::Error::Status(code, r)) => {
                 let detail = Self::read(r).unwrap_or_default();
-                let hint = match code {
-                    401 | 403 => " (check the API key)",
-                    429 => " (rate limited: wait a bit or use another provider)",
-                    _ => "",
-                };
-                Err(ToolError::fail(format!("The search service answered with status {code}{hint}. {}", clip(&plain(&detail), 200))))
+                let hint = if matches!(code, 401 | 403) { " (check the API key)" } else { "" };
+                Err(Failure::Other(ToolError::fail(format!("The search service answered with status {code}{hint}. {}", clip(&plain(&detail), 200)))))
             }
-            Err(ureq::Error::Transport(t)) => Err(ToolError::fail(format!("The search request failed: {t}"))),
+            Err(ureq::Error::Transport(t)) => Err(Failure::Other(ToolError::fail(format!("The search request failed: {t}")))),
         }
     }
 
-    pub fn search(&self, query: &str, count: usize) -> Result<Vec<Hit>, ToolError> {
+    fn lane_key(&self) -> String {
+        format!("{} {}", self.settings.provider, self.settings.url.as_deref().unwrap_or(""))
+    }
+
+    /// Fails while this endpoint is paused, so a search that would be skipped does not ask for permission first.
+    fn check_paused(&self) -> Result<(), ToolError> {
+        let m = lanes().0.lock().unwrap_or_else(|e| e.into_inner());
+        match m.get(&self.lane_key()).and_then(|l| l.paused.as_ref()) {
+            Some((until, why)) if *until > Instant::now() => Err(paused_error(&self.settings.provider, *until, why)),
+            _ => Ok(()),
+        }
+    }
+
+    /// One request, paced with the other searches to the same endpoint (see the module docs).
+    fn paced_search(&self, query: &str, count: usize, ctx: &ToolCtx) -> Result<Vec<Hit>, ToolError> {
+        let provider = self.settings.provider.as_str();
+        let pace = self.settings.pace.unwrap_or_else(|| Pace::for_provider(provider));
+        let turn = Turn::take(&self.lane_key(), provider, pace.gap, &|| ctx.cancelled())?;
+        match self.search(query, count) {
+            Ok(hits) => Ok(hits),
+            Err(Failure::Other(e)) => Err(e),
+            Err(Failure::Limited { message, why, retry_after }) => {
+                let pause = retry_after.unwrap_or(pace.cooldown);
+                turn.pause(pause, why);
+                Err(ToolError::fail(format!(
+                    "{message} moco pauses {provider} searches for {}: searches still waiting are skipped, so don't retry before then. Continue with the results you have, read known pages with webfetch, or configure another provider with `websearch.provider` (duckduckgo, brave, tavily, exa or searxng).",
+                    human(pause)
+                )))
+            }
+        }
+    }
+
+    fn search(&self, query: &str, count: usize) -> Result<Vec<Hit>, Failure> {
         let s = &self.settings;
         let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(20)).build();
         // Requests with a key follow no redirects: ureq would pass `X-Subscription-Token` and `x-api-key` on to the
@@ -227,7 +379,7 @@ impl WebSearch {
                 let page = self.call(agent.post(&base("https://html.duckduckgo.com/html/")).set("User-Agent", UA), None, Some(&[("q", query), ("kl", "wt-wt")]))?;
                 let hits = parse_duckduckgo(&page);
                 if hits.is_empty() && (page.contains("anomaly") || page.contains("captcha") || page.contains("challenge")) {
-                    return Err(ToolError::fail("DuckDuckGo asked for a captcha (too many searches from here). Wait a while, or configure another provider with `websearch.provider` (brave, tavily, exa or searxng)."));
+                    return Err(Failure::Limited { message: "DuckDuckGo asked for a captcha (too many searches from here).".into(), why: "DuckDuckGo asked for a captcha", retry_after: None });
                 }
                 hits
             }
@@ -247,11 +399,11 @@ impl WebSearch {
                 parse_exa(&json_of(self.call(req, Some(json!({"query": query, "numResults": count, "contents": {"highlights": {"numSentences": 2}}})), None)?)?)
             }
             "searxng" => {
-                let Some(root) = &s.url else { return Err(ToolError::fail("the searxng provider needs `websearch.url` (the address of your SearXNG instance)")) };
+                let Some(root) = &s.url else { return Err(ToolError::fail("the searxng provider needs `websearch.url` (the address of your SearXNG instance)").into()) };
                 let url = format!("{}/search?q={}&format=json", root.trim_end_matches('/'), percent_encode(query));
                 parse_searxng(&json_of(self.call(agent.get(&url).set("Accept", "application/json"), None, None)?)?)
             }
-            other => return Err(ToolError::fail(format!("unknown web search provider '{other}' (duckduckgo, brave, tavily, exa or searxng)"))),
+            other => return Err(ToolError::fail(format!("unknown web search provider '{other}' (duckduckgo, brave, tavily, exa or searxng)")).into()),
         };
         Ok(hits.into_iter().filter(|h| !h.url.is_empty()).take(count).collect())
     }
@@ -263,7 +415,9 @@ impl Tool for WebSearch {
     }
     fn description(&self) -> String {
         "Search the web and get back titles, links and short snippets. Use it for current information, library or API documentation, \
-and error messages you do not recognize; read a result in full with `webfetch`. Write a focused query (key terms, not a sentence)."
+and error messages you do not recognize; read a result in full with `webfetch`. Write a focused query (key terms, not a sentence). \
+Prefer a few focused searches over many at once: searches run one at a time, and a burst can make the search service block \
+further searches for minutes. If a search reports that searching is paused, do not retry; work with what you have."
             .into()
     }
     fn schema(&self) -> Value {
@@ -277,11 +431,12 @@ and error messages you do not recognize; read a result in full with `webfetch`. 
             return Err(ToolError::fail("`query` must not be empty"));
         }
         let count = opt_u64(input, "max_results").map(|n| n as usize).unwrap_or(self.settings.max_results).clamp(1, 20);
+        self.check_paused()?;
         ctx.permit("websearch", vec![query.clone()], vec!["*".into()])?;
         if ctx.cancelled() {
             return Err(ToolError::Interrupted);
         }
-        let hits = self.search(&query, count)?;
+        let hits = self.paced_search(&query, count, ctx)?;
         let mut text = format!("Search results for \"{query}\" ({}):\n", self.settings.provider);
         if hits.is_empty() {
             text.push_str("\nNo results. Try different or fewer key terms.");
@@ -309,6 +464,7 @@ mod tests {
         let mut s = Settings::default_for(std::env::temp_dir().join(format!("moco-ws-{}", std::process::id())));
         s.provider = provider.into();
         s.url = url;
+        s.pace = Some(Pace { gap: Duration::ZERO, cooldown: Duration::from_millis(300) });
         WebSearch { settings: s }
     }
 
@@ -412,19 +568,85 @@ mod tests {
     fn searxng_needs_an_address_and_errors_are_explained() {
         let env = Env::new();
         assert!(tool("searxng", None).run(&json!({"query": "q"}), &env.ctx()).unwrap_err().message().contains("websearch.url"));
-        let s = serve(vec![ok("application/json", r#"{"results":[{"title":"S","url":"https://s","content":"hit"}]}"#), error(429, "slow down", vec![]), ok("text/html", "<html>please solve this captcha, anomaly detected</html>"), ok("text/html", "<html>no results at all</html>")]);
+        let s = serve(vec![ok("application/json", r#"{"results":[{"title":"S","url":"https://s","content":"hit"}]}"#), error(429, "slow down", vec![]), ok("text/html", "<html>no results at all</html>")]);
         let t = tool("searxng", Some(format!("{}/", s.url)));
         assert!(t.run(&json!({"query": "x y"}), &env.ctx()).unwrap().text.contains("1. S"));
         assert!(s.requests.lock().unwrap()[0].0.starts_with("GET /search?q=x%20y&format=json "));
         let e = t.run(&json!({"query": "x"}), &env.ctx()).unwrap_err();
         assert!(e.message().contains("status 429") && e.message().contains("rate limited"), "{}", e.message());
-        let e = tool("duckduckgo", Some(s.url.clone())).run(&json!({"query": "x"}), &env.ctx()).unwrap_err();
-        assert!(e.message().contains("captcha"), "{}", e.message());
         let empty = tool("duckduckgo", Some(s.url.clone())).run(&json!({"query": "x"}), &env.ctx()).unwrap();
         assert!(empty.text.contains("No results") && !empty.text.contains("webfetch"));
         assert!(tool("bing", None).run(&json!({"query": "q"}), &env.ctx()).unwrap_err().message().contains("unknown web search provider"));
         assert!(tool("duckduckgo", None).run(&json!({"query": "  "}), &env.ctx()).is_err());
         assert!(tool("duckduckgo", None).run(&json!({}), &env.ctx()).is_err());
+    }
+
+    #[test]
+    fn searches_to_one_endpoint_run_one_at_a_time_with_a_gap() {
+        let s = serve((0..3).map(|_| ok("text/html", DDG)).collect());
+        let mut t = tool("duckduckgo", Some(s.url.clone()));
+        t.settings.pace = Some(Pace { gap: Duration::from_millis(300), cooldown: Duration::from_secs(1) });
+        let start = Instant::now();
+        std::thread::scope(|sc| {
+            for i in 0..3 {
+                let t = &t;
+                sc.spawn(move || {
+                    let env = Env::new();
+                    assert!(t.run(&json!({"query": format!("q{i}")}), &env.ctx()).unwrap().text.contains("1. Timeout in ureq"));
+                });
+            }
+        });
+        assert!(start.elapsed() >= Duration::from_millis(600), "two gaps between three searches: {:?}", start.elapsed());
+        assert_eq!(s.requests.lock().unwrap().len(), 3);
+        // Another endpoint has its own lane.
+        let other = serve(vec![ok("text/html", DDG)]);
+        let mut t2 = tool("duckduckgo", Some(other.url.clone()));
+        t2.settings.pace = t.settings.pace;
+        let start = Instant::now();
+        t2.run(&json!({"query": "q"}), &Env::new().ctx()).unwrap();
+        assert!(start.elapsed() < Duration::from_millis(250), "{:?}", start.elapsed());
+    }
+
+    #[test]
+    fn a_captcha_pauses_the_provider_and_skips_waiting_searches() {
+        let env = Env::new();
+        let s = serve(vec![ok("text/html", "<html>please solve this captcha, anomaly detected</html>"), ok("text/html", DDG)]);
+        let t = tool("duckduckgo", Some(s.url.clone()));
+        let e = t.run(&json!({"query": "x"}), &env.ctx()).unwrap_err();
+        assert!(e.message().contains("captcha") && e.message().contains("pauses duckduckgo searches") && e.message().contains("don't retry"), "{}", e.message());
+        let asked = env.perm.asked().len();
+        let e = t.run(&json!({"query": "y"}), &env.ctx()).unwrap_err();
+        assert!(e.message().starts_with("Not searched: duckduckgo searches are paused") && e.message().contains("DuckDuckGo asked for a captcha"), "{}", e.message());
+        assert_eq!(s.requests.lock().unwrap().len(), 1, "the skipped search sent nothing");
+        assert_eq!(env.perm.asked().len(), asked, "and asked for no permission");
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(t.run(&json!({"query": "z"}), &env.ctx()).unwrap().text.contains("1. Timeout in ureq"), "the pause ends after the cooldown");
+    }
+
+    #[test]
+    fn http_429_pauses_for_retry_after() {
+        let env = Env::new();
+        let s = serve(vec![error(429, "slow down", vec![("Retry-After", "7".into())])]);
+        let t = tool("searxng", Some(s.url.clone()));
+        let e = t.run(&json!({"query": "x"}), &env.ctx()).unwrap_err();
+        assert!(e.message().contains("status 429") && e.message().contains("pauses searxng searches for 7s"), "{}", e.message());
+        std::thread::sleep(Duration::from_millis(400));
+        let e = t.run(&json!({"query": "y"}), &env.ctx()).unwrap_err();
+        assert!(e.message().contains("paused for another") && e.message().contains("HTTP 429"), "Retry-After outlasts the 300 ms cooldown: {}", e.message());
+        assert_eq!(s.requests.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_cancelled_run_stops_waiting_for_its_turn() {
+        let s = serve(vec![ok("text/html", DDG)]);
+        let mut t = tool("duckduckgo", Some(s.url.clone()));
+        t.settings.pace = Some(Pace { gap: Duration::from_secs(30), cooldown: Duration::from_secs(1) });
+        t.run(&json!({"query": "first"}), &Env::new().ctx()).unwrap();
+        let env = Env::new();
+        env.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        let start = Instant::now();
+        assert!(matches!(t.run(&json!({"query": "second"}), &env.ctx()), Err(ToolError::Interrupted)));
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

@@ -145,7 +145,7 @@ The assistant can search the web with the `websearch` tool and read pages with `
 { "websearch": { "provider": "searxng", "url": "https://searx.example.org" } }
 { "websearch": false }                                        // no web search at all
 ```
-Brave, Tavily and Exa need an API key: set `BRAVE_API_KEY` (`TAVILY_API_KEY`, `EXA_API_KEY`) or run `moco auth brave`. DuckDuckGo may show a captcha after many searches in a short time; moco then says so and you can switch provider.
+Brave, Tavily and Exa need an API key: set `BRAVE_API_KEY` (`TAVILY_API_KEY`, `EXA_API_KEY`) or run `moco auth brave`. Searches to the same service run one at a time, a moment apart (2 s for DuckDuckGo, 1 s for Brave and SearXNG, 0.5 s for Tavily and Exa), so many searches at once can't trip the service's limits. If the service still answers with a captcha (DuckDuckGo) or "too many requests" (HTTP 429), moco pauses searches with it (for the service's `Retry-After` time, otherwise 3 minutes for DuckDuckGo and 1 minute for the others). Searches still waiting are skipped without a request, the assistant is told not to retry, and you can switch provider.
 
 ## Formatters
 
