@@ -183,6 +183,9 @@ share it on purpose. Session exports (`moco sessions export -o`, `/export`) are 
   model gets a tool error instead of the stream failing), `Native` and `Finish`.
 - Provider-private data (OpenAI reasoning items, Gemini thought signatures, Anthropic thinking blocks) travels as
   `Block::Native` / `Event::Native`, is stored with the assistant message, and only its own adapter replays it.
+  History can therefore hold tool calls with no replay data for the current adapter (a mid-session model switch, or a
+  refused reply that dropped it). Gemini 3+ rejects a step whose first function call has no thought signature, so
+  `gemini.rs` sends Google's documented dummy `skip_thought_signature_validator` on such calls (#12).
 
 One adapter per wire protocol: Anthropic Messages, OpenAI-compatible Chat Completions, OpenAI Responses and Gemini.
 Responses is the default for the built-in `openai` provider (`ProviderInfo::protocol`, archive#185); Gemini has been
