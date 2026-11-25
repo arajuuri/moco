@@ -4,12 +4,19 @@
 //!
 //! Gemini identifies a function result by the function's *name* and gives calls no ids, so moco makes up ids for calls
 //! and maps them back to names when building a request. Thought signatures that come with function calls are kept as
-//! `Block::Native` and sent back on the same call.
+//! `Block::Native` and sent back on the same call. Gemini 3+ rejects a step whose first function call has no signature
+//! (#12), which happens for calls another provider made before a mid-session model switch, or when the signature was
+//! dropped (a refused reply keeps its calls but not its replay data); those get [`SKIP_SIGNATURE`].
 use super::*;
 use serde_json::{json, Map};
 use std::collections::{BTreeMap, HashMap};
 
 pub const PROVIDER: &str = "gemini";
+
+/// The dummy signature Google documents for function calls the API did not generate (history from another model or
+/// injected calls): it skips signature validation. The thought-signatures FAQ names this and
+/// `context_engineering_is_the_way_to_go` as equivalent.
+pub const SKIP_SIGNATURE: &str = "skip_thought_signature_validator";
 
 pub struct Gemini {
     pub api_key: Option<String>,
@@ -129,14 +136,18 @@ pub fn build_body(req: &Request) -> Value {
                     })
                     .collect();
                 let mut parts: Vec<Value> = vec![];
+                let mut first_call = true;
                 for b in &m.content {
                     match b {
                         Block::Text(t) if !t.is_empty() => parts.push(json!({"text":t})),
                         Block::ToolUse { id, name, input } => {
                             let mut p = json!({"functionCall":{"name":name,"args":input}});
-                            if let Some(sig) = signatures.get(id.as_str()) {
+                            // Gemini validates the first call of each step; later parallel calls never carry one.
+                            // Derived from history alone, so the request stays byte-stable across steps.
+                            if let Some(sig) = signatures.get(id.as_str()).copied().or(first_call.then_some(SKIP_SIGNATURE)) {
                                 p["thoughtSignature"] = json!(sig);
                             }
+                            first_call = false;
                             parts.push(p);
                         }
                         _ => {}
@@ -469,6 +480,40 @@ mod tests {
         let mut r = request();
         r.tools_disabled = true;
         assert_eq!(build_body(&r)["toolConfig"], json!({"functionCallingConfig":{"mode":"NONE"}}));
+    }
+
+    #[test]
+    fn calls_without_a_signature_get_the_documented_dummy() {
+        // #12: calls made by another provider (Anthropic) before switching to Gemini carry no signature, and Gemini 3+
+        // rejects a step whose first function call has none.
+        let mut r = request();
+        r.messages.insert(
+            1,
+            ChatMessage {
+                role: Role::Assistant,
+                content: vec![
+                    Block::Native { provider: "anthropic".into(), data: json!({"type":"thinking","signature":"ANTH"}) },
+                    Block::Text("Checking.".into()),
+                    Block::ToolUse { id: "toolu_1".into(), name: "read".into(), input: json!({"path":"b.rs"}) },
+                    Block::ToolUse { id: "toolu_2".into(), name: "glob".into(), input: json!({}) },
+                ],
+            },
+        );
+        r.messages.insert(2, ChatMessage { role: Role::User, content: vec![Block::ToolResult { id: "toolu_1".into(), content: "x".into(), is_error: false }, Block::ToolResult { id: "toolu_2".into(), content: "y".into(), is_error: false }] });
+        let b = build_body(&r);
+        let c = b["contents"].as_array().unwrap();
+        assert_eq!(c[1]["parts"][1], json!({"functionCall":{"name":"read","args":{"path":"b.rs"}},"thoughtSignature":SKIP_SIGNATURE}), "the first foreign call gets the dummy");
+        assert_eq!(c[1]["parts"][2], json!({"functionCall":{"name":"glob","args":{}}}), "later parallel calls need none");
+        assert_eq!(c[2]["parts"][0]["functionResponse"]["name"], "read");
+        // Gemini's own signed step is untouched: its real signature, nothing on the parallel call.
+        assert_eq!(c[3]["parts"][1]["thoughtSignature"], "SIG1");
+        assert!(c[3]["parts"][2].get("thoughtSignature").is_none());
+        // A Gemini step whose signature was lost (e.g. a refused reply drops replay data) gets the dummy too.
+        let mut lost = request();
+        lost.messages[1].content.retain(|b| !matches!(b, Block::Native { .. }));
+        assert_eq!(build_body(&lost)["contents"][1]["parts"][1]["thoughtSignature"], SKIP_SIGNATURE);
+        // Deterministic: the same history builds the same bytes (prompt-cache prefix stability).
+        assert_eq!(build_body(&r).to_string(), b.to_string());
     }
 
     #[test]
