@@ -19,8 +19,10 @@ fn log_skipped(sid: &str, skipped: &[crate::snapshot::Skipped]) {
 }
 
 impl Engine {
-    /// Capture the working tree before a step. Best effort: a failure disables snapshots for the session with one notice.
-    pub(super) fn take_snapshot(&self, session: &Session, ui: &dyn Ui) -> Option<String> {
+    /// Capture the working tree before a step. Best effort: a failure (too many files or bytes, I/O) disables snapshots
+    /// for the session in this process with one notice; the step goes on without one. Cancelling the run cancels the
+    /// capture, which leaves snapshots on for the next step.
+    pub(super) fn take_snapshot(&self, session: &Session, ui: &dyn Ui, cancel: &AtomicBool) -> Option<String> {
         if !self.cfg.snapshots || self.snapshot_off.lock().unwrap().contains(&session.id) {
             return None;
         }
@@ -30,13 +32,17 @@ impl Engine {
         };
         let started = std::time::Instant::now();
         let snaps = self.snaps(session);
-        match snaps.capture(std::path::Path::new(&session.directory), prev.as_deref()) {
+        match snaps.capture_cancellable(std::path::Path::new(&session.directory), prev.as_deref(), cancel) {
             Ok(id) => {
                 if crate::log::enabled(crate::log::Level::Debug, "snapshot") {
                     let files = snaps.manifest(&id).map(|m| m.files.len().to_string()).unwrap_or_else(|_| "?".into());
                     crate::log_debug!("snapshot", "captured session={} files={files} ms={}", session.id, started.elapsed().as_millis());
                 }
                 Some(id)
+            }
+            Err(crate::snapshot::SnapError::Cancelled) => {
+                crate::log_info!("snapshot", "capture cancelled session={} after {} ms", session.id, started.elapsed().as_millis());
+                None
             }
             Err(e) => {
                 crate::log_warn!("snapshot", "capture failed session={} after {} ms, snapshots are off for this session: {e}", session.id, started.elapsed().as_millis());
@@ -50,6 +56,7 @@ impl Engine {
     pub(super) fn snaps(&self, session: &Session) -> Snapshots {
         let mut s = Snapshots::new(self.cfg.app_dir.join("data/snapshots").join(&session.project_id));
         s.max_files = self.cfg.snapshot_max_files;
+        s.max_total_bytes = self.cfg.snapshot_max_bytes;
         s
     }
 

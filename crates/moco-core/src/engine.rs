@@ -178,7 +178,9 @@ pub struct EngineConfig {
     pub compaction: compaction::Settings,
     /// Capture the working tree before every step so changes can be undone (`/undo`) and diffed.
     pub snapshots: bool,
+    /// Budget of one capture (see `Snapshots::max_files`, `max_total_bytes`); over it, snapshots are off for the session.
     pub snapshot_max_files: usize,
+    pub snapshot_max_bytes: u64,
     /// Model for titles and other small jobs (`provider/model`); the session's model when unset.
     pub small_model: Option<String>,
     /// Automatic classification of shell commands that would otherwise ask (off unless set; see `classifier.rs`).
@@ -216,6 +218,7 @@ impl EngineConfig {
             compaction: compaction::Settings::default(),
             snapshots: true,
             snapshot_max_files: 50_000,
+            snapshot_max_bytes: 512 * 1024 * 1024,
             small_model: None,
             classifier: None,
             skills: vec![],
@@ -2934,6 +2937,21 @@ mod tests {
         let notices: Vec<_> = ui.log().into_iter().filter(|l| l.contains("snapshots are off")).collect();
         assert_eq!(notices.len(), 1, "{notices:?}");
         assert!(f.msgs().iter().all(|m| m.data.get("snapshot").is_none()));
+    }
+
+    #[test]
+    fn a_tree_over_the_byte_budget_turns_snapshots_off_and_the_run_goes_on() {
+        // #23: the snapshot must not hold up the first response; over the budget the step runs without one.
+        let f = fixture_cfg(vec![tool_step(vec![write_call("w1", "a.txt", "v1")]), text("done")], |c| c.snapshot_max_bytes = 10);
+        f.file("big.txt", &"x".repeat(100));
+        f.say("go");
+        let ui = TestUi::default();
+        assert_eq!(f.run(&ui), RunOutcome::Idle);
+        let notices: Vec<_> = ui.log().into_iter().filter(|l| l.contains("snapshots are off") && l.contains("MiB")).collect();
+        assert_eq!(notices.len(), 1, "{:?}", ui.log());
+        assert!(f.msgs().iter().all(|m| m.data.get("snapshot").is_none()));
+        assert_eq!(read_work(&f, "a.txt").as_deref(), Some("v1"), "the step ran");
+        assert!(!f.dir.join("app/data/snapshots").join(&f.session.project_id).join("blobs").exists(), "nothing stored");
     }
 
     #[test]
